@@ -19,6 +19,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
+## Vanilla data
+
+`python tools/fetch_vanilla.py` downloads the 26.3 server jar and runs its data generator
+into `vanilla/26.3/generated/` (`reports/packets.json`, `reports/blocks.json`,
+`reports/registries.json`, `data/minecraft/**`). It needs Java 25:
+`JAVA_HOME="C:/Program Files/Eclipse Adoptium/jdk-25.0.5.8-hotspot"`.
+This is already done on the dev machine; read the files instead of guessing IDs.
+
 ## Layout
 
 | Crate | Owns |
