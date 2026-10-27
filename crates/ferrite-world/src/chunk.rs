@@ -1,0 +1,229 @@
+use crate::{PaletteError, PaletteKind, PalettedContainer};
+use ferrite_nbt::Compound;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockFlags {
+    pub air: bool,
+    pub motion_blocking: bool,
+    pub fluid: bool,
+    pub leaves: bool,
+}
+pub trait BlockInfo {
+    fn flags(&self, state: u32) -> BlockFlags;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HeightmapKind {
+    WorldSurfaceWg = 0,
+    WorldSurface = 1,
+    OceanFloorWg = 2,
+    OceanFloor = 3,
+    MotionBlocking = 4,
+    MotionBlockingNoLeaves = 5,
+}
+impl HeightmapKind {
+    pub const ALL: [Self; 6] = [
+        Self::WorldSurfaceWg,
+        Self::WorldSurface,
+        Self::OceanFloorWg,
+        Self::OceanFloor,
+        Self::MotionBlocking,
+        Self::MotionBlockingNoLeaves,
+    ];
+    fn includes(self, flags: BlockFlags) -> bool {
+        match self {
+            Self::WorldSurface | Self::WorldSurfaceWg => !flags.air,
+            Self::OceanFloor | Self::OceanFloorWg => flags.motion_blocking,
+            Self::MotionBlocking => flags.motion_blocking || flags.fluid,
+            Self::MotionBlockingNoLeaves => (flags.motion_blocking || flags.fluid) && !flags.leaves,
+        }
+    }
+}
+#[derive(Debug, thiserror::Error)]
+pub enum ChunkError {
+    #[error(transparent)]
+    Palette(#[from] PaletteError),
+    #[error("invalid dimension height or bounds")]
+    Bounds,
+}
+#[derive(Debug, Clone)]
+pub struct ChunkSection {
+    pub(crate) blocks: PalettedContainer,
+    pub(crate) biomes: PalettedContainer,
+    pub(crate) block_count: u16,
+}
+impl ChunkSection {
+    pub fn new(air: u32, biome: u32, block_bits: u8, biome_bits: u8) -> Result<Self, ChunkError> {
+        Ok(Self {
+            blocks: PalettedContainer::new(PaletteKind::Blocks, air, block_bits)?,
+            biomes: PalettedContainer::new(PaletteKind::Biomes, biome, biome_bits)?,
+            block_count: 0,
+        })
+    }
+    pub fn block_count(&self) -> u16 {
+        self.block_count
+    }
+    pub fn blocks(&self) -> &PalettedContainer {
+        &self.blocks
+    }
+    pub fn biomes(&self) -> &PalettedContainer {
+        &self.biomes
+    }
+    pub fn set_biome(&mut self, index: usize, value: u32) -> Result<(), ChunkError> {
+        Ok(self.biomes.set(index, value)?)
+    }
+    pub fn set_block(
+        &mut self,
+        index: usize,
+        value: u32,
+        info: &impl BlockInfo,
+    ) -> Result<(), ChunkError> {
+        let old = self.blocks.get(index).ok_or(ChunkError::Bounds)?;
+        self.blocks.set(index, value)?;
+        match (info.flags(old).air, info.flags(value).air) {
+            (true, false) => self.block_count += 1,
+            (false, true) => self.block_count -= 1,
+            _ => {}
+        }
+        Ok(())
+    }
+    pub fn encode_network(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.block_count.to_be_bytes());
+        out.extend(self.blocks.encode_network());
+        out.extend(self.biomes.encode_network());
+        out
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEntity {
+    pub type_id: u32,
+    pub data: Compound,
+}
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub(crate) min_y: i32,
+    pub(crate) height: u32,
+    pub(crate) sections: Vec<ChunkSection>,
+    pub(crate) heights: [Vec<u16>; 6],
+    pub block_entities: BTreeMap<(u8, i32, u8), BlockEntity>,
+    pub(crate) source: Option<Compound>,
+}
+impl Chunk {
+    pub fn new(
+        min_y: i32,
+        height: u32,
+        air: u32,
+        biome: u32,
+        block_bits: u8,
+        biome_bits: u8,
+    ) -> Result<Self, ChunkError> {
+        if min_y % 16 != 0
+            || height == 0
+            || !height.is_multiple_of(16)
+            || height > u16::MAX as u32
+            || min_y.checked_add(height as i32).is_none()
+        {
+            return Err(ChunkError::Bounds);
+        }
+        let mut sections = Vec::with_capacity((height / 16) as usize);
+        for _ in 0..height / 16 {
+            sections.push(ChunkSection::new(air, biome, block_bits, biome_bits)?);
+        }
+        Ok(Self {
+            min_y,
+            height,
+            sections,
+            heights: std::array::from_fn(|_| vec![0; 256]),
+            block_entities: BTreeMap::new(),
+            source: None,
+        })
+    }
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+    pub fn height_blocks(&self) -> u32 {
+        self.height
+    }
+    pub fn sections(&self) -> &[ChunkSection] {
+        &self.sections
+    }
+    pub fn sections_mut(&mut self) -> &mut [ChunkSection] {
+        &mut self.sections
+    }
+    fn coords(&self, x: u8, y: i32, z: u8) -> Result<(usize, usize), ChunkError> {
+        if x >= 16 || z >= 16 || y < self.min_y || y >= self.min_y + self.height as i32 {
+            return Err(ChunkError::Bounds);
+        }
+        let local = (y - self.min_y) as usize;
+        Ok((
+            local / 16,
+            (local % 16) * 256 + usize::from(z) * 16 + usize::from(x),
+        ))
+    }
+    pub fn block(&self, x: u8, y: i32, z: u8) -> Option<u32> {
+        let (s, i) = self.coords(x, y, z).ok()?;
+        self.sections[s].blocks.get(i)
+    }
+    pub fn height(&self, kind: HeightmapKind, x: u8, z: u8) -> Option<u16> {
+        if x >= 16 || z >= 16 {
+            None
+        } else {
+            Some(self.heights[kind as usize][usize::from(z) * 16 + usize::from(x)])
+        }
+    }
+    pub fn set_block(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        value: u32,
+        info: &impl BlockInfo,
+    ) -> Result<(), ChunkError> {
+        let (s, i) = self.coords(x, y, z)?;
+        let old = self.sections[s].blocks.get(i).ok_or(ChunkError::Bounds)?;
+        self.sections[s].set_block(i, value, info)?;
+        let old_flags = info.flags(old);
+        let flags = info.flags(value);
+        let column = usize::from(z) * 16 + usize::from(x);
+        let h = (y - self.min_y + 1) as u16;
+        for kind in HeightmapKind::ALL {
+            let previous = self.heights[kind as usize][column];
+            if kind.includes(flags) && h > previous {
+                self.heights[kind as usize][column] = h;
+            } else if kind.includes(old_flags) && !kind.includes(flags) && h == previous {
+                let mut new_height = 0;
+                for below in (self.min_y..y).rev() {
+                    if kind.includes(info.flags(self.block(x, below, z).unwrap())) {
+                        new_height = (below - self.min_y + 1) as u16;
+                        break;
+                    }
+                }
+                self.heights[kind as usize][column] = new_height;
+            }
+        }
+        Ok(())
+    }
+    pub fn recompute_heightmaps(&mut self, info: &impl BlockInfo) {
+        for map in &mut self.heights {
+            map.fill(0);
+        }
+        for z in 0..16 {
+            for x in 0..16 {
+                for y in (self.min_y..self.min_y + self.height as i32).rev() {
+                    let flags = info.flags(self.block(x, y, z).unwrap());
+                    let i = usize::from(z) * 16 + usize::from(x);
+                    for kind in HeightmapKind::ALL {
+                        if self.heights[kind as usize][i] == 0 && kind.includes(flags) {
+                            self.heights[kind as usize][i] = (y - self.min_y + 1) as u16;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub fn heights(&self, kind: HeightmapKind) -> &[u16] {
+        &self.heights[kind as usize]
+    }
+}

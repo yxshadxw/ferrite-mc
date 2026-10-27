@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-light"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-data.workspace = true
+
+[dev-dependencies]
+ferrite-nbt.workspace = true

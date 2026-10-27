@@ -8,3 +8,10 @@ license.workspace = true
 indexmap = "2"
 thiserror.workspace = true
 flate2.workspace = true
+unicode_names2 = "1"
+uuid.workspace = true
+serde = { workspace = true, optional = true }
+serde-value = { version = "0.7", optional = true }
+
+[features]
+serde = ["dep:serde", "dep:serde-value"]

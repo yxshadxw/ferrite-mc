@@ -197,3 +197,46 @@ fn put_varint(out: &mut Vec<u8>, mut value: u32) {
         value >>= 7;
     }
 }
+
+impl PalettedContainer {
+    /// Repack the values using the smallest valid palette.
+    pub fn compact(&mut self) {
+        let values: Vec<_> = (0..self.kind.len())
+            .map(|i| self.get(i).expect("valid palette"))
+            .collect();
+        self.repack(&values);
+    }
+}
+mod chunk;
+pub use chunk::{
+    BlockEntity, BlockFlags, BlockInfo, Chunk, ChunkError, ChunkSection, HeightmapKind,
+};
+mod network;
+pub use network::{LightData, LightSection, NetworkError, encode_chunk_packet};
+mod region;
+pub use region::{RegionCompression, RegionError, RegionFile};
+mod registry;
+pub use registry::{BlockState, BlockStateRegistry, RegistryError, RuntimeRegistry};
+impl PalettedContainer {
+    pub fn from_values(
+        kind: PaletteKind,
+        values: &[u32],
+        global_bits: u8,
+    ) -> Result<Self, PaletteError> {
+        if values.len() != kind.len() {
+            return Err(PaletteError::Index);
+        }
+        let mut this = Self::new(kind, values[0], global_bits)?;
+        this.counts.clear();
+        for &value in values {
+            if u64::from(value) >= (1u64 << global_bits) {
+                return Err(PaletteError::Value);
+            }
+            *this.counts.entry(value).or_default() += 1;
+        }
+        this.repack(values);
+        Ok(this)
+    }
+}
+mod chunk_nbt;
+pub use chunk_nbt::{ChunkNbtError, DATA_VERSION, chunk_from_nbt, chunk_to_nbt};

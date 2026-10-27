@@ -108,3 +108,6 @@ impl From<Compound> for Tag {
 }
 pub mod binary;
 pub mod snbt;
+
+#[cfg(feature = "serde")]
+pub mod serde;

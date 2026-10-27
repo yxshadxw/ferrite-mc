@@ -62,7 +62,64 @@ impl Parser<'_> {
                 match self.bump() {
                     Some(c) if c == quote => break,
                     Some('\\') => match self.bump() {
-                        Some(c) if c == quote || c == '\\' => s.push(c),
+                        Some(c) if c == quote || c == '\\' || c == '\'' || c == '"' => s.push(c),
+                        Some('b') => s.push('\u{8}'),
+                        Some('s') => s.push(' '),
+                        Some('t') => s.push('\t'),
+                        Some('n') => s.push('\n'),
+                        Some('f') => s.push('\u{c}'),
+                        Some('r') => s.push('\r'),
+                        Some('N') => {
+                            if self.bump() != Some('{') {
+                                return Err(Error(self.pos, "invalid unicode name"));
+                            }
+                            let start = self.pos;
+                            while self.peek().is_some_and(|c| c != '}') {
+                                self.bump();
+                            }
+                            let name = &self.input[start..self.pos];
+                            self.expect('}')?;
+                            s.push(
+                                unicode_names2::character(name)
+                                    .ok_or(Error(self.pos, "unknown unicode name"))?,
+                            );
+                        }
+                        Some(c @ ('x' | 'u' | 'U')) => {
+                            let n = match c {
+                                'x' => 2,
+                                'u' => 4,
+                                _ => 8,
+                            };
+                            let mut value = 0u32;
+                            for _ in 0..n {
+                                value = value * 16
+                                    + self
+                                        .bump()
+                                        .and_then(|x| x.to_digit(16))
+                                        .ok_or(Error(self.pos, "invalid unicode escape"))?;
+                            }
+                            if (0xD800..=0xDBFF).contains(&value) {
+                                if self.bump() != Some('\\') || self.bump() != Some('u') {
+                                    return Err(Error(self.pos, "missing low surrogate"));
+                                }
+                                let mut low = 0u32;
+                                for _ in 0..4 {
+                                    low = low * 16
+                                        + self
+                                            .bump()
+                                            .and_then(|x| x.to_digit(16))
+                                            .ok_or(Error(self.pos, "invalid low surrogate"))?;
+                                }
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(Error(self.pos, "invalid low surrogate"));
+                                }
+                                value = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+                            }
+                            s.push(
+                                char::from_u32(value)
+                                    .ok_or(Error(self.pos, "invalid unicode scalar"))?,
+                            );
+                        }
                         _ => return Err(Error(self.pos, "invalid escape")),
                     },
                     Some(c) => s.push(c),
@@ -105,6 +162,9 @@ impl Parser<'_> {
                         break;
                     }
                     self.expect(',')?;
+                    if self.eat('}') {
+                        break;
+                    }
                 }
                 Ok(Tag::Compound(map))
             }
@@ -112,7 +172,37 @@ impl Parser<'_> {
             Some('\'' | '"') => Ok(Tag::String(self.string()?)),
             Some(_) => {
                 let s = self.string()?;
-                Ok(parse_atom(s))
+                if matches!(s.as_str(), "bool" | "uuid") && self.eat('(') {
+                    let arg = self.value(depth + 1)?;
+                    self.expect(')')?;
+                    if s == "bool" {
+                        let yes = match arg {
+                            Tag::Byte(v) => v != 0,
+                            Tag::Short(v) => v != 0,
+                            Tag::Int(v) => v != 0,
+                            Tag::Long(v) => v != 0,
+                            Tag::Float(v) => v != 0.0,
+                            Tag::Double(v) => v != 0.0,
+                            _ => return Err(Error(self.pos, "bool expects number")),
+                        };
+                        Ok(Tag::Byte(i8::from(yes)))
+                    } else if let Tag::String(v) = arg {
+                        let id = uuid::Uuid::parse_str(&v)
+                            .map_err(|_| Error(self.pos, "invalid UUID"))?;
+                        Ok(Tag::IntArray(
+                            id.as_bytes()
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|x| i32::from_be_bytes(*x))
+                                .collect(),
+                        ))
+                    } else {
+                        Err(Error(self.pos, "uuid expects string"))
+                    }
+                } else {
+                    parse_atom(s, None).map_err(|reason| Error(self.pos, reason))
+                }
             }
             None => Err(Error(self.pos, "expected value")),
         }
@@ -132,11 +222,21 @@ impl Parser<'_> {
         let mut values = Vec::new();
         if !self.eat(']') {
             loop {
-                values.push(self.value(depth)?);
+                if let Some(a) = array {
+                    self.space();
+                    let start = self.pos;
+                    let token = self.string()?;
+                    values.push(parse_atom(token, Some(a)).map_err(|reason| Error(start, reason))?);
+                } else {
+                    values.push(self.value(depth)?);
+                }
                 if self.eat(']') {
                     break;
                 }
                 self.expect(',')?;
+                if self.eat(']') {
+                    break;
+                }
             }
         }
         macro_rules! convert {
@@ -168,10 +268,11 @@ impl Parser<'_> {
                 'I' => {
                     let mut out = Vec::new();
                     for v in values {
-                        if let Tag::Int(x) = v {
-                            out.push(x);
-                        } else {
-                            return Err(Error(self.pos, "invalid int array"));
+                        match v {
+                            Tag::Byte(x) => out.push(i32::from(x)),
+                            Tag::Short(x) => out.push(i32::from(x)),
+                            Tag::Int(x) => out.push(x),
+                            _ => return Err(Error(self.pos, "invalid int array")),
                         }
                     }
                     Tag::IntArray(out)
@@ -179,10 +280,12 @@ impl Parser<'_> {
                 _ => {
                     let mut out = Vec::new();
                     for v in values {
-                        if let Tag::Long(x) = v {
-                            out.push(x);
-                        } else {
-                            return Err(Error(self.pos, "invalid long array"));
+                        match v {
+                            Tag::Byte(x) => out.push(i64::from(x)),
+                            Tag::Short(x) => out.push(i64::from(x)),
+                            Tag::Int(x) => out.push(i64::from(x)),
+                            Tag::Long(x) => out.push(x),
+                            _ => return Err(Error(self.pos, "invalid long array")),
                         }
                     }
                     Tag::LongArray(out)
@@ -193,6 +296,21 @@ impl Parser<'_> {
             return Ok(Tag::List(List::End));
         }
         let id = values[0].id();
+        if values.iter().any(|v| v.id() != id) {
+            return Ok(Tag::List(List::Compound(
+                values
+                    .into_iter()
+                    .map(|v| match v {
+                        Tag::Compound(c) => c,
+                        other => {
+                            let mut c = Compound::new();
+                            c.insert(String::new(), other);
+                            c
+                        }
+                    })
+                    .collect(),
+            )));
+        }
         Ok(Tag::List(match id {
             1 => convert!(Byte, Byte),
             2 => convert!(Short, Short),
@@ -210,45 +328,132 @@ impl Parser<'_> {
         }))
     }
 }
-fn parse_atom(s: String) -> Tag {
-    if s.eq_ignore_ascii_case("true") {
-        return Tag::Byte(1);
+fn parse_atom(s: String, default: Option<char>) -> Result<Tag, &'static str> {
+    if s == "true" {
+        return Ok(Tag::Byte(1));
     }
-    if s.eq_ignore_ascii_case("false") {
-        return Tag::Byte(0);
+    if s == "false" {
+        return Ok(Tag::Byte(0));
     }
-    let suffix = s
-        .as_bytes()
-        .last()
-        .copied()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let stem = &s[..s.len() - 1];
-    macro_rules! number {
-        ($t:ty, $v:ident) => {
-            if let Ok(n) = stem.parse::<$t>() {
-                return Tag::$v(n);
-            }
+    let numeric = s.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'));
+    if !numeric {
+        return if default.is_none() {
+            Ok(Tag::String(s))
+        } else {
+            Err("expected number")
         };
     }
-    match suffix {
-        b'b' => number!(i8, Byte),
-        b's' => number!(i16, Short),
-        b'l' => number!(i64, Long),
-        b'f' => number!(f32, Float),
-        b'd' => number!(f64, Double),
-        _ => {}
-    }
-    if let Ok(n) = s.parse::<i32>() {
-        return Tag::Int(n);
-    }
-    if (s.contains('.') || s.contains('e') || s.contains('E'))
-        && let Ok(n) = s.parse::<f64>()
+    let lower = s.to_ascii_lowercase();
+    let unsigned_body = lower.trim_start_matches(['+', '-']);
+    let radix = if unsigned_body.starts_with("0x") {
+        16
+    } else if unsigned_body.starts_with("0b") {
+        2
+    } else {
+        10
+    };
+    let mut end = lower.len();
+    let last = lower.as_bytes()[end - 1] as char;
+    let has_suffix = matches!(last, 'b' | 's' | 'i' | 'l' | 'f' | 'd')
+        && !(radix == 16
+            && matches!(last, 'b' | 'd' | 'f')
+            && !(lower.ends_with("ub") || lower.ends_with("sb")));
+    let suffix = if has_suffix {
+        end -= 1;
+        last
+    } else {
+        default.unwrap_or('i').to_ascii_lowercase()
+    };
+    let explicit_sign = if has_suffix && end > 0 && matches!(lower.as_bytes()[end - 1], b'u' | b's')
     {
-        return Tag::Double(n);
+        end -= 1;
+        Some(lower.as_bytes()[end] as char)
+    } else {
+        None
+    };
+    let body = &lower[..end];
+    if body.starts_with('_')
+        || body.ends_with('_')
+        || body.contains("._")
+        || body.contains("_.")
+        || body.contains("e_")
+        || body.contains("_e")
+    {
+        return Err("invalid digit separator");
     }
-    Tag::String(s)
+    if body.trim_start_matches(['+', '-']).starts_with("0x_")
+        || body.trim_start_matches(['+', '-']).starts_with("0b_")
+    {
+        return Err("invalid digit separator");
+    }
+    let clean = body.replace('_', "");
+    let is_float =
+        radix == 10 && (matches!(suffix, 'f' | 'd') || clean.contains('.') || clean.contains('e'));
+    if is_float {
+        if explicit_sign.is_some() || !matches!(suffix, 'f' | 'd' | 'i') {
+            return Err("invalid float suffix");
+        }
+        let x: f64 = clean.parse().map_err(|_| "invalid float")?;
+        if !x.is_finite() {
+            return Err("float out of range");
+        }
+        if suffix == 'f' {
+            let x = x as f32;
+            if !x.is_finite() {
+                return Err("float out of range");
+            }
+            return Ok(Tag::Float(x));
+        }
+        return Ok(Tag::Double(x));
+    }
+    let digits = clean.trim_start_matches(['+', '-']);
+    let digits = if radix != 10 {
+        digits.get(2..).ok_or("invalid integer")?
+    } else {
+        digits
+    };
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || (radix == 10 && digits.len() > 1 && digits.starts_with('0'))
+    {
+        return Err("invalid integer");
+    }
+    let magnitude = u128::from_str_radix(digits, radix).map_err(|_| "invalid integer")?;
+    let negative = clean.starts_with('-');
+    let unsigned = explicit_sign == Some('u') || (explicit_sign.is_none() && radix != 10);
+    let bits = match suffix {
+        'b' => 8,
+        's' => 16,
+        'i' => 32,
+        'l' => 64,
+        _ => return Err("invalid integer suffix"),
+    };
+    if unsigned && negative {
+        return Err("negative unsigned integer");
+    }
+    let max = if unsigned {
+        (1u128 << bits) - 1
+    } else if negative {
+        1u128 << (bits - 1)
+    } else {
+        (1u128 << (bits - 1)) - 1
+    };
+    if magnitude > max {
+        return Err("integer out of range");
+    }
+    let value = if negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    Ok(match suffix {
+        'b' => Tag::Byte(value as i8),
+        's' => Tag::Short(value as i16),
+        'i' => Tag::Int(value as i32),
+        _ => Tag::Long(value as i64),
+    })
 }
+
 fn quoted(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {

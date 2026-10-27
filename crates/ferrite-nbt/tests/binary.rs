@@ -84,3 +84,128 @@ fn rejects_large_list_even_when_input_is_long_enough() {
     data.resize(data.len() + 1_000_001, 0);
     assert!(binary::read_named(&data).is_err());
 }
+
+#[test]
+fn modern_snbt_literals() {
+    use ferrite_nbt::snbt::parse;
+    assert_eq!(parse("0xFFub").unwrap(), Tag::Byte(-1));
+    assert_eq!(parse("0b1111_1111b").unwrap(), Tag::Byte(-1));
+    assert_eq!(parse("240ub").unwrap(), Tag::Byte(-16));
+    assert_eq!(parse("0xAB").unwrap(), Tag::Int(171));
+    assert_eq!(parse("1_2.3_4__5f").unwrap(), Tag::Float(12.345));
+    assert_eq!(
+        parse(r#""\u2603\n\U0001F600""#).unwrap(),
+        Tag::String("\u{2603}\n\u{1f600}".into())
+    );
+    assert_eq!(parse("[B;1,2,]").unwrap(), Tag::ByteArray(vec![1, 2]));
+    assert_eq!(parse("[I;1b,2s,3,]").unwrap(), Tag::IntArray(vec![1, 2, 3]));
+    let mixed = parse("['a',{b:3},1]").unwrap();
+    let Tag::List(List::Compound(items)) = mixed else {
+        panic!("expected wrapper compounds")
+    };
+    assert_eq!(items[0].get(""), Some(&Tag::String("a".into())));
+    assert_eq!(items[1].get("b"), Some(&Tag::Int(3)));
+    assert_eq!(items[2].get(""), Some(&Tag::Int(1)));
+    assert!(parse("240sb").is_err());
+    assert!(parse("1e1000").is_err());
+    assert!(parse("[1,,]").is_err());
+}
+
+#[test]
+fn snbt_operations_named_escapes_and_invalid_numbers() {
+    use ferrite_nbt::snbt::parse;
+    assert_eq!(
+        parse(r#""\N{SNOWMAN}\x21""#).unwrap(),
+        Tag::String("\u{2603}!".into())
+    );
+    assert_eq!(parse("bool(3)").unwrap(), Tag::Byte(1));
+    assert_eq!(
+        parse(r#"uuid("00112233-4455-6677-8899-aabbccddeeff")"#).unwrap(),
+        Tag::IntArray(vec![
+            0x00112233,
+            0x44556677,
+            0x8899aabbu32 as i32,
+            0xccddeeffu32 as i32
+        ])
+    );
+    for s in ["0b", "0x", "012", "-", "0x_ff", "1e999", "[B;256]"] {
+        assert!(parse(s).is_err(), "{s}");
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_struct_roundtrip() {
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Example {
+        name: String,
+        health: i32,
+        active: bool,
+        values: Vec<i64>,
+        missing: Option<i32>,
+    }
+    let expected = Example {
+        name: "Steve".into(),
+        health: 20,
+        active: true,
+        values: vec![1, 2],
+        missing: None,
+    };
+    let tag = ferrite_nbt::serde::to_tag(&expected).unwrap();
+    let bytes = binary::write_named("", &tag).unwrap();
+    let actual = ferrite_nbt::serde::from_tag(binary::read_named(&bytes).unwrap().1).unwrap();
+    assert_eq!(expected, actual);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_unsigned_and_enums_roundtrip() {
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Mode {
+        Idle,
+        Active(i32),
+    }
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Value {
+        value: u8,
+        mode: Mode,
+    }
+    for mode in [Mode::Idle, Mode::Active(42)] {
+        let expected = Value { value: 255, mode };
+        assert_eq!(
+            ferrite_nbt::serde::from_tag::<Value>(ferrite_nbt::serde::to_tag(&expected).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_char_and_optional_roundtrip() {
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Value {
+        character: char,
+        optional: Option<i32>,
+    }
+    for optional in [None, Some(4)] {
+        let expected = Value {
+            character: 'Z',
+            optional,
+        };
+        assert_eq!(
+            ferrite_nbt::serde::from_tag::<Value>(ferrite_nbt::serde::to_tag(&expected).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn snbt_surrogate_pairs() {
+    assert_eq!(
+        ferrite_nbt::snbt::parse(r#""\uD83D\uDE00""#).unwrap(),
+        Tag::String("\u{1f600}".into())
+    );
+    assert!(ferrite_nbt::snbt::parse(r#""\uD800x""#).is_err());
+}
