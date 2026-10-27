@@ -89,3 +89,66 @@ mod tests {
         );
     }
 }
+
+/// A plain-text network NBT component encoded as a nameless TAG_String.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainText(pub String);
+impl Encode for PlainText {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let mut bytes = Vec::new();
+        for c in self.0.encode_utf16() {
+            if (1..=0x7f).contains(&c) {
+                bytes.push(c as u8);
+            } else if c <= 0x7ff {
+                bytes.push((0xc0 | (c >> 6)) as u8);
+                bytes.push((0x80 | (c & 0x3f)) as u8);
+            } else {
+                bytes.push((0xe0 | (c >> 12)) as u8);
+                bytes.push((0x80 | ((c >> 6) & 0x3f)) as u8);
+                bytes.push((0x80 | (c & 0x3f)) as u8);
+            }
+        }
+        8u8.encode(out);
+        u16::try_from(bytes.len())
+            .expect("NBT string exceeds 65535 bytes")
+            .encode(out);
+        out.extend_from_slice(&bytes);
+    }
+}
+impl Decode for PlainText {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        if u8::decode(buf)? != 8 {
+            return Err(DecodeError::Invalid("expected NBT string"));
+        }
+        let n = u16::decode(buf)? as usize;
+        let b = crate::codec::take(buf, n)?;
+        let mut units = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let x = b[i];
+            let (value, width) = if (1..=0x7f).contains(&x) {
+                (x as u16, 1)
+            } else if x & 0xe0 == 0xc0 && i + 1 < b.len() && b[i + 1] & 0xc0 == 0x80 {
+                ((((x & 31) as u16) << 6) | ((b[i + 1] & 63) as u16), 2)
+            } else if x & 0xf0 == 0xe0
+                && i + 2 < b.len()
+                && b[i + 1] & 0xc0 == 0x80
+                && b[i + 2] & 0xc0 == 0x80
+            {
+                (
+                    (((x & 15) as u16) << 12)
+                        | (((b[i + 1] & 63) as u16) << 6)
+                        | ((b[i + 2] & 63) as u16),
+                    3,
+                )
+            } else {
+                return Err(DecodeError::Invalid("invalid modified UTF-8"));
+            };
+            units.push(value);
+            i += width;
+        }
+        Ok(Self(String::from_utf16(&units).map_err(|_| {
+            DecodeError::Invalid("invalid modified UTF-8")
+        })?))
+    }
+}
