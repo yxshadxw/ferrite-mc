@@ -106,3 +106,5 @@ impl From<Compound> for Tag {
         Tag::Compound(v)
     }
 }
+pub mod binary;
+pub mod snbt;
