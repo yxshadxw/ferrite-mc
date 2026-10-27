@@ -95,22 +95,29 @@ pub struct PlayerInfo {
 }
 impl Encode for PlayerInfo {
     fn encode(&self, out: &mut Vec<u8>) {
-        1u8.encode(out);
+        9u8.encode(out);
         VarInt(1).encode(out);
         self.uuid.encode(out);
         self.name.encode(out);
         self.properties.encode(out);
+        true.encode(out);
     }
 }
 impl Decode for PlayerInfo {
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
-        if u8::decode(buf)? != 1 || VarInt::decode(buf)?.0 != 1 {
+        if u8::decode(buf)? != 9 || VarInt::decode(buf)?.0 != 1 {
             return Err(DecodeError::Invalid("player info actions"));
         }
+        let uuid = Uuid::decode(buf)?;
+        let name = String::decode(buf)?;
+        let properties = Vec::decode(buf)?;
+        if !bool::decode(buf)? {
+            return Err(DecodeError::Invalid("unlisted player"));
+        }
         Ok(Self {
-            uuid: Uuid::decode(buf)?,
-            name: String::decode(buf)?,
-            properties: Vec::decode(buf)?,
+            uuid,
+            name,
+            properties,
         })
     }
 }
@@ -140,3 +147,71 @@ impl Packet for PlayerLoaded {
     const BOUND: Bound = Bound::Serverbound;
 }
 packet!(PlayDisconnect,32,Clientbound,{reason:crate::types::PlainText});
+packet!(ForgetChunk,38,Clientbound,{z:i32,x:i32});
+packet!(EntityMove,54,Clientbound,{id:VarInt,properties:VarInt,dx:i16,dy:i16,dz:i16});
+packet!(EntityMoveRotation,55,Clientbound,{id:VarInt,properties:VarInt,dx:i16,dy:i16,dz:i16,yaw:u8,pitch:u8});
+packet!(EntityRotation,57,Clientbound,{id:VarInt,on_ground:bool,yaw:u8,pitch:u8});
+packet!(EntityHeadRotation,85,Clientbound,{id:VarInt,yaw:u8});
+packet!(EntityTeleport,35,Clientbound,{id:VarInt,path_type:VarInt,x:f64,y:f64,z:f64,yaw:f32,pitch:f32,on_ground:bool});
+packet!(RemoveEntities,78,Clientbound,{ids:Vec<VarInt>});
+packet!(PlayerInfoRemove,70,Clientbound,{uuids:Vec<Uuid>});
+packet!(SystemChat,124,Clientbound,{content:crate::types::PlainText,overlay:bool});
+packet!(ChunkBatchReceived,11,Serverbound,{chunks_per_tick:f32});
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddEntity {
+    pub id: VarInt,
+    pub uuid: Uuid,
+    pub entity_type: VarInt,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub pitch: u8,
+    pub yaw: u8,
+    pub head_yaw: u8,
+    pub data: VarInt,
+}
+impl Encode for AddEntity {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.uuid.encode(out);
+        self.entity_type.encode(out);
+        self.x.encode(out);
+        self.y.encode(out);
+        self.z.encode(out);
+        0u8.encode(out);
+        self.pitch.encode(out);
+        self.yaw.encode(out);
+        self.head_yaw.encode(out);
+        self.data.encode(out);
+    }
+}
+impl Decode for AddEntity {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let id = VarInt::decode(buf)?;
+        let uuid = Uuid::decode(buf)?;
+        let entity_type = VarInt::decode(buf)?;
+        let x = f64::decode(buf)?;
+        let y = f64::decode(buf)?;
+        let z = f64::decode(buf)?;
+        if u8::decode(buf)? != 0 {
+            return Err(DecodeError::Invalid("nonzero velocity unsupported"));
+        }
+        Ok(Self {
+            id,
+            uuid,
+            entity_type,
+            x,
+            y,
+            z,
+            pitch: u8::decode(buf)?,
+            yaw: u8::decode(buf)?,
+            head_yaw: u8::decode(buf)?,
+            data: VarInt::decode(buf)?,
+        })
+    }
+}
+impl Packet for AddEntity {
+    const ID: i32 = 1;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}

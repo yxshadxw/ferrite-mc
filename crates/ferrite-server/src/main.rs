@@ -47,7 +47,8 @@ async fn main() -> anyhow::Result<()> {
         .context("binding server listener")?;
     tracing::info!(address = %listener.local_addr()?, online_mode = config.online_mode, view_distance = config.view_distance, "Ferrite listener started");
 
-    ferrite_net::serve(
+    let world = game::World::start();
+    let mut server = tokio::spawn(ferrite_net::serve(
         listener,
         ferrite_net::ServerConfig {
             motd: config.motd,
@@ -56,9 +57,18 @@ async fn main() -> anyhow::Result<()> {
             encrypt_offline: false,
             compression_threshold: config.compression_threshold,
             view_distance: config.view_distance,
+            game: Some(world.sender.clone()),
         },
-    )
-    .await
+    ));
+    let result =
+        tokio::select! { result=&mut server=>Some(result), _=tokio::signal::ctrl_c()=>None };
+    world.shutdown().await;
+    if let Some(result) = result {
+        result??;
+    } else {
+        server.abort();
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -76,3 +86,5 @@ mod tests {
         assert_eq!(custom.max_players, 42);
     }
 }
+
+mod game;

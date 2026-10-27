@@ -14,3 +14,5 @@ anyhow.workspace = true
 mimalloc = "0.1"
 serde.workspace = true
 toml = "0.8"
+ferrite-region.workspace = true
+uuid.workspace = true

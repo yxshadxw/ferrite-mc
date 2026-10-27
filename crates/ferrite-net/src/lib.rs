@@ -21,6 +21,7 @@ pub struct ServerConfig {
     pub encrypt_offline: bool,
     pub compression_threshold: usize,
     pub view_distance: u8,
+    pub game: Option<tokio::sync::mpsc::UnboundedSender<game::GameMessage>>,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -31,6 +32,7 @@ impl Default for ServerConfig {
             encrypt_offline: false,
             compression_threshold: 256,
             view_distance: 10,
+            game: None,
         }
     }
 }
@@ -327,6 +329,7 @@ async fn read_config_packet(
         }
     }
 }
+#[cfg(test)]
 fn flat_chunk(x: i32, z: i32, biome: i32) -> ferrite_protocol::packets::play::ChunkData {
     use ferrite_protocol::{
         Encode,
@@ -386,134 +389,43 @@ async fn play(
     profile: Profile,
     vanilla: registry::VanillaData,
 ) -> Result<()> {
-    use ferrite_protocol::packets::play::*;
-    let Profile {
-        uuid,
-        name,
-        properties,
-    } = profile;
-    let dim = vanilla.registries["minecraft:dimension_type"]
+    use ferrite_protocol::packets::play::{PlayDisconnect, PlayKeepAlive};
+    use game::{GameMessage, Outbound};
+    let game = config.game.context("game loop unavailable")?;
+    let dimension_type = vanilla.registries["minecraft:dimension_type"]
         .iter()
         .position(|v| v == "minecraft:overworld")
-        .context("missing overworld dimension")? as i32;
+        .context("missing overworld")? as i32;
     let biome = vanilla.registries["minecraft:worldgen/biome"]
         .iter()
         .position(|v| v == "minecraft:plains")
-        .context("missing plains biome")? as i32;
-    let distance = config.view_distance.clamp(2, 32);
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &PlayLogin {
-            entity_id: 1,
-            hardcore: false,
-            dimensions: vec!["minecraft:overworld".into()],
-            max_players: VarInt(config.max_players as i32),
-            view_distance: VarInt(distance as i32),
-            simulation_distance: VarInt(distance as i32),
-            reduced_debug: false,
-            respawn_screen: true,
-            limited_crafting: false,
-            dimension_type: VarInt(dim),
-            dimension: "minecraft:overworld".into(),
-            seed: 0,
-            game_mode: VarInt(0),
-            previous_game_mode: VarInt(0),
-            debug: false,
-            flat: true,
-            death_location: None,
-            portal_cooldown: VarInt(0),
-            sea_level: VarInt(63),
-            online_mode: config.online_mode,
-            secure_chat: false,
-        },
-    )
-    .await?;
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &PositionSync {
-            teleport_id: VarInt(1),
-            x: 0.5,
-            y: 65.0,
-            z: 0.5,
-            velocity_x: 0.0,
-            velocity_y: 0.0,
-            velocity_z: 0.0,
-            yaw: 0.0,
-            pitch: 0.0,
-            flags: 0,
-        },
-    )
-    .await?;
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &PlayerInfo {
-            uuid,
-            name: name.clone(),
-            properties,
-        },
-    )
-    .await?;
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &DefaultSpawn {
-            dimension: "minecraft:overworld".into(),
-            position: ferrite_protocol::types::BlockPos::new(0, 65, 0).pack(),
-            yaw: 0.0,
-            pitch: 0.0,
-        },
-    )
-    .await?;
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &GameEvent {
-            event: 13,
-            value: 0.0,
-        },
-    )
-    .await?;
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &CenterChunk {
-            x: VarInt(0),
-            z: VarInt(0),
-        },
-    )
-    .await?;
-    send_compressed(&mut stream, &encoder, &ChunkBatchStart).await?;
-    let radius = distance as i32;
-    let mut count = 0;
-    for x in -radius..=radius {
-        for z in -radius..=radius {
-            send_compressed(&mut stream, &encoder, &flat_chunk(x, z, biome)).await?;
-            count += 1;
-        }
-    }
-    send_compressed(
-        &mut stream,
-        &encoder,
-        &ChunkBatchFinished {
-            size: VarInt(count),
-        },
-    )
-    .await?;
-    tracing::info!(player=%name,%uuid,"player joined");
-    let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
-    let mut teleported = false;
-    loop {
-        tokio::select! { _=timer.tick()=>{send_compressed(&mut stream,&encoder,&PlayKeepAlive {id:1}).await?;}, packet=read_packet(&mut stream,&mut decoder)=>{let packet=packet?;let mut body=packet.as_slice(); let id=VarInt::decode(&mut body)?.0; match id {
-        0=>{let confirm=ConfirmTeleport::decode(&mut body)?; if confirm.id.0!=1 {bail!("unexpected teleport confirmation");} teleported=true;},
-        28=>{ClientKeepAlive::decode(&mut body)?;},
-        30=>{MovePosition::decode(&mut body)?;}, 31=>{MovePositionRotation::decode(&mut body)?;}, 32=>{MoveRotation::decode(&mut body)?;}, 33=>{MoveFlags::decode(&mut body)?;},
-        44=>{PlayerLoaded::decode(&mut body)?; tracing::debug!(player=%name,teleported,"player loaded");},
-        7..=9=>{let message=String::decode(&mut body)?;tracing::info!(player=%name,%message,"client chat");},
-        _=>{} } } }
-    }
+        .context("missing plains")? as i32;
+    let uuid = profile.uuid;
+    let (outbound, mut queue) = tokio::sync::mpsc::unbounded_channel();
+    game.send(GameMessage::Joined {
+        uuid,
+        name: profile.name,
+        properties: profile.properties,
+        dimension_type,
+        biome,
+        view_distance: config.view_distance.clamp(2, 32),
+        online_mode: config.online_mode,
+        max_players: config.max_players,
+        outbound,
+    })
+    .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+    let result=async {
+        let mut tick=tokio::time::interval(std::time::Duration::from_millis(50));
+        let mut keepalive=tokio::time::interval_at(tokio::time::Instant::now()+std::time::Duration::from_secs(10),std::time::Duration::from_secs(10));
+        loop {tokio::select! {
+            _=tick.tick()=>{let mut batch=Vec::new();let mut close=false;while let Ok(msg)=queue.try_recv(){match msg {Outbound::Packet(body)=>encoder.encode(&body,&mut batch),Outbound::Disconnect(reason)=>{let mut body=Vec::new();encode_packet(&PlayDisconnect {reason:ferrite_protocol::types::PlainText(reason)},&mut body);encoder.encode(&body,&mut batch);close=true;break;}}} if !batch.is_empty(){stream.write_all(&batch).await?;}
+                if close{return Ok(());}},
+            _=keepalive.tick()=>{send_compressed(&mut stream,&encoder,&PlayKeepAlive{id:1}).await?;},
+            frame=read_packet(&mut stream,&mut decoder)=>{let frame=frame?;if let Some(packet)=game::decode_play(&frame)?{game.send(GameMessage::Input {uuid,packet}).map_err(|_|anyhow::anyhow!("game loop stopped"))?;}}
+        }}
+    }.await;
+    let _ = game.send(GameMessage::Left { uuid });
+    result
 }
 fn minecraft_digest(digest: &[u8]) -> String {
     num_bigint::BigInt::from_signed_bytes_be(digest).to_str_radix(16)
@@ -814,10 +726,64 @@ mod configuration_test {
     async fn configuration_sends_known_pack_and_registries() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (game_tx, mut game_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if let Some(game::GameMessage::Joined {
+                outbound,
+                dimension_type,
+                biome,
+                ..
+            }) = game_rx.recv().await
+            {
+                use ferrite_protocol::packets::play::*;
+                let login = PlayLogin {
+                    entity_id: 1,
+                    hardcore: false,
+                    dimensions: vec!["minecraft:overworld".into()],
+                    max_players: VarInt(20),
+                    view_distance: VarInt(2),
+                    simulation_distance: VarInt(2),
+                    reduced_debug: false,
+                    respawn_screen: true,
+                    limited_crafting: false,
+                    dimension_type: VarInt(dimension_type),
+                    dimension: "minecraft:overworld".into(),
+                    seed: 0,
+                    game_mode: VarInt(0),
+                    previous_game_mode: VarInt(0),
+                    debug: false,
+                    flat: true,
+                    death_location: None,
+                    portal_cooldown: VarInt(0),
+                    sea_level: VarInt(63),
+                    online_mode: false,
+                    secure_chat: false,
+                };
+                let _ = outbound.send(game::packet(&login));
+                let _ = outbound.send(game::packet(&PositionSync {
+                    teleport_id: VarInt(1),
+                    x: 0.5,
+                    y: 65.0,
+                    z: 0.5,
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                    velocity_z: 0.0,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    flags: 0,
+                }));
+                let _ = outbound.send(game::packet(&GameEvent {
+                    event: 13,
+                    value: 0.0,
+                }));
+                let _ = outbound.send(game::packet(&flat_chunk(0, 0, biome)));
+            }
+        });
         let server = tokio::spawn(serve(
             listener,
             ServerConfig {
                 online_mode: false,
+                game: Some(game_tx),
                 ..Default::default()
             },
         ));
@@ -1172,3 +1138,25 @@ mod validation_tests {
         assert!(result.is_ok_and(|r| r.is_err()));
     }
 }
+#[cfg(test)]
+mod game_channel_tests {
+    use super::game::{ServerboundPlay, decode_play};
+    use ferrite_protocol::{encode_packet, packets::play::MovePosition};
+    #[test]
+    fn play_input_decodes_to_typed_event() {
+        let mut bytes = Vec::new();
+        encode_packet(
+            &MovePosition {
+                x: 5.0,
+                y: 65.0,
+                z: 0.5,
+                flags: 1,
+            },
+            &mut bytes,
+        );
+        assert!(
+            matches!(decode_play(&bytes).unwrap(),Some(ServerboundPlay::Position(p)) if p.x==5.0)
+        );
+    }
+}
+pub mod game;

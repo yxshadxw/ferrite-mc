@@ -234,3 +234,93 @@ mod play_tests {
     }
 }
 pub mod play;
+#[cfg(test)]
+mod multiplayer_tests {
+    use super::play::*;
+    use crate::{Decode, Encode, VarInt, types::PlainText};
+    fn rt<T: Encode + Decode + PartialEq + std::fmt::Debug>(x: T) {
+        let mut b = Vec::new();
+        x.encode(&mut b);
+        let mut s = b.as_slice();
+        assert_eq!(T::decode(&mut s).unwrap(), x);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn player_info_marks_players_listed() {
+        let info = PlayerInfo {
+            uuid: uuid::Uuid::nil(),
+            name: "Steve".into(),
+            properties: vec![],
+        };
+        let mut b = Vec::new();
+        info.encode(&mut b);
+        assert_eq!(b[0], 9);
+        assert_eq!(b[b.len() - 1], 1);
+    }
+    #[test]
+    fn multiplayer_packet_roundtrips() {
+        rt(AddEntity {
+            id: VarInt(1),
+            uuid: uuid::Uuid::nil(),
+            entity_type: VarInt(159),
+            x: 0.5,
+            y: 65.0,
+            z: 0.5,
+            pitch: 0,
+            yaw: 0,
+            head_yaw: 0,
+            data: VarInt(0),
+        });
+        rt(EntityMove {
+            id: VarInt(1),
+            properties: VarInt(1),
+            dx: 2,
+            dy: 0,
+            dz: 0,
+        });
+        rt(EntityMoveRotation {
+            id: VarInt(1),
+            properties: VarInt(1),
+            dx: 2,
+            dy: 0,
+            dz: 0,
+            yaw: 2,
+            pitch: 3,
+        });
+        rt(EntityRotation {
+            id: VarInt(1),
+            on_ground: true,
+            yaw: 2,
+            pitch: 3,
+        });
+        rt(EntityHeadRotation {
+            id: VarInt(1),
+            yaw: 2,
+        });
+        rt(EntityTeleport {
+            id: VarInt(1),
+            path_type: VarInt(0),
+            x: 1.0,
+            y: 65.0,
+            z: 2.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: true,
+        });
+        rt(ForgetChunk { z: 1, x: -2 });
+        rt(RemoveEntities {
+            ids: vec![VarInt(1)],
+        });
+        rt(PlayerInfoRemove {
+            uuids: vec![uuid::Uuid::nil()],
+        });
+        rt(SystemChat {
+            content: PlainText("hello".into()),
+            overlay: false,
+        });
+        rt(ChunkBatchReceived {
+            chunks_per_tick: 3.0,
+        });
+    }
+}
