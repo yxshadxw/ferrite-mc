@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrite-nbt.workspace = true
+thiserror.workspace = true
+flate2.workspace = true

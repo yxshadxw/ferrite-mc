@@ -1,0 +1,5 @@
+/target
+/run
+/vanilla
+*.jar
+!java/**/gradle-wrapper.jar

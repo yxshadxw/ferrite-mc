@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-nbt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+indexmap = "2"
+thiserror.workspace = true
+flate2.workspace = true

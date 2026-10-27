@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+ferrite-nbt = { path = "crates/ferrite-nbt" }
+ferrite-protocol = { path = "crates/ferrite-protocol" }
+ferrite-net = { path = "crates/ferrite-net" }
+ferrite-region = { path = "crates/ferrite-region" }
+ferrite-world = { path = "crates/ferrite-world" }
+ferrite-data = { path = "crates/ferrite-data" }
+
+bytes = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v3", "v4"] }
+flate2 = "1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
