@@ -1,0 +1,722 @@
+Compiled from "PluginClassLoader.java"
+public final class org.bukkit.plugin.java.PluginClassLoader extends java.net.URLClassLoader implements io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader {
+  private final org.bukkit.plugin.java.JavaPluginLoader loader;
+
+  private final java.util.Map<java.lang.String, java.lang.Class<?>> classes;
+
+  private final org.bukkit.plugin.PluginDescriptionFile description;
+
+  private final java.io.File dataFolder;
+
+  private final java.io.File file;
+
+  private final java.util.jar.JarFile jar;
+
+  private final java.util.jar.Manifest manifest;
+
+  private final java.net.URL url;
+
+  private final java.lang.ClassLoader libraryLoader;
+
+  final org.bukkit.plugin.java.JavaPlugin plugin;
+
+  private org.bukkit.plugin.java.JavaPlugin pluginInit;
+
+  private java.lang.IllegalStateException pluginState;
+
+  private final java.util.Set<java.lang.String> seenIllegalAccess;
+
+  private java.util.logging.Logger logger;
+
+  private io.papermc.paper.plugin.provider.classloader.PluginClassLoaderGroup classLoaderGroup;
+
+  public io.papermc.paper.plugin.provider.entrypoint.DependencyContext dependencyContext;
+
+  public org.bukkit.plugin.java.PluginClassLoader(java.lang.ClassLoader, org.bukkit.plugin.PluginDescriptionFile, java.io.File, java.io.File, java.lang.ClassLoader, java.util.jar.JarFile, io.papermc.paper.plugin.provider.entrypoint.DependencyContext) throws java.io.IOException, org.bukkit.plugin.InvalidPluginException, java.net.MalformedURLException;
+    Code:
+         0: aload_0
+         1: aload         4
+         3: invokevirtual #1                  // Method java/io/File.getName:()Ljava/lang/String;
+         6: iconst_1
+         7: anewarray     #7                  // class java/net/URL
+        10: dup
+        11: iconst_0
+        12: aload         4
+        14: invokevirtual #9                  // Method java/io/File.toURI:()Ljava/net/URI;
+        17: invokevirtual #13                 // Method java/net/URI.toURL:()Ljava/net/URL;
+        20: aastore
+        21: aload_1
+        22: invokespecial #19                 // Method java/net/URLClassLoader."<init>":(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V
+        25: aload_0
+        26: new           #25                 // class java/util/concurrent/ConcurrentHashMap
+        29: dup
+        30: invokespecial #27                 // Method java/util/concurrent/ConcurrentHashMap."<init>":()V
+        33: putfield      #30                 // Field classes:Ljava/util/Map;
+        36: aload_0
+        37: new           #25                 // class java/util/concurrent/ConcurrentHashMap
+        40: dup
+        41: invokespecial #27                 // Method java/util/concurrent/ConcurrentHashMap."<init>":()V
+        44: invokestatic  #36                 // Method java/util/Collections.newSetFromMap:(Ljava/util/Map;)Ljava/util/Set;
+        47: putfield      #42                 // Field seenIllegalAccess:Ljava/util/Set;
+        50: aload_0
+        51: aconst_null
+        52: putfield      #46                 // Field loader:Lorg/bukkit/plugin/java/JavaPluginLoader;
+        55: aload_0
+        56: aload_2
+        57: putfield      #50                 // Field description:Lorg/bukkit/plugin/PluginDescriptionFile;
+        60: aload_0
+        61: aload_3
+        62: putfield      #54                 // Field dataFolder:Ljava/io/File;
+        65: aload_0
+        66: aload         4
+        68: putfield      #58                 // Field file:Ljava/io/File;
+        71: aload_0
+        72: aload         6
+        74: putfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+        77: aload_0
+        78: aload_0
+        79: getfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+        82: invokevirtual #65                 // Method java/util/jar/JarFile.getManifest:()Ljava/util/jar/Manifest;
+        85: putfield      #71                 // Field manifest:Ljava/util/jar/Manifest;
+        88: aload_0
+        89: aload         4
+        91: invokevirtual #9                  // Method java/io/File.toURI:()Ljava/net/URI;
+        94: invokevirtual #13                 // Method java/net/URI.toURL:()Ljava/net/URL;
+        97: putfield      #75                 // Field url:Ljava/net/URL;
+       100: aload_0
+       101: aload         5
+       103: putfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+       106: aload_0
+       107: aload_2
+       108: invokestatic  #83                 // Method com/destroystokyo/paper/utils/PaperPluginLogger.getLogger:(Lorg/bukkit/plugin/PluginDescriptionFile;)Ljava/util/logging/Logger;
+       111: putfield      #89                 // Field logger:Ljava/util/logging/Logger;
+       114: aload_0
+       115: aload         7
+       117: putfield      #93                 // Field dependencyContext:Lio/papermc/paper/plugin/provider/entrypoint/DependencyContext;
+       120: aload_0
+       121: invokestatic  #97                 // InterfaceMethod io/papermc/paper/plugin/provider/classloader/PaperClassLoaderStorage.instance:()Lio/papermc/paper/plugin/provider/classloader/PaperClassLoaderStorage;
+       124: aload_0
+       125: invokeinterface #103,  2          // InterfaceMethod io/papermc/paper/plugin/provider/classloader/PaperClassLoaderStorage.registerSpigotGroup:(Lorg/bukkit/plugin/java/PluginClassLoader;)Lio/papermc/paper/plugin/provider/classloader/PluginClassLoaderGroup;
+       130: putfield      #107                // Field classLoaderGroup:Lio/papermc/paper/plugin/provider/classloader/PluginClassLoaderGroup;
+       133: aload_2
+       134: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       137: iconst_1
+       138: aload_0
+       139: invokestatic  #116                // Method java/lang/Class.forName:(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;
+       142: astore        8
+       144: goto          168
+       147: astore        9
+       149: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       152: dup
+       153: aload_2
+       154: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       157: invokedynamic #126,  0            // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       162: aload         9
+       164: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       167: athrow
+       168: aload         8
+       170: ldc           #133                // class org/bukkit/plugin/java/JavaPlugin
+       172: invokevirtual #135                // Method java/lang/Class.asSubclass:(Ljava/lang/Class;)Ljava/lang/Class;
+       175: astore        9
+       177: goto          201
+       180: astore        10
+       182: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       185: dup
+       186: aload_2
+       187: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       190: invokedynamic #141,  0            // InvokeDynamic #1:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       195: aload         10
+       197: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       200: athrow
+       201: aload         9
+       203: iconst_0
+       204: anewarray     #117                // class java/lang/Class
+       207: invokevirtual #142                // Method java/lang/Class.getDeclaredConstructor:([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;
+       210: astore        10
+       212: goto          236
+       215: astore        11
+       217: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       220: dup
+       221: aload_2
+       222: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       225: invokedynamic #148,  0            // InvokeDynamic #2:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       230: aload         11
+       232: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       235: athrow
+       236: aload         10
+       238: iconst_1
+       239: invokevirtual #149                // Method java/lang/reflect/Constructor.setAccessible:(Z)V
+       242: goto          266
+       245: astore        11
+       247: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       250: dup
+       251: aload_2
+       252: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       255: invokedynamic #159,  0            // InvokeDynamic #3:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       260: aload         11
+       262: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       265: athrow
+       266: aload_0
+       267: aload         10
+       269: iconst_0
+       270: anewarray     #160                // class java/lang/Object
+       273: invokevirtual #162                // Method java/lang/reflect/Constructor.newInstance:([Ljava/lang/Object;)Ljava/lang/Object;
+       276: checkcast     #133                // class org/bukkit/plugin/java/JavaPlugin
+       279: putfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+       282: goto          369
+       285: astore        11
+       287: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       290: dup
+       291: aload_2
+       292: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       295: invokedynamic #159,  0            // InvokeDynamic #3:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       300: aload         11
+       302: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       305: athrow
+       306: astore        11
+       308: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       311: dup
+       312: aload_2
+       313: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       316: invokedynamic #174,  0            // InvokeDynamic #4:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       321: aload         11
+       323: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       326: athrow
+       327: astore        11
+       329: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       332: dup
+       333: aload_2
+       334: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       337: invokedynamic #177,  0            // InvokeDynamic #5:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       342: aload         11
+       344: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       347: athrow
+       348: astore        11
+       350: new           #124                // class org/bukkit/plugin/InvalidPluginException
+       353: dup
+       354: aload_2
+       355: invokevirtual #111                // Method org/bukkit/plugin/PluginDescriptionFile.getMain:()Ljava/lang/String;
+       358: invokedynamic #182,  0            // InvokeDynamic #6:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       363: aload         11
+       365: invokespecial #130                // Method org/bukkit/plugin/InvalidPluginException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       368: athrow
+       369: return
+      Exception table:
+         from    to  target type
+           133   144   147   Class java/lang/ClassNotFoundException
+           168   177   180   Class java/lang/ClassCastException
+           201   212   215   Class java/lang/NoSuchMethodException
+           236   242   245   Class java/lang/reflect/InaccessibleObjectException
+           236   242   245   Class java/lang/SecurityException
+           266   282   285   Class java/lang/IllegalAccessException
+           266   282   306   Class java/lang/InstantiationException
+           266   282   327   Class java/lang/IllegalArgumentException
+           266   282   348   Class java/lang/ExceptionInInitializerError
+           266   282   348   Class java/lang/reflect/InvocationTargetException
+
+  public java.net.URL getResource(java.lang.String);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: invokevirtual #183                // Method findResource:(Ljava/lang/String;)Ljava/net/URL;
+         5: astore_2
+         6: aload_2
+         7: ifnonnull     26
+        10: aload_0
+        11: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        14: ifnull        26
+        17: aload_0
+        18: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        21: aload_1
+        22: invokevirtual #187                // Method java/lang/ClassLoader.getResource:(Ljava/lang/String;)Ljava/net/URL;
+        25: areturn
+        26: aload_2
+        27: areturn
+
+  public java.util.Enumeration<java.net.URL> getResources(java.lang.String) throws java.io.IOException;
+    Code:
+         0: new           #192                // class java/util/ArrayList
+         3: dup
+         4: invokespecial #194                // Method java/util/ArrayList."<init>":()V
+         7: astore_2
+         8: aload_0
+         9: aload_2
+        10: aload_0
+        11: aload_1
+        12: invokevirtual #195                // Method findResources:(Ljava/lang/String;)Ljava/util/Enumeration;
+        15: invokevirtual #199                // Method addEnumeration:(Ljava/util/ArrayList;Ljava/util/Enumeration;)V
+        18: aload_0
+        19: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        22: ifnull        38
+        25: aload_0
+        26: aload_2
+        27: aload_0
+        28: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        31: aload_1
+        32: invokevirtual #203                // Method java/lang/ClassLoader.getResources:(Ljava/lang/String;)Ljava/util/Enumeration;
+        35: invokevirtual #199                // Method addEnumeration:(Ljava/util/ArrayList;Ljava/util/Enumeration;)V
+        38: aload_2
+        39: invokestatic  #206                // Method java/util/Collections.enumeration:(Ljava/util/Collection;)Ljava/util/Enumeration;
+        42: areturn
+
+  private <T> void addEnumeration(java.util.ArrayList<T>, java.util.Enumeration<T>);
+    Code:
+         0: aload_2
+         1: invokeinterface #210,  1          // InterfaceMethod java/util/Enumeration.hasMoreElements:()Z
+         6: ifeq          23
+         9: aload_1
+        10: aload_2
+        11: invokeinterface #216,  1          // InterfaceMethod java/util/Enumeration.nextElement:()Ljava/lang/Object;
+        16: invokevirtual #220                // Method java/util/ArrayList.add:(Ljava/lang/Object;)Z
+        19: pop
+        20: goto          0
+        23: return
+
+  public java.lang.Class<?> loadClass(java.lang.String, boolean, boolean, boolean) throws java.lang.ClassNotFoundException;
+    Code:
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: iload_3
+         4: iload         4
+         6: invokevirtual #224                // Method loadClass0:(Ljava/lang/String;ZZZ)Ljava/lang/Class;
+         9: areturn
+
+  public io.papermc.paper.plugin.configuration.PluginMeta getConfiguration();
+    Code:
+         0: aload_0
+         1: getfield      #50                 // Field description:Lorg/bukkit/plugin/PluginDescriptionFile;
+         4: areturn
+
+  public void init(org.bukkit.plugin.java.JavaPlugin);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: invokevirtual #228                // Method initialize:(Lorg/bukkit/plugin/java/JavaPlugin;)V
+         5: return
+
+  public org.bukkit.plugin.java.JavaPlugin getPlugin();
+    Code:
+         0: aload_0
+         1: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+         4: areturn
+
+  protected java.lang.Class<?> loadClass(java.lang.String, boolean) throws java.lang.ClassNotFoundException;
+    Code:
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: iconst_1
+         4: iconst_1
+         5: invokevirtual #224                // Method loadClass0:(Ljava/lang/String;ZZZ)Ljava/lang/Class;
+         8: areturn
+
+  java.lang.Class<?> loadClass0(java.lang.String, boolean, boolean, boolean) throws java.lang.ClassNotFoundException;
+    Code:
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: invokespecial #232                // Method java/net/URLClassLoader.loadClass:(Ljava/lang/String;Z)Ljava/lang/Class;
+         6: astore        5
+         8: iload_3
+         9: ifne          21
+        12: aload         5
+        14: invokevirtual #236                // Method java/lang/Class.getClassLoader:()Ljava/lang/ClassLoader;
+        17: aload_0
+        18: if_acmpne     24
+        21: aload         5
+        23: areturn
+        24: goto          29
+        27: astore        5
+        29: iload         4
+        31: ifeq          52
+        34: aload_0
+        35: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        38: ifnull        52
+        41: aload_0
+        42: getfield      #79                 // Field libraryLoader:Ljava/lang/ClassLoader;
+        45: aload_1
+        46: invokevirtual #240                // Method java/lang/ClassLoader.loadClass:(Ljava/lang/String;)Ljava/lang/Class;
+        49: areturn
+        50: astore        5
+        52: iload_3
+        53: ifeq          78
+        56: aload_0
+        57: getfield      #107                // Field classLoaderGroup:Lio/papermc/paper/plugin/provider/classloader/PluginClassLoaderGroup;
+        60: aload_1
+        61: iload_2
+        62: aload_0
+        63: invokeinterface #243,  4          // InterfaceMethod io/papermc/paper/plugin/provider/classloader/PluginClassLoaderGroup.getClassByName:(Ljava/lang/String;ZLio/papermc/paper/plugin/provider/classloader/ConfiguredPluginClassLoader;)Ljava/lang/Class;
+        68: astore        5
+        70: aload         5
+        72: ifnull        78
+        75: aload         5
+        77: areturn
+        78: new           #122                // class java/lang/ClassNotFoundException
+        81: dup
+        82: aload_1
+        83: invokespecial #249                // Method java/lang/ClassNotFoundException."<init>":(Ljava/lang/String;)V
+        86: athrow
+      Exception table:
+         from    to  target type
+             0    23    27   Class java/lang/ClassNotFoundException
+            41    49    50   Class java/lang/ClassNotFoundException
+
+  protected java.lang.Class<?> findClass(java.lang.String) throws java.lang.ClassNotFoundException;
+    Code:
+         0: aload_1
+         1: ldc           #252                // String org.bukkit.
+         3: invokevirtual #254                // Method java/lang/String.startsWith:(Ljava/lang/String;)Z
+         6: ifne          19
+         9: aload_1
+        10: ldc_w         #260                // String net.minecraft.
+        13: invokevirtual #254                // Method java/lang/String.startsWith:(Ljava/lang/String;)Z
+        16: ifeq          28
+        19: new           #122                // class java/lang/ClassNotFoundException
+        22: dup
+        23: aload_1
+        24: invokespecial #249                // Method java/lang/ClassNotFoundException."<init>":(Ljava/lang/String;)V
+        27: athrow
+        28: aload_0
+        29: getfield      #30                 // Field classes:Ljava/util/Map;
+        32: aload_1
+        33: invokeinterface #262,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+        38: checkcast     #117                // class java/lang/Class
+        41: astore_2
+        42: aload_2
+        43: ifnonnull     373
+        46: aload_1
+        47: bipush        46
+        49: bipush        47
+        51: invokevirtual #268                // Method java/lang/String.replace:(CC)Ljava/lang/String;
+        54: ldc_w         #272                // String .class
+        57: invokevirtual #274                // Method java/lang/String.concat:(Ljava/lang/String;)Ljava/lang/String;
+        60: astore_3
+        61: aload_0
+        62: getfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+        65: aload_3
+        66: invokevirtual #277                // Method java/util/jar/JarFile.getJarEntry:(Ljava/lang/String;)Ljava/util/jar/JarEntry;
+        69: astore        4
+        71: goto          108
+        74: astore        5
+        76: aload_0
+        77: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+        80: ifnonnull     86
+        83: aload         5
+        85: athrow
+        86: new           #281                // class java/lang/IllegalStateException
+        89: dup
+        90: aload_0
+        91: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+        94: invokevirtual #283                // Method org/bukkit/plugin/java/JavaPlugin.getName:()Ljava/lang/String;
+        97: invokedynamic #284,  0            // InvokeDynamic #7:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       102: aload         5
+       104: invokespecial #285                // Method java/lang/IllegalStateException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       107: athrow
+       108: aload         4
+       110: ifnull        345
+       113: aload_0
+       114: getfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+       117: aload         4
+       119: invokevirtual #286                // Method java/util/jar/JarFile.getInputStream:(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;
+       122: astore        6
+       124: aload         6
+       126: invokestatic  #290                // Method com/google/common/io/ByteStreams.toByteArray:(Ljava/io/InputStream;)[B
+       129: astore        5
+       131: aload         6
+       133: ifnull        171
+       136: aload         6
+       138: invokevirtual #296                // Method java/io/InputStream.close:()V
+       141: goto          171
+       144: astore        7
+       146: aload         6
+       148: ifnull        168
+       151: aload         6
+       153: invokevirtual #296                // Method java/io/InputStream.close:()V
+       156: goto          168
+       159: astore        8
+       161: aload         7
+       163: aload         8
+       165: invokevirtual #303                // Method java/lang/Throwable.addSuppressed:(Ljava/lang/Throwable;)V
+       168: aload         7
+       170: athrow
+       171: goto          187
+       174: astore        6
+       176: new           #122                // class java/lang/ClassNotFoundException
+       179: dup
+       180: aload_1
+       181: aload         6
+       183: invokespecial #309                // Method java/lang/ClassNotFoundException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+       186: athrow
+       187: invokestatic  #310                // Method org/bukkit/Bukkit.getServer:()Lorg/bukkit/Server;
+       190: invokeinterface #316,  1          // InterfaceMethod org/bukkit/Server.getUnsafe:()Lorg/bukkit/UnsafeValues;
+       195: aload_0
+       196: getfield      #50                 // Field description:Lorg/bukkit/plugin/PluginDescriptionFile;
+       199: aload_3
+       200: aload         5
+       202: invokeinterface #322,  4          // InterfaceMethod org/bukkit/UnsafeValues.processClass:(Lorg/bukkit/plugin/PluginDescriptionFile;Ljava/lang/String;[B)[B
+       207: astore        5
+       209: aload_1
+       210: bipush        46
+       212: invokevirtual #328                // Method java/lang/String.lastIndexOf:(I)I
+       215: istore        6
+       217: iload         6
+       219: iconst_m1
+       220: if_icmpeq     309
+       223: aload_1
+       224: iconst_0
+       225: iload         6
+       227: invokevirtual #332                // Method java/lang/String.substring:(II)Ljava/lang/String;
+       230: astore        7
+       232: aload_0
+       233: aload         7
+       235: invokevirtual #336                // Method getPackage:(Ljava/lang/String;)Ljava/lang/Package;
+       238: ifnonnull     309
+       241: aload_0
+       242: getfield      #71                 // Field manifest:Ljava/util/jar/Manifest;
+       245: ifnull        266
+       248: aload_0
+       249: aload         7
+       251: aload_0
+       252: getfield      #71                 // Field manifest:Ljava/util/jar/Manifest;
+       255: aload_0
+       256: getfield      #75                 // Field url:Ljava/net/URL;
+       259: invokevirtual #340                // Method definePackage:(Ljava/lang/String;Ljava/util/jar/Manifest;Ljava/net/URL;)Ljava/lang/Package;
+       262: pop
+       263: goto          280
+       266: aload_0
+       267: aload         7
+       269: aconst_null
+       270: aconst_null
+       271: aconst_null
+       272: aconst_null
+       273: aconst_null
+       274: aconst_null
+       275: aconst_null
+       276: invokevirtual #344                // Method definePackage:(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/net/URL;)Ljava/lang/Package;
+       279: pop
+       280: goto          309
+       283: astore        8
+       285: aload_0
+       286: aload         7
+       288: invokevirtual #336                // Method getPackage:(Ljava/lang/String;)Ljava/lang/Package;
+       291: ifnonnull     309
+       294: new           #281                // class java/lang/IllegalStateException
+       297: dup
+       298: aload         7
+       300: invokedynamic #347,  0            // InvokeDynamic #8:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       305: invokespecial #348                // Method java/lang/IllegalStateException."<init>":(Ljava/lang/String;)V
+       308: athrow
+       309: aload         4
+       311: invokevirtual #349                // Method java/util/jar/JarEntry.getCodeSigners:()[Ljava/security/CodeSigner;
+       314: astore        7
+       316: new           #355                // class java/security/CodeSource
+       319: dup
+       320: aload_0
+       321: getfield      #75                 // Field url:Ljava/net/URL;
+       324: aload         7
+       326: invokespecial #357                // Method java/security/CodeSource."<init>":(Ljava/net/URL;[Ljava/security/CodeSigner;)V
+       329: astore        8
+       331: aload_0
+       332: aload_1
+       333: aload         5
+       335: iconst_0
+       336: aload         5
+       338: arraylength
+       339: aload         8
+       341: invokevirtual #360                // Method defineClass:(Ljava/lang/String;[BIILjava/security/CodeSource;)Ljava/lang/Class;
+       344: astore_2
+       345: aload_2
+       346: ifnonnull     355
+       349: aload_0
+       350: aload_1
+       351: invokespecial #364                // Method java/net/URLClassLoader.findClass:(Ljava/lang/String;)Ljava/lang/Class;
+       354: astore_2
+       355: aload_0
+       356: getfield      #30                 // Field classes:Ljava/util/Map;
+       359: aload_1
+       360: aload_2
+       361: invokeinterface #367,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       366: pop
+       367: aload_0
+       368: aload_1
+       369: aload_2
+       370: invokevirtual #371                // Method setClass:(Ljava/lang/String;Ljava/lang/Class;)V
+       373: aload_2
+       374: areturn
+      Exception table:
+         from    to  target type
+            61    71    74   Class java/lang/IllegalStateException
+           124   131   144   Class java/lang/Throwable
+           151   156   159   Class java/lang/Throwable
+           113   171   174   Class java/io/IOException
+           241   280   283   Class java/lang/IllegalArgumentException
+
+  public void close() throws java.io.IOException;
+    Code:
+         0: aload_0
+         1: invokevirtual #375                // Method getClasses:()Ljava/util/Collection;
+         4: astore_1
+         5: aload_1
+         6: invokeinterface #379,  1          // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+        11: astore_2
+        12: aload_2
+        13: invokeinterface #385,  1          // InterfaceMethod java/util/Iterator.hasNext:()Z
+        18: ifeq          39
+        21: aload_2
+        22: invokeinterface #390,  1          // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        27: checkcast     #117                // class java/lang/Class
+        30: astore_3
+        31: aload_0
+        32: aload_3
+        33: invokevirtual #393                // Method removeClass:(Ljava/lang/Class;)V
+        36: goto          12
+        39: aload_0
+        40: invokespecial #397                // Method java/net/URLClassLoader.close:()V
+        43: aload_0
+        44: getfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+        47: invokevirtual #398                // Method java/util/jar/JarFile.close:()V
+        50: goto          65
+        53: astore        4
+        55: aload_0
+        56: getfield      #61                 // Field jar:Ljava/util/jar/JarFile;
+        59: invokevirtual #398                // Method java/util/jar/JarFile.close:()V
+        62: aload         4
+        64: athrow
+        65: return
+      Exception table:
+         from    to  target type
+             0    43    53   any
+            53    55    53   any
+
+  java.util.Collection<java.lang.Class<?>> getClasses();
+    Code:
+         0: aload_0
+         1: getfield      #30                 // Field classes:Ljava/util/Map;
+         4: invokeinterface #399,  1          // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+         9: areturn
+
+  public synchronized void initialize(org.bukkit.plugin.java.JavaPlugin);
+    Code:
+         0: aload_1
+         1: ifnull        8
+         4: iconst_1
+         5: goto          9
+         8: iconst_0
+         9: ldc_w         #402                // String Initializing plugin cannot be null
+        12: invokestatic  #404                // Method com/google/common/base/Preconditions.checkArgument:(ZLjava/lang/Object;)V
+        15: aload_1
+        16: invokevirtual #410                // Method java/lang/Object.getClass:()Ljava/lang/Class;
+        19: invokevirtual #236                // Method java/lang/Class.getClassLoader:()Ljava/lang/ClassLoader;
+        22: aload_0
+        23: if_acmpne     30
+        26: iconst_1
+        27: goto          31
+        30: iconst_0
+        31: ldc_w         #414                // String Cannot initialize plugin outside of this class loader
+        34: invokestatic  #404                // Method com/google/common/base/Preconditions.checkArgument:(ZLjava/lang/Object;)V
+        37: aload_0
+        38: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+        41: ifnonnull     51
+        44: aload_0
+        45: getfield      #416                // Field pluginInit:Lorg/bukkit/plugin/java/JavaPlugin;
+        48: ifnull        66
+        51: new           #175                // class java/lang/IllegalArgumentException
+        54: dup
+        55: ldc_w         #419                // String Plugin already initialized!
+        58: aload_0
+        59: getfield      #421                // Field pluginState:Ljava/lang/IllegalStateException;
+        62: invokespecial #425                // Method java/lang/IllegalArgumentException."<init>":(Ljava/lang/String;Ljava/lang/Throwable;)V
+        65: athrow
+        66: aload_0
+        67: new           #281                // class java/lang/IllegalStateException
+        70: dup
+        71: ldc_w         #426                // String Initial initialization
+        74: invokespecial #348                // Method java/lang/IllegalStateException."<init>":(Ljava/lang/String;)V
+        77: putfield      #421                // Field pluginState:Ljava/lang/IllegalStateException;
+        80: aload_0
+        81: aload_1
+        82: putfield      #416                // Field pluginInit:Lorg/bukkit/plugin/java/JavaPlugin;
+        85: aload_1
+        86: invokestatic  #310                // Method org/bukkit/Bukkit.getServer:()Lorg/bukkit/Server;
+        89: aload_0
+        90: getfield      #50                 // Field description:Lorg/bukkit/plugin/PluginDescriptionFile;
+        93: aload_0
+        94: getfield      #54                 // Field dataFolder:Ljava/io/File;
+        97: aload_0
+        98: getfield      #58                 // Field file:Ljava/io/File;
+       101: aload_0
+       102: aload_0
+       103: getfield      #50                 // Field description:Lorg/bukkit/plugin/PluginDescriptionFile;
+       106: aload_0
+       107: getfield      #89                 // Field logger:Ljava/util/logging/Logger;
+       110: invokevirtual #428                // Method org/bukkit/plugin/java/JavaPlugin.init:(Lorg/bukkit/Server;Lorg/bukkit/plugin/PluginDescriptionFile;Ljava/io/File;Ljava/io/File;Ljava/lang/ClassLoader;Lio/papermc/paper/plugin/configuration/PluginMeta;Ljava/util/logging/Logger;)V
+       113: return
+
+  public java.lang.String toString();
+    Code:
+         0: aload_0
+         1: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+         4: ifnull        14
+         7: aload_0
+         8: getfield      #166                // Field plugin:Lorg/bukkit/plugin/java/JavaPlugin;
+        11: goto          18
+        14: aload_0
+        15: getfield      #416                // Field pluginInit:Lorg/bukkit/plugin/java/JavaPlugin;
+        18: astore_1
+        19: aload_1
+        20: invokestatic  #432                // Method java/lang/String.valueOf:(Ljava/lang/Object;)Ljava/lang/String;
+        23: aload_1
+        24: ifnonnull     33
+        27: ldc_w         #436                // String uninitialized
+        30: goto          40
+        33: aload_1
+        34: invokevirtual #438                // Method org/bukkit/plugin/java/JavaPlugin.isEnabled:()Z
+        37: invokestatic  #441                // Method java/lang/Boolean.valueOf:(Z)Ljava/lang/Boolean;
+        40: invokestatic  #432                // Method java/lang/String.valueOf:(Ljava/lang/Object;)Ljava/lang/String;
+        43: aload_0
+        44: getfield      #58                 // Field file:Ljava/io/File;
+        47: invokestatic  #432                // Method java/lang/String.valueOf:(Ljava/lang/Object;)Ljava/lang/String;
+        50: invokedynamic #446,  0            // InvokeDynamic #9:makeConcatWithConstants:(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+        55: areturn
+
+  void setClass(java.lang.String, java.lang.Class<?>);
+    Code:
+         0: ldc_w         #449                // class org/bukkit/configuration/serialization/ConfigurationSerializable
+         3: aload_2
+         4: invokevirtual #451                // Method java/lang/Class.isAssignableFrom:(Ljava/lang/Class;)Z
+         7: ifeq          22
+        10: aload_2
+        11: ldc_w         #449                // class org/bukkit/configuration/serialization/ConfigurationSerializable
+        14: invokevirtual #135                // Method java/lang/Class.asSubclass:(Ljava/lang/Class;)Ljava/lang/Class;
+        17: astore_3
+        18: aload_3
+        19: invokestatic  #455                // Method org/bukkit/configuration/serialization/ConfigurationSerialization.registerClass:(Ljava/lang/Class;)V
+        22: return
+
+  private void removeClass(java.lang.Class<?>);
+    Code:
+         0: ldc_w         #449                // class org/bukkit/configuration/serialization/ConfigurationSerializable
+         3: aload_1
+         4: invokevirtual #451                // Method java/lang/Class.isAssignableFrom:(Ljava/lang/Class;)Z
+         7: ifeq          22
+        10: aload_1
+        11: ldc_w         #449                // class org/bukkit/configuration/serialization/ConfigurationSerializable
+        14: invokevirtual #135                // Method java/lang/Class.asSubclass:(Ljava/lang/Class;)Ljava/lang/Class;
+        17: astore_2
+        18: aload_2
+        19: invokestatic  #460                // Method org/bukkit/configuration/serialization/ConfigurationSerialization.unregisterClass:(Ljava/lang/Class;)V
+        22: return
+
+  public io.papermc.paper.plugin.provider.classloader.PluginClassLoaderGroup getGroup();
+    Code:
+         0: aload_0
+         1: getfield      #107                // Field classLoaderGroup:Lio/papermc/paper/plugin/provider/classloader/PluginClassLoaderGroup;
+         4: areturn
+
+  static {};
+    Code:
+         0: invokestatic  #463                // Method java/lang/ClassLoader.registerAsParallelCapable:()Z
+         3: pop
+         4: return
+}

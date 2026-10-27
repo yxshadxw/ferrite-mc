@@ -1,0 +1,3 @@
+Compiled from "ConsoleCommandSender.java"
+public interface org.bukkit.command.ConsoleCommandSender extends org.bukkit.command.CommandSender,org.bukkit.conversations.Conversable {
+}
