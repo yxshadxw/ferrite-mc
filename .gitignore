@@ -3,3 +3,5 @@
 /vanilla
 *.jar
 !java/**/gradle-wrapper.jar
+/logs
+__pycache__/
