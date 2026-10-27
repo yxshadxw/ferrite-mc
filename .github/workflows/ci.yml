@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            # rust-toolchain.toml pins a windows-msvc channel, which cannot run on
+            # Linux, so the host toolchain is forced there.
+            toolchain: stable
+            python: python3
+          - os: windows-latest
+            toolchain: stable-x86_64-pc-windows-msvc
+            python: python
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      # vanilla/ is generated locally and gitignored; only cache the produced
+      # data, keyed on the generator script that defines its layout.
+      - name: Cache vanilla data
+        uses: actions/cache@v4
+        with:
+          path: vanilla
+          key: vanilla-${{ runner.os }}-${{ hashFiles('tools/fetch_vanilla.py') }}
+
+      - name: Fetch vanilla data
+        run: ${{ matrix.python }} tools/fetch_vanilla.py
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
