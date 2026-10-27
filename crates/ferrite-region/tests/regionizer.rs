@@ -140,43 +140,70 @@ fn holder_counts_and_global_queue_are_preserved() {
 #[ignore = "long-running concurrent stress test"]
 fn stress_mutations_and_queued_tasks() {
     use ferrite_region::Scheduler;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
-    let scheduler = Scheduler::new(Regionizer::<Data>::new(0, 1), (), 4, |_| {}, |_| {});
-    let mut held = [false; 64];
-    let mut seed = 1u32;
-    for _ in 0..5000 {
-        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        let i = (seed as usize >> 16) % held.len();
-        let chunk = ChunkPos((i * 4) as i32, 0);
-        if held[i] {
-            scheduler.remove_chunk(chunk);
-        } else {
-            scheduler.add_chunk(chunk);
-        }
-        held[i] = !held[i];
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    for i in 0..64 {
+        topology.add_chunk(ChunkPos(i * 10, 0));
+        topology.add_chunk(ChunkPos(i * 10 + 2, 0));
     }
+    let scheduler = Arc::new(Scheduler::new(topology, (), 4, |_| {}, |_| {}));
     let (tx, rx) = mpsc::channel();
-    for (i, is_held) in held.iter().enumerate() {
-        let chunk = ChunkPos((i * 4) as i32, 0);
-        if !is_held {
-            scheduler.add_chunk(chunk);
-        }
-        let tx = tx.clone();
-        scheduler.schedule_at_chunk(chunk, move |_| {
-            tx.send(i).unwrap();
-        });
-    }
+    let workers: Vec<_> = (0..4)
+        .map(|worker| {
+            let scheduler = scheduler.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut seed = worker as u32 + 1;
+                for sequence in 0..1000 {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let i = worker * 16 + ((seed >> 16) % 16) as i32;
+                    let extra = ChunkPos(i * 10 + 1, 0);
+                    scheduler.add_chunk(extra);
+                    let tx = tx.clone();
+                    scheduler.schedule_at_chunk(extra, move |_| {
+                        tx.send((worker, sequence)).unwrap();
+                    });
+                    scheduler.remove_chunk(extra);
+                }
+            })
+        })
+        .collect();
     drop(tx);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    // Re-acquire every temporary section, so tasks parked by a removal can run.
+    for i in 0..64 {
+        scheduler.add_chunk(ChunkPos(i * 10 + 1, 0));
+    }
     let mut received = HashSet::new();
-    for _ in 0..64 {
-        assert!(received.insert(rx.recv_timeout(Duration::from_secs(10)).unwrap()));
+    for _ in 0..4000 {
+        assert!(received.insert(rx.recv_timeout(Duration::from_secs(20)).unwrap()));
     }
     for i in 0..64 {
-        assert!(scheduler.owner(ChunkPos(i * 4, 0)).is_some());
+        assert_eq!(
+            scheduler.owner(ChunkPos(i * 10, 0)),
+            scheduler.owner(ChunkPos(i * 10 + 1, 0))
+        );
+        assert_eq!(
+            scheduler.owner(ChunkPos(i * 10, 0)),
+            scheduler.owner(ChunkPos(i * 10 + 2, 0))
+        );
     }
+    let owners: HashSet<_> = (0..64)
+        .map(|i| scheduler.owner(ChunkPos(i * 10, 0)).unwrap())
+        .collect();
+    assert_eq!(owners.len(), 64);
     assert_eq!(scheduler.region_count(), 64);
-    assert!(scheduler.shutdown().pending_tasks.is_empty());
+    assert!(
+        Arc::try_unwrap(scheduler)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .pending_tasks
+            .is_empty()
+    );
 }
 
 #[test]
@@ -204,4 +231,71 @@ fn tasks_run_on_the_region_that_owns_the_target() {
     let result = scheduler.shutdown();
     assert_eq!(result.regions.len(), 2);
     assert_eq!(result.pending_tasks.len(), 1);
+}
+
+#[test]
+fn ticking_region_does_not_block_distant_regions_or_chunk_add() {
+    use ferrite_region::Scheduler;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    topology.add_chunk(ChunkPos(100, 0));
+    let scheduler = Arc::new(Scheduler::new(topology, (), 3, |_| {}, |_| {}));
+    let (entered, wait_entered) = mpsc::channel();
+    let (release, wait_release) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(0, 0), move |_| {
+        entered.send(()).unwrap();
+        wait_release.recv().unwrap();
+    });
+    wait_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (added, wait_added) = mpsc::channel();
+    let cloned = scheduler.clone();
+    std::thread::spawn(move || {
+        cloned.add_chunk(ChunkPos(0, 0));
+        cloned.add_chunk(ChunkPos(200, 0));
+        cloned.remove_chunk(ChunkPos(200, 0));
+        added.send(()).unwrap();
+    });
+    wait_added.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(100, 0), move |_| {
+        tx.send(()).unwrap();
+    });
+    let result = rx.recv_timeout(Duration::from_millis(500));
+    release.send(()).unwrap();
+    assert!(
+        result.is_ok(),
+        "distant region was blocked by unrelated tick and mutation"
+    );
+    Arc::try_unwrap(scheduler).ok().unwrap().shutdown();
+}
+
+#[test]
+fn bridge_task_queued_during_tick_survives_deferred_merge() {
+    use ferrite_region::Scheduler;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    topology.add_chunk(ChunkPos(2, 0));
+    let scheduler = Scheduler::new(topology, (), 3, |_| {}, |_| {});
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(0, 0), move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    scheduler.add_chunk(ChunkPos(1, 0));
+    let (tx, rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(1, 0), move |_| {
+        tx.send(()).unwrap();
+    });
+    assert_eq!(scheduler.region_count(), 2);
+    release_tx.send(()).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(scheduler.region_count(), 1);
+    assert!(rx.try_recv().is_err());
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
