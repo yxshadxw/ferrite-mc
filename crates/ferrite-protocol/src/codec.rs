@@ -72,6 +72,8 @@ pub struct VarInt(pub i32);
 impl VarInt {
     pub const MAX_LEN: usize = 5;
 
+    /// Encoded length in bytes (1..=5).
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
         match self.0 as u32 {
             0..=0x7f => 1,

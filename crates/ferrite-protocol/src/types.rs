@@ -72,6 +72,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::unusual_byte_groupings)] // grouped as x / z / y fields
     fn block_pos_packs() {
         for p in [
             BlockPos::new(0, 0, 0),
