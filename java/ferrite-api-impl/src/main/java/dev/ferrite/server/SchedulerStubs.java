@@ -1,0 +1,39 @@
+package dev.ferrite.server;
+@SuppressWarnings({"deprecation","unchecked","rawtypes"})
+abstract class SchedulerStubs implements org.bukkit.scheduler.BukkitScheduler {
+public <T> java.util.concurrent.Future<T> callSyncMethod(org.bukkit.plugin.Plugin a0, java.util.concurrent.Callable<T> a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#callSyncMethod"); }
+public void cancelTask(int a0) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#cancelTask"); }
+public void cancelTasks(org.bukkit.plugin.Plugin a0) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#cancelTasks"); }
+public java.util.List<org.bukkit.scheduler.BukkitWorker> getActiveWorkers() { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#getActiveWorkers"); }
+public java.util.concurrent.Executor getMainThreadExecutor(org.bukkit.plugin.Plugin a0) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#getMainThreadExecutor"); }
+public java.util.List<org.bukkit.scheduler.BukkitTask> getPendingTasks() { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#getPendingTasks"); }
+public boolean isCurrentlyRunning(int a0) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#isCurrentlyRunning"); }
+public boolean isQueued(int a0) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#isQueued"); }
+public org.bukkit.scheduler.BukkitTask runTaskAsynchronously(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskAsynchronously(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskAsynchronously"); }
+public void runTaskAsynchronously(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskLaterAsynchronously(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLaterAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskLaterAsynchronously(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLaterAsynchronously"); }
+public void runTaskLaterAsynchronously(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLaterAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskLater(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLater"); }
+public org.bukkit.scheduler.BukkitTask runTaskLater(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLater"); }
+public void runTaskLater(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskLater"); }
+public org.bukkit.scheduler.BukkitTask runTaskTimerAsynchronously(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimerAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskTimerAsynchronously(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimerAsynchronously"); }
+public void runTaskTimerAsynchronously(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimerAsynchronously"); }
+public org.bukkit.scheduler.BukkitTask runTaskTimer(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimer"); }
+public org.bukkit.scheduler.BukkitTask runTaskTimer(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimer"); }
+public void runTaskTimer(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTaskTimer"); }
+public org.bukkit.scheduler.BukkitTask runTask(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTask"); }
+public org.bukkit.scheduler.BukkitTask runTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTask"); }
+public void runTask(org.bukkit.plugin.Plugin a0, java.util.function.Consumer<? super org.bukkit.scheduler.BukkitTask> a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#runTask"); }
+public int scheduleAsyncDelayedTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleAsyncDelayedTask"); }
+public int scheduleAsyncDelayedTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleAsyncDelayedTask"); }
+public int scheduleAsyncRepeatingTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleAsyncRepeatingTask"); }
+public int scheduleSyncDelayedTask(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncDelayedTask"); }
+public int scheduleSyncDelayedTask(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncDelayedTask"); }
+public int scheduleSyncDelayedTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncDelayedTask"); }
+public int scheduleSyncDelayedTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncDelayedTask"); }
+public int scheduleSyncRepeatingTask(org.bukkit.plugin.Plugin a0, org.bukkit.scheduler.BukkitRunnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncRepeatingTask"); }
+public int scheduleSyncRepeatingTask(org.bukkit.plugin.Plugin a0, java.lang.Runnable a1, long a2, long a3) { throw new UnsupportedOperationException("Ferrite: not implemented: BukkitScheduler#scheduleSyncRepeatingTask"); }
+}

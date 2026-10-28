@@ -1,0 +1,11 @@
+name: FerriteTest
+version: 1.0
+main: dev.ferrite.test.TestPlugin
+api-version: '26.3'
+commands:
+  ferrite-test:
+    aliases: [ft]
+    description: Test command
+    permission: ferrite.test
+depend: [FerriteAlias]
+folia-supported: true
