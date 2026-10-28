@@ -1,0 +1,21 @@
+# Ferrite 서버 설정 예시입니다.
+# 이 파일을 실행 디렉터리의 ferrite.toml로 복사한 뒤 값을 수정하세요.
+# 모든 키는 생략 가능하며, 생략하면 아래 기본값이 사용됩니다.
+
+# 서버가 접속을 받을 주소 (IP:포트).
+bind-address = "0.0.0.0:25565"
+
+# true면 Mojang 인증(정품) 사용, false면 오프라인 모드로 로컬 테스트 가능.
+online-mode = true
+
+# 서버 목록에 표시되는 설명 문구.
+motd = "A Ferrite server"
+
+# 최대 동시 접속자 수.
+max-players = 20
+
+# 플레이어에게 전송하는 청크 반경 (2~32로 제한됨).
+view-distance = 10
+
+# 이 크기(바이트) 이상인 패킷을 압축합니다.
+compression-threshold = 256

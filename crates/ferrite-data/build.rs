@@ -1,5 +1,5 @@
 //! Turns the vanilla data generator output in `vanilla/<version>/generated/` into static Rust
-//! tables for block states, registries and packet ids.
+//! tables for block states, registries, packet ids and block physics.
 //!
 //! The data is produced by `python tools/fetch_vanilla.py`; this script only reads it and
 //! fails with a pointer to that command when it is missing.
@@ -32,14 +32,15 @@ fn main() {
     let registries = generated.join("reports").join("registries.json");
     let packets = generated.join("reports").join("packets.json");
     let data = generated.join("data").join("minecraft");
-    for path in [&blocks, &registries, &packets, &data] {
+    let physics = generated.join("ferrite").join("block_states.json");
+    for path in [&blocks, &registries, &packets, &data, &physics] {
         if !path.exists() {
             missing(path);
         }
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    for path in [&blocks, &registries, &packets, &data] {
+    for path in [&blocks, &registries, &packets, &data, &physics] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -50,6 +51,7 @@ fn main() {
         &gen_registries(&registries, &data),
     );
     write_file(&out_dir.join("packets.rs"), &gen_packets(&packets));
+    write_file(&out_dir.join("block_props.rs"), &gen_block_props(&physics));
 }
 
 /// Reports missing vanilla data, telling the user how to produce it.
@@ -602,4 +604,306 @@ fn gen_packets(path: &Path) -> String {
     }
     out.push_str("];\n");
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// block properties
+// ---------------------------------------------------------------------------------------------
+
+/// The empty shape, always index 0 of the generated shape table.
+const EMPTY_SHAPE: &str = "&[]";
+/// The full cube shape, always index 1 of the generated shape table.
+const FULL_SHAPE: &str = "&[[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]";
+
+fn gen_block_props(path: &Path) -> String {
+    let report = read_json(path);
+    let states = report
+        .get("states")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{}: expected a states array", path.display()));
+
+    let mut props: Vec<String> = Vec::new();
+    let mut prop_ids: BTreeMap<String, usize> = BTreeMap::new();
+    let mut state_props: Vec<usize> = Vec::with_capacity(states.len());
+    let mut shapes: Vec<String> = vec![EMPTY_SHAPE.to_string(), FULL_SHAPE.to_string()];
+    let mut shape_ids: BTreeMap<String, usize> = BTreeMap::new();
+    shape_ids.insert(EMPTY_SHAPE.to_string(), 0);
+    shape_ids.insert(FULL_SHAPE.to_string(), 1);
+    let mut state_collision: Vec<usize> = Vec::with_capacity(states.len());
+    let mut state_occlusion: Vec<usize> = Vec::with_capacity(states.len());
+
+    for (index, state) in states.iter().enumerate() {
+        let id = u16::try_from(index)
+            .unwrap_or_else(|_| panic!("{}: too many block states", path.display()));
+        let reported = integer(state, "id", id);
+        if reported != u64::from(id) {
+            panic!(
+                "{}: expected state {id}, found id {reported}",
+                path.display()
+            );
+        }
+
+        let fluid = match state.get("fluid") {
+            Some(serde_json::Value::Null) | None => "None".to_string(),
+            Some(fluid) => {
+                let kind = match text(fluid, "id", id) {
+                    // Flowing water/lava share the fluid kind of their source block; the amount
+                    // and `falling` flag carry the flow level.
+                    "minecraft:water" | "minecraft:flowing_water" => "FluidKind::Water".to_string(),
+                    "minecraft:lava" | "minecraft:flowing_lava" => "FluidKind::Lava".to_string(),
+                    other => format!("FluidKind::Other({})", literal(other)),
+                };
+                format!(
+                    "Some(({kind}, {}, {}))",
+                    integer(fluid, "amount", id),
+                    boolean(fluid, "falling", id)
+                )
+            }
+        };
+        let entry = format!(
+            "BlockProps {{ light_emission: {}, light_opacity: {}, can_occlude: {}, \
+             use_shape_for_light_occlusion: {}, propagates_skylight_down: {}, is_air: {}, \
+             blocks_motion: {}, is_solid_render: {}, is_redstone_conductor: {}, fluid: {fluid}, \
+             hardness: {}, requires_correct_tool: {}, replaceable: {}, full_collision: {}, \
+             empty_collision: {}, heightmaps: {}, randomly_ticking: {}, is_signal_source: {}, \
+             has_analog_output: {}, friction: {}, speed_factor: {}, jump_factor: {} }},",
+            integer(state, "lightEmission", id),
+            integer(state, "lightOpacity", id),
+            boolean(state, "canOcclude", id),
+            boolean(state, "useShapeForLightOcclusion", id),
+            boolean(state, "propagatesSkylightDown", id),
+            boolean(state, "isAir", id),
+            boolean(state, "blocksMotion", id),
+            boolean(state, "isSolidRender", id),
+            boolean(state, "isRedstoneConductor", id),
+            float(state, "hardness", id),
+            boolean(state, "requiresCorrectTool", id),
+            boolean(state, "replaceable", id),
+            shape_is(state, "collision", "full", id),
+            shape_is(state, "collision", "empty", id),
+            integer(state, "heightmaps", id),
+            boolean(state, "randomlyTicking", id),
+            boolean(state, "isSignalSource", id),
+            boolean(state, "hasAnalogOutput", id),
+            float(state, "friction", id),
+            float(state, "speedFactor", id),
+            float(state, "jumpFactor", id),
+        );
+        let prop = *prop_ids.entry(entry.clone()).or_insert_with(|| {
+            props.push(entry);
+            props.len() - 1
+        });
+        state_props.push(prop);
+        state_collision.push(shape_index(
+            &mut shapes,
+            &mut shape_ids,
+            state,
+            "collision",
+            id,
+        ));
+        state_occlusion.push(shape_index(
+            &mut shapes,
+            &mut shape_ids,
+            state,
+            "occlusion",
+            id,
+        ));
+    }
+
+    let mut out = header("ferrite/block_states.json");
+    writeln!(
+        out,
+        "/// Number of block states covered by the generated tables.\n\
+         pub const STATE_COUNT: usize = {};\n",
+        states.len()
+    )
+    .expect("writing to a String cannot fail");
+
+    out.push_str("/// Deduplicated block properties, referenced by [`STATE_PROPS`].\n");
+    out.push_str("static PROPS: &[BlockProps] = &[\n");
+    for prop in &props {
+        out.push_str("    ");
+        out.push_str(prop);
+        out.push('\n');
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// State id -> index into [`PROPS`].\nstatic STATE_PROPS: &[u16] = &[\n");
+    let rows: Vec<String> = state_props.iter().map(usize::to_string).collect();
+    items(&mut out, "    ", &rows);
+    out.push_str("\n];\n\n");
+
+    out.push_str(
+        "/// Deduplicated shapes, each box as `[min_x, min_y, min_z, max_x, max_y, max_z]`.\n",
+    );
+    out.push_str("static SHAPES: &[&[[f32; 6]]] = &[\n");
+    for shape in &shapes {
+        out.push_str("    ");
+        out.push_str(shape);
+        out.push_str(",\n");
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// State id -> index into [`SHAPES`] for the collision shape.\n");
+    out.push_str("static STATE_COLLISION: &[u16] = &[\n");
+    let rows: Vec<String> = state_collision.iter().map(usize::to_string).collect();
+    items(&mut out, "    ", &rows);
+    out.push_str("\n];\n\n");
+
+    out.push_str("/// State id -> index into [`SHAPES`] for the occlusion shape.\n");
+    out.push_str("static STATE_OCCLUSION: &[u16] = &[\n");
+    let rows: Vec<String> = state_occlusion.iter().map(usize::to_string).collect();
+    items(&mut out, "    ", &rows);
+    out.push_str("\n];\n\n");
+
+    out.push_str("/// Per-block metadata, sorted by `name` for binary search.\n");
+    out.push_str("static BLOCK_INFO: &[BlockInfo] = &[\n");
+    let blocks = report
+        .get("blocks")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{}: expected a blocks array", path.display()));
+    let mut blocks: Vec<&serde_json::Value> = blocks.iter().collect();
+    blocks.sort_unstable_by_key(|block| block.get("name").and_then(serde_json::Value::as_str));
+    for block in blocks {
+        let name = block
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{}: block without a name", path.display()));
+        let default_state = block
+            .get("defaultState")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("{name}: block without a default state"));
+        let resistance = block
+            .get("explosionResistance")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("{name}: block without an explosion resistance"));
+        let item = match block.get("item") {
+            Some(serde_json::Value::String(item)) => format!("Some({})", literal(item)),
+            _ => "None".to_string(),
+        };
+        writeln!(
+            out,
+            "    BlockInfo {{ name: {}, default_state: {default_state}, \
+             explosion_resistance: {}, item: {item} }},",
+            literal(name),
+            float_literal(resistance)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push_str("];\n");
+
+    out
+}
+
+/// A string field of a JSON object, panicking with the state id when it is missing.
+fn text<'a>(value: &'a serde_json::Value, field: &str, id: u16) -> &'a str {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("block state {id} has no string field {field}"))
+}
+
+/// A boolean field of a JSON object, panicking with the state id when it is missing.
+fn boolean(value: &serde_json::Value, field: &str, id: u16) -> bool {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("block state {id} has no boolean field {field}"))
+}
+
+/// An integer field of a JSON object, panicking with the state id when it is missing.
+fn integer(value: &serde_json::Value, field: &str, id: u16) -> u64 {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("block state {id} has no integer field {field}"))
+}
+
+/// Whether a state's `"empty"`/`"full"`/box shape is the expected kind.
+fn shape_is(state: &serde_json::Value, field: &str, expected: &str, id: u16) -> bool {
+    match state.get(field) {
+        Some(serde_json::Value::String(kind)) => kind == expected,
+        Some(serde_json::Value::Object(_)) => expected == "custom",
+        other => panic!("block state {id} has an unexpected {field} shape: {other:?}"),
+    }
+}
+
+/// The index of a state's shape in the deduplicated shape table.
+fn shape_index(
+    shapes: &mut Vec<String>,
+    shape_ids: &mut BTreeMap<String, usize>,
+    state: &serde_json::Value,
+    field: &str,
+    id: u16,
+) -> usize {
+    let shape = state
+        .get(field)
+        .unwrap_or_else(|| panic!("block state {id} has no {field} shape"));
+    let entry = match shape {
+        serde_json::Value::String(kind) if kind == "empty" => EMPTY_SHAPE.to_string(),
+        serde_json::Value::String(kind) if kind == "full" => FULL_SHAPE.to_string(),
+        serde_json::Value::Object(object) => {
+            let boxes = object
+                .get("boxes")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("block state {id} has a {field} shape without boxes"));
+            let mut entry = String::from("&[");
+            for (index, box_value) in boxes.iter().enumerate() {
+                let coordinates = box_value.as_array().unwrap_or_else(|| {
+                    panic!("block state {id} has a {field} box that is not an array")
+                });
+                if coordinates.len() != 6 {
+                    panic!(
+                        "block state {id} has a {field} box with {} coordinates; expected 6",
+                        coordinates.len()
+                    );
+                }
+                if index > 0 {
+                    entry.push_str(", ");
+                }
+                entry.push('[');
+                for (corner, coordinate) in coordinates.iter().enumerate() {
+                    if corner > 0 {
+                        entry.push_str(", ");
+                    }
+                    let value = coordinate.as_f64().unwrap_or_else(|| {
+                        panic!("block state {id} has a non-numeric {field} coordinate")
+                    });
+                    entry.push_str(&float_literal(value));
+                }
+                entry.push(']');
+            }
+            entry.push(']');
+            entry
+        }
+        other => panic!("block state {id} has an unexpected {field} shape: {other:?}"),
+    };
+    *shape_ids.entry(entry.clone()).or_insert_with(|| {
+        shapes.push(entry);
+        shapes.len() - 1
+    })
+}
+
+/// A numeric field of a JSON object, rendered as a Rust `f32` literal.
+fn float(value: &serde_json::Value, field: &str, id: u16) -> String {
+    let value = value
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_else(|| panic!("block state {id} has no numeric field {field}"));
+    float_literal(value)
+}
+
+/// Renders a number as a Rust `f32` literal, handling the non-finite values vanilla uses.
+fn float_literal(value: f64) -> String {
+    let value = value as f32;
+    if value.is_nan() {
+        "f32::NAN".to_string()
+    } else if value == f32::INFINITY {
+        "f32::INFINITY".to_string()
+    } else if value == f32::NEG_INFINITY {
+        "f32::NEG_INFINITY".to_string()
+    } else {
+        format!("{value:?}")
+    }
 }

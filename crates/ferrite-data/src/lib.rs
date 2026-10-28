@@ -84,6 +84,106 @@ pub mod blocks {
     }
 }
 
+pub mod block_props {
+    //! Physical properties of every block state, extracted from the vanilla server by
+    //! `tools/extractor` into `generated/ferrite/block_states.json`.
+
+    /// Which fluid fills a block state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum FluidKind {
+        Water,
+        Lava,
+        /// A fluid without a dedicated variant.
+        Other(&'static str),
+    }
+
+    /// Physical properties of one block state.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct BlockProps {
+        /// Light level the state emits (0..=15).
+        pub light_emission: u8,
+        /// Light level the state dampens by (vanilla's `getLightDampening`, 0..=15).
+        pub light_opacity: u8,
+        pub can_occlude: bool,
+        pub use_shape_for_light_occlusion: bool,
+        pub propagates_skylight_down: bool,
+        pub is_air: bool,
+        /// Vanilla's `isSolid()`: the state blocks entity motion.
+        pub blocks_motion: bool,
+        pub is_solid_render: bool,
+        pub is_redstone_conductor: bool,
+        /// The state's fluid: kind, amount (8 is a full source block) and whether it is falling.
+        pub fluid: Option<(FluidKind, u8, bool)>,
+        /// Destroy speed in vanilla's units; `-1.0` for states that cannot be broken.
+        pub hardness: f32,
+        pub requires_correct_tool: bool,
+        pub replaceable: bool,
+        /// The collision shape is the unit cube.
+        pub full_collision: bool,
+        /// The collision shape is empty, so entities pass through.
+        pub empty_collision: bool,
+        /// Bit mask of the heightmaps the state counts for: [`WORLD_SURFACE`], [`OCEAN_FLOOR`],
+        /// [`MOTION_BLOCKING`] and [`MOTION_BLOCKING_NO_LEAVES`].
+        pub heightmaps: u8,
+        pub randomly_ticking: bool,
+        pub is_signal_source: bool,
+        pub has_analog_output: bool,
+        pub friction: f32,
+        pub speed_factor: f32,
+        pub jump_factor: f32,
+    }
+
+    /// Per-block metadata extracted alongside the states.
+    #[derive(Clone, Copy, Debug)]
+    pub struct BlockInfo {
+        /// Vanilla block name, e.g. `"minecraft:stone"`.
+        pub name: &'static str,
+        /// Global state id of the block's default state.
+        pub default_state: u16,
+        pub explosion_resistance: f32,
+        /// Item the block is mined with, `None` for blocks without an item (water, fire).
+        pub item: Option<&'static str>,
+    }
+
+    /// The state counts for the `WORLD_SURFACE` heightmap.
+    pub const WORLD_SURFACE: u8 = 1;
+    /// The state counts for the `OCEAN_FLOOR` heightmap.
+    pub const OCEAN_FLOOR: u8 = 2;
+    /// The state counts for the `MOTION_BLOCKING` heightmap.
+    pub const MOTION_BLOCKING: u8 = 4;
+    /// The state counts for the `MOTION_BLOCKING_NO_LEAVES` heightmap.
+    pub const MOTION_BLOCKING_NO_LEAVES: u8 = 8;
+
+    include!(concat!(env!("OUT_DIR"), "/block_props.rs"));
+
+    /// Physical properties of a global block state id.
+    ///
+    /// Panics when `state` is not a valid state id; [`crate::blocks::STATE_COUNT`] is the
+    /// number of valid ids.
+    pub fn get(state: u16) -> &'static BlockProps {
+        &PROPS[usize::from(STATE_PROPS[usize::from(state)])]
+    }
+
+    /// Collision boxes of a state, each `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    pub fn collision_shape(state: u16) -> &'static [[f32; 6]] {
+        SHAPES[usize::from(STATE_COLLISION[usize::from(state)])]
+    }
+
+    /// Occlusion boxes of a state, used for light propagation and face culling.
+    pub fn occlusion_shape(state: u16) -> &'static [[f32; 6]] {
+        SHAPES[usize::from(STATE_OCCLUSION[usize::from(state)])]
+    }
+
+    /// Per-block metadata for a block name, with or without `"minecraft:"`.
+    pub fn block_info(name: &str) -> Option<&'static BlockInfo> {
+        let name = super::key(name);
+        let index = BLOCK_INFO
+            .binary_search_by(|info| super::key(info.name).cmp(name))
+            .ok()?;
+        BLOCK_INFO.get(index)
+    }
+}
+
 pub mod registries {
     //! Built-in registries (`reports/registries.json`) and data-driven registry entry names
     //! (`data/minecraft/**`).

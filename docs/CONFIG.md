@@ -1,0 +1,32 @@
+# Ferrite 설정 (`ferrite.toml`)
+
+Ferrite는 실행 디렉터리의 `ferrite.toml`을 읽습니다. 파일이 없으면 모든 값이 기본값으로
+동작하고, 파일에 없는 키도 각각 기본값을 사용합니다. 키 이름은 kebab-case입니다.
+템플릿은 저장소 루트의 [`ferrite.toml.example`](../ferrite.toml.example)에 있습니다.
+
+| 키 | 타입 | 기본값 | 설명 |
+|---|---|---|---|
+| `bind-address` | 문자열 (`String`) | `"0.0.0.0:25565"` | 서버가 접속을 받을 주소. `IP:포트` 형식이며, 모든 인터페이스에서 받으려면 `0.0.0.0:<포트>`를 사용합니다. |
+| `online-mode` | 불리언 (`bool`) | `true` | `true`면 Mojang 세션 서버로 인증하고(암호화 + `hasJoined` 검증) 정품 계정만 접속할 수 있습니다. `false`면 오프라인 모드로 아무 이름이나 접속할 수 있습니다. |
+| `motd` | 문자열 (`String`) | `"A Ferrite server"` | 서버 목록(멀티플레이 화면)에 표시되는 서버 설명 문구입니다. |
+| `max-players` | 정수 (`u32`) | `20` | 최대 동시 접속자 수. 상태 응답에 표시되고 접속 제한에 사용됩니다. |
+| `view-distance` | 정수 (`u8`) | `10` | 플레이어에게 전송하는 청크 반경(단위: 청크). 실제 적용 시 2~32 범위로 제한됩니다. |
+| `compression-threshold` | 정수 (`usize`) | `256` | 이 크기(바이트) 이상인 패킷을 압축합니다. 값이 작을수록 더 많은 패킷을 압축합니다. |
+
+참고: `compression-threshold`와 `max-players`는 프로토콜이 `i32`로 표현할 수 있는 범위를
+넘으면 서버가 시작 단계에서 오류로 종료됩니다.
+
+## 실행 방법
+
+```sh
+source tools/env.sh                 # Git Bash (PowerShell: . .\tools\env.ps1)
+cp ferrite.toml.example ferrite.toml
+cargo run --release -p ferrite-server
+```
+
+- `ferrite.toml`은 **실행 시의 작업 디렉터리**에서 읽습니다. 보통 저장소 루트에서
+  `cargo run`을 실행하므로 저장소 루트에 두면 됩니다.
+- 로컬 테스트(정품 인증 없이 접속)라면 `ferrite.toml`에 `online-mode = false`를 설정하고
+  클라이언트에서 `localhost`로 접속하세요. 이 설정은 인증을 하지 않으므로 공개 서버에서는
+  사용하지 마세요.
+- 로그 수준은 환경 변수 `RUST_LOG`로 조정할 수 있습니다(기본값 `info`, 예: `RUST_LOG=debug`).

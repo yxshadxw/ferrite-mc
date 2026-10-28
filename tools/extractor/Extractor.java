@@ -1,0 +1,384 @@
+// Extracts the physical properties of every block state (and basic item data) from the official
+// server jar, for the data the vanilla data generator does not report.
+//
+// This runs Mojang's own code locally; neither this source nor its output may be committed.
+// Build and run it against the deobfuscated 26.3 server jar and its libraries:
+//
+//     tools/extractor/build.sh 26.3
+//
+// or let `python tools/fetch_vanilla.py` do both. Output goes to
+// vanilla/<version>/generated/ferrite/{block_states,items}.json.
+
+import java.io.IOException;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.VanillaPackResources;
+import net.minecraft.server.packs.repository.ServerPacksSource;
+import net.minecraft.server.packs.resources.MultiPackResourceManager;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.TagKey;
+import net.minecraft.tags.TagLoader;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.EmptyBlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.FlowingFluid;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+public final class Extractor {
+    private static final VoxelShape FULL_BLOCK =
+        Shapes.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+
+    public static void main(String[] args) throws IOException {
+        if (args.length < 1 || args.length > 2) {
+            System.err.println("usage: Extractor <output-directory> [item-components-directory]");
+            System.exit(2);
+        }
+        Path outDir = Path.of(args[0]);
+        Files.createDirectories(outDir);
+
+        // Bootstrap the registries exactly like the dedicated server does. Bootstrapping alone
+        // leaves every tag empty, but the heightmap predicates are tag based, so read the
+        // vanilla block tags from the server jar that is on the classpath.
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        Map<TagKey<Block>, List<Block>> tags = loadBlockTags();
+
+        int stateCount = Block.BLOCK_STATE_REGISTRY.size();
+        StringBuilder states = new StringBuilder(1 << 24);
+        states.append('[');
+        for (int id = 0; id < stateCount; id++) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
+            if (state == null) {
+                throw new IllegalStateException("block state registry has a gap at " + id);
+            }
+            if (id > 0) {
+                states.append(",\n");
+            }
+            appendState(states, id, state, tags);
+        }
+        states.append("\n]");
+
+        StringBuilder blocks = new StringBuilder(1 << 20);
+        List<Block> sortedBlocks = new ArrayList<>(BuiltInRegistries.BLOCK.stream().toList());
+        sortedBlocks.sort(Comparator.comparing(block ->
+            BuiltInRegistries.BLOCK.getKey(block).toString()));
+        blocks.append('[');
+        for (int i = 0; i < sortedBlocks.size(); i++) {
+            Block block = sortedBlocks.get(i);
+            if (i > 0) {
+                blocks.append(",\n");
+            }
+            appendBlock(blocks, block);
+        }
+        blocks.append("\n]");
+
+        // Item components (stack size, damage, rarity, food) come from the data generator's
+        // per-item component report; binding them inside a bare JVM needs a loaded data pack.
+        Map<String, JsonObject> components = args.length > 1
+            ? readComponents(Path.of(args[1]))
+            : new HashMap<>();
+        StringBuilder items = new StringBuilder(1 << 20);
+        List<Item> sortedItems = new ArrayList<>(BuiltInRegistries.ITEM.stream().toList());
+        sortedItems.sort(Comparator.comparing(item ->
+            BuiltInRegistries.ITEM.getKey(item).toString()));
+        items.append('[');
+        for (int i = 0; i < sortedItems.size(); i++) {
+            Item item = sortedItems.get(i);
+            if (i > 0) {
+                items.append(",\n");
+            }
+            appendItem(items, item, components);
+        }
+        items.append("\n]");
+
+        StringBuilder root = new StringBuilder(states.length() + blocks.length() + items.length() + 128);
+        root.append("{\"version\":");
+        quote(root, SharedConstants.getCurrentVersion().name());
+        root.append(",\"protocol\":").append(SharedConstants.getProtocolVersion());
+        root.append(",\"stateCount\":").append(stateCount);
+        root.append(",\"states\":").append(states);
+        root.append(",\"blocks\":").append(blocks);
+        root.append(",\"items\":").append(items);
+        root.append("}\n");
+
+        Path file = outDir.resolve("block_states.json");
+        try (Writer writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
+            writer.write(root.toString());
+        }
+        System.out.printf(Locale.ROOT, "wrote %d block states, %d blocks, %d items to %s%n",
+            stateCount, sortedBlocks.size(), sortedItems.size(), file);
+    }
+
+    /**
+     * The vanilla block tags, read from the server jar on the classpath.
+     *
+     * Bootstrapping freezes the registries before data packs bind any tags, so load (and
+     * resolve) them here instead of calling `BlockState.is`, which would see empty tags.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<TagKey<Block>, List<Block>> loadBlockTags() throws IOException {
+        VanillaPackResources vanilla = ServerPacksSource.createVanillaPackSource();
+        TagLoader.ElementLookup<Holder<Block>> lookup =
+            (TagLoader.ElementLookup<Holder<Block>>) (TagLoader.ElementLookup<?>)
+                TagLoader.ElementLookup.fromFrozenRegistry(BuiltInRegistries.BLOCK);
+        Map<TagKey<Block>, List<Holder<Block>>> loaded;
+        try (MultiPackResourceManager resources = new MultiPackResourceManager(
+            PackType.SERVER_DATA, List.of(vanilla.fullResources()))) {
+            loaded = TagLoader.<Block>loadTagsForRegistry(
+                resources, Registries.BLOCK, lookup);
+        }
+        Map<TagKey<Block>, List<Block>> tags = new HashMap<>();
+        loaded.forEach((tag, holders) -> tags.put(
+            tag, holders.stream().<Block>map(Holder::value).toList()));
+        System.out.printf(Locale.ROOT, "loaded %d block tags (%d blocks in heightmap tag)%n",
+            tags.size(), tags.getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP, List.of()).size());
+        return tags;
+    }
+
+    // `isSolid()` (the blocks-motion predicate) is deprecated in 26.3 in favour of the
+    // heightmap tags, but it is still the only API that reports motion blocking.
+    @SuppressWarnings("deprecation")
+    private static void appendState(
+        StringBuilder out, int id, BlockState state, Map<TagKey<Block>, List<Block>> tags
+    ) {
+        Block block = state.getBlock();
+        BlockPos pos = BlockPos.ZERO;
+        CollisionContext context = CollisionContext.empty();
+
+        VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, pos, context);
+        VoxelShape occlusion = state.getOcclusionShape();
+
+        out.append("{\"id\":").append(id);
+        out.append(",\"block\":");
+        quote(out, BuiltInRegistries.BLOCK.getKey(block).toString());
+        out.append(",\"lightEmission\":").append(state.getLightEmission());
+        // 26.3 renamed the old `getLightBlock` to `getLightDampening`.
+        out.append(",\"lightOpacity\":").append(state.getLightDampening());
+        out.append(",\"canOcclude\":").append(state.canOcclude());
+        out.append(",\"useShapeForLightOcclusion\":").append(state.useShapeForLightOcclusion());
+        out.append(",\"propagatesSkylightDown\":").append(state.propagatesSkylightDown());
+        out.append(",\"isAir\":").append(state.isAir());
+        out.append(",\"blocksMotion\":").append(state.isSolid());
+        out.append(",\"isSolidRender\":").append(state.isSolidRender());
+        out.append(",\"isRedstoneConductor\":")
+            .append(state.isRedstoneConductor(EmptyBlockGetter.INSTANCE, pos));
+
+        FluidState fluid = state.getFluidState();
+        out.append(",\"fluid\":");
+        if (fluid.isEmpty()) {
+            out.append("null");
+        } else {
+            out.append("{\"id\":");
+            quote(out, BuiltInRegistries.FLUID.getKey(fluid.getType()).toString());
+            out.append(",\"amount\":").append(fluid.getAmount());
+            out.append(",\"falling\":").append(
+                fluid.hasProperty(FlowingFluid.FALLING) && fluid.getValue(FlowingFluid.FALLING));
+            out.append('}');
+        }
+
+        out.append(",\"hardness\":")
+            .append(number(state.getDestroySpeed(EmptyBlockGetter.INSTANCE, pos)));
+        out.append(",\"requiresCorrectTool\":").append(state.requiresCorrectToolForDrops());
+        out.append(",\"replaceable\":").append(state.canBeReplaced());
+        out.append(",\"collision\":");
+        appendShape(out, collision);
+        out.append(",\"occlusion\":");
+        appendShape(out, occlusion);
+
+        // Same predicates as `Heightmap.Types.isOpaque()` in 26.3, which is tag based.
+        boolean fluidPresent = !fluid.isEmpty();
+        boolean motion = tags.getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP, List.of())
+            .contains(block);
+        boolean motionNoLeaves = tags
+            .getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES, List.of())
+            .contains(block);
+        int heightmaps = 0;
+        if (!state.isAir()) {
+            heightmaps |= 1; // WORLD_SURFACE
+        }
+        if (motion) {
+            heightmaps |= 2; // OCEAN_FLOOR
+        }
+        if (motion || fluidPresent) {
+            heightmaps |= 4; // MOTION_BLOCKING
+        }
+        if (motionNoLeaves || fluidPresent) {
+            heightmaps |= 8; // MOTION_BLOCKING_NO_LEAVES
+        }
+        out.append(",\"heightmaps\":").append(heightmaps);
+        out.append(",\"randomlyTicking\":").append(state.isRandomlyTicking());
+        out.append(",\"isSignalSource\":").append(state.isSignalSource());
+        out.append(",\"hasAnalogOutput\":").append(state.hasAnalogOutputSignal());
+        out.append(",\"friction\":").append(number(block.getFriction()));
+        out.append(",\"speedFactor\":").append(number(block.getSpeedFactor()));
+        out.append(",\"jumpFactor\":").append(number(block.getJumpFactor()));
+        out.append('}');
+    }
+
+    /** Writes a shape as `"empty"`, `"full"` or `{"boxes":[[x1,y1,z1,x2,y2,z2],...]}`. */
+    private static void appendShape(StringBuilder out, VoxelShape shape) {
+        if (shape.isEmpty()) {
+            out.append("\"empty\"");
+            return;
+        }
+        if (shape.equals(FULL_BLOCK)) {
+            out.append("\"full\"");
+            return;
+        }
+        out.append("{\"boxes\":[");
+        List<AABB> boxes = shape.toAabbs();
+        for (int i = 0; i < boxes.size(); i++) {
+            AABB box = boxes.get(i);
+            if (i > 0) {
+                out.append(',');
+            }
+            out.append('[')
+                .append(number((float) box.minX)).append(',')
+                .append(number((float) box.minY)).append(',')
+                .append(number((float) box.minZ)).append(',')
+                .append(number((float) box.maxX)).append(',')
+                .append(number((float) box.maxY)).append(',')
+                .append(number((float) box.maxZ)).append(']');
+        }
+        out.append("]}");
+    }
+
+    private static void appendBlock(StringBuilder out, Block block) {
+        out.append("{\"name\":");
+        quote(out, BuiltInRegistries.BLOCK.getKey(block).toString());
+        out.append(",\"defaultState\":")
+            .append(Block.BLOCK_STATE_REGISTRY.getId(block.defaultBlockState()));
+        out.append(",\"explosionResistance\":").append(number(block.getExplosionResistance()));
+        Item item = block.asItem();
+        String itemId = BuiltInRegistries.ITEM.getKey(item).toString();
+        out.append(",\"item\":");
+        if (itemId.equals("minecraft:air")) {
+            out.append("null");
+        } else {
+            quote(out, itemId);
+        }
+        out.append('}');
+    }
+
+    /** Reads `reports/minecraft/components/item/*.json` into `item id -> components`. */
+    private static Map<String, JsonObject> readComponents(Path dir) throws IOException {
+        Map<String, JsonObject> components = new HashMap<>();
+        if (!Files.isDirectory(dir)) {
+            System.out.println("no item component report at " + dir + ", writing stack sizes only");
+            return components;
+        }
+        List<Path> files;
+        try (Stream<Path> listing = Files.list(dir)) {
+            files = listing
+                .filter(file -> file.getFileName().toString().endsWith(".json"))
+                .toList();
+        }
+        for (Path file : files) {
+            String name = file.getFileName().toString();
+            String id = "minecraft:" + name.substring(0, name.length() - ".json".length());
+            JsonObject root = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+            JsonObject value = root.getAsJsonObject("components");
+            components.put(id, value == null ? new JsonObject() : value);
+        }
+        return components;
+    }
+
+    private static void appendItem(
+        StringBuilder out, Item item, Map<String, JsonObject> componentsByName
+    ) {
+        String name = BuiltInRegistries.ITEM.getKey(item).toString();
+        JsonObject components = componentsByName.getOrDefault(name, new JsonObject());
+        out.append("{\"name\":");
+        quote(out, name);
+
+        JsonElement maxStackSize = primitive(components, "minecraft:max_stack_size");
+        out.append(",\"maxStackSize\":").append(
+            maxStackSize == null ? item.getDefaultMaxStackSize() : maxStackSize.getAsInt());
+        JsonElement maxDamage = primitive(components, "minecraft:max_damage");
+        out.append(",\"maxDamage\":").append(maxDamage == null ? 0 : maxDamage.getAsInt());
+
+        out.append(",\"rarity\":");
+        JsonElement rarity = primitive(components, "minecraft:rarity");
+        quote(out, rarity == null ? "common" : rarity.getAsString().replace("minecraft:", ""));
+
+        out.append(",\"food\":");
+        JsonObject food = components.has("minecraft:food")
+            ? components.getAsJsonObject("minecraft:food")
+            : null;
+        if (food == null) {
+            out.append("null");
+        } else {
+            out.append("{\"nutrition\":").append(food.get("nutrition").getAsInt());
+            out.append(",\"saturation\":").append(number(food.get("saturation").getAsFloat()));
+            JsonElement canAlwaysEat = primitive(food, "can_always_eat");
+            out.append(",\"canAlwaysEat\":")
+                .append(canAlwaysEat != null && canAlwaysEat.getAsBoolean());
+            out.append('}');
+        }
+        out.append('}');
+    }
+
+    /** A component value that is a JSON primitive, or null when it is absent. */
+    private static JsonElement primitive(JsonObject components, String name) {
+        return components.has(name) ? components.get(name) : null;
+    }
+
+    /** Renders a float as a JSON number, keeping whole values short. */
+    private static String number(float value) {
+        if (value == (long) value) {
+            return Long.toString((long) value);
+        }
+        return Float.toString(value);
+    }
+
+    private static void quote(StringBuilder out, String value) {
+        out.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        out.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        out.append(ch);
+                    }
+                }
+            }
+        }
+        out.append('"');
+    }
+
+    private Extractor() {
+    }
+}

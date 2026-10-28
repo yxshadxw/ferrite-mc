@@ -6,6 +6,8 @@ Output (gitignored):
   vanilla/<version>/server.jar
   vanilla/<version>/generated/reports/{packets,registries,blocks,items,...}.json
   vanilla/<version>/generated/data/minecraft/...   (worldgen, loot tables, recipes, tags)
+  vanilla/<version>/generated/ferrite/block_states.json + items.json
+  vanilla/<version>/lib/                          (bundled server jar + libraries, extractor input)
 
 Nothing produced here may be committed; the repo only ships code that reads it.
 """
@@ -19,9 +21,11 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+EXTRACTOR = ROOT / "tools" / "extractor" / "Extractor.java"
 
 
 def default_version() -> str:
@@ -59,6 +63,66 @@ def find_java(major: int) -> str:
     return java
 
 
+def extract_bundled(jar: pathlib.Path, lib: pathlib.Path, version: str) -> list[pathlib.Path]:
+    """Extract the bundled server jar and its libraries from the bootstrapper jar.
+
+    `lib/` keeps the extractor's classpath together and outside the game directory, so
+    rerunning the data generator cannot clobber it.
+    """
+    lib.mkdir(parents=True, exist_ok=True)
+    classpath: list[pathlib.Path] = []
+    with zipfile.ZipFile(jar) as outer:
+        versions = [
+            line.split("\t")
+            for line in outer.read("META-INF/versions.list").decode().splitlines()
+            if line.strip()
+        ]
+        if len(versions) != 1:
+            sys.exit(f"expected one bundled server jar, found {len(versions)}")
+        server = lib / f"server-{version}.jar"
+        if not server.exists():
+            server.write_bytes(outer.read("META-INF/versions/" + versions[0][2]))
+        classpath.append(server)
+
+        libraries = lib / "libraries"
+        for line in outer.read("META-INF/libraries.list").decode().splitlines():
+            if not line.strip():
+                continue
+            path = line.split("\t")[2]
+            library = libraries / path
+            if not library.exists():
+                library.parent.mkdir(parents=True, exist_ok=True)
+                library.write_bytes(outer.read("META-INF/libraries/" + path))
+            classpath.append(library)
+    return classpath
+
+
+def run_extractor(java: str, version: str, out: pathlib.Path) -> None:
+    """Compile and run tools/extractor against the bundled server jar in vanilla/<ver>/lib."""
+    javac = pathlib.Path(java).with_name("javac.exe" if os.name == "nt" else "javac")
+    if not javac.exists():
+        print(f"skipping ferrite extractor: {javac} not found (a full JDK is required)")
+        return
+    lib = out / "lib"
+    classes = lib / "extractor-classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    classpath = os.pathsep.join(
+        str(path) for path in extract_bundled(out / "server.jar", lib, version)
+    )
+    print("compiling tools/extractor/Extractor.java")
+    subprocess.run(
+        [str(javac), "-d", str(classes), "-cp", classpath, str(EXTRACTOR)],
+        check=True,
+    )
+    print("extracting block and item properties")
+    subprocess.run(
+        [java, "-cp", os.pathsep.join([str(classes), classpath]), "Extractor",
+         str(out / "generated" / "ferrite"),
+         str(out / "generated" / "reports" / "minecraft" / "components" / "item")],
+        check=True,
+    )
+
+
 def main() -> None:
     global version_label
     version = sys.argv[1] if len(sys.argv) > 1 else default_version()
@@ -82,6 +146,7 @@ def main() -> None:
          "--reports", "--server", "--output", str(gen)],
         cwd=out, check=True,
     )
+    run_extractor(java, version, out)
     print(f"ok: {gen}")
 
 
