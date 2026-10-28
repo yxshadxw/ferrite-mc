@@ -1,0 +1,33 @@
+_version_: 1
+chunk-system:
+  gen-parallelism: 2
+  io-threads: 4
+  worker-threads: 8
+collisions:
+  enable-player-collisions: false
+  send-full-pos-for-hard-colliding-entities: true
+messages:
+  kick:
+    authentication-servers-down: '<lang:multiplayer.disconnect.authservers_down>'
+    connection-throttle: 'Connection throttled! Please wait before reconnecting.'
+    flying-player: '<lang:multiplayer.disconnect.flying>'
+    flying-vehicle: '<lang:multiplayer.disconnect.flying>'
+  no-permission: '<red>nope'
+proxies:
+  bungee-cord:
+    online-mode: false
+  proxy-protocol: true
+  velocity:
+    enabled: true
+    online-mode: false
+    secret: hunter2
+timings:
+  enabled: false
+  history-interval: 600
+misc:
+  max-joins-per-tick: 3
+  catchup-ticks: default
+plugin-only-key:
+  nested:
+    - alpha
+    - beta

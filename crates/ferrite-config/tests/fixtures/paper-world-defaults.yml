@@ -1,0 +1,41 @@
+_version_: 1
+anticheat:
+  anti-xray:
+    enabled: false
+    engine-mode: 2
+    hidden-blocks:
+      - copper_ore
+      - chest
+    replacement-blocks:
+      - stone
+      - deepslate
+    max-block-height: 48
+chunks:
+  auto-save-interval: 1200
+  delay-chunk-unloads-by: 25m
+  entity-per-chunk-save-limit:
+    experience_orb: 8
+    item: 4
+  max-auto-save-chunks-per-tick: 12
+collisions:
+  max-entity-collisions: 6
+entities:
+  mob-effects:
+    immune-to-wither-effect:
+      wither: false
+      wither-skeleton: true
+  spawning:
+    per-player-mob-spawns: false
+    duplicate-uuid:
+      mode: DELETE
+      safe-regen-delete-range: 16
+environment:
+  void-damage-amount: disabled
+  nether-ceiling-void-damage-height: 200
+hopper:
+  disable-move-event: true
+misc:
+  redstone-implementation: EIGENCRAFT
+tick-rates:
+  mob-spawner: 2
+unknown-world-key: keep-me

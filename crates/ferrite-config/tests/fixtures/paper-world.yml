@@ -1,0 +1,5 @@
+anticheat:
+  anti-xray:
+    enabled: true
+hopper:
+  cooldown-when-full: false
