@@ -3,7 +3,13 @@
 > **English summary** — Ferrite is a Minecraft Java server written in Rust. It aims for
 > Folia-style regionized multithreading, and — via an embedded JVM — the ability to run
 > Bukkit/Spigot/Paper/Folia plugins, with multiple Minecraft versions supported later.
-> Current status: **phase 1 (foundation) in progress — nothing is playable yet.**
+> Current status: **phase 1 (foundation) nearly complete, with much of phase 2 working on a
+> superflat world** — login and encryption, registry sync, spawn, movement, chunk streaming,
+> multiplayer visibility and chat, on top of a Folia-style regionizer, Starlight-style lighting
+> (**0 mismatches vs vanilla** on 256 chunks), Anvil world IO, `plugin.yml` parsing and an
+> embedded JVM bootstrap; measured idle RSS is **16.7 MB**. **Honest caveats: it has not been
+> tested with a real client yet, there is no block breaking/placing, no plugin actually runs,
+> and no world generation beyond superflat.**
 > Target: Minecraft Java 26.3, protocol 777. Build with Rust stable + Java 25, generate
 > vanilla data with `python tools/fetch_vanilla.py`, then `cargo test --workspace`.
 > No Mojang code or assets are distributed here; see the legal note below.
@@ -19,10 +25,34 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 
 ## 현재 상태
 
-**1단계(기반) 진행 중입니다. 아직 플레이할 수 없습니다.**
-접속(핸드셰이크/상태/로그인/설정) 뼈대, 프로토콜 인코딩, NBT, 리전 스케줄러, 청크/팔레트
-컨테이너 등 바닥 작업만 존재하며, 월드에 들어가 블록을 캐고 움직이는 동작은 구현되어
-있지 않습니다. 진행 상황은 아래 로드맵 기준으로만 판단해 주세요.
+**1단계(기반)는 거의 끝났고, 2단계의 핵심 기능도 슈퍼플랫 월드 위에서 구현되어
+있습니다.** 로그인/암호화, 레지스트리 동기화, 스폰, 이동, 청크 스트리밍, 멀티플레이
+가시성, 채팅까지 동작하며, 그 아래에 Folia 스타일 리전라이저와 Starlight 스타일
+라이팅이 받쳐 줍니다. 다만 **아직 실제 26.3 클라이언트로 접속해 검증하지는
+않았습니다.**
+
+구현되어 커밋된 것:
+
+- **로그인/암호화** — 오프라인 로그인과 온라인 로그인(RSA/AES-CFB8, Mojang `hasJoined`
+  검증)
+- **레지스트리 동기화** — known-pack 레지스트리/태그 동기화
+- **스폰, 이동, 청크 스트리밍, 멀티플레이 가시성, 채팅** — 슈퍼플랫 월드 기준
+- **Folia 스타일 리전라이저** — 리전 로컬 세이프 포인트, 리전별 큐, 힙 데드라인
+- **Starlight 스타일 라이팅** — 256개 청크에서 바닐라와 대조해 **불일치 0**
+- **Anvil 월드 IO** — `.mca`/`.mcc`, 26.3 청크 NBT, 네트워크 인코딩
+- **플러그인 기반** — `plugin.yml`/`paper-plugin.yml` 파싱, 내장 JVM(Java 25)
+  부트스트랩
+- **측정값** — 릴리스 서버 유휴 RSS **16.7 MB**
+
+아직 아닌 것(솔직하게):
+
+- **실제 클라이언트로 접속 테스트를 하지 않았습니다.** 다음 첫 작업입니다.
+- 블록 캐기/설치 없음
+- 플러그인이 실제로 로드되어 `onEnable`을 실행하지는 않음
+- 슈퍼플랫 외 월드 생성 없음
+
+설정 키와 실행 방법은 [`docs/CONFIG.md`](docs/CONFIG.md)에 정리되어 있습니다. 진행
+상황은 아래 로드맵 기준으로만 판단해 주세요.
 
 ## 로드맵
 
