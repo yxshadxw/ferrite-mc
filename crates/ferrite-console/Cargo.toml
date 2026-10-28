@@ -1,0 +1,13 @@
+[package]
+name = "ferrite-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.29"
+crossbeam.workspace = true
+flate2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
