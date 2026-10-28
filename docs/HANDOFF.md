@@ -57,3 +57,30 @@ Unverified WIP on branch `wip/day2-2026-10-28`: T2 block place/break/inventory/c
 ops-by-UUID security fix done), ferrite-recipe (no vanilla tests yet), ferrite-protocol-translate (agent hit rate limit mid-pair-module),
 FB11 libdeflate/VarInt (clippy collapsible_if at codec.rs:98), FB12 profiler / FB13 item never started (prompts unsent).
 Also: delete crates/ferrite-noise/logs/ (accidentally committed log). T3 remaining: java/T3-CHECKPOINT.md. FB15 part 2 (ferrite-data tags) not started.
+
+
+---
+# Day 3 (2026-10-29) end
+Branch phase1-foundation. **A real 26.3 client now joins, walks, breaks/places blocks** (offline mode, superflat). Fixed along the way:
+3 missing synchronized registries, light BitSet wire format, plus chunk streaming (prefetch) and player resume (playerdata/<uuid>.json).
+`python tools/wirecheck/run.py` (server must be running) verifies every packet against the real client codecs — run it after ANY packet change.
+
+Committed today: exact block props, fluid-count/palette/light perf, real-world loading + persistence, phase-2 gameplay (break/place/commands/ops by UUID),
+loot tables, recipes (1,763), item components + wire codec, entity data tables, tags, worldgen data model + multi-noise biome source,
+admin lists, config files (server.properties/bukkit/spigot/paper), profiler crate, console crate, admin/config crates, plugin bridge (Paper-only loading, RegionContext).
+Parked on `wip/day3-2026-10-29`: T3's unfinished registry/inventory work (does NOT compile: OfflinePlayerSnapshot / register_offline_player missing). Earlier: `wip/day2-2026-10-28` (translate crate).
+Running freebuff tasks at end of day (prompts may be unsent in their tabs): FB21 ferrite-fluid, FB22 ferrite-explosion, FB23 ferrite-rules — check `git status` for their crates, verify, commit.
+
+## Goals (user)
+ALL vanilla features incl. every command; Rust-first, Java only when unavoidable. **Tomorrow: use Codex (one terra at a time) and PUBLISH TO GITHUB.**
+
+## Next steps (priority)
+1. Wire `ferrite-profiler` into the tick loop: /tps /mspt (currently prints "TPS unavailable"); then `/spark`-like profile.
+2. Commands: all vanilla commands (commands.json has the tree; ferrite-command loads it; most nodes are stubs "Command not implemented") — implement by family: gamemode/tp/give/clear/effect/xp/time/weather/difficulty/gamerule/kill/summon/setblock/fill/clone/data/execute/scoreboard/team/bossbar/title/tellraw/say/me/msg/list/kick/ban/op/whitelist/save-all/stop/... 
+3. Signed chat (the "Chat message validation failed" notice appears because chat is relayed unsigned) — implement secure chat or disguised chat properly.
+4. Block-change fidelity: neighbor updates/placement rules (FB23), fluids (FB21), explosions (FB22), redstone, random ticks, gravity blocks.
+5. Entities & mobs (largest): entity ECS, metadata/tracking, AI goals, spawning, combat, drops (ferrite-loot ready), item entities; inventory clicks (hashed slots) & crafting (ferrite-recipe ready).
+6. World generation: density-function evaluator on ferrite-noise + biome_source + surface rules + features/structures (phase 6).
+7. Multi-version translation layer (wip/day2 has the start).
+8. Plugin API breadth (Server 26/206 implemented), EssentialsX needs CraftBukkit shim; compat-report.md on the WIP branch has probe results.
+9. **GitHub release prep**: LICENSE-MIT/LICENSE-APACHE, README polish, CI check on Linux (rust-toolchain.toml pins MSVC — CI overrides), confirm no vanilla/ or Mojang data committed (`git ls-files | grep -i vanilla`), choose repo name, push.

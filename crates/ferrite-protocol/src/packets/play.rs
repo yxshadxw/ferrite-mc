@@ -59,8 +59,10 @@ fn decode_bitset(buf: &mut &[u8]) -> Result<Vec<i64>, DecodeError> {
     let mut bytes = Vec::<u8>::decode(buf)?;
     bytes.resize(bytes.len().div_ceil(8) * 8, 0);
     Ok(bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().expect("chunk of 8")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect())
 }
 impl Encode for ChunkData {
