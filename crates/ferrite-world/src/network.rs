@@ -92,13 +92,15 @@ fn write_mask(out: &mut Vec<u8>, sections: &[LightSection], empty: bool) {
             words[i / 64] |= 1u64 << (i % 64);
         }
     }
-    while words.last() == Some(&0) {
-        words.pop();
+    // 26.3 reads a light mask (`java.util.BitSet`) as a VarInt-prefixed byte array of
+    // `BitSet.toByteArray()`: little-endian bytes without trailing zero bytes. (Older versions and the
+    // wiki describe a long array; the real client codec says otherwise — see tools/wirecheck.)
+    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    while bytes.last() == Some(&0) {
+        bytes.pop();
     }
-    put_varint(out, words.len() as u32);
-    for word in words {
-        out.extend_from_slice(&word.to_be_bytes());
-    }
+    put_varint(out, bytes.len() as u32);
+    out.extend_from_slice(&bytes);
 }
 fn write_arrays(out: &mut Vec<u8>, sections: &[LightSection]) {
     put_varint(
