@@ -23,6 +23,29 @@ class BootstrapTest {
         @org.bukkit.event.EventHandler public void inherited(CancelEvent event) { called.incrementAndGet(); }
     }
     static final class ChildListener extends ParentListener {}
+    @Test void paperOnlyLoadsAndFailureRollsBack() throws Exception {
+        var jar = java.nio.file.Files.createTempFile("ferrite-paper", ".jar");
+        try (var input = new java.util.jar.JarFile(System.getProperty("test.dependency.jar")); var output = new java.util.jar.JarOutputStream(java.nio.file.Files.newOutputStream(jar))) {
+            var entries = input.entries();
+            while (entries.hasMoreElements()) {
+                var entry = entries.nextElement();
+                if (entry.getName().equals("plugin.yml")) continue;
+                output.putNextEntry(new java.util.jar.JarEntry(entry.getName()));
+                try (var in = input.getInputStream(entry)) { in.transferTo(output); }
+                output.closeEntry();
+            }
+            output.putNextEntry(new java.util.jar.JarEntry("paper-plugin.yml"));
+            output.write("name: PaperOnly\nversion: '1.0'\nmain: dev.ferrite.dependency.DependencyPlugin\napi-version: '26.3'\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            output.closeEntry();
+        }
+        var manager = (FerritePluginManager) new FerriteServer().getPluginManager();
+        manager.loadOrdered(new String[]{jar.toString()}, null);
+        assertTrue(manager.isPluginEnabled("PaperOnly"));
+        manager.disablePlugins();
+        var failing = (FerritePluginManager) new FerriteServer().getPluginManager();
+        assertThrows(IllegalStateException.class, () -> failing.loadOrdered(new String[]{jar.toString(), jar + ".missing"}, null));
+        assertEquals(0, failing.getPlugins().length);
+    }
     @Test void loadsRunsAndDisablesPlugin() {
         List<String> log = new ArrayList<>();
         Logger.getLogger("").addHandler(new Handler() {
@@ -47,6 +70,7 @@ class BootstrapTest {
         Bukkit.getPluginManager().registerEvent(CancelEvent.class, registered, org.bukkit.event.EventPriority.MONITOR, (listener, event) -> order.add("last"), owner, false);
         var child = new ChildListener();
         Bukkit.getPluginManager().registerEvents(child, owner);
+        Bukkit.getPluginManager().registerEvent(CancelEvent.class, registered, org.bukkit.event.EventPriority.LOWEST, (listener, event) -> { throw new IllegalStateException("expected"); }, owner, false);
         Bukkit.getPluginManager().callEvent(new CancelEvent());
         assertEquals(1, child.called.get());
         assertEquals(List.of("first", "last"), order);

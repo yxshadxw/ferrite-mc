@@ -19,3 +19,11 @@ Status: incomplete; the coordinator requested a stop. No commits were made. The 
 5. Re-run the requested full workspace clippy and fmt after other workers finish; review the final diff and JNI signatures, and run all scoped tests again after any fixes. Server wiring is intentionally outside this task's ownership.
 
 The artifact and API overview is also in `java/README.md`. The shared `Cargo.lock` may include changes from concurrent workers; do not attribute its entire diff to T3.
+
+## Continuation results (incomplete)
+
+- Added `RegionContext` routing/ownership hooks and fake-backed integration coverage, with validation against issued region/entity tasks; server implementation and entity retirement remain outstanding. Shutdown clears issued tasks but does not yet synchronize with already-running region-aware callbacks.
+- Paper-only descriptors now load, startup exceptions roll back constructed plugins and classloaders, and listener failures are logged without stopping subsequent handlers. The rollback test covers a missing second jar, not an exception during enable; Paper descriptor compatibility and cyclic concurrent classloading need further work.
+- Event conversion and the typed join/quit/chat/command `PluginHost` API remain unimplemented; `call_event` still returns `EventUnsupported`. Player objects, mutable event results, signed chat, and registration must be designed and tested before server wiring.
+- Several scheduler edge cases and retirement behavior remain incomplete; do not treat this bridge as production-ready. `FerriteServer` overrides 26 of 206 generated `Server` methods; 180 remain inherited stubs (method overloads counted separately).
+- Verified `gradlew.bat build`, scoped `cargo test -p ferrite-jvm -p ferrite-plugin-meta -p ferrite-plugin`, scoped `cargo clippy -p ferrite-jvm -p ferrite-plugin-meta -p ferrite-plugin --lib --tests --examples -- -D warnings`, and scoped `cargo fmt -p ferrite-plugin -p ferrite-jvm -p ferrite-plugin-meta -- --check`. Workspace-wide `cargo fmt --all -- --check` fails on concurrent changes in `ferrite-net` and `ferrite-server`, which are outside this worker's ownership.

@@ -34,6 +34,7 @@ public final class FerriteServer extends ServerStubs {
             }
         }
     }
+    void unregisterCommands(org.bukkit.plugin.Plugin plugin) { commands.values().removeIf(command -> command.getPlugin() == plugin); }
     @Override public org.bukkit.command.PluginCommand getPluginCommand(String name) { return commands.get(name.toLowerCase(java.util.Locale.ROOT)); }
     @Override public boolean dispatchCommand(org.bukkit.command.CommandSender sender, String line) {
         String[] parts = line.trim().split("\\s+");
@@ -62,8 +63,8 @@ public final class FerriteServer extends ServerStubs {
     @Override public boolean isOwnedByCurrentRegion(org.bukkit.World world, io.papermc.paper.math.Position pos, int radius) { return isOwnedByCurrentRegion(world, pos.blockX() >> 4, pos.blockZ() >> 4, radius); }
     @Override public boolean isOwnedByCurrentRegion(org.bukkit.Location location) { return isOwnedByCurrentRegion(java.util.Objects.requireNonNull(location.getWorld()), location.getBlockX() >> 4, location.getBlockZ() >> 4); }
     @Override public boolean isOwnedByCurrentRegion(org.bukkit.Location location, int radius) { return isOwnedByCurrentRegion(java.util.Objects.requireNonNull(location.getWorld()), location.getBlockX() >> 4, location.getBlockZ() >> 4, radius); }
-    @Override public boolean isOwnedByCurrentRegion(org.bukkit.World world, int x, int z, int radius) { if (radius < 0) throw new IllegalArgumentException("radius"); return radius == 0 && isOwnedByCurrentRegion(world, x, z); }
-    @Override public boolean isOwnedByCurrentRegion(org.bukkit.World world, int minX, int minZ, int maxX, int maxZ) { if (minX > maxX || minZ > maxZ) throw new IllegalArgumentException("invalid range"); return minX == maxX && minZ == maxZ && isOwnedByCurrentRegion(world, minX, minZ); }
+    @Override public boolean isOwnedByCurrentRegion(org.bukkit.World world, int x, int z, int radius) { if (radius < 0) throw new IllegalArgumentException("radius"); long minX = (long) x - radius, minZ = (long) z - radius, maxX = (long) x + radius, maxZ = (long) z + radius; if (minX < Integer.MIN_VALUE || minZ < Integer.MIN_VALUE || maxX > Integer.MAX_VALUE || maxZ > Integer.MAX_VALUE) return false; return isOwnedByCurrentRegion(world, (int) minX, (int) minZ, (int) maxX, (int) maxZ); }
+    @Override public boolean isOwnedByCurrentRegion(org.bukkit.World world, int minX, int minZ, int maxX, int maxZ) { if (minX > maxX || minZ > maxZ) throw new IllegalArgumentException("invalid range"); for (long x = minX; x <= maxX; x++) for (long z = minZ; z <= maxZ; z++) if (!isOwnedByCurrentRegion(world, (int) x, (int) z)) return false; return true; }
     @Override public boolean isOwnedByCurrentRegion(org.bukkit.entity.Entity entity) { return entitySchedulers.isOwned(entity.getUniqueId()); }
     final FerriteScheduler scheduler = new FerriteScheduler();
     private final FerriteGlobalScheduler globalScheduler = new FerriteGlobalScheduler(scheduler);

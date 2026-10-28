@@ -1,4 +1,24 @@
-use ferrite_plugin::{CommandSender, PluginConfig, PluginHost};
+use ferrite_plugin::{
+    CommandSender, EntityTask, PluginConfig, PluginHost, RegionContext, RegionTask,
+};
+
+#[derive(Default)]
+struct FakeRegions {
+    regions: std::sync::Mutex<Vec<RegionTask>>,
+    entities: std::sync::Mutex<Vec<EntityTask>>,
+}
+impl RegionContext for FakeRegions {
+    fn is_owned_by_current_region(&self, _: uuid::Uuid, x: i32, z: i32) -> bool {
+        z == 8 && (-4..=-3).contains(&x)
+    }
+    fn schedule_on_region(&self, task: RegionTask) {
+        self.regions.lock().unwrap().push(task);
+    }
+    fn schedule_on_entity(&self, task: EntityTask) {
+        self.entities.lock().unwrap().push(task);
+    }
+    fn retire_entity(&self, _: uuid::Uuid) {}
+}
 use std::{path::PathBuf, process::Command};
 
 #[test]
@@ -65,7 +85,9 @@ fn plugin_lifecycle() {
     .unwrap();
     let called = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = called.clone();
+    let regions = std::sync::Arc::new(FakeRegions::default());
     let cfg = PluginConfig {
+        region_context: Some(regions.clone()),
         command_handler: Some(std::sync::Arc::new(move |_, line| {
             captured.lock().unwrap().push(line.to_owned());
             true
@@ -103,7 +125,8 @@ fn plugin_lifecycle() {
             .count(),
         6
     );
-    let entities = host.take_entity_tasks();
+    host.route_ready_tasks().unwrap();
+    let entities = std::mem::take(&mut *regions.entities.lock().unwrap());
     assert_eq!(entities.len(), 2);
     assert!(entities.iter().any(|task| task.region_aware));
     assert!(entities.iter().any(|task| !task.region_aware));
@@ -118,8 +141,12 @@ fn plugin_lifecycle() {
             .iter()
             .any(|line| line.contains("FerriteTest entity"))
     );
+    let mut forged_entity = entities[0].clone();
+    forged_entity.entity = "forged".into();
+    assert!(host.run_entity_task(forged_entity).is_err());
     for task in entities {
-        host.run_entity_task(task).unwrap();
+        host.run_entity_task(task.clone()).unwrap();
+        assert!(host.run_entity_task(task).is_err());
     }
     assert_eq!(
         host.logs()
@@ -128,7 +155,7 @@ fn plugin_lifecycle() {
             .count(),
         2
     );
-    let tasks = host.take_region_tasks();
+    let tasks = std::mem::take(&mut *regions.regions.lock().unwrap());
     assert_eq!(tasks.len(), 2);
     assert!(tasks.iter().any(|task| task.region_aware));
     assert!(tasks.iter().any(|task| !task.region_aware));
@@ -144,8 +171,12 @@ fn plugin_lifecycle() {
             .iter()
             .any(|line| line.contains("FerriteTest region"))
     );
+    let mut forged_region = tasks[0].clone();
+    forged_region.chunk_x += 1;
+    assert!(host.run_region_task(forged_region).is_err());
     for task in tasks {
-        host.run_region_task(task).unwrap();
+        host.run_region_task(task.clone()).unwrap();
+        assert!(host.run_region_task(task).is_err());
     }
     assert_eq!(
         host.logs()
@@ -158,6 +189,13 @@ fn plugin_lifecycle() {
         host.logs()
             .iter()
             .filter(|line| line.contains("FerriteTest owned"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        host.logs()
+            .iter()
+            .filter(|line| line.contains("FerriteTest range owned"))
             .count(),
         2
     );

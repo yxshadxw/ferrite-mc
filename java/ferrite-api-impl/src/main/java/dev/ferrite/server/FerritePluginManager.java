@@ -34,7 +34,7 @@ final class FerritePluginManager extends PluginManagerStubs {
         synchronized (this) { snapshot = List.copyOf(handlers); }
         for (Handler handler : snapshot) {
             if (!handler.owner().isEnabled() || !handler.type().isInstance(event) || (handler.ignoreCancelled() && event instanceof org.bukkit.event.Cancellable c && c.isCancelled())) continue;
-            try { if (isLegacy(handler.owner())) { synchronized (Bootstrap.LEGACY_LOCK) { if (handler.owner().isEnabled()) handler.method().invoke(event); } } else handler.method().invoke(event); } catch (Throwable e) { throw new IllegalStateException("Event handler failed", e); }
+            try { if (isLegacy(handler.owner())) { synchronized (Bootstrap.LEGACY_LOCK) { if (handler.owner().isEnabled()) handler.method().invoke(event); } } else handler.method().invoke(event); } catch (Throwable e) { handler.owner().getLogger().log(java.util.logging.Level.SEVERE, "Event handler failed", e); }
         }
     }
     private final java.util.Map<Plugin, Boolean> regionAware = java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
@@ -54,8 +54,11 @@ final class FerritePluginManager extends PluginManagerStubs {
                 boolean paper;
                 Map<?, ?> metadata;
                 try (JarFile jar = new JarFile(file)) {
-                    try (InputStream in = jar.getInputStream(jar.getJarEntry("plugin.yml"))) { desc = new PluginDescriptionFile(in); }
                     paper = jar.getJarEntry("paper-plugin.yml") != null;
+                    var descriptionEntry = jar.getJarEntry("plugin.yml");
+                    if (descriptionEntry == null) descriptionEntry = jar.getJarEntry("paper-plugin.yml");
+                    if (descriptionEntry == null) throw new IllegalArgumentException("Missing plugin descriptor: " + file);
+                    try (InputStream in = jar.getInputStream(descriptionEntry)) { desc = new PluginDescriptionFile(in); }
                     try (InputStream in = jar.getInputStream(jar.getJarEntry(paper ? "paper-plugin.yml" : "plugin.yml"))) {
                         Object data = new org.yaml.snakeyaml.Yaml(new org.yaml.snakeyaml.constructor.SafeConstructor(new org.yaml.snakeyaml.LoaderOptions())).load(in);
                         if (!(data instanceof Map<?, ?> map)) throw new IllegalArgumentException("Invalid descriptor: " + file);
@@ -87,7 +90,7 @@ final class FerritePluginManager extends PluginManagerStubs {
                 plugins.add(plugin); regionAware.put(plugin, aware); server.registerCommands(plugin); plugin.onLoad();
             }
             for (JavaPlugin plugin : plugins) plugin.setEnabled(true);
-        } catch (Exception e) { throw new IllegalStateException("Failed to load plugin", e); }
+        } catch (Throwable e) { disablePlugins(); throw new IllegalStateException("Failed to load plugin", e); }
     }
     public Plugin getPlugin(String name) { Plugin direct = plugins.stream().filter(p -> p.getName().equalsIgnoreCase(name)).findFirst().orElse(null); return direct != null ? direct : plugins.stream().filter(p -> p.getDescription().getProvidedPlugins().stream().anyMatch(alias -> alias.equalsIgnoreCase(name))).findFirst().orElse(null); }
     public Plugin[] getPlugins() { return plugins.toArray(Plugin[]::new); }
@@ -97,12 +100,14 @@ final class FerritePluginManager extends PluginManagerStubs {
         for (int i = plugins.size() - 1; i >= 0; i--) {
             JavaPlugin plugin = plugins.get(i);
             try { plugin.setEnabled(false); }
-            catch (Exception | LinkageError e) { plugin.getLogger().log(java.util.logging.Level.SEVERE, "Plugin disable failed", e); }
+            catch (Throwable e) { plugin.getLogger().log(java.util.logging.Level.SEVERE, "Plugin disable failed", e); }
             finally { server.scheduler.cancelTasks(plugin); server.regionScheduler.cancelTasks(plugin); server.asyncScheduler.cancelTasks(plugin); server.entitySchedulers.cancelTasks(plugin); }
         }
         synchronized (this) { handlers.clear(); }
         for (FerriteClassLoader loader : new HashSet<>(loaders.values())) {
             try { loader.close(); } catch (IOException e) { server.getLogger().warning("Could not close plugin classloader: " + e); }
         }
+        for (JavaPlugin plugin : plugins) server.unregisterCommands(plugin);
+        plugins.clear(); regionAware.clear(); loaders.clear();
     }
 }

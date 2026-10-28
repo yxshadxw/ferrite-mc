@@ -14,6 +14,7 @@ static REGION_QUEUE: OnceLock<Mutex<scheduling::Queue>> = OnceLock::new();
 static READY: OnceLock<Mutex<Vec<RegionTask>>> = OnceLock::new();
 static READY_ENTITIES: OnceLock<Mutex<Vec<EntityTask>>> = OnceLock::new();
 static MODES: OnceLock<HashMap<String, bool>> = OnceLock::new();
+static REGION_CONTEXT: OnceLock<Option<std::sync::Arc<dyn RegionContext>>> = OnceLock::new();
 static COMMAND_HANDLER: OnceLock<Option<CommandHandler>> = OnceLock::new();
 thread_local! { static REGION: std::cell::RefCell<Option<(String, i32, i32)>> = const { std::cell::RefCell::new(None) }; }
 const BOOTSTRAP: &str = "dev/ferrite/server/Bootstrap";
@@ -23,6 +24,14 @@ pub struct PluginConfig {
     pub bridge_jar: PathBuf,
     pub java_home: Option<PathBuf>,
     pub command_handler: Option<CommandHandler>,
+    pub region_context: Option<std::sync::Arc<dyn RegionContext>>,
+}
+/// Server-owned routing and thread ownership information for region-aware plugins.
+pub trait RegionContext: Send + Sync {
+    fn is_owned_by_current_region(&self, world: uuid::Uuid, chunk_x: i32, chunk_z: i32) -> bool;
+    fn schedule_on_region(&self, task: RegionTask);
+    fn schedule_on_entity(&self, task: EntityTask);
+    fn retire_entity(&self, entity: uuid::Uuid);
 }
 pub type CommandHandler = std::sync::Arc<dyn Fn(CommandSender, &str) -> bool + Send + Sync>;
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +44,10 @@ pub enum Error {
     Metadata(String),
     #[error("event bridge is not implemented")]
     EventUnsupported,
+    #[error("task was not issued or has already been consumed")]
+    InvalidTask,
+    #[error("region context is not configured")]
+    MissingRegionContext,
 }
 pub enum CommandSender {
     Console,
@@ -42,6 +55,9 @@ pub enum CommandSender {
 }
 pub struct PluginHost {
     jvm: Jvm,
+    issued_regions: Mutex<Vec<RegionTask>>,
+    issued_entities: Mutex<Vec<EntityTask>>,
+    region_context: Option<std::sync::Arc<dyn RegionContext>>,
 }
 extern "system" fn log(mut env: JNIEnv, _: JClass, message: JString) {
     if let Ok(s) = env.get_string(&message) {
@@ -159,6 +175,16 @@ extern "system" fn is_region_thread(
         return 0;
     };
     let world: String = world.into();
+    if let Some(context) = REGION_CONTEXT.get().and_then(Option::as_ref) {
+        return uuid::Uuid::parse_str(&world).ok().map_or(0, |id| {
+            u8::from(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    context.is_owned_by_current_region(id, x, z)
+                }))
+                .unwrap_or(false),
+            )
+        });
+    }
     REGION.with(|region| {
         u8::from(
             region
@@ -193,6 +219,7 @@ impl PluginHost {
         })?;
         let _ = MODES.set(modes);
         let _ = COMMAND_HANDLER.set(cfg.command_handler);
+        let _ = REGION_CONTEXT.set(cfg.region_context.clone());
         jvm.register_natives(
             "dev/ferrite/server/Native$Bindings",
             &[
@@ -251,7 +278,12 @@ impl PluginHost {
             )?;
             Ok(())
         })?;
-        Ok(Self { jvm })
+        Ok(Self {
+            jvm,
+            issued_regions: Mutex::new(Vec::new()),
+            issued_entities: Mutex::new(Vec::new()),
+            region_context: cfg.region_context,
+        })
     }
     pub fn logs(&self) -> Vec<String> {
         LOGS.get_or_init(Default::default)
@@ -312,27 +344,53 @@ impl PluginHost {
         Ok(())
     }
     pub fn take_region_tasks(&self) -> Vec<RegionTask> {
-        std::mem::take(
+        let tasks = std::mem::take(
             &mut *READY
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        self.issued_regions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tasks.iter().cloned());
+        tasks
     }
     pub fn take_entity_tasks(&self) -> Vec<EntityTask> {
-        std::mem::take(
+        let tasks = std::mem::take(
             &mut *READY_ENTITIES
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        self.issued_entities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tasks.iter().cloned());
+        tasks
+    }
+    /// Transfer ready work to the server's region and entity schedulers.
+    pub fn route_ready_tasks(&self) -> Result<(), Error> {
+        let context = self
+            .region_context
+            .as_ref()
+            .ok_or(Error::MissingRegionContext)?;
+        for task in self.take_region_tasks() {
+            context.schedule_on_region(task);
+        }
+        for task in self.take_entity_tasks() {
+            context.schedule_on_entity(task);
+        }
+        Ok(())
     }
     pub fn run_entity_task(&self, task: EntityTask) -> Result<(), Error> {
+        consume_task(&self.issued_entities, &task)?;
         Ok(self
             .jvm
             .call_static(BOOTSTRAP, "runEntityTask", "(J)V", &[JValue::Long(task.id)])?)
     }
     pub fn run_region_task(&self, task: RegionTask) -> Result<(), Error> {
+        consume_task(&self.issued_regions, &task)?;
         let previous = REGION
             .with(|region| region.replace(Some((task.world.clone(), task.chunk_x, task.chunk_z))));
         let result =
@@ -346,7 +404,26 @@ impl PluginHost {
         Err(Error::EventUnsupported)
     }
     pub fn shutdown(&self) -> Result<(), Error> {
+        self.issued_regions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.issued_entities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(self.jvm.call_static(BOOTSTRAP, "shutdown", "()V", &[])?)
     }
+}
+fn consume_task<T: PartialEq>(issued: &Mutex<Vec<T>>, task: &T) -> Result<(), Error> {
+    let mut issued = issued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = issued
+        .iter()
+        .position(|candidate| candidate == task)
+        .ok_or(Error::InvalidTask)?;
+    issued.swap_remove(index);
+    Ok(())
 }
 mod scheduling;
