@@ -1,6 +1,6 @@
 use crate::{BlockFlags, BlockInfo};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::Path,
 };
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -36,8 +36,6 @@ pub struct RuntimeRegistry {
     biome_ids: HashMap<String, u32>,
     entities: HashMap<String, u32>,
     entity_names: HashMap<u32, String>,
-    motion: HashSet<String>,
-    leaves: HashSet<String>,
 }
 impl RuntimeRegistry {
     pub fn load(base: impl AsRef<Path>) -> Result<Self, RegistryError> {
@@ -120,16 +118,7 @@ impl RuntimeRegistry {
             entities.insert(name.clone(), id);
             entity_names.insert(id, name.clone());
         }
-        let tag_dir = base.join("data/minecraft/tags/block");
-        let motion = load_tag(
-            &tag_dir,
-            "minecraft:blocks_motion_in_heightmap",
-            &mut HashSet::new(),
-        )?;
-        let leaves = load_tag(&tag_dir, "minecraft:leaves", &mut HashSet::new())?;
         Ok(Self {
-            motion,
-            leaves,
             states,
             lookup,
             defaults,
@@ -175,65 +164,44 @@ impl BlockStateRegistry for RuntimeRegistry {
         ((usize::BITS - self.biomes.len().saturating_sub(1).leading_zeros()) as u8).max(4)
     }
 }
-/// Heightmap motion and leaves use generated vanilla block tags; aquatic fluid
-/// state uses the known vanilla plant and waterlogged representations until
-/// an authoritative per-state table is supplied through `BlockInfo`.
+/// Vanilla state properties, indexed by the global state ID.
 impl BlockInfo for RuntimeRegistry {
     fn flags(&self, id: u32) -> BlockFlags {
-        let Some(state) = self.block_state(id) else {
+        let Ok(id) = u16::try_from(id) else {
             return BlockFlags::default();
         };
-        let name = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
-        let air = matches!(name, "air" | "cave_air" | "void_air");
-        let fluid = matches!(
-            name,
-            "water"
-                | "lava"
-                | "seagrass"
-                | "tall_seagrass"
-                | "kelp"
-                | "kelp_plant"
-                | "bubble_column"
-        ) || state
-            .properties
-            .get("waterlogged")
-            .is_some_and(|v| v == "true");
+        if usize::from(id) >= ferrite_data::block_props::STATE_COUNT
+            || self.block_state(u32::from(id)).is_none()
+        {
+            return BlockFlags::default();
+        }
+        let props = ferrite_data::block_props::get(id);
         BlockFlags {
-            air,
-            fluid,
-            leaves: self.leaves.contains(&state.name),
-            motion_blocking: self.motion.contains(&state.name),
+            air: props.is_air,
+            fluid: props.fluid.is_some(),
+            motion_blocking: props.heightmaps & ferrite_data::block_props::OCEAN_FLOOR != 0,
+            leaves: props.heightmaps & ferrite_data::block_props::MOTION_BLOCKING != 0
+                && props.heightmaps & ferrite_data::block_props::MOTION_BLOCKING_NO_LEAVES == 0,
         }
     }
 }
-fn load_tag(
-    dir: &Path,
-    name: &str,
-    active: &mut HashSet<String>,
-) -> Result<HashSet<String>, RegistryError> {
-    if !active.insert(name.to_owned()) {
-        return Err(RegistryError::Invalid("cyclic block tag"));
-    }
-    let local = name
-        .strip_prefix("minecraft:")
-        .ok_or(RegistryError::Invalid("non-vanilla block tag"))?;
-    let data: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(dir.join(format!("{local}.json")))?)?;
-    let mut result = HashSet::new();
-    for value in data["values"]
-        .as_array()
-        .ok_or(RegistryError::Invalid("block tag values"))?
-    {
-        let value = value
-            .as_str()
-            .or_else(|| value.get("id").and_then(|v| v.as_str()))
-            .ok_or(RegistryError::Invalid("block tag value"))?;
-        if let Some(tag) = value.strip_prefix('#') {
-            result.extend(load_tag(dir, tag, active)?);
-        } else {
-            result.insert(value.to_owned());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_vanilla_heightmap_predicate_is_representable() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3/generated");
+        let registry = RuntimeRegistry::load(path).unwrap();
+        for id in 0..ferrite_data::block_props::STATE_COUNT as u32 {
+            let p = ferrite_data::block_props::get(id as u16);
+            let f = registry.flags(id);
+            let mask = u8::from(!f.air)
+                | (u8::from(f.motion_blocking) << 1)
+                | (u8::from(f.motion_blocking || f.fluid) << 2)
+                | (u8::from((f.motion_blocking || f.fluid) && !f.leaves) << 3);
+            assert_eq!(mask, p.heightmaps, "state {id}");
+            assert_eq!(f.fluid, p.fluid.is_some(), "state {id}");
         }
     }
-    active.remove(name);
-    Ok(result)
 }

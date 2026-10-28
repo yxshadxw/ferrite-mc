@@ -92,7 +92,9 @@ pub mod block_props {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum FluidKind {
         Water,
+        FlowingWater,
         Lava,
+        FlowingLava,
         /// A fluid without a dedicated variant.
         Other(&'static str),
     }
@@ -122,6 +124,10 @@ pub mod block_props {
         pub full_collision: bool,
         /// The collision shape is empty, so entities pass through.
         pub empty_collision: bool,
+        /// The occlusion shape is the unit cube.
+        pub full_occlusion: bool,
+        /// The occlusion shape is empty.
+        pub empty_occlusion: bool,
         /// Bit mask of the heightmaps the state counts for: [`WORLD_SURFACE`], [`OCEAN_FLOOR`],
         /// [`MOTION_BLOCKING`] and [`MOTION_BLOCKING_NO_LEAVES`].
         pub heightmaps: u8,
@@ -165,13 +171,28 @@ pub mod block_props {
     }
 
     /// Collision boxes of a state, each `[min_x, min_y, min_z, max_x, max_y, max_z]`.
-    pub fn collision_shape(state: u16) -> &'static [[f32; 6]] {
+    pub fn collision_shape(state: u16) -> &'static [[f64; 6]] {
         SHAPES[usize::from(STATE_COLLISION[usize::from(state)])]
     }
 
     /// Occlusion boxes of a state, used for light propagation and face culling.
-    pub fn occlusion_shape(state: u16) -> &'static [[f32; 6]] {
+    pub fn occlusion_shape(state: u16) -> &'static [[f64; 6]] {
         SHAPES[usize::from(STATE_OCCLUSION[usize::from(state)])]
+    }
+
+    /// Face shape in west, east, down, up, north, south order.
+    pub fn face_occlusion(state: u16, direction: usize) -> &'static [[f64; 6]] {
+        SHAPES[usize::from(STATE_FACES[usize::from(state)][direction])]
+    }
+
+    /// Compact face shape identifier (zero is empty, one is full).
+    pub fn face_occlusion_id(state: u16, direction: usize) -> u16 {
+        STATE_FACES[usize::from(state)][direction]
+    }
+
+    /// Shape boxes for a compact face identifier.
+    pub fn shape_by_id(id: u16) -> &'static [[f64; 6]] {
+        SHAPES[usize::from(id)]
     }
 
     /// Per-block metadata for a block name, with or without `"minecraft:"`.

@@ -101,8 +101,7 @@ def run_extractor(java: str, version: str, out: pathlib.Path) -> None:
     """Compile and run tools/extractor against the bundled server jar in vanilla/<ver>/lib."""
     javac = pathlib.Path(java).with_name("javac.exe" if os.name == "nt" else "javac")
     if not javac.exists():
-        print(f"skipping ferrite extractor: {javac} not found (a full JDK is required)")
-        return
+        sys.exit(f"ferrite extractor requires a full JDK: {javac} not found")
     lib = out / "lib"
     classes = lib / "extractor-classes"
     classes.mkdir(parents=True, exist_ok=True)

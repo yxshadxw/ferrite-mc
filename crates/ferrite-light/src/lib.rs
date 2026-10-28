@@ -5,9 +5,7 @@
 //! one section above and below the world. Pending edge chunks identify missing
 //! neighbors which must be rechecked when loaded. Queue entries encode a local
 //! position and permitted directions in one `u64`; no per-step allocation occurs.
-//! The built-in property table is incomplete; applications can override it via
-//! `LightBlockView::properties` until exact vanilla shapes are available.
-mod classifications;
+//! Vanilla properties include the exact face occlusion shapes.
 mod properties;
 pub use properties::{LightProperties, vanilla_properties};
 use std::collections::{HashSet, VecDeque};
@@ -312,7 +310,7 @@ impl LightEngine {
                 for y in (0..self.height).rev() {
                     let i = Self::index(x, y, z);
                     let p = self.blocks[i];
-                    if above.faces[2] | p.faces[3] == 15 {
+                    if properties::occludes(above.faces[2], p.faces[3], 2) {
                         value = 0;
                     } else {
                         value = value.saturating_sub(if value == 15 {
@@ -369,13 +367,15 @@ impl LightEngine {
                 }
                 let n = Self::index(nx as usize, ny as usize, nz as usize);
                 let target = self.blocks[n];
-                if (if from.emission > 0 {
-                    0
-                } else {
-                    from.faces[direction]
-                }) | target.faces[OPPOSITE[direction]]
-                    == 15
-                {
+                if properties::occludes(
+                    if from.emission > 0 {
+                        0
+                    } else {
+                        from.faces[direction]
+                    },
+                    target.faces[OPPOSITE[direction]],
+                    direction,
+                ) {
                     continue;
                 }
                 let value = level.saturating_sub(target.opacity.max(1));
@@ -456,7 +456,7 @@ impl LightEngine {
             for py in (0..self.height).rev() {
                 let i = Self::index(lx, py, lz);
                 let p = self.blocks[i];
-                if above.faces[2] | p.faces[3] == 15 {
+                if properties::occludes(above.faces[2], p.faces[3], 2) {
                     value = 0;
                 } else {
                     value = value.saturating_sub(if value == 15 {

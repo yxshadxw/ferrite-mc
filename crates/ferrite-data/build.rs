@@ -632,6 +632,7 @@ fn gen_block_props(path: &Path) -> String {
     shape_ids.insert(FULL_SHAPE.to_string(), 1);
     let mut state_collision: Vec<usize> = Vec::with_capacity(states.len());
     let mut state_occlusion: Vec<usize> = Vec::with_capacity(states.len());
+    let mut state_faces: Vec<[usize; 6]> = Vec::with_capacity(states.len());
 
     for (index, state) in states.iter().enumerate() {
         let id = u16::try_from(index)
@@ -648,10 +649,10 @@ fn gen_block_props(path: &Path) -> String {
             Some(serde_json::Value::Null) | None => "None".to_string(),
             Some(fluid) => {
                 let kind = match text(fluid, "id", id) {
-                    // Flowing water/lava share the fluid kind of their source block; the amount
-                    // and `falling` flag carry the flow level.
-                    "minecraft:water" | "minecraft:flowing_water" => "FluidKind::Water".to_string(),
-                    "minecraft:lava" | "minecraft:flowing_lava" => "FluidKind::Lava".to_string(),
+                    "minecraft:water" => "FluidKind::Water".to_string(),
+                    "minecraft:flowing_water" => "FluidKind::FlowingWater".to_string(),
+                    "minecraft:lava" => "FluidKind::Lava".to_string(),
+                    "minecraft:flowing_lava" => "FluidKind::FlowingLava".to_string(),
                     other => format!("FluidKind::Other({})", literal(other)),
                 };
                 format!(
@@ -666,7 +667,7 @@ fn gen_block_props(path: &Path) -> String {
              use_shape_for_light_occlusion: {}, propagates_skylight_down: {}, is_air: {}, \
              blocks_motion: {}, is_solid_render: {}, is_redstone_conductor: {}, fluid: {fluid}, \
              hardness: {}, requires_correct_tool: {}, replaceable: {}, full_collision: {}, \
-             empty_collision: {}, heightmaps: {}, randomly_ticking: {}, is_signal_source: {}, \
+             empty_collision: {}, full_occlusion: {}, empty_occlusion: {}, heightmaps: {}, randomly_ticking: {}, is_signal_source: {}, \
              has_analog_output: {}, friction: {}, speed_factor: {}, jump_factor: {} }},",
             integer(state, "lightEmission", id),
             integer(state, "lightOpacity", id),
@@ -682,6 +683,8 @@ fn gen_block_props(path: &Path) -> String {
             boolean(state, "replaceable", id),
             shape_is(state, "collision", "full", id),
             shape_is(state, "collision", "empty", id),
+            shape_is(state, "occlusion", "full", id),
+            shape_is(state, "occlusion", "empty", id),
             integer(state, "heightmaps", id),
             boolean(state, "randomlyTicking", id),
             boolean(state, "isSignalSource", id),
@@ -702,6 +705,14 @@ fn gen_block_props(path: &Path) -> String {
             "collision",
             id,
         ));
+        let faces = state["faces"].as_array().expect("faces array");
+        assert_eq!(faces.len(), 6);
+        let mut face_ids = [0; 6];
+        for (i, face) in faces.iter().enumerate() {
+            let wrapper = serde_json::json!({"face": face});
+            face_ids[i] = shape_index(&mut shapes, &mut shape_ids, &wrapper, "face", id);
+        }
+        state_faces.push(face_ids);
         state_occlusion.push(shape_index(
             &mut shapes,
             &mut shape_ids,
@@ -737,7 +748,7 @@ fn gen_block_props(path: &Path) -> String {
     out.push_str(
         "/// Deduplicated shapes, each box as `[min_x, min_y, min_z, max_x, max_y, max_z]`.\n",
     );
-    out.push_str("static SHAPES: &[&[[f32; 6]]] = &[\n");
+    out.push_str("static SHAPES: &[&[[f64; 6]]] = &[\n");
     for shape in &shapes {
         out.push_str("    ");
         out.push_str(shape);
@@ -757,6 +768,11 @@ fn gen_block_props(path: &Path) -> String {
     items(&mut out, "    ", &rows);
     out.push_str("\n];\n\n");
 
+    out.push_str("static STATE_FACES: &[[u16; 6]] = &[\n");
+    for faces in &state_faces {
+        writeln!(out, "    {:?},", faces).unwrap();
+    }
+    out.push_str("];\n");
     out.push_str("/// Per-block metadata, sorted by `name` for binary search.\n");
     out.push_str("static BLOCK_INFO: &[BlockInfo] = &[\n");
     let blocks = report
@@ -870,7 +886,7 @@ fn shape_index(
                     let value = coordinate.as_f64().unwrap_or_else(|| {
                         panic!("block state {id} has a non-numeric {field} coordinate")
                     });
-                    entry.push_str(&float_literal(value));
+                    entry.push_str(&format!("{value:?}"));
                 }
                 entry.push(']');
             }

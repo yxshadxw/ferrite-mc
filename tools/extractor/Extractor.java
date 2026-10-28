@@ -1,7 +1,7 @@
 // Extracts the physical properties of every block state (and basic item data) from the official
 // server jar, for the data the vanilla data generator does not report.
 //
-// This runs Mojang's own code locally; neither this source nor its output may be committed.
+// This runs Mojang's own code locally; its generated output must not be committed.
 // Build and run it against the deobfuscated 26.3 server jar and its libraries:
 //
 //     tools/extractor/build.sh 26.3
@@ -28,6 +28,9 @@ import com.google.gson.JsonParser;
 
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.shapes.BooleanOp;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
@@ -67,7 +70,7 @@ public final class Extractor {
         // vanilla block tags from the server jar that is on the classpath.
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
-        Map<TagKey<Block>, List<Block>> tags = loadBlockTags();
+        loadBlockTags();
 
         int stateCount = Block.BLOCK_STATE_REGISTRY.size();
         StringBuilder states = new StringBuilder(1 << 24);
@@ -80,7 +83,7 @@ public final class Extractor {
             if (id > 0) {
                 states.append(",\n");
             }
-            appendState(states, id, state, tags);
+            appendState(states, id, state);
         }
         states.append("\n]");
 
@@ -138,11 +141,11 @@ public final class Extractor {
     /**
      * The vanilla block tags, read from the server jar on the classpath.
      *
-     * Bootstrapping freezes the registries before data packs bind any tags, so load (and
-     * resolve) them here instead of calling `BlockState.is`, which would see empty tags.
+     * Bootstrapping freezes the registries before data packs bind tags. Load and apply
+     * the vanilla tags before invoking the vanilla heightmap predicates.
      */
     @SuppressWarnings("unchecked")
-    private static Map<TagKey<Block>, List<Block>> loadBlockTags() throws IOException {
+    private static void loadBlockTags() throws IOException {
         VanillaPackResources vanilla = ServerPacksSource.createVanillaPackSource();
         TagLoader.ElementLookup<Holder<Block>> lookup =
             (TagLoader.ElementLookup<Holder<Block>>) (TagLoader.ElementLookup<?>)
@@ -153,19 +156,14 @@ public final class Extractor {
             loaded = TagLoader.<Block>loadTagsForRegistry(
                 resources, Registries.BLOCK, lookup);
         }
-        Map<TagKey<Block>, List<Block>> tags = new HashMap<>();
-        loaded.forEach((tag, holders) -> tags.put(
-            tag, holders.stream().<Block>map(Holder::value).toList()));
-        System.out.printf(Locale.ROOT, "loaded %d block tags (%d blocks in heightmap tag)%n",
-            tags.size(), tags.getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP, List.of()).size());
-        return tags;
+        BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK, loaded)).apply();
     }
 
     // `isSolid()` (the blocks-motion predicate) is deprecated in 26.3 in favour of the
     // heightmap tags, but it is still the only API that reports motion blocking.
     @SuppressWarnings("deprecation")
     private static void appendState(
-        StringBuilder out, int id, BlockState state, Map<TagKey<Block>, List<Block>> tags
+        StringBuilder out, int id, BlockState state
     ) {
         Block block = state.getBlock();
         BlockPos pos = BlockPos.ZERO;
@@ -210,27 +208,19 @@ public final class Extractor {
         appendShape(out, collision);
         out.append(",\"occlusion\":");
         appendShape(out, occlusion);
+        out.append(",\"faces\":[");
+        Direction[] directions = {Direction.WEST, Direction.EAST, Direction.DOWN, Direction.UP, Direction.NORTH, Direction.SOUTH};
+        for (int i = 0; i < directions.length; i++) {
+            if (i > 0) out.append(',');
+            appendShape(out, state.getFaceOcclusionShape(directions[i]));
+        }
+        out.append(']');
 
-        // Same predicates as `Heightmap.Types.isOpaque()` in 26.3, which is tag based.
-        boolean fluidPresent = !fluid.isEmpty();
-        boolean motion = tags.getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP, List.of())
-            .contains(block);
-        boolean motionNoLeaves = tags
-            .getOrDefault(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES, List.of())
-            .contains(block);
         int heightmaps = 0;
-        if (!state.isAir()) {
-            heightmaps |= 1; // WORLD_SURFACE
-        }
-        if (motion) {
-            heightmaps |= 2; // OCEAN_FLOOR
-        }
-        if (motion || fluidPresent) {
-            heightmaps |= 4; // MOTION_BLOCKING
-        }
-        if (motionNoLeaves || fluidPresent) {
-            heightmaps |= 8; // MOTION_BLOCKING_NO_LEAVES
-        }
+        if (Heightmap.Types.WORLD_SURFACE.isOpaque().test(state)) heightmaps |= 1;
+        if (Heightmap.Types.OCEAN_FLOOR.isOpaque().test(state)) heightmaps |= 2;
+        if (Heightmap.Types.MOTION_BLOCKING.isOpaque().test(state)) heightmaps |= 4;
+        if (Heightmap.Types.MOTION_BLOCKING_NO_LEAVES.isOpaque().test(state)) heightmaps |= 8;
         out.append(",\"heightmaps\":").append(heightmaps);
         out.append(",\"randomlyTicking\":").append(state.isRandomlyTicking());
         out.append(",\"isSignalSource\":").append(state.isSignalSource());
@@ -247,7 +237,7 @@ public final class Extractor {
             out.append("\"empty\"");
             return;
         }
-        if (shape.equals(FULL_BLOCK)) {
+        if (!Shapes.joinIsNotEmpty(shape, FULL_BLOCK, BooleanOp.NOT_SAME)) {
             out.append("\"full\"");
             return;
         }
@@ -259,12 +249,12 @@ public final class Extractor {
                 out.append(',');
             }
             out.append('[')
-                .append(number((float) box.minX)).append(',')
-                .append(number((float) box.minY)).append(',')
-                .append(number((float) box.minZ)).append(',')
-                .append(number((float) box.maxX)).append(',')
-                .append(number((float) box.maxY)).append(',')
-                .append(number((float) box.maxZ)).append(']');
+                .append(number(box.minX)).append(',')
+                .append(number(box.minY)).append(',')
+                .append(number(box.minZ)).append(',')
+                .append(number(box.maxX)).append(',')
+                .append(number(box.maxY)).append(',')
+                .append(number(box.maxZ)).append(']');
         }
         out.append("]}");
     }
@@ -347,6 +337,10 @@ public final class Extractor {
     /** A component value that is a JSON primitive, or null when it is absent. */
     private static JsonElement primitive(JsonObject components, String name) {
         return components.has(name) ? components.get(name) : null;
+    }
+
+    private static String number(double value) {
+        return Double.toString(value);
     }
 
     /** Renders a float as a JSON number, keeping whole values short. */

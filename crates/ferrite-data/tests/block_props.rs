@@ -131,3 +131,26 @@ fn every_state_has_consistent_shapes() {
         );
     }
 }
+
+#[test]
+fn slab_face_shapes_follow_vanilla() {
+    let state = blocks::default_state("stone_slab").unwrap();
+    assert_eq!(
+        block_props::face_occlusion(state, 2),
+        &[[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
+    );
+    assert!(block_props::face_occlusion(state, 3).is_empty());
+    assert_eq!(
+        block_props::face_occlusion(state, 0),
+        &[[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]
+    );
+}
+
+#[test]
+fn flowing_fluid_retains_its_vanilla_id() {
+    let state = blocks::state_id("water", &[("level", "1")]).unwrap();
+    assert_eq!(
+        block_props::get(state).fluid.unwrap().0,
+        FluidKind::FlowingWater
+    );
+}

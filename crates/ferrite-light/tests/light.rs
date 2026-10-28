@@ -180,8 +180,35 @@ fn stair_faces_follow_half_facing_and_corner_shape() {
     .unwrap();
     let p = vanilla_properties(id);
     assert_eq!(p.opacity, 0);
-    // west/east/down/up/north/south, with four face quadrants.
-    assert_eq!(p.faces, [7, 3, 15, 1, 7, 3]);
+    // Sample the exact face boxes at each quadrant center.
+    let masks: Vec<u8> = p
+        .faces
+        .iter()
+        .enumerate()
+        .map(|(direction, &id)| {
+            let (u, v) = match direction {
+                0 | 1 => (2, 1),
+                2 | 3 => (0, 2),
+                _ => (0, 1),
+            };
+            let boxes = ferrite_data::block_props::shape_by_id(id);
+            let mut mask = 0;
+            for y in 0..2 {
+                for x in 0..2 {
+                    let a = (x as f64 + 0.5) / 2.0;
+                    let b = (y as f64 + 0.5) / 2.0;
+                    if boxes
+                        .iter()
+                        .any(|r| r[u] <= a && a < r[u + 3] && r[v] <= b && b < r[v + 3])
+                    {
+                        mask |= 1 << (y * 2 + x);
+                    }
+                }
+            }
+            mask
+        })
+        .collect();
+    assert_eq!(masks, [7, 3, 15, 1, 7, 3]);
 }
 
 #[test]
