@@ -30,6 +30,7 @@
 //! load the complete vanilla data set in strict mode so a new vanilla field fails loudly.
 
 mod biome;
+mod biome_source;
 mod density;
 mod dimension;
 mod id;
@@ -45,6 +46,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub use biome::{Biome, BiomeEffects, Carvers, GrassColorModifier, TemperatureModifier};
+pub use biome_source::{
+    ClimateTargetPoint, MultiNoiseBiomeSource, MultiNoiseError, quantize_coord,
+};
 pub use density::{
     Axis, DensityFunction, DensityNode, DistanceMetric, Spline, SplinePoint, SplineValue,
 };

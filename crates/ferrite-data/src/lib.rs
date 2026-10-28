@@ -1,5 +1,5 @@
-//! Vanilla data (registries, tags, block states, packet ids) extracted from the official server
-//! jar.
+//! Vanilla data (registries, tags, block states, entity types, packet ids) extracted from the
+//! official server jar.
 //!
 //! The tables are generated at build time by `build.rs` from the data generator output in
 //! `vanilla/26.3/generated/`. When that directory is missing, the build fails with a pointer to
@@ -203,6 +203,76 @@ pub mod block_props {
             .binary_search_by(|info| super::key(info.name).cmp(name))
             .ok()?;
         BLOCK_INFO.get(index)
+    }
+}
+
+pub mod entity_props {
+    //! Entity type properties, extracted from the vanilla server by `tools/extractor` into
+    //! `generated/ferrite/entity_types.json`.
+
+    /// Properties and default attributes of one entity type.
+    #[derive(Clone, Copy, Debug)]
+    pub struct EntityProps {
+        /// Global protocol id, also the index of this entry in the generated table.
+        pub id: u16,
+        /// Vanilla entity type id, e.g. `"minecraft:zombie"`.
+        pub key: &'static str,
+        /// Spawn category (`MobCategory`), e.g. `"monster"` or `"creature"`.
+        pub category: &'static str,
+        /// Base width in blocks.
+        pub width: f32,
+        /// Base height in blocks.
+        pub height: f32,
+        pub eye_height: f32,
+        /// Whether the dimensions ignore scale modifiers (vanilla's `EntityDimensions.fixed`).
+        pub fixed: bool,
+        /// Single-point attachments, sorted by name: passenger, vehicle, name tag, warden chest.
+        pub attachments: &'static [(&'static str, [f32; 3])],
+        /// Chunk tracking range in blocks.
+        pub client_tracking_range: i32,
+        /// Update interval in ticks; `i32::MAX` means the type never updates.
+        pub update_interval: i32,
+        pub fire_immune: bool,
+        pub can_spawn_far_from_player: bool,
+        pub is_summonable: bool,
+        pub is_serializable: bool,
+        /// Vanilla exposes one serialization flag; this mirrors [`Self::is_serializable`].
+        pub can_be_serialized: bool,
+        /// Default attribute values for living entity types, sorted by attribute name.
+        pub attributes: &'static [(&'static str, f64)],
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/entity_props.rs"));
+
+    /// Properties of a global entity type protocol id.
+    ///
+    /// Panics when `id` is not a valid entity type id; [`ENTITY_TYPE_COUNT`] is the number of
+    /// valid ids.
+    pub fn get(id: u16) -> &'static EntityProps {
+        &ENTITY_TYPES[usize::from(id)]
+    }
+
+    /// Properties of an entity type by name, with or without `"minecraft:"`.
+    pub fn by_name(name: &str) -> Option<&'static EntityProps> {
+        let name = super::key(name);
+        let index = ENTITY_BY_NAME
+            .binary_search_by(|(key, _)| super::key(key).cmp(name))
+            .ok()?;
+        ENTITY_BY_NAME.get(index).map(|(_, id)| get(*id))
+    }
+
+    /// Base value of one of an entity type's default attributes, e.g.
+    /// `default_attribute(entity_props::by_name("zombie").unwrap(), "max_health")`.
+    ///
+    /// `attribute` accepts names with or without `"minecraft:"`; returns `None` when the type
+    /// does not define that attribute (or is not a living entity type).
+    pub fn default_attribute(id: u16, attribute: &str) -> Option<f64> {
+        let attribute = super::key(attribute);
+        let attributes = get(id).attributes;
+        let index = attributes
+            .binary_search_by(|(name, _)| super::key(name).cmp(attribute))
+            .ok()?;
+        attributes.get(index).map(|(_, value)| *value)
     }
 }
 

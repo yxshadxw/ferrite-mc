@@ -6,7 +6,7 @@ Output (gitignored):
   vanilla/<version>/server.jar
   vanilla/<version>/generated/reports/{packets,registries,blocks,items,...}.json
   vanilla/<version>/generated/data/minecraft/...   (worldgen, loot tables, recipes, tags)
-  vanilla/<version>/generated/ferrite/block_states.json + items.json
+  vanilla/<version>/generated/ferrite/block_states.json, items inside it + entity_types.json
   vanilla/<version>/lib/                          (bundled server jar + libraries, extractor input)
 
 Nothing produced here may be committed; the repo only ships code that reads it.
@@ -113,7 +113,7 @@ def run_extractor(java: str, version: str, out: pathlib.Path) -> None:
         [str(javac), "-d", str(classes), "-cp", classpath, str(EXTRACTOR)],
         check=True,
     )
-    print("extracting block and item properties")
+    print("extracting block, item and entity properties")
     subprocess.run(
         [java, "-cp", os.pathsep.join([str(classes), classpath]), "Extractor",
          str(out / "generated" / "ferrite"),

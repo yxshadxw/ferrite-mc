@@ -5,3 +5,5 @@
 !java/**/gradle-wrapper.jar
 /logs
 __pycache__/
+/plugins-test/
+**/logs/

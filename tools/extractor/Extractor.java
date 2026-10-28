@@ -7,7 +7,7 @@
 //     tools/extractor/build.sh 26.3
 //
 // or let `python tools/fetch_vanilla.py` do both. Output goes to
-// vanilla/<version>/generated/ferrite/{block_states,items}.json.
+// vanilla/<version>/generated/ferrite/{block_states,items,entity_types}.json.
 
 import java.io.IOException;
 import java.io.Writer;
@@ -20,6 +20,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.stream.Stream;
 
 import com.google.gson.JsonElement;
@@ -42,6 +43,13 @@ import net.minecraft.server.packs.resources.MultiPackResourceManager;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.tags.TagLoader;
+import net.minecraft.world.entity.EntityAttachment;
+import net.minecraft.world.entity.EntityDimensions;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.attributes.Attribute;
+import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
+import net.minecraft.world.entity.ai.attributes.DefaultAttributes;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
@@ -49,6 +57,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.FlowingFluid;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -120,6 +129,9 @@ public final class Extractor {
         }
         items.append("\n]");
 
+        StringBuilder entities = new StringBuilder(1 << 16);
+        int entityCount = appendEntityTypes(entities);
+
         StringBuilder root = new StringBuilder(states.length() + blocks.length() + items.length() + 128);
         root.append("{\"version\":");
         quote(root, SharedConstants.getCurrentVersion().name());
@@ -136,6 +148,19 @@ public final class Extractor {
         }
         System.out.printf(Locale.ROOT, "wrote %d block states, %d blocks, %d items to %s%n",
             stateCount, sortedBlocks.size(), sortedItems.size(), file);
+
+        StringBuilder entityRoot = new StringBuilder(entities.length() + 128);
+        entityRoot.append("{\"version\":");
+        quote(entityRoot, SharedConstants.getCurrentVersion().name());
+        entityRoot.append(",\"protocol\":").append(SharedConstants.getProtocolVersion());
+        entityRoot.append(",\"count\":").append(entityCount);
+        entityRoot.append(",\"types\":").append(entities);
+        entityRoot.append("}\n");
+        Path entityFile = outDir.resolve("entity_types.json");
+        try (Writer writer = Files.newBufferedWriter(entityFile, StandardCharsets.UTF_8)) {
+            writer.write(entityRoot.toString());
+        }
+        System.out.printf(Locale.ROOT, "wrote %d entity types to %s%n", entityCount, entityFile);
     }
 
     /**
@@ -272,6 +297,121 @@ public final class Extractor {
             out.append("null");
         } else {
             quote(out, itemId);
+        }
+        out.append('}');
+    }
+
+    /**
+     * Writes every entity type in registry id order, with its dimensions (and the single-point
+     * attachments vanilla defines), tracking settings and, for living entities, default
+     * attribute values.
+     */
+    private static int appendEntityTypes(StringBuilder out) {
+        List<EntityType<?>> types =
+            new ArrayList<>(BuiltInRegistries.ENTITY_TYPE.stream().toList());
+        types.sort(Comparator.comparingInt(type -> BuiltInRegistries.ENTITY_TYPE.getId(type)));
+        out.append('[');
+        for (int index = 0; index < types.size(); index++) {
+            EntityType<?> type = types.get(index);
+            int id = BuiltInRegistries.ENTITY_TYPE.getId(type);
+            if (id != index) {
+                throw new IllegalStateException("entity type registry has a gap at " + index);
+            }
+            if (index > 0) {
+                out.append(",\n");
+            }
+            appendEntityType(out, id, type);
+        }
+        out.append("\n]");
+        return types.size();
+    }
+
+    private static void appendEntityType(StringBuilder out, int id, EntityType<?> type) {
+        EntityDimensions dimensions = type.getDimensions();
+        out.append("{\"id\":").append(id);
+        out.append(",\"key\":");
+        quote(out, EntityType.getKey(type).toString());
+        out.append(",\"category\":");
+        quote(out, type.getCategory().getSerializedName());
+        out.append(",\"width\":").append(number(dimensions.width()));
+        out.append(",\"height\":").append(number(dimensions.height()));
+        out.append(",\"eyeHeight\":").append(number(dimensions.eyeHeight()));
+        out.append(",\"fixed\":").append(dimensions.fixed());
+        out.append(",\"attachments\":");
+        appendAttachments(out, dimensions);
+        out.append(",\"clientTrackingRange\":").append(type.clientTrackingRange());
+        out.append(",\"updateInterval\":").append(type.updateInterval());
+        out.append(",\"fireImmune\":").append(type.fireImmune());
+        out.append(",\"canSpawnFarFromPlayer\":").append(type.canSpawnFarFromPlayer());
+        out.append(",\"isSummonable\":").append(type.canSummon());
+        // 26.3 exposes one serialization flag; both spellings describe the same value.
+        out.append(",\"isSerializable\":").append(type.canSerialize());
+        out.append(",\"canBeSerialized\":").append(type.canSerialize());
+        out.append(",\"attributes\":");
+        appendAttributes(out, type);
+        out.append('}');
+    }
+
+    /**
+     * Single-point attachments as `attachment: [x, y, z]`. Multi-point attachments (the happy
+     * ghast's four passenger seats) do not fit the simple point form and are skipped.
+     */
+    private static void appendAttachments(StringBuilder out, EntityDimensions dimensions) {
+        out.append('{');
+        boolean first = true;
+        for (EntityAttachment attachment : EntityAttachment.values()) {
+            List<Vec3> points = new ArrayList<>(1);
+            for (int index = 0; ; index++) {
+                Vec3 point = dimensions.attachments().getNullable(attachment, index, 0.0f);
+                if (point == null) {
+                    break;
+                }
+                points.add(point);
+            }
+            if (points.size() != 1) {
+                continue;
+            }
+            if (!first) {
+                out.append(',');
+            }
+            first = false;
+            quote(out, attachment.name().toLowerCase(Locale.ROOT));
+            Vec3 point = points.get(0);
+            out.append(":[")
+                .append(number((float) point.x)).append(',')
+                .append(number((float) point.y)).append(',')
+                .append(number((float) point.z)).append(']');
+        }
+        out.append('}');
+    }
+
+    /** Default attribute values (`attribute id -> base value`) of a living entity type. */
+    @SuppressWarnings("unchecked")
+    private static void appendAttributes(StringBuilder out, EntityType<?> type) {
+        out.append('{');
+        if (DefaultAttributes.hasSupplier(type)) {
+            EntityType<? extends LivingEntity> living =
+                (EntityType<? extends LivingEntity>) type;
+            AttributeSupplier supplier = DefaultAttributes.getSupplier(living);
+            TreeMap<String, Double> values = new TreeMap<>();
+            for (int index = 0; index < BuiltInRegistries.ATTRIBUTE.size(); index++) {
+                Attribute attribute = BuiltInRegistries.ATTRIBUTE.byId(index);
+                Holder<Attribute> holder = BuiltInRegistries.ATTRIBUTE.wrapAsHolder(attribute);
+                if (supplier.hasAttribute(holder)) {
+                    values.put(
+                        BuiltInRegistries.ATTRIBUTE.getKey(attribute).toString(),
+                        supplier.getBaseValue(holder));
+                }
+            }
+            boolean first = true;
+            for (Map.Entry<String, Double> entry : values.entrySet()) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                quote(out, entry.getKey());
+                out.append(':').append(number(entry.getValue()));
+            }
         }
         out.append('}');
     }

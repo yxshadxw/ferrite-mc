@@ -542,11 +542,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "ferrite-admin"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "ferrite-command"
 version = "0.1.0"
 dependencies = [
  "ferrite-protocol",
  "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "ferrite-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_norway",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -571,6 +593,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-item"
+version = "0.1.0"
+dependencies = [
+ "ferrite-nbt",
+ "ferrite-protocol",
+ "ferrite-text",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ferrite-jvm"
 version = "0.1.0"
 dependencies = [
@@ -586,6 +619,14 @@ version = "0.1.0"
 dependencies = [
  "ferrite-data",
  "ferrite-nbt",
+]
+
+[[package]]
+name = "ferrite-loot"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -655,6 +696,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-profiler"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrite-protocol"
 version = "0.1.0"
 dependencies = [
@@ -665,6 +715,14 @@ dependencies = [
  "libdeflater",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "ferrite-recipe"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -681,6 +739,9 @@ name = "ferrite-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ferrite-command",
+ "ferrite-data",
+ "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",
  "ferrite-protocol",
@@ -688,6 +749,7 @@ dependencies = [
  "ferrite-world",
  "mimalloc",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -717,6 +779,15 @@ dependencies = [
  "thiserror 2.0.21",
  "xxhash-rust",
  "zip 2.6.1",
+]
+
+[[package]]
+name = "ferrite-worldgen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2533,6 +2604,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "md-5",
+ "serde_core",
  "wasm-bindgen",
 ]
 

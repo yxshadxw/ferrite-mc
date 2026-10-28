@@ -14,6 +14,18 @@
 //! kept as [`Component::Opaque`] raw NBT, so a stack can always be re-encoded without losing
 //! data.
 //!
+//! # Network slots
+//!
+//! [`wire`] implements the 26.3 network slot: [`ItemStack::encode_network`] and
+//! [`ItemStack::decode_network`], plus [`HashedSlot`] for the hashed slot of the serverbound
+//! `Click Container` packet. All 122 component types are parsed structurally. Components with a
+//! typed variant decode to it; the rest, and any payload whose shape a typed variant cannot
+//! hold, stay as [`Component::Raw`] and re-encode verbatim. Typed payloads re-encode in the
+//! canonical form (components in type id order, enchantments in name order), so encoding is
+//! deterministic. With the `protocol` feature the crate also implements
+//! `ferrite_protocol::Encode`/`Decode` for [`ItemStack`]; `ferrite-protocol` never depends on
+//! this crate.
+//!
 //! # Default components
 //!
 //! The 26.3 data generator writes no `reports/items.json`; it writes one file per item under
@@ -37,6 +49,7 @@
 mod component;
 mod defaults;
 mod stack;
+pub mod wire;
 
 pub use component::{
     AttributeModifier, AttributeOperation, COMPONENT_COUNT, Component, ComponentPatch,
@@ -48,6 +61,7 @@ pub use defaults::{
     item_id, item_name, items,
 };
 pub use stack::{ItemStack, MAX_COUNT};
+pub use wire::{HashedSlot, WireError};
 
 /// Generated protocol ids of the `minecraft:data_component_type` registry.
 ///
@@ -91,4 +105,7 @@ pub enum Error {
     /// wrong component.
     #[error("component {kind} cannot be stored under data component type id {id}")]
     ComponentIdMismatch { kind: &'static str, id: u16 },
+    /// A network-only component payload was offered to the NBT save format.
+    #[error("component {0} has no NBT form")]
+    NoNbtForm(&'static str),
 }

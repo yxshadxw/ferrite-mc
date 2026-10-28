@@ -3,7 +3,8 @@
 //! A component value is typed when the crate knows the 26.3 NBT shape of its component type.
 //! Decoding is deliberately tolerant of the shapes vanilla produces (missing default fields,
 //! an int where a float is expected) and falls back to [`Component::Opaque`] for anything else,
-//! so a stack never loses a value it does not understand.
+//! so a stack never loses a value it does not understand. The network codec in [`crate::wire`]
+//! has the same policy with [`Component::Raw`], which keeps a received payload verbatim.
 
 use std::collections::BTreeMap;
 
@@ -101,6 +102,13 @@ pub enum AttributeOperation {
 }
 
 impl AttributeOperation {
+    /// Every operation, in the order of vanilla's protocol ids.
+    pub const ALL: [Self; 3] = [
+        Self::AddValue,
+        Self::AddMultipliedBase,
+        Self::AddMultipliedTotal,
+    ];
+
     /// The name vanilla uses, e.g. `"add_multiplied_base"`.
     pub const fn name(self) -> &'static str {
         match self {
@@ -132,12 +140,14 @@ pub enum EquipmentSlot {
     Legs,
     Chest,
     Head,
+    Armor,
     Body,
+    Saddle,
 }
 
 impl EquipmentSlot {
-    /// Every slot, in vanilla's order.
-    pub const ALL: [Self; 9] = [
+    /// Every slot, in the order of vanilla's `EquipmentSlotGroup` ids.
+    pub const ALL: [Self; 11] = [
         Self::Any,
         Self::Mainhand,
         Self::Offhand,
@@ -146,7 +156,9 @@ impl EquipmentSlot {
         Self::Legs,
         Self::Chest,
         Self::Head,
+        Self::Armor,
         Self::Body,
+        Self::Saddle,
     ];
 
     /// The name vanilla uses, e.g. `"mainhand"`.
@@ -160,7 +172,9 @@ impl EquipmentSlot {
             Self::Legs => "legs",
             Self::Chest => "chest",
             Self::Head => "head",
+            Self::Armor => "armor",
             Self::Body => "body",
+            Self::Saddle => "saddle",
         }
     }
 
@@ -175,7 +189,9 @@ impl EquipmentSlot {
             "legs" => Some(Self::Legs),
             "chest" => Some(Self::Chest),
             "head" => Some(Self::Head),
+            "armor" => Some(Self::Armor),
             "body" => Some(Self::Body),
+            "saddle" => Some(Self::Saddle),
             _ => None,
         }
     }
@@ -593,6 +609,10 @@ pub enum Component {
     /// A component without a typed variant, or a value whose NBT shape did not match its typed
     /// variant. Kept verbatim.
     Opaque(Tag),
+    /// A component payload kept exactly as it appeared on the wire, produced by
+    /// [`crate::wire`] for components without a typed variant. It has no NBT form; re-encoding
+    /// it to the network writes the bytes verbatim.
+    Raw(Vec<u8>),
 }
 
 impl Component {
@@ -617,7 +637,7 @@ impl Component {
             Self::AttributeModifiers(_) => ids::ATTRIBUTE_MODIFIERS,
             Self::Food(_) => ids::FOOD,
             Self::Tool(_) => ids::TOOL,
-            Self::Opaque(_) => return None,
+            Self::Opaque(_) | Self::Raw(_) => return None,
         })
     }
 
@@ -642,12 +662,17 @@ impl Component {
             Self::Food(_) => "food",
             Self::Tool(_) => "tool",
             Self::Opaque(_) => "opaque",
+            Self::Raw(_) => "raw",
         }
     }
 
     /// Encodes the value as NBT, in the shape the 26.3 item save format uses.
-    pub fn to_nbt(&self) -> Tag {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// [`Component::Raw`] only exists in the network form, so it cannot be saved as NBT.
+    pub fn to_nbt(&self) -> Result<Tag, Error> {
+        Ok(match self {
             Self::CustomName(text) | Self::ItemName(text) => text.to_nbt(),
             Self::Lore(lore) => text_list(lore),
             Self::Damage(value)
@@ -675,7 +700,8 @@ impl Component {
             Self::Food(food) => Tag::Compound(food.to_compound()),
             Self::Tool(tool) => Tag::Compound(tool.to_compound()),
             Self::Opaque(tag) => tag.clone(),
-        }
+            Self::Raw(_) => return Err(Error::NoNbtForm("raw")),
+        })
     }
 
     /// Decodes a component value of type `id`.
@@ -817,7 +843,7 @@ impl ComponentPatch {
                             id: *id,
                         });
                     }
-                    out.insert(name.to_owned(), component.to_nbt());
+                    out.insert(name.to_owned(), component.to_nbt()?);
                 }
                 None => {
                     out.insert(format!("!{name}"), Tag::Compound(Compound::new()));
@@ -1115,7 +1141,9 @@ mod tests {
 
         for (id, component) in cases {
             assert_eq!(component.type_id(), Some(id), "{component:?}");
-            let tag = component.to_nbt();
+            let tag = component
+                .to_nbt()
+                .expect("typed components have an NBT form");
             assert_eq!(
                 Component::from_nbt(id, &tag),
                 component,

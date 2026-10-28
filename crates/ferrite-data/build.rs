@@ -35,6 +35,8 @@ fn main() {
     let data = generated.join("data").join("minecraft");
     let tags = data.join("tags");
     let physics = generated.join("ferrite").join("block_states.json");
+    // Optional: an older extraction may predate entity types, so a missing file only warns.
+    let entity_types = generated.join("ferrite").join("entity_types.json");
     for path in [
         &blocks,
         &registries,
@@ -50,6 +52,11 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", entity_types.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        generated.join("ferrite").display()
+    );
     for path in [
         &blocks,
         &registries,
@@ -71,6 +78,10 @@ fn main() {
     write_file(&out_dir.join("packets.rs"), &gen_packets(&packets));
     write_file(&out_dir.join("tags.rs"), &gen_tags(&tags, &datapack));
     write_file(&out_dir.join("block_props.rs"), &gen_block_props(&physics));
+    write_file(
+        &out_dir.join("entity_props.rs"),
+        &gen_entity_props(&entity_types),
+    );
 }
 
 /// Reports missing vanilla data, telling the user how to produce it.
@@ -928,6 +939,240 @@ fn gen_packets(path: &Path) -> String {
     }
     out.push_str("];\n");
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// entity properties
+// ---------------------------------------------------------------------------------------------
+
+fn gen_entity_props(path: &Path) -> String {
+    let mut out = header("ferrite/entity_types.json");
+    if !path.exists() {
+        println!(
+            "cargo:warning=vanilla entity data is missing at {}; run `python tools/fetch_vanilla.py` to generate it",
+            path.display()
+        );
+        out.push_str(
+            "/// Number of entity types; zero until `python tools/fetch_vanilla.py` has been rerun.\n\
+             pub const ENTITY_TYPE_COUNT: usize = 0;\n\n",
+        );
+        out.push_str("static ENTITY_TYPES: &[EntityProps] = &[];\n\n");
+        out.push_str("/// `(key, protocol id)` sorted by key for binary search.\n");
+        out.push_str("static ENTITY_BY_NAME: &[(&str, u16)] = &[];\n");
+        return out;
+    }
+
+    let report = read_json(path);
+    let types = report
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{}: expected a types array", path.display()));
+    let mut by_name: Vec<(&str, u16)> = Vec::with_capacity(types.len());
+
+    writeln!(
+        out,
+        "/// Number of entity types.\npub const ENTITY_TYPE_COUNT: usize = {};\n",
+        types.len()
+    )
+    .expect("writing to a String cannot fail");
+    out.push_str("/// Entity type properties, indexed by protocol id.\nstatic ENTITY_TYPES: &[EntityProps] = &[\n");
+
+    for (index, value) in types.iter().enumerate() {
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("{}: entity type {index} without an id", path.display()));
+        if id != index as u64 {
+            panic!(
+                "{}: entity type ids are not contiguous; expected {index}, found {id}",
+                path.display()
+            );
+        }
+        let id = u16::try_from(id)
+            .unwrap_or_else(|_| panic!("{}: too many entity types", path.display()));
+        let key = value
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{}: entity type {id} without a key", path.display()));
+        by_name.push((key, id));
+
+        let category = value
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{key}: entity type without a category"));
+
+        out.push_str("    EntityProps {\n");
+        writeln!(out, "        id: {id},").expect("writing to a String cannot fail");
+        writeln!(out, "        key: {},", literal(key)).expect("writing to a String cannot fail");
+        writeln!(out, "        category: {},", literal(category))
+            .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        width: {},",
+            float_literal(entity_number(value, "width", key))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        height: {},",
+            float_literal(entity_number(value, "height", key))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        eye_height: {},",
+            float_literal(entity_number(value, "eyeHeight", key))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(out, "        fixed: {},", entity_bool(value, "fixed", key))
+            .expect("writing to a String cannot fail");
+
+        let no_attachments = serde_json::Map::new();
+        let attachment_json = value
+            .get("attachments")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&no_attachments);
+        let mut attachments: BTreeMap<&str, [f32; 3]> = BTreeMap::new();
+        for (name, point) in attachment_json {
+            let coordinates = point
+                .as_array()
+                .unwrap_or_else(|| panic!("{key}: attachment {name} is not an array"));
+            if coordinates.len() != 3 {
+                panic!(
+                    "{key}: attachment {name} has {} coordinates; expected 3",
+                    coordinates.len()
+                );
+            }
+            let mut xyz = [0.0f32; 3];
+            for (slot, coordinate) in coordinates.iter().enumerate() {
+                xyz[slot] = coordinate.as_f64().unwrap_or_else(|| {
+                    panic!("{key}: attachment {name} has a non-numeric coordinate")
+                }) as f32;
+            }
+            attachments.insert(name, xyz);
+        }
+        if attachments.is_empty() {
+            out.push_str("        attachments: &[],\n");
+        } else {
+            out.push_str("        attachments: &[\n");
+            let rendered: Vec<String> = attachments
+                .iter()
+                .map(|(name, [x, y, z])| {
+                    format!(
+                        "({}, [{}, {}, {}])",
+                        literal(name),
+                        float_literal(f64::from(*x)),
+                        float_literal(f64::from(*y)),
+                        float_literal(f64::from(*z))
+                    )
+                })
+                .collect();
+            items(&mut out, "            ", &rendered);
+            out.push_str("\n        ],\n");
+        }
+
+        writeln!(
+            out,
+            "        client_tracking_range: {},",
+            entity_integer(value, "clientTrackingRange", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        update_interval: {},",
+            entity_integer(value, "updateInterval", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        fire_immune: {},",
+            entity_bool(value, "fireImmune", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        can_spawn_far_from_player: {},",
+            entity_bool(value, "canSpawnFarFromPlayer", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        is_summonable: {},",
+            entity_bool(value, "isSummonable", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        is_serializable: {},",
+            entity_bool(value, "isSerializable", key)
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "        can_be_serialized: {},",
+            entity_bool(value, "canBeSerialized", key)
+        )
+        .expect("writing to a String cannot fail");
+
+        let no_attributes = serde_json::Map::new();
+        let attribute_json = value
+            .get("attributes")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&no_attributes);
+        let mut attributes: BTreeMap<&str, f64> = BTreeMap::new();
+        for (name, attribute) in attribute_json {
+            let attribute = attribute
+                .as_f64()
+                .unwrap_or_else(|| panic!("{key}: attribute {name} is not a number"));
+            attributes.insert(name, attribute);
+        }
+        if attributes.is_empty() {
+            out.push_str("        attributes: &[],\n");
+        } else {
+            out.push_str("        attributes: &[\n");
+            let rendered: Vec<String> = attributes
+                .iter()
+                .map(|(name, attribute)| format!("({}, {attribute:?})", literal(name)))
+                .collect();
+            items(&mut out, "            ", &rendered);
+            out.push_str("\n        ],\n");
+        }
+        out.push_str("    },\n");
+    }
+    out.push_str("];\n\n");
+
+    by_name.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    out.push_str("/// `(key, protocol id)` sorted by key for binary search.\n");
+    out.push_str("static ENTITY_BY_NAME: &[(&str, u16)] = &[\n");
+    for (key, id) in by_name {
+        writeln!(out, "    ({}, {id}),", literal(key)).expect("writing to a String cannot fail");
+    }
+    out.push_str("];\n");
+
+    out
+}
+
+fn entity_number(value: &serde_json::Value, field: &str, key: &str) -> f64 {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_else(|| panic!("{key}: entity type without a numeric {field}"))
+}
+
+fn entity_integer(value: &serde_json::Value, field: &str, key: &str) -> i32 {
+    let number = value
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("{key}: entity type without an integer {field}"));
+    i32::try_from(number)
+        .unwrap_or_else(|_| panic!("{key}: entity type {field} {number} does not fit in i32"))
+}
+
+fn entity_bool(value: &serde_json::Value, field: &str, key: &str) -> bool {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| panic!("{key}: entity type without a boolean {field}"))
 }
 
 // ---------------------------------------------------------------------------------------------

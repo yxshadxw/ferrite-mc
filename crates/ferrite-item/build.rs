@@ -38,14 +38,15 @@ fn main() {
         .join("minecraft")
         .join("components")
         .join("item");
-    for path in [&registries, &item_reports] {
+    let enchantments = generated.join("data").join("minecraft").join("enchantment");
+    for path in [&registries, &item_reports, &enchantments] {
         if !path.exists() {
             missing(path);
         }
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    for path in [&registries, &item_reports] {
+    for path in [&registries, &item_reports, &enchantments] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -62,6 +63,74 @@ fn main() {
     write_file(&out_dir.join("items.rs"), &items_source);
     fs::write(out_dir.join("defaults.nbt"), default_components)
         .expect("failed to write defaults.nbt");
+    write_file(
+        &out_dir.join("wire_registries.rs"),
+        &gen_wire_registries(&registry, &enchantments),
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// network registry ids
+// ---------------------------------------------------------------------------------------------
+
+/// Built-in registries and the data-driven enchantment registry are what the typed network
+/// components need to resolve names to ids and back. Blocks and attributes come from
+/// `registries.json`; enchantment ids are the sorted order of `data/minecraft/enchantment`.
+fn gen_wire_registries(registry: &serde_json::Value, enchantment_dir: &Path) -> String {
+    let attributes = registry_entries(registry, "minecraft:attribute");
+    let blocks = registry_entries(registry, "minecraft:block");
+    let mut enchantments: Vec<String> = fs::read_dir(enchantment_dir)
+        .unwrap_or_else(|error| panic!("failed to list {}: {error}", enchantment_dir.display()))
+        .map(|entry| entry.expect("the directory is readable").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter_map(|name| {
+            name.strip_suffix(".json")
+                .map(|stem| format!("minecraft:{stem}"))
+        })
+        .collect();
+    enchantments.sort_unstable();
+    assert!(
+        !enchantments.is_empty(),
+        "{} has no enchantment files",
+        enchantment_dir.display()
+    );
+
+    let mut out = header("reports/registries.json and data/minecraft/enchantment");
+    for (name, entries) in [("ATTRIBUTES", &attributes), ("BLOCKS", &blocks)] {
+        writeln!(
+            out,
+            "/// `{name}` entries sorted by name: `(name, protocol id)`.\nstatic {name}: &[(&str, u16)] = &["
+        )
+        .expect("writing to a String cannot fail");
+        for (entry, id) in entries.iter() {
+            writeln!(out, "    ({}, {id}),", literal(entry))
+                .expect("writing to a String cannot fail");
+        }
+        out.push_str("];\n\n");
+
+        let mut by_id: Vec<(&str, u16)> = entries.to_vec();
+        by_id.sort_unstable_by_key(|(_, id)| *id);
+        let names = name.trim_end_matches('S');
+        writeln!(
+            out,
+            "/// `{name}` names by protocol id.\nstatic {names}_NAMES: &[&str] = &["
+        )
+        .expect("writing to a String cannot fail");
+        for (entry, _) in &by_id {
+            writeln!(out, "    {},", literal(entry)).expect("writing to a String cannot fail");
+        }
+        out.push_str("];\n\n");
+    }
+
+    out.push_str(
+        "/// `minecraft:enchantment` names in registry id order (sorted by name).\n\
+         static ENCHANTMENTS: &[&str] = &[\n",
+    );
+    for enchantment in &enchantments {
+        writeln!(out, "    {},", literal(enchantment)).expect("writing to a String cannot fail");
+    }
+    out.push_str("];\n");
+    out
 }
 
 /// Reports missing vanilla data, telling the user how to produce it.
