@@ -46,3 +46,14 @@ Interrupted, never built. Too big for freebuff; reassign to Codex terra, startin
 - Java 25: `C:/Program Files/Eclipse Adoptium/jdk-25.0.5.8-hotspot` (JAVA_HOME for `python tools/fetch_vanilla.py`).
 - Vanilla data + fixture world + protocol docs (gitignored): `vanilla/26.3/`, `vanilla/docs/`.
 - Orca run `run_4622c45f6259`; F5/F6/F7 dispatches were never settled (interrupted) — create new tasks rather than reusing them.
+
+---
+# Day 2 (2026-10-28) end
+phase1-foundation HEAD `0eac5a9`. Committed today: exact block props, fluid count fix, palette/light perf,
+real-world Anvil loading + persistence, 200-bot load test (avg 0.4 ms MSPT), regionizer v3, ferrite-command,
+ferrite-text, ferrite-math, ferrite-console, ferrite-noise (bit-exact), SNBT hardening, plugin bridge checkpoint.
+NOT re-verified by coordinator at the end (usage limit): the last two commits rely on worker-reported checks — run tools/check.sh first.
+Unverified WIP on branch `wip/day2-2026-10-28`: T2 block place/break/inventory/commands (creative-break test still red;
+ops-by-UUID security fix done), ferrite-recipe (no vanilla tests yet), ferrite-protocol-translate (agent hit rate limit mid-pair-module),
+FB11 libdeflate/VarInt (clippy collapsible_if at codec.rs:98), FB12 profiler / FB13 item never started (prompts unsent).
+Also: delete crates/ferrite-noise/logs/ (accidentally committed log). T3 remaining: java/T3-CHECKPOINT.md. FB15 part 2 (ferrite-data tags) not started.
