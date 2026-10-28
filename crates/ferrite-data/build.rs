@@ -31,16 +31,34 @@ fn main() {
     let blocks = generated.join("reports").join("blocks.json");
     let registries = generated.join("reports").join("registries.json");
     let packets = generated.join("reports").join("packets.json");
+    let datapack = generated.join("reports").join("datapack.json");
     let data = generated.join("data").join("minecraft");
+    let tags = data.join("tags");
     let physics = generated.join("ferrite").join("block_states.json");
-    for path in [&blocks, &registries, &packets, &data, &physics] {
+    for path in [
+        &blocks,
+        &registries,
+        &packets,
+        &datapack,
+        &data,
+        &tags,
+        &physics,
+    ] {
         if !path.exists() {
             missing(path);
         }
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    for path in [&blocks, &registries, &packets, &data, &physics] {
+    for path in [
+        &blocks,
+        &registries,
+        &packets,
+        &datapack,
+        &data,
+        &tags,
+        &physics,
+    ] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -51,6 +69,7 @@ fn main() {
         &gen_registries(&registries, &data),
     );
     write_file(&out_dir.join("packets.rs"), &gen_packets(&packets));
+    write_file(&out_dir.join("tags.rs"), &gen_tags(&tags, &datapack));
     write_file(&out_dir.join("block_props.rs"), &gen_block_props(&physics));
 }
 
@@ -533,6 +552,311 @@ fn registry_root<'a>(dir: &'a str, roots: &BTreeSet<&str>) -> Option<&'a str> {
         }
     }
     roots.contains(&dir[..prefix]).then(|| &dir[..prefix])
+}
+
+// ---------------------------------------------------------------------------------------------
+// tags
+// ---------------------------------------------------------------------------------------------
+
+/// One value of a tag file: a concrete registry entry or a reference to another tag.
+enum TagEntry {
+    Entry(String),
+    /// A tag reference; `required: false` may resolve to nothing without failing the build.
+    Tag {
+        name: String,
+        required: bool,
+    },
+}
+
+/// A tag after resolution: its sorted, deduplicated entries and how many entries its expanded
+/// (not deduplicated) value list holds.
+struct ResolvedTag {
+    entries: Vec<String>,
+    occurrences: usize,
+}
+
+fn gen_tags(tags_root: &Path, datapack: &Path) -> String {
+    let registries = tagged_registries(datapack);
+    let mut files = Vec::new();
+    tag_files(tags_root, "", &mut files);
+    files.sort();
+
+    // Tags keyed by (registry path, namespaced tag name) so the same tag name in two registries
+    // stays distinct.
+    let mut raw: BTreeMap<(String, String), Vec<TagEntry>> = BTreeMap::new();
+    for (relative, path) in &files {
+        let Some((registry, tag)) = split_tag_path(relative, &registries) else {
+            panic!(
+                "{}: tag is not below a registry that supports tags",
+                path.display()
+            );
+        };
+        let value = read_json(path);
+        let values = value
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{}: tag file without a values array", path.display()));
+        let mut entries = Vec::with_capacity(values.len());
+        for value in values {
+            let (id, required) = match value {
+                serde_json::Value::String(id) => (id.as_str(), true),
+                serde_json::Value::Object(object) => {
+                    let id = object
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| panic!("{}: tag entry without an id", path.display()));
+                    let required = object
+                        .get("required")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    (id, required)
+                }
+                _ => panic!(
+                    "{}: a tag entry must be a string or an object",
+                    path.display()
+                ),
+            };
+            entries.push(tag_entry(id, required, path));
+        }
+        let key = (registry.to_string(), format!("minecraft:{tag}"));
+        if raw.insert(key, entries).is_some() {
+            panic!("{}: duplicate tag file", path.display());
+        }
+    }
+
+    let resolved = resolve_tags(&raw);
+    let registries: BTreeSet<&str> = raw.keys().map(|(registry, _)| registry.as_str()).collect();
+    let occurrences: usize = resolved.values().map(|tag| tag.occurrences).sum();
+
+    let mut out = header("data/minecraft/tags");
+    writeln!(
+        out,
+        "/// Number of registries with built-in tags.\npub const REGISTRY_COUNT: usize = {};\n",
+        registries.len()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "/// Number of built-in tags.\npub const TAG_COUNT: usize = {};\n",
+        resolved.len()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "/// Total resolved entries of all tags: an entry reached through several `#tag`\n\
+         /// references counts once per reference. This is the size of the expanded value lists\n\
+         /// before duplicates are removed.\npub const RESOLVED_ENTRIES: usize = {occurrences};\n"
+    )
+    .expect("writing to a String cannot fail");
+
+    out.push_str(
+        "/// Registries with built-in tags, sorted by name.\nstatic REGISTRIES: &[&str] = &[\n",
+    );
+    let names: Vec<String> = registries
+        .iter()
+        .map(|registry| literal(&format!("minecraft:{registry}")))
+        .collect();
+    items(&mut out, "    ", &names);
+    out.push_str("\n];\n\n");
+
+    out.push_str(
+        "/// Built-in tags, sorted by registry and then name.\nstatic TAGS: &[Tag] = &[\n",
+    );
+    for ((registry, name), tag) in &resolved {
+        out.push_str("    Tag {\n");
+        writeln!(
+            out,
+            "        registry: {},",
+            literal(&format!("minecraft:{registry}"))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(out, "        name: {},", literal(name)).expect("writing to a String cannot fail");
+        if tag.entries.is_empty() {
+            out.push_str("        entries: &[],\n");
+        } else {
+            out.push_str("        entries: &[\n");
+            items(
+                &mut out,
+                "            ",
+                &tag.entries
+                    .iter()
+                    .map(String::as_str)
+                    .map(literal)
+                    .collect::<Vec<_>>(),
+            );
+            out.push_str("\n        ],\n");
+        }
+        out.push_str("    },\n");
+    }
+    out.push_str("];\n");
+
+    out
+}
+
+/// Names of the registries that support tags, from `reports/datapack.json`.
+fn tagged_registries(path: &Path) -> BTreeSet<String> {
+    let report = read_json(path);
+    let registries = report
+        .get("registries")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{}: expected a registries object", path.display()));
+    registries
+        .iter()
+        .filter(|(_, value)| {
+            value
+                .get("tags")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name.strip_prefix("minecraft:").unwrap_or(name).to_string())
+        .collect()
+}
+
+/// One tag file's value: an entry id (namespaced if needed) or a `#tag` reference.
+fn tag_entry(id: &str, required: bool, path: &Path) -> TagEntry {
+    match id.strip_prefix('#') {
+        None => TagEntry::Entry(namespaced(id)),
+        Some("") => panic!("{}: empty tag reference", path.display()),
+        Some(reference) => TagEntry::Tag {
+            name: namespaced(reference),
+            required,
+        },
+    }
+}
+
+/// Adds the `minecraft:` namespace to a name that does not carry one.
+fn namespaced(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    }
+}
+
+/// Collects `(path without .json, file)` for every tag file below `root`.
+fn tag_files(root: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+    let dir = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    };
+    let entries =
+        fs::read_dir(&dir).unwrap_or_else(|err| panic!("failed to list {}: {err}", dir.display()));
+    let mut children: Vec<(bool, String)> = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to list {}: {err}", dir.display()));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry
+            .file_type()
+            .unwrap_or_else(|err| panic!("failed to stat {}: {err}", entry.path().display()))
+            .is_dir();
+        children.push((is_dir, name));
+    }
+    children.sort();
+    for (is_dir, name) in children {
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if is_dir {
+            tag_files(root, &relative, out);
+        } else if let Some(stem) = name.strip_suffix(".json") {
+            let relative = if prefix.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{prefix}/{stem}")
+            };
+            out.push((relative, dir.join(name)));
+        }
+    }
+}
+
+/// Splits a tag path into the deepest registry directory and the tag name below it, e.g.
+/// `worldgen/biome/is_beach` -> `("worldgen/biome", "is_beach")`.
+fn split_tag_path<'a>(
+    relative: &'a str,
+    registries: &BTreeSet<String>,
+) -> Option<(&'a str, &'a str)> {
+    for (offset, ch) in relative.char_indices().rev() {
+        if ch == '/' {
+            let registry = &relative[..offset];
+            if registries.contains(registry) {
+                return Some((registry, &relative[offset + 1..]));
+            }
+        }
+    }
+    None
+}
+
+/// Resolves every tag, expanding `#tag` references within the same registry.
+fn resolve_tags(
+    raw: &BTreeMap<(String, String), Vec<TagEntry>>,
+) -> BTreeMap<(String, String), ResolvedTag> {
+    let mut resolved = BTreeMap::new();
+    let mut state = BTreeMap::new();
+    let keys: Vec<(String, String)> = raw.keys().cloned().collect();
+    for key in &keys {
+        resolve_tag(key, raw, &mut state, &mut resolved);
+    }
+    resolved
+}
+
+/// Resolves one tag, memoizing the result; `state` is 1 while a tag is being expanded and 2 once
+/// it is done, which detects cyclic references.
+fn resolve_tag(
+    key: &(String, String),
+    raw: &BTreeMap<(String, String), Vec<TagEntry>>,
+    state: &mut BTreeMap<(String, String), u8>,
+    resolved: &mut BTreeMap<(String, String), ResolvedTag>,
+) -> ResolvedTag {
+    if let Some(tag) = resolved.get(key) {
+        return ResolvedTag {
+            entries: tag.entries.clone(),
+            occurrences: tag.occurrences,
+        };
+    }
+    match state.get(key).copied() {
+        Some(1) => panic!("tag #{} is part of a reference cycle", key.1),
+        Some(2) => unreachable!("resolved tags are memoized"),
+        _ => {}
+    }
+    state.insert(key.clone(), 1);
+
+    let mut entries = BTreeSet::new();
+    let mut occurrences = 0;
+    for entry in raw.get(key).expect("tags are resolved from the raw table") {
+        match entry {
+            TagEntry::Entry(id) => {
+                entries.insert(id.clone());
+                occurrences += 1;
+            }
+            TagEntry::Tag { name, required } => {
+                let reference = (key.0.clone(), name.clone());
+                if raw.contains_key(&reference) {
+                    let referenced = resolve_tag(&reference, raw, state, resolved);
+                    entries.extend(referenced.entries);
+                    occurrences += referenced.occurrences;
+                } else if *required {
+                    panic!("tag #{} references missing tag #{name}", key.1);
+                }
+            }
+        }
+    }
+
+    state.insert(key.clone(), 2);
+    let tag = ResolvedTag {
+        entries: entries.into_iter().collect(),
+        occurrences,
+    };
+    resolved.insert(
+        key.clone(),
+        ResolvedTag {
+            entries: tag.entries.clone(),
+            occurrences: tag.occurrences,
+        },
+    );
+    tag
 }
 
 // ---------------------------------------------------------------------------------------------

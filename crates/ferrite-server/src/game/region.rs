@@ -14,13 +14,16 @@ use uuid::Uuid;
 pub enum Command {
     Input(ServerboundPlay),
     Leave,
+    SetMode(i32),
+    Teleport([f64; 3]),
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
+pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
 pub enum Signal {
     Transfer {
         from: ChunkPos,
         to: ChunkPos,
-        player: Player,
+        player: Box<Player>,
     },
     Hold {
         chunk: ChunkPos,
@@ -41,6 +44,8 @@ pub enum Signal {
 }
 pub struct Player {
     pub uuid: Uuid,
+    pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
+    pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
     pub pos: [f64; 3],
     pub yaw: f32,
@@ -51,6 +56,10 @@ pub struct Player {
     pub outbound: UnboundedSender<Outbound>,
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
+    pub gamemode: i32,
+    pub inventory: [ItemStack; 46],
+    pub held_slot: u8,
+    pub breaking: Option<(i64, u32, u32)>,
     pub view: i32,
     pub pending_teleport: Option<i32>,
     pub next_teleport: i32,
@@ -130,6 +139,9 @@ impl Player {
         for (x, z) in forget {
             send(self, &ForgetChunk { z, x });
             self.loaded.remove(&(x, z));
+            if let Some((loaded, _)) = self.tracking.lock().unwrap().get_mut(&self.uuid) {
+                loaded.remove(&(x, z));
+            }
             let _ = self.signals.send(Signal::Hold {
                 chunk: ChunkPos(x, z),
                 add: false,
@@ -161,6 +173,7 @@ impl Player {
         if self.awaiting_batch || self.queue.is_empty() {
             return;
         }
+        let mut tracking = self.tracking.lock().unwrap();
         let count = (self.rate.clamp(1.0, 64.0) as usize).min(self.queue.len());
         let mut chunks = Vec::new();
         for _ in 0..count {
@@ -197,6 +210,9 @@ impl Player {
         for (x, z, packet) in chunks {
             let _ = self.outbound.send(Outbound::Packet(packet));
             self.loaded.insert((x, z));
+            if let Some((loaded, _)) = tracking.get_mut(&self.uuid) {
+                loaded.insert((x, z));
+            }
             let _ = self.signals.send(Signal::Hold {
                 chunk: ChunkPos(x, z),
                 add: true,
@@ -210,15 +226,336 @@ impl Player {
         );
         self.awaiting_batch = true;
     }
+    fn interaction_ready(&self, location: i64) -> bool {
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        if (f64::from(pos.x) - self.pos[0]).abs() > 7.0
+            || (f64::from(pos.y) - self.pos[1]).abs() > 7.0
+            || (f64::from(pos.z) - self.pos[2]).abs() > 7.0
+        {
+            return true;
+        }
+        let Some(source) = &self.source else {
+            return true;
+        };
+        let mut ready = true;
+        let min_x = (self.pos[0] - 6.0).floor() as i32;
+        let max_x = (self.pos[0] + 6.0).floor() as i32;
+        let min_z = (self.pos[2] - 6.0).floor() as i32;
+        let max_z = (self.pos[2] + 6.0).floor() as i32;
+        for x in min_x.div_euclid(16)..=max_x.div_euclid(16) {
+            for z in min_z.div_euclid(16)..=max_z.div_euclid(16) {
+                match source.get(x, z, self.biome) {
+                    None => ready = false,
+                    Some(Err(error)) => {
+                        tracing::error!(x,z,%error,"failed to load interaction chunk");
+                        return true;
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+        ready
+    }
+    fn hit(&self, target: ferrite_protocol::types::BlockPos) -> Option<ferrite_math::BlockHit> {
+        use ferrite_math::{AABB, Vec3, look_from_yaw_pitch, raycast};
+        let source = self.source.as_ref()?;
+        let eye = Vec3::new(self.pos[0], self.pos[1] + 1.62, self.pos[2]);
+        let mut shapes = HashMap::new();
+        let look = look_from_yaw_pitch(self.yaw, self.pitch);
+        let distance = if self.gamemode == 1 { 5.0 } else { 4.5 };
+        let end = eye + look * distance;
+        let start = ferrite_math::BlockPos::containing(eye);
+        let end = ferrite_math::BlockPos::containing(end);
+        for x in start.x.min(end.x)..=start.x.max(end.x) {
+            for y in start.y.min(end.y)..=start.y.max(end.y) {
+                for z in start.z.min(end.z)..=start.z.max(end.z) {
+                    let boxes: Vec<_> = match source
+                        .block(x, y, z)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .filter(|v| usize::from(*v) < ferrite_data::blocks::STATE_COUNT)
+                    {
+                        Some(state) => ferrite_data::block_props::collision_shape(state)
+                            .iter()
+                            .map(|b| AABB::new(b[0], b[1], b[2], b[3], b[4], b[5]))
+                            .collect(),
+                        None => vec![AABB::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
+                    };
+                    if !boxes.is_empty() {
+                        shapes.insert((x, y, z), boxes);
+                    }
+                }
+            }
+        }
+        raycast(eye, look, distance, |p| {
+            shapes.get(&(p.x, p.y, p.z)).map(Vec::as_slice)
+        })
+        .filter(|hit| (hit.pos.x, hit.pos.y, hit.pos.z) == (target.x, target.y, target.z))
+    }
+    fn send_block_snapshot(&self, location: i64) {
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        if let Some(state) = self
+            .source
+            .as_ref()
+            .and_then(|s| s.block(pos.x, pos.y, pos.z))
+        {
+            send(
+                self,
+                &BlockUpdate {
+                    location,
+                    block_state: VarInt(state as i32),
+                },
+            );
+        }
+    }
+    fn change_block(&self, location: i64, expected: u32, state: u32) -> bool {
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        let tracking = self.tracking.lock().unwrap();
+        if self.source.as_ref().is_some_and(|source| {
+            source
+                .compare_set_block(pos.x, pos.y, pos.z, Some(expected), state)
+                .is_ok()
+        }) {
+            let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+            for (loaded, outbound) in tracking.values() {
+                if loaded.contains(&chunk) {
+                    let _ = outbound.send(packet(&BlockUpdate {
+                        location,
+                        block_state: VarInt(state as i32),
+                    }));
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+    fn place(&mut self, p: &UseItemOn) {
+        if !(self.gamemode == 0 || self.gamemode == 1)
+            || !(0..=1).contains(&p.hand.0)
+            || !(0..=5).contains(&p.face.0)
+            || ![p.cursor_x, p.cursor_y, p.cursor_z]
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            || p.world_border_hit
+        {
+            return;
+        }
+        let clicked = ferrite_protocol::types::BlockPos::unpack(p.location);
+        if !self
+            .hit(clicked)
+            .is_some_and(|hit| hit.face == ferrite_math::Direction::ALL[p.face.0 as usize])
+        {
+            return;
+        }
+        let Some(source) = &self.source else { return };
+        let Some(clicked_state) = source
+            .block(clicked.x, clicked.y, clicked.z)
+            .and_then(|s| u16::try_from(s).ok())
+        else {
+            return;
+        };
+        let face = ferrite_math::Direction::ALL[p.face.0 as usize];
+        let (dx, dy, dz) = if ferrite_data::block_props::get(clicked_state).replaceable {
+            (0, 0, 0)
+        } else {
+            face.step()
+        };
+        let target =
+            ferrite_protocol::types::BlockPos::new(clicked.x + dx, clicked.y + dy, clicked.z + dz);
+        let Some(old) = source
+            .block(target.x, target.y, target.z)
+            .and_then(|s| u16::try_from(s).ok())
+        else {
+            return;
+        };
+        if !ferrite_data::block_props::get(old).replaceable {
+            return;
+        }
+        let slot = if p.hand.0 == 0 {
+            36 + self.held_slot as usize
+        } else {
+            45
+        };
+        let item = self.inventory[slot];
+        if item.count <= 0 {
+            return;
+        }
+        let Some(state) =
+            super::interaction::placement_state(item.item_id, p.face.0, p.cursor_y, self.yaw, old)
+        else {
+            return;
+        };
+        let positions = self.positions.lock().unwrap();
+        let offset = ferrite_math::Vec3::new(target.x as f64, target.y as f64, target.z as f64);
+        if positions.iter().any(|(uuid, pos)| {
+            let pos = if *uuid == self.uuid { &self.pos } else { pos };
+            let player_box = ferrite_math::AABB::new(
+                pos[0] - 0.3,
+                pos[1],
+                pos[2] - 0.3,
+                pos[0] + 0.3,
+                pos[1] + 1.8,
+                pos[2] + 0.3,
+            );
+            ferrite_data::block_props::collision_shape(state)
+                .iter()
+                .any(|b| {
+                    player_box.intersects(
+                        ferrite_math::AABB::new(b[0], b[1], b[2], b[3], b[4], b[5]).move_by(offset),
+                    )
+                })
+        }) {
+            return;
+        }
+        let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
+        drop(positions);
+        if placed && self.gamemode == 0 {
+            self.inventory[slot].count -= 1;
+            if self.inventory[slot].count == 0 {
+                self.inventory[slot] = ItemStack::default();
+            }
+            send(
+                self,
+                &ContainerSlot {
+                    window: VarInt(0),
+                    state: VarInt(0),
+                    slot: slot as i16,
+                    item: self.inventory[slot],
+                },
+            );
+        }
+    }
     fn update(&mut self) -> bool {
-        let commands: Vec<_> = self.mailbox.lock().unwrap().drain(..).collect();
+        if let Some((_, _, elapsed)) = &mut self.breaking {
+            *elapsed = elapsed.saturating_add(1);
+        }
+        let mut commands: VecDeque<_> = self.mailbox.lock().unwrap().drain(..).collect();
         let start = self.pos;
         let mut changed = false;
-        for command in commands {
-            let Command::Input(msg) = command else {
-                return false;
+        while let Some(command) = commands.pop_front() {
+            let location = match &command {
+                Command::Input(ServerboundPlay::PlayerAction(p))
+                    if p.status.0 == 0 || p.status.0 == 2 =>
+                {
+                    Some(p.location)
+                }
+                Command::Input(ServerboundPlay::UseItemOn(p)) => Some(p.location),
+                _ => None,
+            };
+            if location.is_some_and(|location| !self.interaction_ready(location)) {
+                let mut mailbox = self.mailbox.lock().unwrap();
+                commands.push_front(command);
+                commands.append(&mut mailbox);
+                *mailbox = commands;
+                break;
+            }
+            let msg = match command {
+                Command::Leave => return false,
+                Command::SetMode(mode) => {
+                    self.gamemode = mode;
+                    send(
+                        self,
+                        &GameEvent {
+                            event: 3,
+                            value: mode as f32,
+                        },
+                    );
+                    continue;
+                }
+                Command::Teleport(pos) => {
+                    if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
+                        self.pos = pos;
+                        self.teleport();
+                        changed = true;
+                    }
+                    continue;
+                }
+                Command::Input(msg) => msg,
             };
             match msg {
+                ServerboundPlay::PlayerAction(p) => {
+                    let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
+                    match p.status.0 {
+                        0 if self.hit(pos).is_some() => {
+                            let state = self
+                                .source
+                                .as_ref()
+                                .and_then(|s| s.block(pos.x, pos.y, pos.z));
+                            if let Some(state) = state {
+                                if self.gamemode == 1 {
+                                    self.change_block(p.location, state, 0);
+                                } else if self.gamemode == 0 {
+                                    self.breaking = Some((p.location, state, 0));
+                                }
+                            }
+                        }
+                        1 => self.breaking = None,
+                        2 => {
+                            if let Some((location, state, elapsed)) = self.breaking.take()
+                                && location == p.location
+                                && self.hit(pos).is_some()
+                                && u16::try_from(state)
+                                    .ok()
+                                    .and_then(super::interaction::break_ticks)
+                                    .is_some_and(|ticks| elapsed >= ticks)
+                            {
+                                self.change_block(location, state, 0);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.send_block_snapshot(p.location);
+                    send(
+                        self,
+                        &AcknowledgeBlockChange {
+                            sequence: p.sequence,
+                        },
+                    );
+                }
+                ServerboundPlay::UseItemOn(p) => {
+                    self.place(&p);
+                    self.send_block_snapshot(p.location);
+                    if let Some(face) = usize::try_from(p.face.0)
+                        .ok()
+                        .and_then(|i| ferrite_math::Direction::ALL.get(i))
+                    {
+                        let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
+                        let (dx, dy, dz) = face.step();
+                        self.send_block_snapshot(
+                            ferrite_protocol::types::BlockPos::new(
+                                pos.x + dx,
+                                pos.y + dy,
+                                pos.z + dz,
+                            )
+                            .pack(),
+                        );
+                    }
+                    send(
+                        self,
+                        &AcknowledgeBlockChange {
+                            sequence: p.sequence,
+                        },
+                    );
+                }
+                ServerboundPlay::SetHeldItem(p) => {
+                    if (0..=8).contains(&p.slot) {
+                        self.held_slot = p.slot as u8;
+                    }
+                }
+                ServerboundPlay::CreativeSlot(p) => {
+                    if self.gamemode == 1 && (0..46).contains(&p.slot) {
+                        self.inventory[p.slot as usize] = p.item;
+                        send(
+                            self,
+                            &ContainerSlot {
+                                window: VarInt(0),
+                                state: VarInt(0),
+                                slot: p.slot,
+                                item: p.item,
+                            },
+                        );
+                    }
+                }
                 ServerboundPlay::Confirm(p) => {
                     if self.pending_teleport == Some(p.id.0) {
                         self.pending_teleport = None;
@@ -271,6 +608,7 @@ impl Player {
             }
         }
         if changed {
+            self.positions.lock().unwrap().insert(self.uuid, self.pos);
             let _ = self.signals.send(Signal::Update {
                 uuid: self.uuid,
                 pos: self.pos,
@@ -308,7 +646,7 @@ impl Region {
                 let _ = tx.send(Signal::Transfer {
                     from,
                     to: next,
-                    player: p,
+                    player: Box::new(p),
                 });
                 continue;
             }

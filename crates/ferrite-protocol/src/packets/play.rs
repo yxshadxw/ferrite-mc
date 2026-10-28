@@ -92,25 +92,28 @@ pub struct PlayerInfo {
     pub uuid: Uuid,
     pub name: String,
     pub properties: Vec<Property>,
+    pub game_mode: VarInt,
 }
 impl Encode for PlayerInfo {
     fn encode(&self, out: &mut Vec<u8>) {
-        9u8.encode(out);
+        13u8.encode(out);
         VarInt(1).encode(out);
         self.uuid.encode(out);
         self.name.encode(out);
         self.properties.encode(out);
+        self.game_mode.encode(out);
         true.encode(out);
     }
 }
 impl Decode for PlayerInfo {
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
-        if u8::decode(buf)? != 9 || VarInt::decode(buf)?.0 != 1 {
+        if u8::decode(buf)? != 13 || VarInt::decode(buf)?.0 != 1 {
             return Err(DecodeError::Invalid("player info actions"));
         }
         let uuid = Uuid::decode(buf)?;
         let name = String::decode(buf)?;
         let properties = Vec::decode(buf)?;
+        let game_mode = VarInt::decode(buf)?;
         if !bool::decode(buf)? {
             return Err(DecodeError::Invalid("unlisted player"));
         }
@@ -118,6 +121,7 @@ impl Decode for PlayerInfo {
             uuid,
             name,
             properties,
+            game_mode,
         })
     }
 }
@@ -214,4 +218,147 @@ impl Packet for AddEntity {
     const ID: i32 = 1;
     const STATE: State = State::Play;
     const BOUND: Bound = Bound::Clientbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerGameMode {
+    pub uuid: Uuid,
+    pub game_mode: VarInt,
+}
+impl Encode for PlayerGameMode {
+    fn encode(&self, out: &mut Vec<u8>) {
+        4u8.encode(out);
+        VarInt(1).encode(out);
+        self.uuid.encode(out);
+        self.game_mode.encode(out);
+    }
+}
+impl Decode for PlayerGameMode {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        if u8::decode(buf)? != 4 || VarInt::decode(buf)?.0 != 1 {
+            return Err(DecodeError::Invalid("game mode update"));
+        }
+        Ok(Self {
+            uuid: Uuid::decode(buf)?,
+            game_mode: VarInt::decode(buf)?,
+        })
+    }
+}
+impl Packet for PlayerGameMode {
+    const ID: i32 = 71;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+packet!(PlayerAction,41,Serverbound,{status:VarInt,location:i64,face:i8,sequence:VarInt});
+packet!(UseItemOn,66,Serverbound,{hand:VarInt,location:i64,face:VarInt,cursor_x:f32,cursor_y:f32,cursor_z:f32,inside:bool,world_border_hit:bool,sequence:VarInt});
+packet!(BlockUpdate,8,Clientbound,{location:i64,block_state:VarInt});
+packet!(AcknowledgeBlockChange,4,Clientbound,{sequence:VarInt});
+packet!(SetHeldItem,54,Serverbound,{slot:i16});
+packet!(CreativeSlot,57,Serverbound,{slot:i16,item:ItemStack});
+packet!(ContainerContent,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<ItemStack>,carried:ItemStack});
+packet!(ContainerSlot,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:ItemStack});
+
+/// Minimal item stack; component patches are deliberately rejected until supported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ItemStack {
+    pub count: i32,
+    pub item_id: i32,
+}
+impl Encode for ItemStack {
+    fn encode(&self, out: &mut Vec<u8>) {
+        VarInt(self.count).encode(out);
+        if self.count > 0 {
+            VarInt(self.item_id).encode(out);
+            VarInt(0).encode(out);
+            VarInt(0).encode(out);
+        }
+    }
+}
+impl Decode for ItemStack {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let count = VarInt::decode(buf)?.0;
+        if count == 0 {
+            return Ok(Self::default());
+        }
+        if !(1..=99).contains(&count) {
+            return Err(DecodeError::Invalid("invalid item count"));
+        }
+        let item_id = VarInt::decode(buf)?.0;
+        if item_id < 0 {
+            return Err(DecodeError::Invalid("invalid item id"));
+        }
+        if VarInt::decode(buf)?.0 != 0 || VarInt::decode(buf)?.0 != 0 {
+            return Err(DecodeError::Invalid("item components unsupported"));
+        }
+        Ok(Self { count, item_id })
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    fn roundtrip<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
+        let mut bytes = Vec::new();
+        value.encode(&mut bytes);
+        let mut data = bytes.as_slice();
+        assert_eq!(T::decode(&mut data).unwrap(), value);
+        assert!(data.is_empty());
+    }
+    #[test]
+    fn interaction_packets_roundtrip() {
+        roundtrip(PlayerGameMode {
+            uuid: Uuid::nil(),
+            game_mode: VarInt(1),
+        });
+        roundtrip(PlayerAction {
+            status: VarInt(0),
+            location: 15,
+            face: 1,
+            sequence: VarInt(42),
+        });
+        roundtrip(UseItemOn {
+            hand: VarInt(0),
+            location: 15,
+            face: VarInt(1),
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: VarInt(3),
+        });
+        roundtrip(BlockUpdate {
+            location: 15,
+            block_state: VarInt(9),
+        });
+        roundtrip(AcknowledgeBlockChange {
+            sequence: VarInt(3),
+        });
+        roundtrip(SetHeldItem { slot: 2 });
+        roundtrip(CreativeSlot {
+            slot: 36,
+            item: ItemStack {
+                count: 3,
+                item_id: 7,
+            },
+        });
+        roundtrip(ContainerContent {
+            window: VarInt(0),
+            state: VarInt(0),
+            slots: vec![
+                ItemStack::default(),
+                ItemStack {
+                    count: 1,
+                    item_id: 2,
+                },
+            ],
+            carried: ItemStack::default(),
+        });
+        roundtrip(ContainerSlot {
+            window: VarInt(0),
+            state: VarInt(3),
+            slot: 36,
+            item: ItemStack::default(),
+        });
+    }
 }

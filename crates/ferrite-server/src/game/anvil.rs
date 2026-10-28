@@ -1,15 +1,27 @@
 use ferrite_nbt::{List, Tag, binary};
 use ferrite_world::{
-    LightData, LightSection, RegionFile, RuntimeRegistry, chunk_from_nbt, encode_chunk_packet,
+    BlockStateRegistry, Chunk, LightData, LightSection, RegionFile, RuntimeRegistry,
+    chunk_from_nbt, encode_chunk_packet,
 };
 use std::path::Path;
 
+#[cfg(test)]
 pub fn read_chunk(
     world: &Path,
     registry: &RuntimeRegistry,
     x: i32,
     z: i32,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(read_column(world, registry, x, z)?
+        .map(|(chunk, light)| encode_chunk_packet(x, z, &chunk, &light))
+        .transpose()?)
+}
+fn read_column(
+    world: &Path,
+    registry: &RuntimeRegistry,
+    x: i32,
+    z: i32,
+) -> anyhow::Result<Option<(Chunk, LightData)>> {
     let rx = x.div_euclid(32);
     let rz = z.div_euclid(32);
     let dir = world.join("dimensions/minecraft/overworld/region");
@@ -52,22 +64,27 @@ pub fn read_chunk(
             }
         }
     }
-    Ok(Some(encode_chunk_packet(x, z, &chunk, &light)?))
+    Ok(Some((chunk, light)))
 }
 
-use super::chunk::{ChunkSource, FlatGenerator};
 use ferrite_protocol::{Encode, Packet, VarInt, packets::play::ChunkData};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 const CACHE_LIMIT: usize = 256;
 const PENDING_LIMIT: usize = 32;
 enum Entry {
     Pending(u64),
-    Ready(Result<Vec<u8>, String>, u64),
+    Ready(Result<Box<Column>, String>, u64),
+}
+#[derive(Clone)]
+struct Column {
+    chunk: Chunk,
+    light: LightData,
+    packet: Vec<u8>,
 }
 struct Cache {
     entries: HashMap<(i32, i32, i32), Entry>,
@@ -81,16 +98,43 @@ struct Dirty {
     version: u64,
 }
 pub struct AnvilChunkSource {
-    path: PathBuf,
-    registry: RuntimeRegistry,
+    path: Option<PathBuf>,
+    registry: Arc<RuntimeRegistry>,
     cache: Mutex<Cache>,
     runtime: tokio::runtime::Handle,
     flush_lock: tokio::sync::Mutex<()>,
+    flat: Mutex<HashMap<i32, (Chunk, LightData)>>,
 }
 impl AnvilChunkSource {
     pub fn new(path: PathBuf, registry: RuntimeRegistry) -> Arc<Self> {
         Arc::new(Self {
-            path,
+            path: Some(path),
+            registry: Arc::new(registry),
+            cache: Mutex::new(Cache {
+                entries: HashMap::new(),
+                clock: 0,
+                dirty: HashMap::new(),
+            }),
+            runtime: tokio::runtime::Handle::current(),
+            flush_lock: tokio::sync::Mutex::new(()),
+            flat: Mutex::new(HashMap::new()),
+        })
+    }
+    pub fn new_memory() -> Arc<Self> {
+        static REGISTRY: OnceLock<Arc<RuntimeRegistry>> = OnceLock::new();
+        let registry = REGISTRY
+            .get_or_init(|| {
+                Arc::new(
+                    RuntimeRegistry::load(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../vanilla/26.3/generated"),
+                    )
+                    .expect("loading vanilla registry"),
+                )
+            })
+            .clone();
+        Arc::new(Self {
+            path: None,
             registry,
             cache: Mutex::new(Cache {
                 entries: HashMap::new(),
@@ -99,7 +143,109 @@ impl AnvilChunkSource {
             }),
             runtime: tokio::runtime::Handle::current(),
             flush_lock: tokio::sync::Mutex::new(()),
+            flat: Mutex::new(HashMap::new()),
         })
+    }
+    pub fn modified_packet(&self, x: i32, z: i32) -> Option<Vec<u8>> {
+        self.cache
+            .lock()
+            .unwrap()
+            .dirty
+            .get(&(x, z))
+            .map(|dirty| dirty.packet.clone())
+    }
+    pub fn block(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        let cache = self.cache.lock().unwrap();
+        if let Some(d) = cache.dirty.get(&key) {
+            return d
+                .chunk
+                .block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8);
+        }
+        let column = cache.entries.iter().find_map(|(&(cx, cz, _), entry)| {
+            if (cx, cz) == key {
+                if let Entry::Ready(Ok(c), _) = entry {
+                    Some(c)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })?;
+        column
+            .chunk
+            .block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8)
+    }
+    pub fn set_block(&self, x: i32, y: i32, z: i32, state: u32) -> anyhow::Result<()> {
+        self.compare_set_block(x, y, z, None, state)
+    }
+    pub fn compare_set_block(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        expected: Option<u32>,
+        state: u32,
+    ) -> anyhow::Result<()> {
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        let mut cache = self.cache.lock().unwrap();
+        let (mut chunk, light) = if let Some(d) = cache.dirty.get(&key) {
+            (d.chunk.clone(), d.light.clone())
+        } else {
+            let column = cache
+                .entries
+                .iter()
+                .find_map(|(&(cx, cz, _), entry)| {
+                    if (cx, cz) == key {
+                        if let Entry::Ready(Ok(c), _) = entry {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("chunk not loaded"))?;
+            (column.chunk.clone(), column.light.clone())
+        };
+        anyhow::ensure!(
+            self.path.is_none()
+                || cache.dirty.contains_key(&key)
+                || cache.dirty.len() < CACHE_LIMIT,
+            "dirty chunk cache is full"
+        );
+        if let Some(expected) = expected {
+            anyhow::ensure!(
+                chunk.block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8) == Some(expected),
+                "block changed"
+            );
+        }
+        chunk.set_block(
+            x.rem_euclid(16) as u8,
+            y,
+            z.rem_euclid(16) as u8,
+            state,
+            &*self.registry,
+        )?;
+        let body = encode_chunk_packet(key.0, key.1, &chunk, &light)?;
+        let mut packet = Vec::new();
+        VarInt(ChunkData::ID).encode(&mut packet);
+        packet.extend(body);
+        cache.clock += 1;
+        let version = cache.clock;
+        cache.entries.retain(|&(cx, cz, _), _| (cx, cz) != key);
+        cache.dirty.insert(
+            key,
+            Dirty {
+                chunk,
+                light,
+                packet,
+                version,
+            },
+        );
+        Ok(())
     }
     /// Records a modified column for streaming and eventual Anvil writeback.
     /// TODO: call this when block-editing gameplay is implemented.
@@ -116,7 +262,9 @@ impl AnvilChunkSource {
         packet.extend(body);
         let mut cache = self.cache.lock().unwrap();
         anyhow::ensure!(
-            cache.dirty.contains_key(&(x, z)) || cache.dirty.len() < CACHE_LIMIT,
+            self.path.is_none()
+                || cache.dirty.contains_key(&(x, z))
+                || cache.dirty.len() < CACHE_LIMIT,
             "dirty chunk cache is full"
         );
         cache.clock += 1;
@@ -134,6 +282,9 @@ impl AnvilChunkSource {
         Ok(())
     }
     pub async fn flush_chunk(self: &Arc<Self>, x: i32, z: i32) -> anyhow::Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
         let _guard = self.flush_lock.lock().await;
         let item = {
             let cache = self.cache.lock().unwrap();
@@ -147,12 +298,16 @@ impl AnvilChunkSource {
         };
         let source = Arc::clone(self);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let dir = source.path.join("dimensions/minecraft/overworld/region");
+            let dir = source
+                .path
+                .as_ref()
+                .unwrap()
+                .join("dimensions/minecraft/overworld/region");
             std::fs::create_dir_all(&dir)?;
             let rx = x.div_euclid(32);
             let rz = z.div_euclid(32);
             let region = RegionFile::open(dir.join(format!("r.{rx}.{rz}.mca")), rx, rz)?;
-            let mut tag = ferrite_world::chunk_to_nbt(&chunk, &source.registry)?;
+            let mut tag = ferrite_world::chunk_to_nbt(&chunk, &*source.registry)?;
             if let Tag::Compound(root) = &mut tag {
                 root.insert("xPos".into(), Tag::Int(x));
                 root.insert("zPos".into(), Tag::Int(z));
@@ -183,6 +338,9 @@ impl AnvilChunkSource {
         Ok(())
     }
     pub async fn flush_all(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
         loop {
             let next = { self.cache.lock().unwrap().dirty.keys().next().copied() };
             let Some((x, z)) = next else { return Ok(()) };
@@ -202,7 +360,11 @@ impl AnvilChunkSource {
                 Entry::Pending(_) => None,
                 Entry::Ready(data, used) => {
                     *used = now;
-                    Some(data.clone())
+                    Some(
+                        data.as_ref()
+                            .map(|column| column.packet.clone())
+                            .map_err(Clone::clone),
+                    )
                 }
             };
         }
@@ -235,27 +397,17 @@ impl AnvilChunkSource {
         let source = Arc::clone(self);
         let request = now;
         self.runtime.spawn_blocking(move || {
-            let result = read_chunk(&source.path, &source.registry, x, z)
-                .map(|packet| match packet {
-                    Some(body) => {
-                        let mut packet = Vec::new();
-                        VarInt(ChunkData::ID).encode(&mut packet);
-                        packet.extend(body);
-                        packet
-                    }
-                    None => {
-                        let mut generator = FlatGenerator::default();
-                        let chunk = generator.get(x, z, biome);
-                        let mut packet = Vec::new();
-                        ferrite_protocol::encode_packet(&chunk, &mut packet);
-                        packet
-                    }
-                })
-                .map_err(|e| format!("{e:#}"));
+            let result = (|| -> anyhow::Result<Column> {
+                let loaded = match &source.path { Some(path) => read_column(path, &source.registry, x, z)?, None => None };
+                let (chunk, light) = match loaded { Some(column) => column, None => { let mut flat = source.flat.lock().unwrap(); if let Some(column) = flat.get(&biome) { column.clone() } else { let column = (flat_chunk(&source.registry, biome)?, LightData { sky: vec![LightSection::Empty;26], block: vec![LightSection::Empty;26] }); flat.insert(biome, column.clone()); column } } };
+                let body = encode_chunk_packet(x, z, &chunk, &light)?;
+                let mut packet = Vec::new(); VarInt(ChunkData::ID).encode(&mut packet); packet.extend(body);
+                Ok(Column { chunk, light, packet })
+            })().map_err(|e| format!("{e:#}"));
             let mut cache = source.cache.lock().unwrap();
             cache.clock += 1;
             let now = cache.clock;
-            if matches!(cache.entries.get(&key), Some(Entry::Pending(version)) if *version == request) { cache.entries.insert(key, Entry::Ready(result, now)); }
+            if matches!(cache.entries.get(&key), Some(Entry::Pending(version)) if *version == request) { cache.entries.insert(key, Entry::Ready(result.map(Box::new), now)); }
         });
         None
     }
@@ -310,4 +462,39 @@ fn apply_light(tag: &mut Tag, light: &LightData) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn flat_chunk(registry: &RuntimeRegistry, biome: i32) -> anyhow::Result<Chunk> {
+    let air = registry
+        .block_id("minecraft:air", &Default::default())
+        .ok_or_else(|| anyhow::anyhow!("missing air"))?;
+    let bedrock = registry
+        .block_id("minecraft:bedrock", &Default::default())
+        .ok_or_else(|| anyhow::anyhow!("missing bedrock"))?;
+    let dirt = registry
+        .block_id("minecraft:dirt", &Default::default())
+        .ok_or_else(|| anyhow::anyhow!("missing dirt"))?;
+    let grass = registry
+        .block_id("minecraft:grass_block", &Default::default())
+        .ok_or_else(|| anyhow::anyhow!("missing grass"))?;
+    let mut chunk = Chunk::new(
+        -64,
+        384,
+        air,
+        biome as u32,
+        registry.block_bits(),
+        registry.biome_bits(),
+    )?;
+    for (section, layer, state) in [
+        (7, 13, bedrock),
+        (7, 14, dirt),
+        (7, 15, dirt),
+        (8, 0, grass),
+    ] {
+        for index in layer * 256..(layer + 1) * 256 {
+            chunk.sections_mut()[section].set_block(index, state, registry)?;
+        }
+    }
+    chunk.recompute_heightmaps(registry);
+    Ok(chunk)
 }

@@ -1,4 +1,5 @@
-//! Vanilla data (registries, block states, packet ids) extracted from the official server jar.
+//! Vanilla data (registries, tags, block states, packet ids) extracted from the official server
+//! jar.
 //!
 //! The tables are generated at build time by `build.rs` from the data generator output in
 //! `vanilla/26.3/generated/`. When that directory is missing, the build fails with a pointer to
@@ -255,6 +256,95 @@ pub mod registries {
             .binary_search_by(|(name, _)| name.cmp(&registry))
             .ok()?;
         DATA.get(index).map(|(_, entries)| *entries)
+    }
+}
+
+pub mod tags {
+    //! Built-in registry tags (`data/minecraft/tags/**`), with nested `#tag` references expanded
+    //! inside their own registry.
+
+    /// A resolved tag: its registry, its namespaced name and its sorted entries.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Tag {
+        registry: &'static str,
+        name: &'static str,
+        entries: &'static [&'static str],
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/tags.rs"));
+
+    impl Tag {
+        /// Registry of the tag, e.g. `"minecraft:block"`.
+        pub const fn registry(&self) -> &'static str {
+            self.registry
+        }
+
+        /// Namespaced tag name, e.g. `"minecraft:logs"`.
+        pub const fn name(&self) -> &'static str {
+            self.name
+        }
+
+        /// The entries the tag resolves to, sorted by name and without duplicates.
+        pub const fn entries(&self) -> &'static [&'static str] {
+            self.entries
+        }
+
+        /// Number of resolved entries.
+        pub const fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        /// Whether the tag resolves to no entries.
+        pub const fn is_empty(&self) -> bool {
+            self.entries.is_empty()
+        }
+
+        /// Whether the tag contains `entry`; names are accepted with or without `minecraft:`.
+        pub fn contains(&self, entry: &str) -> bool {
+            let entry = super::key(entry);
+            self.entries
+                .binary_search_by(|candidate| super::key(candidate).cmp(entry))
+                .is_ok()
+        }
+
+        /// Whether the tag contains the entry with the bare name `name`, e.g. `"oak_log"`.
+        pub fn contains_name(&self, name: &str) -> bool {
+            self.contains(name)
+        }
+    }
+
+    /// Every built-in tag, sorted by registry and then name.
+    pub fn all() -> &'static [Tag] {
+        TAGS
+    }
+
+    /// Registries with built-in tags, sorted by name.
+    pub fn registries() -> &'static [&'static str] {
+        REGISTRIES
+    }
+
+    /// The tag in `registry` named `name`, e.g. `get("block", "logs")` or
+    /// `get("minecraft:block", "minecraft:logs")`. The `minecraft:` prefix is optional for both.
+    pub fn get(registry: &str, name: &str) -> Option<&'static Tag> {
+        let registry = super::key(registry);
+        let name = super::key(name);
+        let index = TAGS
+            .binary_search_by(|tag| {
+                (super::key(tag.registry), super::key(tag.name)).cmp(&(registry, name))
+            })
+            .ok()?;
+        TAGS.get(index)
+    }
+
+    /// Whether the tag `name` in `registry` contains `entry`; names may omit `minecraft:`.
+    pub fn contains(registry: &str, name: &str, entry: &str) -> bool {
+        get(registry, name).is_some_and(|tag| tag.contains(entry))
+    }
+
+    /// Whether the tag `name` in `registry` contains the entry with the bare name `entry`, e.g.
+    /// `contains_name("block", "logs", "oak_log")`.
+    pub fn contains_name(registry: &str, name: &str, entry: &str) -> bool {
+        get(registry, name).is_some_and(|tag| tag.contains_name(entry))
     }
 }
 

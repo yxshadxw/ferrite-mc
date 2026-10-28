@@ -7,6 +7,8 @@ pub fn new_anvil_source(
     AnvilChunkSource::new(path, registry)
 }
 mod chunk;
+mod commands;
+pub mod interaction;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,7 +36,7 @@ use self::{
     region::{Command, Mailbox, Player, Region, Signal},
 };
 use ferrite_net::game::{self, GameMessage, Outbound, ServerboundPlay};
-use ferrite_protocol::{VarInt, packets::play::*};
+use ferrite_protocol::{Encode, VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, Regionizer, Scheduler};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -42,6 +44,32 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+#[derive(Debug, Clone)]
+pub struct Operator {
+    pub uuid: Uuid,
+    pub level: u8,
+}
+#[derive(Debug, Clone)]
+pub struct WorldSettings {
+    pub gamemode: i32,
+    pub ops: Vec<Operator>,
+}
+impl WorldSettings {
+    fn permission(&self, uuid: Uuid) -> u8 {
+        self.ops
+            .iter()
+            .find(|op| op.uuid == uuid)
+            .map_or(0, |op| op.level)
+    }
+}
+impl Default for WorldSettings {
+    fn default() -> Self {
+        Self {
+            gamemode: 1,
+            ops: Vec::new(),
+        }
+    }
+}
 pub struct World {
     pub sender: mpsc::UnboundedSender<GameMessage>,
     task: tokio::task::JoinHandle<()>,
@@ -52,14 +80,40 @@ impl World {
         Self::start_with(None, [0, 65, 0])
     }
     pub fn start_with(source: Option<Arc<anvil::AnvilChunkSource>>, spawn: [i32; 3]) -> Self {
+        Self::start_configured(source, spawn, WorldSettings::default())
+    }
+    pub fn start_configured(
+        source: Option<Arc<anvil::AnvilChunkSource>>,
+        spawn: [i32; 3],
+        settings: WorldSettings,
+    ) -> Self {
+        let flat = source.is_none();
+        let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
         let (sender, rx) = mpsc::unbounded_channel();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(run(rx, sender.clone(), source, spawn, tick_samples.clone()));
+        let task = tokio::spawn(run(
+            rx,
+            sender.clone(),
+            source,
+            flat,
+            spawn,
+            tick_samples.clone(),
+            settings,
+        ));
         Self {
             sender,
             task,
             tick_samples,
         }
+    }
+    pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {
+        let (complete, done) = oneshot::channel();
+        self.sender
+            .send(GameMessage::Console { command, complete })
+            .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+        done.await
+            .map_err(|_| anyhow::anyhow!("console response lost"))?
+            .map_err(anyhow::Error::msg)
     }
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let (complete, done) = oneshot::channel();
@@ -80,8 +134,10 @@ async fn run(
     mut events: mpsc::UnboundedReceiver<GameMessage>,
     event_tx: mpsc::UnboundedSender<GameMessage>,
     source: Option<Arc<anvil::AnvilChunkSource>>,
+    flat: bool,
     spawn: [i32; 3],
     tick_samples: Arc<Mutex<Vec<f64>>>,
+    settings: WorldSettings,
 ) {
     let scheduler = Scheduler::with_default_threads(
         Regionizer::<Region>::default(),
@@ -100,7 +156,14 @@ async fn run(
     let mut mailboxes: HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)> =
         HashMap::new();
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
+    let mut permissions: HashMap<Uuid, u8> = HashMap::new();
+    let command_tree = commands::dispatcher();
+    let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vanilla/26.3/generated/reports");
+    let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
+    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
+    let positions = Arc::new(Mutex::new(HashMap::new()));
     let mut next_entity = 1i32;
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
@@ -118,27 +181,59 @@ async fn run(
              if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, dimension_type, biome, view_distance, online_mode, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
              continue;
            }
+           let permission = settings.permission(uuid);
+           permissions.insert(uuid, permission);
            let entity=next_entity;next_entity+=1;
-           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(0),previous_game_mode:VarInt(0),debug:false,flat:source.is_none(),death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
+           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(settings.gamemode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
+           let (actions, _) = mpsc::unbounded_channel();
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
+               let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
+           }
+           emit(&outbound, &ContainerContent { window:VarInt(0), state:VarInt(0), slots:vec![ItemStack::default();46], carried:ItemStack::default() });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:spawn_pos[0],y:spawn_pos[1],z:spawn_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:0.0,pitch:0.0,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
-           let mut player=Player{uuid,source:source.clone(),pos:spawn_pos,yaw:0.0,pitch:0.0,ground:true,chunk:spawn_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
+           positions.lock().unwrap().insert(uuid, spawn_pos);
+           tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
+           let mut player=Player{uuid,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:spawn_pos,yaw:0.0,pitch:0.0,ground:true,chunk:spawn_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:settings.gamemode,inventory:[ItemStack::default();46],held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.players.insert(uuid,player);});
-           scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = spawn_pos; g.join(player)});tracing::info!(%uuid,"player joined");
+           let mode = settings.gamemode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = spawn_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
           GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {scheduler.schedule_global(move |g|g.chat(uuid,&text));}},
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::Command(command)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) {tracing::info!(%uuid,%command,"player command");}},
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::Command(command)}=>{if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
+              let (actions, mut received) = mpsc::unbounded_channel();
+              let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
+              if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
+              while let Ok(action) = received.try_recv() { match action {
+                  commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
+                  commands::Action::Teleport(pos) => mailbox.lock().unwrap().push_back(Command::Teleport(pos)),
+                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::Tps => emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText("TPS unavailable".into()), overlay:false }),
+                  commands::Action::Stop => {},
+              }}
+          }},
           GameMessage::Input{session,uuid,packet}=>{if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Input(packet));}},
           GameMessage::Left{session,uuid}=>{if matches!(pending.get(&uuid), Some(GameMessage::Joined { session: id, .. }) if *id == session) { pending.remove(&uuid); }
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
-          GameMessage::Shutdown{complete}=>{let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; tokio::time::sleep(std::time::Duration::from_millis(100)).await;let _=complete.send(result);break;}
+          GameMessage::Console{command,complete}=>{
+              let (actions, mut received) = mpsc::unbounded_channel();
+              let result = command_tree.execute(command.trim().trim_start_matches('/'), commands::Source { permission: 4, console: true, actions }).map_err(|e| e.to_string());
+              let mut stop = false;
+              while let Ok(action) = received.try_recv() { match action {
+                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::Stop => stop = true,
+                  commands::Action::Tps => tracing::info!("TPS unavailable"),
+                  _ => tracing::warn!("command requires a player"),
+              }}
+              let _ = complete.send(result.map(|_| stop));
+          },
+          GameMessage::Shutdown{complete}=>{let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let _stopped = scheduler.shutdown();let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; let _=complete.send(result);break;}
          }},
          signal=signals.recv()=>{let Some(signal)=signal else {break}; match signal {
           Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);}else{release_hold(&scheduler, &mut holds, &source, chunk);},
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
-          Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.players.insert(id,player);});scheduler.remove_chunk(from);},
-          Signal::Leave{uuid,chunk,held}=>{mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
+          Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.players.insert(id,*player);});scheduler.remove_chunk(from);},
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }}
         }
     }
@@ -249,4 +344,28 @@ async fn modified_chunk_is_written_on_flush() {
     let chunk = ferrite_world::chunk_from_nbt(&tag, -64, 384, &registry).unwrap();
     assert_eq!(chunk.block(0, 68, 0), Some(value));
     std::fs::remove_dir_all(temp).unwrap();
+}
+#[test]
+fn operator_permissions_require_the_configured_uuid() {
+    let settings = WorldSettings {
+        gamemode: 1,
+        ops: vec![Operator {
+            uuid: Uuid::from_u128(10),
+            level: 3,
+        }],
+    };
+    assert_eq!(settings.permission(Uuid::from_u128(11)), 0);
+    assert_eq!(settings.permission(Uuid::from_u128(10)), 3);
+}
+
+#[tokio::test]
+async fn memory_chunk_block_mutation_is_visible() {
+    let source = anvil::AnvilChunkSource::new_memory();
+    while source.get(0, 0, 0).is_none() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let before = source.block(0, 64, 0).unwrap();
+    assert_ne!(before, 0);
+    source.set_block(0, 64, 0, 0).unwrap();
+    assert_eq!(source.block(0, 64, 0), Some(0));
 }
