@@ -88,3 +88,41 @@ fn every_palette_transition_and_compaction() {
         }
     }
 }
+
+#[test]
+fn adding_and_replacing_values_reuses_indirect_slots() {
+    let mut c = PalettedContainer::new(PaletteKind::Blocks, 100, 16).unwrap();
+    c.set(0, 200).unwrap();
+    let prior = c.packed_data().to_vec();
+    c.set(1, 50).unwrap();
+    assert_eq!(c.packed_data()[0] & 15, prior[0] & 15);
+    c.set(0, 300).unwrap();
+    assert_eq!(c.get(0), Some(300));
+    assert_eq!(c.get(1), Some(50));
+    assert_eq!(c.get(2), Some(100));
+    assert_eq!(c.palette().len(), 3);
+}
+
+#[test]
+fn randomized_palette_churn_matches_plain_values() {
+    let mut c = PalettedContainer::new(PaletteKind::Blocks, 0, 16).unwrap();
+    let mut reference = vec![0; 4096];
+    let mut seed = 2026u32;
+    for step in 0..20_000 {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let i = (seed as usize >> 8) % reference.len();
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let value = (seed >> 16) % 400;
+        c.set(i, value).unwrap();
+        reference[i] = value;
+        if step % 1000 == 0 {
+            for (index, &expected) in reference.iter().enumerate() {
+                assert_eq!(c.get(index), Some(expected));
+            }
+            c.compact();
+        }
+    }
+    for (index, &expected) in reference.iter().enumerate() {
+        assert_eq!(c.get(index), Some(expected));
+    }
+}

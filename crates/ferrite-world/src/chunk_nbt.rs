@@ -187,10 +187,14 @@ pub fn chunk_from_nbt(
         let count = (0..4096)
             .filter(|&i| !registry.flags(blocks.get(i).unwrap()).air)
             .count() as u16;
+        let fluid_count = (0..4096)
+            .filter(|&i| registry.flags(blocks.get(i).unwrap()).fluid)
+            .count() as u16;
         chunk.sections[idx as usize] = ChunkSection {
             blocks,
             biomes,
             block_count: count,
+            fluid_count,
         };
     }
     if let Some(Tag::List(List::Compound(entities))) = root.get("block_entities") {
@@ -289,15 +293,21 @@ fn encode_container(
         );
     }
     if palette.len() > 1 {
+        let indices: BTreeMap<u32, usize> = palette
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
         let bits = ((usize::BITS - (palette.len() - 1).leading_zeros()) as usize)
             .max(if kind == PaletteKind::Blocks { 4 } else { 1 });
         let per = 64 / bits;
         let mut words = vec![0u64; kind.len().div_ceil(per)];
         for i in 0..kind.len() {
             let id = container.get(i).unwrap();
-            let index = palette
-                .binary_search(&id)
-                .map_err(|_| ChunkNbtError::Invalid("missing palette value"))?;
+            let index = *indices
+                .get(&id)
+                .ok_or(ChunkNbtError::Invalid("missing palette value"))?;
             words[i / per] |= (index as u64) << ((i % per) * bits);
         }
         out.insert(

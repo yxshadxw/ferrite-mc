@@ -104,30 +104,53 @@ impl PalettedContainer {
         if old == value {
             return Ok(());
         }
-        let old_count = self.counts[&old];
+        let remove_old = self.counts[&old] == 1;
         let new_value = !self.counts.contains_key(&value);
-        let remove_old = old_count == 1;
-        if new_value || remove_old {
-            let mut values: Vec<u32> = (0..self.kind.len())
-                .map(|i| self.get(i).expect("internal palette invariant"))
-                .collect();
-            values[index] = value;
-            if remove_old {
-                self.counts.remove(&old);
-            } else {
-                *self.counts.get_mut(&old).unwrap() -= 1;
-            }
-            *self.counts.entry(value).or_default() += 1;
-            self.repack(&values);
+        if remove_old {
+            self.counts.remove(&old);
         } else {
             *self.counts.get_mut(&old).unwrap() -= 1;
-            *self.counts.get_mut(&value).unwrap() += 1;
-            let raw = if self.bits == self.global_bits {
-                value
+        }
+        *self.counts.entry(value).or_default() += 1;
+
+        if self.counts.len() == 1 {
+            self.palette.clear();
+            self.palette.push(value);
+            self.bits = 0;
+            self.data.clear();
+        } else if self.bits == self.global_bits {
+            if remove_old || new_value {
+                self.palette = self.counts.keys().copied().collect();
+            }
+            self.write(index, value);
+        } else if self.bits == 0 {
+            // All old entries are palette index zero; initialize the first indirect word array.
+            self.bits = self.kind.min_bits();
+            self.palette.push(value);
+            let per = 64 / usize::from(self.bits);
+            self.data = vec![0; self.kind.len().div_ceil(per)];
+            self.write(index, 1);
+        } else {
+            let slot = self.palette.iter().position(|&v| v == value).or_else(|| {
+                self.palette
+                    .iter()
+                    .position(|v| !self.counts.contains_key(v))
+            });
+            let raw = if let Some(slot) = slot {
+                self.palette[slot] = value;
+                slot
+            } else if self.palette.len() < (1usize << self.bits) {
+                self.palette.push(value);
+                self.palette.len() - 1
             } else {
-                self.palette.iter().position(|v| *v == value).unwrap() as u32
+                let mut values: Vec<_> = (0..self.kind.len())
+                    .map(|i| self.get(i).expect("internal palette invariant"))
+                    .collect();
+                values[index] = value;
+                self.repack(&values);
+                return Ok(());
             };
-            self.write(index, raw);
+            self.write(index, raw as u32);
         }
         Ok(())
     }

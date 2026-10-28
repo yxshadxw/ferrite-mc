@@ -52,6 +52,7 @@ pub struct ChunkSection {
     pub(crate) blocks: PalettedContainer,
     pub(crate) biomes: PalettedContainer,
     pub(crate) block_count: u16,
+    pub(crate) fluid_count: u16,
 }
 impl ChunkSection {
     pub fn new(air: u32, biome: u32, block_bits: u8, biome_bits: u8) -> Result<Self, ChunkError> {
@@ -59,10 +60,14 @@ impl ChunkSection {
             blocks: PalettedContainer::new(PaletteKind::Blocks, air, block_bits)?,
             biomes: PalettedContainer::new(PaletteKind::Biomes, biome, biome_bits)?,
             block_count: 0,
+            fluid_count: 0,
         })
     }
     pub fn block_count(&self) -> u16 {
         self.block_count
+    }
+    pub fn fluid_count(&self) -> u16 {
+        self.fluid_count
     }
     pub fn blocks(&self) -> &PalettedContainer {
         &self.blocks
@@ -81,7 +86,14 @@ impl ChunkSection {
     ) -> Result<(), ChunkError> {
         let old = self.blocks.get(index).ok_or(ChunkError::Bounds)?;
         self.blocks.set(index, value)?;
-        match (info.flags(old).air, info.flags(value).air) {
+        let old_flags = info.flags(old);
+        let new_flags = info.flags(value);
+        match (old_flags.fluid, new_flags.fluid) {
+            (false, true) => self.fluid_count += 1,
+            (true, false) => self.fluid_count -= 1,
+            _ => {}
+        }
+        match (old_flags.air, new_flags.air) {
             (true, false) => self.block_count += 1,
             (false, true) => self.block_count -= 1,
             _ => {}
@@ -91,6 +103,7 @@ impl ChunkSection {
     pub fn encode_network(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.block_count.to_be_bytes());
+        out.extend_from_slice(&self.fluid_count.to_be_bytes());
         out.extend(self.blocks.encode_network());
         out.extend(self.biomes.encode_network());
         out

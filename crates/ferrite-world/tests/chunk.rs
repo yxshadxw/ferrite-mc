@@ -60,3 +60,37 @@ fn full_chunk_network_encoding_includes_light_masks_and_data() {
     assert!(encoded.windows(2048).any(|a| a == [0x21; 2048]));
     assert!(encode_chunk_packet(0, 0, &c, &LightData::default()).is_err());
 }
+
+#[test]
+fn network_section_counts_water_and_waterlogged_blocks() {
+    use ferrite_world::ChunkSection;
+    struct Vanilla;
+    impl BlockInfo for Vanilla {
+        fn flags(&self, id: u32) -> BlockFlags {
+            let p = ferrite_data::block_props::get(id as u16);
+            BlockFlags {
+                air: p.is_air,
+                fluid: p.fluid.is_some(),
+                ..Default::default()
+            }
+        }
+    }
+    let air = ferrite_data::blocks::default_state("air").unwrap() as u32;
+    let water = ferrite_data::blocks::default_state("water").unwrap() as u32;
+    let slab = ferrite_data::blocks::state_id(
+        "stone_slab",
+        &[("type", "bottom"), ("waterlogged", "true")],
+    )
+    .unwrap() as u32;
+    let mut s = ChunkSection::new(air, 0, 16, 6).unwrap();
+    s.set_block(0, water, &Vanilla).unwrap();
+    s.set_block(1, slab, &Vanilla).unwrap();
+    let bytes = s.encode_network();
+    assert_eq!(&bytes[..4], &[0, 2, 0, 2]);
+    let mut expected = vec![0, 2, 0, 2];
+    expected.extend(s.blocks().encode_network());
+    expected.extend(s.biomes().encode_network());
+    assert_eq!(bytes, expected);
+    s.set_block(0, air, &Vanilla).unwrap();
+    assert_eq!(&s.encode_network()[..4], &[0, 1, 0, 1]);
+}

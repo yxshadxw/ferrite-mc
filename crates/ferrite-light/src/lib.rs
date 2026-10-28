@@ -172,7 +172,8 @@ impl LightEngine {
     }
     fn level(&self, kind: LightKind, index: usize) -> u8 {
         let (x, y, z) = Self::unpack(index);
-        let (section, offset) = self.section_index(x, self.min_y + y as i32, z).unwrap();
+        let section = (y / 16 + 1) * 9 + (z / 16) * 3 + x / 16;
+        let offset = (y % 16) * 256 + (z % 16) * 16 + x % 16;
         match kind {
             LightKind::Sky => &self.sections[section].sky,
             LightKind::Block => &self.sections[section].block,
@@ -182,7 +183,8 @@ impl LightEngine {
     }
     fn set(&mut self, kind: LightKind, index: usize, value: u8) {
         let (x, y, z) = Self::unpack(index);
-        let (section, offset) = self.section_index(x, self.min_y + y as i32, z).unwrap();
+        let section = (y / 16 + 1) * 9 + (z / 16) * 3 + x / 16;
+        let offset = (y % 16) * 256 + (z % 16) * 16 + x % 16;
         match kind {
             LightKind::Sky => &mut self.sections[section].sky,
             LightKind::Block => &mut self.sections[section].block,
@@ -367,6 +369,10 @@ impl LightEngine {
                 }
                 let n = Self::index(nx as usize, ny as usize, nz as usize);
                 let target = self.blocks[n];
+                let value = level.saturating_sub(target.opacity.max(1));
+                if value <= self.level(kind, n) {
+                    continue;
+                }
                 if properties::occludes(
                     if from.emission > 0 {
                         0
@@ -378,13 +384,9 @@ impl LightEngine {
                 ) {
                     continue;
                 }
-                let value = level.saturating_sub(target.opacity.max(1));
-                if value > self.level(kind, n) {
-                    self.set(kind, n, value);
-                    self.queue.push_back(
-                        ((n as u64) << 6) | u64::from(63u8 & !(1 << OPPOSITE[direction])),
-                    );
-                }
+                self.set(kind, n, value);
+                self.queue
+                    .push_back(((n as u64) << 6) | u64::from(63u8 & !(1 << OPPOSITE[direction])));
             }
         }
     }
