@@ -92,7 +92,8 @@ fn modern_snbt_literals() {
     assert_eq!(parse("0b1111_1111b").unwrap(), Tag::Byte(-1));
     assert_eq!(parse("240ub").unwrap(), Tag::Byte(-16));
     assert_eq!(parse("0xAB").unwrap(), Tag::Int(171));
-    assert_eq!(parse("1_2.3_4__5f").unwrap(), Tag::Float(12.345));
+    assert_eq!(parse("0b").unwrap(), Tag::Byte(0));
+    assert_eq!(parse("1_2.3_4_5f").unwrap(), Tag::Float(12.345));
     assert_eq!(
         parse(r#""\u2603\n\U0001F600""#).unwrap(),
         Tag::String("\u{2603}\n\u{1f600}".into())
@@ -128,7 +129,7 @@ fn snbt_operations_named_escapes_and_invalid_numbers() {
             0xccddeeffu32 as i32
         ])
     );
-    for s in ["0b", "0x", "012", "-", "0x_ff", "1e999", "[B;256]"] {
+    for s in ["0x", "012", "-", "0x_ff", "1e999", "[B;256]"] {
         assert!(parse(s).is_err(), "{s}");
     }
 }

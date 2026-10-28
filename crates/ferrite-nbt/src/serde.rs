@@ -1,4 +1,67 @@
 //! Serde conversion between Rust values and the NBT model.
+//!
+//! # Serialization contract
+//!
+//! | Rust value | NBT tag |
+//! |---|---|
+//! | `bool` | `Byte(0)` / `Byte(1)` |
+//! | `i8`, `u8` | `Byte` |
+//! | `i16`, `u16` | `Short` |
+//! | `i32`, `u32` | `Int` |
+//! | `i64`, `u64` | `Long` |
+//! | `f32` | `Float` |
+//! | `f64` | `Double` |
+//! | `char`, `String`, `&str` | `String` |
+//! | `Option<T>` | `Some` serializes as `T`; `None` is omitted from a compound and is an error at the top level or inside a sequence |
+//! | newtype struct | the wrapped value |
+//! | unit / unit struct | error (NBT has no null or unit) |
+//! | struct | `Compound` keyed by field name |
+//! | map with `String` keys | `Compound` |
+//! | enum unit variant | `String("Variant")` |
+//! | enum newtype/tuple/struct variant | `Compound { "Variant": payload }` |
+//! | sequence with every element a `Byte` | `ByteArray` |
+//! | sequence with every element an `Int` | `IntArray` |
+//! | sequence with every element a `Long` | `LongArray` |
+//! | empty sequence | `List::End` |
+//! | other homogeneous sequence | typed `List` (`Short`, `Float`, `String`, ...) |
+//! | heterogeneous sequence | `List::Compound`, wrapping every non-compound element under the empty key (vanilla's representation) |
+//! | `Vec<u8>`, `Vec<i8>`, `Vec<bool>` | `ByteArray` |
+//! | `Vec<u32>` | `IntArray` |
+//! | `Vec<u64>` | `LongArray` |
+//! | `Vec<f32>` / `Vec<f64>` | `List::Float` / `List::Double` |
+//! | tuple, tuple struct, fixed array | follows the sequence rules |
+//! | bytes (`serde_bytes`) | `ByteArray` |
+//!
+//! Unsigned integers are stored in the corresponding signed tag with a
+//! two's-complement cast, so `u64` values above [`i64::MAX`] wrap; reading them
+//! back casts in the other direction. `serde_value` uses a sorted map, so
+//! compound key order is lexicographic rather than struct field order, and
+//! duplicate keys are not possible.
+//!
+//! # Deserialization contract
+//!
+//! The reverse direction accepts the tags from the table above. In addition:
+//!
+//! * `Compound` deserializes into structs and maps with `String` keys; map
+//!   keys are always strings in NBT.
+//! * `ByteArray`, `IntArray`, `LongArray` and every `List` variant deserialize
+//!   as sequences, so `Vec<u8>`, `Vec<i32>`, `Vec<i64>`, fixed arrays and
+//!   tuples all work.
+//! * `Byte` deserializes as `bool` (`0` is false, anything else true) as well
+//!   as `i8`/`u8`. `u8`/`u16`/`u32`/`u64` require the same-width tag
+//!   (`Byte`/`Short`/`Int`/`Long`) and reinterpret the bits; the signed and
+//!   float types go through serde's usual numeric coercions, so a `Long` tag
+//!   can be read as `i64` and an `Int` tag as `i32`.
+//! * `Option<T>` always deserializes as `Some`; NBT has no null. Serde supplies
+//!   `None` for a missing compound field.
+//! * Enum deserialization expects `String` for unit variants and a
+//!   single-entry `Compound` for payload variants.
+//! * Canonical heterogeneous lists (`List::Compound` wrappers with more than
+//!   one recovered type) are unwrapped before being presented as a sequence,
+//!   which is what makes tuple variants and mixed sequences round-trip.
+//!
+//! Wrong tag shapes produce [`Error`] values, for example reading a `String`
+//! tag as a struct or calling [`to_tag`] on a non-string-keyed map.
 use crate::{Compound, List, Tag};
 use ::serde::{
     Serialize,
@@ -7,6 +70,7 @@ use ::serde::{
 use serde_value::Value;
 use std::fmt;
 
+/// Error produced by [`to_tag`] and [`from_tag`].
 #[derive(Debug)]
 pub struct Error(String);
 impl fmt::Display for Error {
@@ -20,9 +84,12 @@ impl de::Error for Error {
         Self(msg.to_string())
     }
 }
+/// Serializes a Rust value as an NBT [`Tag`] according to the module contract.
 pub fn to_tag<T: Serialize>(value: &T) -> Result<Tag, Error> {
     to_nbt(serde_value::to_value(value).map_err(|e| Error(e.to_string()))?)
 }
+
+/// Deserializes an NBT [`Tag`] into a Rust value according to the module contract.
 pub fn from_tag<T: DeserializeOwned>(tag: Tag) -> Result<T, Error> {
     T::deserialize(Deserializer(tag))
 }
@@ -59,32 +126,80 @@ fn to_nbt(v: Value) -> Result<Tag, Error> {
         }
         Value::Seq(v) => {
             let tags: Vec<Tag> = v.into_iter().map(to_nbt).collect::<Result<_, _>>()?;
-            Tag::List(make_list(tags)?)
+            sequence_to_tag(tags)
         }
     })
 }
-fn make_list(tags: Vec<Tag>) -> Result<List, Error> {
+
+/// Maps a serialized sequence to an array tag when all elements share an
+/// integer type, to a typed list when they share any other type, and to a
+/// wrapper compound list when the element types are mixed.
+fn sequence_to_tag(tags: Vec<Tag>) -> Tag {
     if tags.is_empty() {
-        return Ok(List::End);
+        return Tag::List(List::End);
     }
+    let id = tags[0].id();
+    if tags.iter().all(|tag| tag.id() == id) {
+        return match id {
+            1 => Tag::ByteArray(
+                tags.into_iter()
+                    .map(|tag| match tag {
+                        Tag::Byte(value) => value,
+                        _ => unreachable!("all sequence elements share one type"),
+                    })
+                    .collect(),
+            ),
+            3 => Tag::IntArray(
+                tags.into_iter()
+                    .map(|tag| match tag {
+                        Tag::Int(value) => value,
+                        _ => unreachable!("all sequence elements share one type"),
+                    })
+                    .collect(),
+            ),
+            4 => Tag::LongArray(
+                tags.into_iter()
+                    .map(|tag| match tag {
+                        Tag::Long(value) => value,
+                        _ => unreachable!("all sequence elements share one type"),
+                    })
+                    .collect(),
+            ),
+            _ => Tag::List(make_list(tags)),
+        };
+    }
+
+    // Vanilla stores heterogeneous lists as compound lists, leaving compound
+    // elements bare and wrapping everything else under the empty key.
+    Tag::List(List::Compound(
+        tags.into_iter()
+            .map(|tag| match tag {
+                Tag::Compound(compound) => compound,
+                other => {
+                    let mut compound = Compound::new();
+                    compound.insert(String::new(), other);
+                    compound
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn make_list(tags: Vec<Tag>) -> List {
     macro_rules! list {
         ($variant:ident) => {{
             let mut out = Vec::with_capacity(tags.len());
             for tag in tags {
-                if let Tag::$variant(v) = tag {
-                    out.push(v);
-                } else {
-                    return Err(Error("NBT lists must have one element type".into()));
-                }
+                let Tag::$variant(value) = tag else {
+                    unreachable!("all list elements share one type")
+                };
+                out.push(value);
             }
             List::$variant(out)
         }};
     }
-    Ok(match tags[0].id() {
-        1 => list!(Byte),
+    match tags[0].id() {
         2 => list!(Short),
-        3 => list!(Int),
-        4 => list!(Long),
         5 => list!(Float),
         6 => list!(Double),
         7 => list!(ByteArray),
@@ -93,10 +208,12 @@ fn make_list(tags: Vec<Tag>) -> Result<List, Error> {
         10 => list!(Compound),
         11 => list!(IntArray),
         12 => list!(LongArray),
-        _ => unreachable!(),
-    })
+        _ => unreachable!("byte, int and long sequences become arrays"),
+    }
 }
 /// An owned deserializer which interprets byte tags as booleans when requested.
+///
+/// See the module documentation for the full tag-to-Rust contract.
 pub struct Deserializer(pub Tag);
 impl<'de> de::Deserializer<'de> for Deserializer {
     type Error = Error;
@@ -204,10 +321,45 @@ fn list_tags(v: List) -> Vec<Tag> {
         List::ByteArray(v) => tags!(v, ByteArray),
         List::String(v) => tags!(v, String),
         List::List(v) => tags!(v, List),
-        List::Compound(v) => tags!(v, Compound),
+        List::Compound(values) => unwrap_heterogeneous(values),
         List::IntArray(v) => tags!(v, IntArray),
         List::LongArray(v) => tags!(v, LongArray),
     }
+}
+
+/// A canonical heterogeneous list is a compound list whose elements are plain
+/// compounds plus single-entry compounds with an empty key. When unwrapping the
+/// wrappers yields more than one tag type, the list really is heterogeneous and
+/// the wrappers are removed for deserialization.
+fn unwrap_heterogeneous(values: Vec<Compound>) -> Vec<Tag> {
+    let mut ids = Vec::with_capacity(values.len());
+    let mut unwrapped = Vec::with_capacity(values.len());
+    for compound in &values {
+        match wrapper_value(compound) {
+            Some(inner) if !matches!(inner, Tag::Compound(_)) => {
+                ids.push(inner.id());
+                unwrapped.push(inner.clone());
+            }
+            _ => {
+                // 10 is the NBT compound tag id.
+                ids.push(10);
+                unwrapped.push(Tag::Compound(compound.clone()));
+            }
+        }
+    }
+    if ids.windows(2).any(|pair| pair[0] != pair[1]) {
+        unwrapped
+    } else {
+        values.into_iter().map(Tag::Compound).collect()
+    }
+}
+
+fn wrapper_value(compound: &Compound) -> Option<&Tag> {
+    if compound.len() != 1 {
+        return None;
+    }
+    let (key, value) = compound.iter().next()?;
+    key.is_empty().then_some(value)
 }
 impl<'de> IntoDeserializer<'de, Error> for Deserializer {
     type Deserializer = Self;
