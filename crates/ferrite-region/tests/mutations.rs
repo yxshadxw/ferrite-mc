@@ -1,0 +1,390 @@
+//! Per-region deferred topology mutations.
+use ferrite_region::{ChunkPos, RegionData, Regionizer, Scheduler, SectionPos};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Region data tracks the sections it was seeded with, so merges are visible.
+#[derive(Default)]
+struct Data(HashSet<SectionPos>);
+impl RegionData for Data {
+    fn merge(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+    fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
+        let moved = self.0.intersection(sections).copied().collect();
+        self.0.retain(|s| !sections.contains(s));
+        Self(moved)
+    }
+}
+
+/// Blocks the region owning `chunk` inside a task until the returned sender fires.
+fn block_region(scheduler: &Scheduler<Data, ()>, chunk: ChunkPos) -> mpsc::Sender<()> {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    scheduler.schedule_at_chunk(chunk, move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    release_tx
+}
+
+#[test]
+fn mutations_near_ticking_region_do_not_delay_idle_region() {
+    // A at x=0, B at x=100, C at x=104 (radius 1, one chunk per section).
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    for x in [0, 100, 104] {
+        topology.add_chunk(ChunkPos(x, 0));
+    }
+    let scheduler = Scheduler::new(topology, (), 3, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+
+    // Touches only A, which is mid-tick: deferred on A.
+    scheduler.add_chunk(ChunkPos(1, 0));
+    scheduler.add_chunk(ChunkPos(-1, 1));
+    assert_eq!(scheduler.owner(ChunkPos(1, 0)), None);
+    assert_eq!(scheduler.pending_mutations(), 2);
+
+    // Near B/C only: applied at once, or at most after B's/C's own in-flight
+    // (no-op) tick, but never after A's tick, which stays blocked throughout.
+    let eventually = |what: &str, cond: &dyn Fn() -> bool| {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_millis(200),
+                "{what} was delayed by the ticking region"
+            );
+            thread::yield_now();
+        }
+    };
+    let b = scheduler.owner(ChunkPos(100, 0)).unwrap();
+    scheduler.add_chunk(ChunkPos(101, 0));
+    eventually("add near B", &|| {
+        scheduler.owner(ChunkPos(101, 0)) == Some(b)
+    });
+    // Bridge B and C (both idle): merges without waiting for A.
+    scheduler.add_chunk(ChunkPos(102, 0));
+    scheduler.add_chunk(ChunkPos(103, 0));
+    eventually("B-C merge", &|| scheduler.region_count() == 2);
+    assert_eq!(
+        scheduler.owner(ChunkPos(104, 0)),
+        scheduler.owner(ChunkPos(100, 0))
+    );
+    // ... and splits without waiting for A.
+    scheduler.remove_chunk(ChunkPos(102, 0));
+    eventually("B-C split", &|| scheduler.region_count() == 3);
+    eventually("B/C queues", &|| scheduler.pending_mutations() == 2);
+    assert_eq!(
+        scheduler.owner(ChunkPos(1, 0)),
+        None,
+        "A must still be ticking"
+    );
+    scheduler.check_invariants().unwrap();
+
+    // B keeps ticking while A is stuck.
+    let (tx, rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(100, 0), move |_| tx.send(()).unwrap());
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("idle region was delayed by a ticking one");
+    assert_eq!(scheduler.pending_mutations(), 2);
+
+    release.send(()).unwrap();
+    let start = Instant::now();
+    while scheduler.pending_mutations() != 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "A's mutations never applied"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(
+        scheduler.owner(ChunkPos(1, 0)),
+        scheduler.owner(ChunkPos(0, 0))
+    );
+    assert_eq!(
+        scheduler.owner(ChunkPos(-1, 1)),
+        scheduler.owner(ChunkPos(0, 0))
+    );
+    scheduler.check_invariants().unwrap();
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
+
+#[test]
+fn merge_of_ticking_and_idle_region_applies_right_after_the_tick() {
+    let a = SectionPos(0, 0);
+    let b = SectionPos(2, 0);
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    topology.add_chunk(ChunkPos(2, 0));
+    let ia = topology.owner(ChunkPos(0, 0)).unwrap();
+    let ib = topology.owner(ChunkPos(2, 0)).unwrap();
+    topology.data_mut(ia).unwrap().0.insert(a);
+    topology.data_mut(ib).unwrap().0.insert(b);
+
+    // Tick log: (start time, sections in the ticking region's data).
+    let log = Arc::new(Mutex::new(Vec::<(Instant, HashSet<SectionPos>)>::new()));
+    let tick_log = log.clone();
+    let scheduler = Scheduler::new(
+        topology,
+        (),
+        3,
+        move |data: &mut Data| {
+            tick_log
+                .lock()
+                .unwrap()
+                .push((Instant::now(), data.0.clone()));
+        },
+        |_| {},
+    );
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    scheduler.add_chunk(ChunkPos(1, 0));
+    let submitted = Instant::now();
+    assert_eq!(scheduler.region_count(), 2, "merge must wait for A's tick");
+    assert_eq!(scheduler.pending_mutations(), 1);
+    // B is reserved by the pending merge: it must not start new ticks.
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(scheduler.region_count(), 2);
+
+    let released = Instant::now();
+    release.send(()).unwrap();
+    while scheduler.region_count() != 1 {
+        assert!(
+            released.elapsed() < Duration::from_secs(1),
+            "merge never applied"
+        );
+        thread::yield_now();
+    }
+    let merged_at = released.elapsed();
+    // Wait for a tick of the merged region.
+    let start = Instant::now();
+    loop {
+        if log.lock().unwrap().iter().any(|(_, d)| d.len() == 2) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
+        thread::yield_now();
+    }
+    let log = log.lock().unwrap();
+    let b_only_after_submit = log
+        .iter()
+        .filter(|(t, d)| *t > submitted && *d == HashSet::from([b]))
+        .count();
+    let a_only_after_release = log
+        .iter()
+        .filter(|(t, d)| *t > released && *d == HashSet::from([a]))
+        .count();
+    // At most one B tick could already have been dispatched when the merge was
+    // submitted; none may start afterwards.
+    assert!(b_only_after_submit <= 1, "reserved region kept ticking");
+    // Exactly the tick that finished A's blocked work ran unmerged.
+    assert_eq!(
+        a_only_after_release, 1,
+        "merge was not applied at A's safe point"
+    );
+    assert!(
+        merged_at < Duration::from_millis(50),
+        "merge took {merged_at:?}, more than one tick period"
+    );
+    drop(log);
+    assert_eq!(scheduler.shutdown().regions.len(), 1);
+}
+
+#[test]
+fn pending_merge_chain_across_three_regions_applies_in_order() {
+    // A ticking; B, C idle. Bridges A-B then B-C must both wait for A, and a
+    // remove of the first bridge must apply after its add.
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    for x in [0, 2, 4] {
+        topology.add_chunk(ChunkPos(x, 0));
+    }
+    let scheduler = Scheduler::new(topology, (), 3, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    scheduler.add_chunk(ChunkPos(1, 0));
+    scheduler.add_chunk(ChunkPos(3, 0));
+    scheduler.remove_chunk(ChunkPos(1, 0));
+    assert_eq!(scheduler.region_count(), 3);
+    scheduler.check_invariants().unwrap();
+    release.send(()).unwrap();
+    let start = Instant::now();
+    while scheduler.pending_mutations() != 0 {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        thread::yield_now();
+    }
+    scheduler.check_invariants().unwrap();
+    assert_eq!(scheduler.owner(ChunkPos(1, 0)), None);
+    assert_eq!(scheduler.region_count(), 2);
+    assert_eq!(
+        scheduler.owner(ChunkPos(2, 0)),
+        scheduler.owner(ChunkPos(4, 0))
+    );
+    scheduler.shutdown();
+}
+
+/// Concurrent adds/removes/tasks from 4 threads while regions tick (some slowly),
+/// checking invariants continuously and task exactly-once delivery at the end.
+fn stress(ops_per_thread: usize, area: i32) {
+    // One chunk per section, so the sparse random population forms many regions.
+    let topology = Regionizer::<Data>::new(0, 1);
+    let ticks = Arc::new(AtomicU64::new(0));
+    let tick_counter = ticks.clone();
+    let scheduler = Arc::new(Scheduler::new(
+        topology,
+        (),
+        4,
+        move |_: &mut Data| {
+            let n = tick_counter.fetch_add(1, Ordering::Relaxed);
+            let work = if n.is_multiple_of(37) {
+                Duration::from_millis(3)
+            } else {
+                Duration::from_micros(50)
+            };
+            let start = Instant::now();
+            while start.elapsed() < work {
+                std::hint::spin_loop();
+            }
+        },
+        |_| {},
+    ));
+    let (tx, rx) = mpsc::channel::<(usize, usize)>();
+    let ran = Arc::new(Mutex::new(HashMap::<(usize, usize), usize>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let checker = {
+        let scheduler = scheduler.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut checks = 0;
+            let mut max_age = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                scheduler.check_invariants().unwrap();
+                if let Some(age) = scheduler.oldest_pending_mutation() {
+                    max_age = max_age.max(age);
+                    assert!(age < Duration::from_secs(5), "mutation starved for {age:?}");
+                }
+                checks += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            (checks, max_age)
+        })
+    };
+    let workers: Vec<_> = (0..4)
+        .map(|worker| {
+            let scheduler = scheduler.clone();
+            let tx = tx.clone();
+            let ran = ran.clone();
+            thread::spawn(move || {
+                let mut held: Vec<ChunkPos> = Vec::new();
+                let mut seed = worker as u64 * 7919 + 17;
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut tasks = 0;
+                let mut deferred = 0;
+                for _ in 0..ops_per_thread {
+                    let r = next();
+                    let chunk = ChunkPos((r % area as u64) as i32, ((r >> 8) % area as u64) as i32);
+                    match (r >> 20) % 4 {
+                        0 | 1 => {
+                            scheduler.add_chunk(chunk);
+                            if scheduler.owner(chunk).is_none() {
+                                deferred += 1;
+                            }
+                            held.push(chunk);
+                        }
+                        2 if !held.is_empty() => {
+                            let i = (r >> 24) as usize % held.len();
+                            scheduler.remove_chunk(held.swap_remove(i));
+                        }
+                        _ => {
+                            let tx = tx.clone();
+                            let ran = ran.clone();
+                            let key = (worker, tasks);
+                            tasks += 1;
+                            scheduler.schedule_at_chunk(chunk, move |_| {
+                                *ran.lock().unwrap().entry(key).or_default() += 1;
+                                tx.send(key).unwrap();
+                            });
+                        }
+                    }
+                }
+                (held, tasks, deferred)
+            })
+        })
+        .collect();
+    drop(tx);
+    let mut total_tasks = 0;
+    let mut deferred_adds = 0;
+    let mut held_all = Vec::new();
+    for w in workers {
+        let (held, tasks, deferred) = w.join().unwrap();
+        total_tasks += tasks;
+        deferred_adds += deferred;
+        held_all.extend(held);
+    }
+    // Hold every section in the area so tasks parked on unheld sections run.
+    for x in 0..area {
+        for z in 0..area {
+            scheduler.add_chunk(ChunkPos(x, z));
+        }
+    }
+    let mut received = HashSet::new();
+    for _ in 0..total_tasks {
+        let key = rx.recv_timeout(Duration::from_secs(20)).expect("task lost");
+        assert!(received.insert(key), "task {key:?} ran twice");
+    }
+    let start = Instant::now();
+    while scheduler.pending_mutations() != 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "mutations starved"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (checks, max_age) = checker.join().unwrap();
+    scheduler.check_invariants().unwrap();
+    // The whole area is held and contiguous: exactly one region.
+    assert_eq!(scheduler.region_count(), 1);
+    let owner = scheduler.owner(ChunkPos(0, 0)).unwrap();
+    for c in &held_all {
+        assert_eq!(scheduler.owner(*c), Some(owner));
+    }
+    // Release everything: no region may remain.
+    for x in 0..area {
+        for z in 0..area {
+            scheduler.remove_chunk(ChunkPos(x, z));
+        }
+    }
+    for c in held_all {
+        scheduler.remove_chunk(c);
+    }
+    let scheduler = Arc::try_unwrap(scheduler).ok().unwrap();
+    scheduler.check_invariants().unwrap();
+    let result = scheduler.shutdown();
+    assert!(result.pending_tasks.is_empty());
+    assert!(ran.lock().unwrap().values().all(|&n| n == 1));
+    assert_eq!(ran.lock().unwrap().len(), total_tasks);
+    eprintln!(
+        "stress: {total_tasks} tasks, {} ticks, {checks} invariant checks, >= {deferred_adds} deferred adds, oldest pending mutation {max_age:?}",
+        ticks.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn concurrent_stress_small() {
+    stress(2_000, 24);
+}
+
+#[test]
+#[ignore = "long-running concurrent stress test"]
+fn concurrent_stress_large() {
+    stress(100_000, 64);
+}
