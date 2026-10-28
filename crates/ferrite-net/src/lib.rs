@@ -400,9 +400,12 @@ async fn play(
         .iter()
         .position(|v| v == "minecraft:plains")
         .context("missing plains")? as i32;
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uuid = profile.uuid;
     let (outbound, mut queue) = tokio::sync::mpsc::unbounded_channel();
     game.send(GameMessage::Joined {
+        session,
         uuid,
         name: profile.name,
         properties: profile.properties,
@@ -421,10 +424,10 @@ async fn play(
             _=tick.tick()=>{let mut batch=Vec::new();let mut close=false;while let Ok(msg)=queue.try_recv(){match msg {Outbound::Packet(body)=>encoder.encode(&body,&mut batch),Outbound::Disconnect(reason)=>{let mut body=Vec::new();encode_packet(&PlayDisconnect {reason:ferrite_protocol::types::PlainText(reason)},&mut body);encoder.encode(&body,&mut batch);close=true;break;}}} if !batch.is_empty(){stream.write_all(&batch).await?;}
                 if close{return Ok(());}},
             _=keepalive.tick()=>{send_compressed(&mut stream,&encoder,&PlayKeepAlive{id:1}).await?;},
-            frame=read_packet(&mut stream,&mut decoder)=>{let frame=frame?;if let Some(packet)=game::decode_play(&frame)?{game.send(GameMessage::Input {uuid,packet}).map_err(|_|anyhow::anyhow!("game loop stopped"))?;}}
+            frame=read_packet(&mut stream,&mut decoder)=>{let frame=frame?;if let Some(packet)=game::decode_play(&frame)?{game.send(GameMessage::Input {session,uuid,packet}).map_err(|_|anyhow::anyhow!("game loop stopped"))?;}}
         }}
     }.await;
-    let _ = game.send(GameMessage::Left { uuid });
+    let _ = game.send(GameMessage::Left { session, uuid });
     result
 }
 fn minecraft_digest(digest: &[u8]) -> String {

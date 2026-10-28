@@ -20,6 +20,7 @@ pub enum ServerboundPlay {
 #[derive(Debug)]
 pub enum GameMessage {
     Joined {
+        session: u64,
         uuid: Uuid,
         name: String,
         properties: Vec<Property>,
@@ -31,14 +32,16 @@ pub enum GameMessage {
         outbound: mpsc::UnboundedSender<Outbound>,
     },
     Input {
+        session: u64,
         uuid: Uuid,
         packet: ServerboundPlay,
     },
     Left {
+        session: u64,
         uuid: Uuid,
     },
     Shutdown {
-        complete: tokio::sync::oneshot::Sender<()>,
+        complete: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
 #[derive(Debug)]

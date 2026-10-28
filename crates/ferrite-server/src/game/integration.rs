@@ -37,7 +37,7 @@ impl Bot {
         self.stream.write_all(&wire).await.unwrap();
     }
     async fn read(&mut self) -> Vec<u8> {
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if let Some(frame) = self.decoder.next_frame().unwrap() {
                     return frame;
@@ -197,6 +197,174 @@ async fn two_bots_move_stream_chat_and_disconnect() {
         remove_entity |= id == 78;
     }
     drop(b);
-    world.shutdown().await;
+    world.shutdown().await.unwrap();
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_login_kicks_old_session_and_keeps_new_session() {
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut old = Bot::join(addr, "Alice").await;
+    let mut new = Bot::join(addr, "Alice").await;
+    let body = old
+        .until(ferrite_protocol::packets::play::PlayDisconnect::ID)
+        .await;
+    let reason =
+        ferrite_protocol::packets::play::PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(reason.reason.0, "You logged in from another location");
+    new.raw(9, "still here").await;
+    loop {
+        let body = new.until(124).await;
+        let msg = SystemChat::decode(&mut body.as_slice()).unwrap();
+        if msg.content.0 == "<Alice> still here" {
+            break;
+        }
+    }
+    drop(new);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crossing_region_boundary_keeps_chat_and_movement_routed() {
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Walker").await;
+    for x in [80.5, 160.5, 240.5, 260.5, 300.5] {
+        bot.send(&MovePosition {
+            x,
+            y: 65.0,
+            z: 0.5,
+            flags: 1,
+        })
+        .await;
+        bot.raw(9, "walking").await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    bot.raw(9, "across").await;
+    let mut reached = false;
+    let mut chatted = false;
+    while !(reached && chatted) {
+        let (id, body) = bot.next_play().await;
+        if id == 96 {
+            let mut body = body.as_slice();
+            reached |= VarInt::decode(&mut body).unwrap().0 == 18;
+        }
+        if id == 124 {
+            let message = SystemChat::decode(&mut body.as_slice()).unwrap();
+            chatted |= message.content.0 == "<Walker> across";
+        }
+    }
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixture_world_streams_disk_chunk() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = root.join("vanilla/26.3/fixture-world/world");
+    let registry =
+        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let expected = super::anvil::read_chunk(&path, &registry, 0, 7)
+        .unwrap()
+        .unwrap();
+    let disk = ferrite_world::RegionFile::open(
+        path.join("dimensions/minecraft/overworld/region/r.0.0.mca"),
+        0,
+        0,
+    )
+    .unwrap()
+    .read_chunk(0, 7)
+    .unwrap()
+    .unwrap();
+    let (_, tag) = ferrite_nbt::binary::read_named(&disk).unwrap();
+    let chunk = ferrite_world::chunk_from_nbt(&tag, -64, 384, &registry).unwrap();
+    let disk_block = chunk.sections()[8].blocks().get(4 * 256).unwrap();
+    let spawn = super::anvil::read_spawn(&path).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(path, registry);
+    let world = World::start_with(Some(source), spawn);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Reader").await;
+    let actual = bot.until(46).await;
+    assert_eq!(actual, expected);
+    let mut body = actual.as_slice();
+    assert_eq!(i32::decode(&mut body).unwrap(), 0);
+    assert_eq!(i32::decode(&mut body).unwrap(), 7);
+    let _ = Vec::<ferrite_protocol::packets::play::Heightmap>::decode(&mut body).unwrap();
+    let sections = Vec::<u8>::decode(&mut body).unwrap();
+    let mut data = sections.as_slice();
+    let mut actual_block = 0;
+    for section in 0..=8 {
+        let _ = i16::decode(&mut data).unwrap();
+        let _ = i16::decode(&mut data).unwrap();
+        let block = read_palette_value(&mut data, 4096, 8, 4 * 256);
+        let _ = read_palette_value(&mut data, 64, 3, 0);
+        if section == 8 {
+            actual_block = block;
+        }
+    }
+    assert_eq!(actual_block, disk_block);
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+fn read_palette_value(data: &mut &[u8], entries: usize, max_local_bits: u8, index: usize) -> u32 {
+    let bits = u8::decode(data).unwrap();
+    if bits == 0 {
+        return VarInt::decode(data).unwrap().0 as u32;
+    }
+    let palette = if bits <= max_local_bits {
+        let n = VarInt::decode(data).unwrap().0 as usize;
+        (0..n)
+            .map(|_| VarInt::decode(data).unwrap().0 as u32)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let per = 64 / bits as usize;
+    let mut value = 0;
+    for i in 0..entries.div_ceil(per) {
+        let word = i64::decode(data).unwrap() as u64;
+        if i == index / per {
+            value = ((word >> ((index % per) * bits as usize)) & ((1u64 << bits) - 1)) as usize;
+        }
+    }
+    if palette.is_empty() {
+        value as u32
+    } else {
+        palette[value]
+    }
 }

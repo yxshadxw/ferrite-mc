@@ -41,6 +41,7 @@ pub enum Signal {
 }
 pub struct Player {
     pub uuid: Uuid,
+    pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -161,11 +162,40 @@ impl Player {
             return;
         }
         let count = (self.rate.clamp(1.0, 64.0) as usize).min(self.queue.len());
-        send(self, &ChunkBatchStart);
+        let mut chunks = Vec::new();
         for _ in 0..count {
-            let (x, z) = self.queue.pop_front().unwrap();
-            let chunk = generator.get(x, z, self.biome);
-            send(self, &chunk);
+            let Some(&(x, z)) = self.queue.front() else {
+                break;
+            };
+            let packet = if let Some(source) = &self.source {
+                match source.get(x, z, self.biome) {
+                    None => break,
+                    Some(Ok(packet)) => packet,
+                    Some(Err(error)) => {
+                        tracing::error!(x, z, %error, "failed to load chunk");
+                        let _ = self
+                            .outbound
+                            .send(Outbound::Disconnect("Failed to load world chunk".into()));
+                        self.mailbox.lock().unwrap().push_back(Command::Leave);
+                        return;
+                    }
+                }
+            } else {
+                let chunk = generator.get(x, z, self.biome);
+                let mut packet = Vec::new();
+                ferrite_protocol::encode_packet(&chunk, &mut packet);
+                packet
+            };
+            self.queue.pop_front();
+            chunks.push((x, z, packet));
+        }
+        if chunks.is_empty() {
+            return;
+        }
+        send(self, &ChunkBatchStart);
+        let count = chunks.len();
+        for (x, z, packet) in chunks {
+            let _ = self.outbound.send(Outbound::Packet(packet));
             self.loaded.insert((x, z));
             let _ = self.signals.send(Signal::Hold {
                 chunk: ChunkPos(x, z),
