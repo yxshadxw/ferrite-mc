@@ -44,6 +44,25 @@ pub struct ChunkData {
     pub sky_arrays: Vec<Vec<u8>>,
     pub block_arrays: Vec<Vec<u8>>,
 }
+/// Light masks are `java.util.BitSet`s. In 26.3 the client reads them as a VarInt-prefixed *byte* array
+/// (`BitSet.toByteArray()`: little-endian, no trailing zero bytes), not as the long array older versions
+/// and the wiki describe. Verified against the real client codec with `tools/wirecheck`.
+fn encode_bitset(longs: &[i64], out: &mut Vec<u8>) {
+    let mut bytes: Vec<u8> = longs.iter().flat_map(|l| l.to_le_bytes()).collect();
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    VarInt(bytes.len() as i32).encode(out);
+    out.extend_from_slice(&bytes);
+}
+fn decode_bitset(buf: &mut &[u8]) -> Result<Vec<i64>, DecodeError> {
+    let mut bytes = Vec::<u8>::decode(buf)?;
+    bytes.resize(bytes.len().div_ceil(8) * 8, 0);
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("chunk of 8")))
+        .collect())
+}
 impl Encode for ChunkData {
     fn encode(&self, out: &mut Vec<u8>) {
         self.x.encode(out);
@@ -51,10 +70,10 @@ impl Encode for ChunkData {
         self.heightmaps.encode(out);
         self.data.encode(out);
         VarInt(0).encode(out);
-        self.sky_mask.encode(out);
-        self.block_mask.encode(out);
-        self.empty_sky_mask.encode(out);
-        self.empty_block_mask.encode(out);
+        encode_bitset(&self.sky_mask, out);
+        encode_bitset(&self.block_mask, out);
+        encode_bitset(&self.empty_sky_mask, out);
+        encode_bitset(&self.empty_block_mask, out);
         self.sky_arrays.encode(out);
         self.block_arrays.encode(out);
     }
@@ -73,10 +92,10 @@ impl Decode for ChunkData {
             z,
             heightmaps,
             data,
-            sky_mask: Vec::decode(buf)?,
-            block_mask: Vec::decode(buf)?,
-            empty_sky_mask: Vec::decode(buf)?,
-            empty_block_mask: Vec::decode(buf)?,
+            sky_mask: decode_bitset(buf)?,
+            block_mask: decode_bitset(buf)?,
+            empty_sky_mask: decode_bitset(buf)?,
+            empty_block_mask: decode_bitset(buf)?,
             sky_arrays: Vec::decode(buf)?,
             block_arrays: Vec::decode(buf)?,
         })
