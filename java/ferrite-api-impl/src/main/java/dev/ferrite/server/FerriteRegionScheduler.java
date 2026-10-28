@@ -42,7 +42,7 @@ final class FerriteRegionScheduler implements RegionScheduler {
         Task task = new Task(id, plugin, world.getUID().toString(), x, z, period, action);
         tasks.put(id, task); Native.scheduleRegion(id, task.world, x, z, delay, plugin.getName()); return task;
     }
-    void execute(long id) { Task task = tasks.get(id); if (task != null) { if (((FerritePluginManager) org.bukkit.Bukkit.getPluginManager()).isLegacy(task.plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { task.execute(); } } else task.execute(); } }
+    void execute(long id) { Task task = tasks.get(id); if (task != null) { if (((FerriteServer) org.bukkit.Bukkit.getServer()).plugins.isLegacy(task.plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { task.execute(); } } else task.execute(); } }
     void cancelTasks(Plugin plugin) { tasks.values().stream().filter(t -> t.plugin == plugin).forEach(Task::cancel); }
     public void execute(Plugin plugin, World world, int x, int z, Runnable action) { run(plugin, world, x, z, t -> action.run()); }
     public ScheduledTask run(Plugin p, World w, int x, int z, Consumer<ScheduledTask> action) { return schedule(p,w,x,z,action,1,0); }

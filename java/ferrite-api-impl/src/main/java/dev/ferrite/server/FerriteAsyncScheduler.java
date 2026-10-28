@@ -23,7 +23,7 @@ final class FerriteAsyncScheduler implements AsyncScheduler {
         }
         public ExecutionState getExecutionState() { return state; }
         public void run() {
-            if (((FerritePluginManager) org.bukkit.Bukkit.getPluginManager()).isLegacy(plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { execute(); } }
+            if (((FerriteServer) org.bukkit.Bukkit.getServer()).plugins.isLegacy(plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { execute(); } }
             else execute();
         }
         private void execute() {

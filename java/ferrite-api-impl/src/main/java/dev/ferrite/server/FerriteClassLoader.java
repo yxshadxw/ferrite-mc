@@ -8,7 +8,8 @@ final class FerriteClassLoader extends URLClassLoader implements ConfiguredPlugi
     private final FerriteServer server;
     private final File file;
     private final PluginDescriptionFile description;
-    private static final ThreadLocal<java.util.Set<FerriteClassLoader>> LOOKUP = ThreadLocal.withInitial(java.util.HashSet::new);
+    private record Lookup(FerriteClassLoader loader, String name) {}
+    private static final ThreadLocal<java.util.Set<Lookup>> LOOKUP = ThreadLocal.withInitial(java.util.HashSet::new);
     private final java.util.List<String> dependencies;
     private final java.util.Map<String, FerriteClassLoader> loaders;
     private JavaPlugin plugin;
@@ -17,8 +18,9 @@ final class FerriteClassLoader extends URLClassLoader implements ConfiguredPlugi
         this.server = server; this.file = file; this.description = description; this.dependencies = java.util.List.copyOf(dependencies); this.loaders = loaders;
     }
     @Override protected Class<?> findClass(String name) throws ClassNotFoundException {
-        java.util.Set<FerriteClassLoader> visited = LOOKUP.get();
-        if (!visited.add(this)) throw new ClassNotFoundException(name);
+        java.util.Set<Lookup> visited = LOOKUP.get();
+        Lookup lookup = new Lookup(this, name);
+        if (!visited.add(lookup)) throw new ClassNotFoundException(name);
         try {
             try { return super.findClass(name); }
             catch (ClassNotFoundException original) {
@@ -28,7 +30,7 @@ final class FerriteClassLoader extends URLClassLoader implements ConfiguredPlugi
                 }
                 throw original;
             }
-        } finally { visited.remove(this); if (visited.isEmpty()) LOOKUP.remove(); }
+        } finally { visited.remove(lookup); if (visited.isEmpty()) LOOKUP.remove(); }
     }
     public PluginDescriptionFile getConfiguration() { return description; }
     public Class<?> loadClass(String name, boolean resolve, boolean checkGlobal, boolean checkLibraries) throws ClassNotFoundException { return loadClass(name, resolve); }

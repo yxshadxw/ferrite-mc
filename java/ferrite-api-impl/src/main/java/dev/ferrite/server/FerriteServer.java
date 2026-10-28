@@ -1,16 +1,97 @@
 package dev.ferrite.server;
 
-public final class FerriteServer extends ServerStubs {
+public class FerriteServer extends ServerStubs {
+    public record Settings(String motd, int maxPlayers, int port, int viewDistance, boolean whitelist, boolean onlineMode) {}
+    private final Settings settings;
+    public FerriteServer() { this(new Settings("Ferrite", 20, 25565, 10, false, true)); }
+    protected FerriteServer(Settings settings) { this.settings = settings; this.whitelistEnabled = settings.whitelist(); facade.paperPluginManager = plugins; }
+    @Override public String getMotd() { return settings.motd(); }
+    @Override public int getMaxPlayers() { return settings.maxPlayers(); }
+    @Override public int getPort() { return settings.port(); }
+    @Override public int getViewDistance() { return settings.viewDistance(); }
+    @Override public boolean getOnlineMode() { return settings.onlineMode(); }
+    @Override public boolean hasWhitelist() { return whitelistEnabled; }
+    private final java.util.concurrent.ConcurrentMap<java.util.UUID, org.bukkit.World> worlds = new java.util.concurrent.ConcurrentHashMap<>();
+    public void registerWorld(org.bukkit.World world) { worlds.put(world.getUID(), world); }
+    public void unregisterWorld(java.util.UUID id) { worlds.remove(id); }
+    @Override public java.util.List<org.bukkit.World> getWorlds() { return java.util.List.copyOf(worlds.values()); }
+    @Override public org.bukkit.World getWorld(java.util.UUID id) { return worlds.get(id); }
+    @Override public org.bukkit.World getWorld(String name) { return worlds.values().stream().filter(world -> world.getName().equalsIgnoreCase(name)).findFirst().orElse(null); }
+    @Override public org.bukkit.World getWorld(net.kyori.adventure.key.Key key) { return worlds.values().stream().filter(world -> world.key().equals(key)).findFirst().orElse(null); }
     private final java.util.concurrent.ConcurrentMap<java.util.UUID, org.bukkit.entity.Player> players = new java.util.concurrent.ConcurrentHashMap<>();
     public void registerPlayer(org.bukkit.entity.Player player) { players.put(player.getUniqueId(), player); }
     public void unregisterPlayer(java.util.UUID id) { players.remove(id); }
     @Override public org.bukkit.entity.Player getPlayer(java.util.UUID id) { return players.get(id); }
+    @Override public org.bukkit.entity.Player getPlayerExact(String name) {
+        java.util.Objects.requireNonNull(name, "name");
+        return players.values().stream().filter(p -> p.getName().equalsIgnoreCase(name)).findFirst().orElse(null);
+    }
+    @Override public org.bukkit.entity.Player getPlayer(String name) {
+        java.util.Objects.requireNonNull(name, "name");
+        var exact = getPlayerExact(name);
+        if (exact != null) return exact;
+        String prefix = name.toLowerCase(java.util.Locale.ROOT);
+        return players.values().stream().filter(p -> p.getName().toLowerCase(java.util.Locale.ROOT).startsWith(prefix)).min(java.util.Comparator.comparingInt(p -> p.getName().length())).orElse(null);
+    }
+    private final org.bukkit.plugin.messaging.Messenger messenger = new org.bukkit.plugin.messaging.StandardMessenger();
+    @Override public org.bukkit.plugin.messaging.Messenger getMessenger() { return messenger; }
+    @Override public java.util.Set<String> getListeningPluginChannels() { return messenger.getIncomingChannels(); }
+    private final java.util.concurrent.ConcurrentMap<java.util.UUID, org.bukkit.OfflinePlayer> offlinePlayers = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Set<java.util.UUID> operators = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private org.bukkit.OfflinePlayer offline(java.util.UUID id, String name) {
+        return offlinePlayers.computeIfAbsent(id, key -> (org.bukkit.OfflinePlayer) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.OfflinePlayer.class}, (proxy, method, args) -> switch (method.getName()) {
+            case "getUniqueId" -> key;
+            case "getName" -> name;
+            case "getPlayer" -> players.get(key);
+            case "isOnline" -> players.containsKey(key);
+            case "isOp" -> operators.contains(key);
+            case "setOp" -> { boolean value = (boolean) args[0]; if (!Native.playerOperator(key.toString(), value)) throw new IllegalStateException("No player command handler"); if (value) operators.add(key); else operators.remove(key); yield null; }
+            case "hashCode" -> key.hashCode();
+            case "equals" -> args[0] instanceof org.bukkit.OfflinePlayer other && key.equals(other.getUniqueId());
+            case "toString" -> "OfflinePlayer[" + key + "]";
+            default -> throw new UnsupportedOperationException("Ferrite: not implemented: OfflinePlayer#" + method.getName());
+        }));
+    }
+    @Override public org.bukkit.OfflinePlayer getOfflinePlayer(java.util.UUID id) { var player = players.get(id); return player != null ? player : offline(id, null); }
+    @Override public org.bukkit.OfflinePlayer getOfflinePlayer(String name) {
+        java.util.Objects.requireNonNull(name, "name");
+        var player = getPlayerExact(name);
+        if (player != null) return player;
+        return offline(java.util.UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(java.nio.charset.StandardCharsets.UTF_8)), name);
+    }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getOperators() {
+        var result = new java.util.HashSet<org.bukkit.OfflinePlayer>();
+        for (var id : operators) result.add(getOfflinePlayer(id));
+        for (var player : players.values()) if (player.isOp()) result.add(player);
+        return java.util.Set.copyOf(result);
+    }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, int size) { return FerriteInventory.create(holder, org.bukkit.event.inventory.InventoryType.CHEST, size); }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, int size, String title) { java.util.Objects.requireNonNull(title); return createInventory(holder, size); }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, int size, net.kyori.adventure.text.Component title) { java.util.Objects.requireNonNull(title); return createInventory(holder, size); }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, org.bukkit.event.inventory.InventoryType type) { return FerriteInventory.create(holder, type, type.getDefaultSize()); }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, org.bukkit.event.inventory.InventoryType type, String title) { java.util.Objects.requireNonNull(title); return createInventory(holder, type); }
+    @Override public org.bukkit.inventory.Inventory createInventory(org.bukkit.inventory.InventoryHolder holder, org.bukkit.event.inventory.InventoryType type, net.kyori.adventure.text.Component title) { java.util.Objects.requireNonNull(title); return createInventory(holder, type); }
+    private final org.bukkit.scoreboard.ScoreboardManager scoreboards = new FerriteScoreboards();
+    @Override public org.bukkit.scoreboard.ScoreboardManager getScoreboardManager() { return scoreboards; }
+    private final FerriteIpBanList ipBans = new FerriteIpBanList();
+    void seedIpBan(String ip) { ipBans.seed(ip); }
+    @SuppressWarnings("unchecked") @Override public <T extends org.bukkit.BanList<?>> T getBanList(org.bukkit.BanList.Type type) { if (type != org.bukkit.BanList.Type.IP) throw new UnsupportedOperationException("Ferrite: profile bans not implemented"); return (T) ipBans; }
+    @SuppressWarnings("unchecked") @Override public <B extends org.bukkit.BanList<E>, E> B getBanList(io.papermc.paper.ban.BanListType<B> type) { if (type != io.papermc.paper.ban.BanListType.IP) throw new UnsupportedOperationException("Ferrite: profile bans not implemented"); return (B) ipBans; }
+    @Override public void banIP(String address) { ipBans.addBan(address, null, (java.util.Date) null, null); }
+    @Override public void banIP(java.net.InetAddress address) { ipBans.addBan(address, null, (java.util.Date) null, null); }
+    @Override public void unbanIP(String address) { ipBans.pardon(address); }
+    @Override public void unbanIP(java.net.InetAddress address) { ipBans.pardon(address); }
+    @Override public java.util.Set<String> getIPBans() { return ipBans.addresses(); }
+    private volatile boolean whitelistEnabled;
+    @Override public void setWhitelist(boolean value) { if (!Native.serverWhitelist(value)) throw new IllegalStateException("No server command handler"); whitelistEnabled = value; }
     private final Thread primaryThread = Thread.currentThread();
     private final org.bukkit.plugin.ServicesManager services = new org.bukkit.plugin.SimpleServicesManager();
     @Override public org.bukkit.plugin.ServicesManager getServicesManager() { return services; }
     @Override public net.kyori.adventure.text.Component permissionMessage() { return net.kyori.adventure.text.Component.text("You do not have permission to use this command."); }
     @Override public boolean isPrimaryThread() { return Thread.currentThread() == primaryThread || Thread.holdsLock(Bootstrap.LEGACY_LOCK); }
-    private final java.util.Map<String, org.bukkit.command.PluginCommand> commands = new java.util.HashMap<>();
+    private final java.util.Map<String, org.bukkit.command.Command> commands = new java.util.HashMap<>();
+    private final org.bukkit.command.SimpleCommandMap commandMap = new org.bukkit.command.SimpleCommandMap(this, commands);
+    @Override public org.bukkit.command.CommandMap getCommandMap() { return commandMap; }
     void registerCommands(org.bukkit.plugin.java.JavaPlugin plugin) throws ReflectiveOperationException {
         var constructor = org.bukkit.command.PluginCommand.class.getDeclaredConstructor(String.class, org.bukkit.plugin.Plugin.class);
         constructor.setAccessible(true);
@@ -34,18 +115,19 @@ public final class FerriteServer extends ServerStubs {
             }
         }
     }
-    void unregisterCommands(org.bukkit.plugin.Plugin plugin) { commands.values().removeIf(command -> command.getPlugin() == plugin); }
-    @Override public org.bukkit.command.PluginCommand getPluginCommand(String name) { return commands.get(name.toLowerCase(java.util.Locale.ROOT)); }
+    void unregisterCommands(org.bukkit.plugin.Plugin plugin) { commands.values().removeIf(command -> command instanceof org.bukkit.command.PluginCommand pc && pc.getPlugin() == plugin); }
+    @Override public org.bukkit.command.PluginCommand getPluginCommand(String name) { var command = commands.get(name.toLowerCase(java.util.Locale.ROOT)); return command instanceof org.bukkit.command.PluginCommand pc ? pc : null; }
     @Override public boolean dispatchCommand(org.bukkit.command.CommandSender sender, String line) {
-        String[] parts = line.trim().split("\\s+");
-        var command = getPluginCommand(parts[0]);
-        return command != null && command.execute(sender, parts[0], java.util.Arrays.copyOfRange(parts, 1, parts.length));
+        return commandMap.dispatch(sender, line);
     }
     private final org.bukkit.command.ConsoleCommandSender console = createConsoleSender();
     @Override public org.bukkit.command.ConsoleCommandSender getConsoleSender() { return console; }
     private org.bukkit.command.ConsoleCommandSender createConsoleSender() {
         return (org.bukkit.command.ConsoleCommandSender) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.command.ConsoleCommandSender.class}, (proxy, method, args) -> {
             if (method.getName().equals("sendMessage") && args != null) { for (Object arg : args) if (arg instanceof String message) getLogger().info(message); return null; }
+            if (method.getName().equals("equals")) return proxy == args[0];
+            if (method.getName().equals("hashCode")) return System.identityHashCode(proxy);
+            if (method.getName().equals("toString")) return "ConsoleCommandSender";
             if (method.getName().equals("getName")) return "CONSOLE";
             if (method.getName().equals("getServer")) return this;
             if (method.getName().equals("isOp") || method.getName().equals("hasPermission")) return true;
@@ -70,8 +152,9 @@ public final class FerriteServer extends ServerStubs {
     private final FerriteGlobalScheduler globalScheduler = new FerriteGlobalScheduler(scheduler);
     @Override public io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler getGlobalRegionScheduler() { return globalScheduler; }
     @Override public org.bukkit.scheduler.BukkitScheduler getScheduler() { return scheduler; }
-    private final FerritePluginManager plugins = new FerritePluginManager(this);
-    @Override public org.bukkit.plugin.PluginManager getPluginManager() { return plugins; }
+    final FerritePluginManager plugins = new FerritePluginManager(this);
+    final org.bukkit.plugin.SimplePluginManager facade = new org.bukkit.plugin.SimplePluginManager(this, commandMap);
+    @Override public org.bukkit.plugin.PluginManager getPluginManager() { return facade; }
     @Override public String getName() { return "Ferrite"; }
     @Override public String getVersion() { return "Ferrite 0.1.0"; }
     @Override public String getBukkitVersion() { return "26.3"; }
