@@ -14,3 +14,15 @@ tasks.register<Jar>("shadedJar") {
 tasks.build { dependsOn("shadedJar") }
 tasks.test { dependsOn(":test-dependency:jar"); inputs.file(project(":test-dependency").layout.buildDirectory.file("libs/test-dependency.jar")); systemProperty("test.dependency.jar", project(":test-dependency").layout.buildDirectory.file("libs/test-dependency.jar").get().asFile.absolutePath) }
 tasks.test { dependsOn(":test-plugin:legacyJar"); inputs.file(project(":test-plugin").layout.buildDirectory.file("libs/test-plugin-legacy.jar")); systemProperty("test.legacy.jar", project(":test-plugin").layout.buildDirectory.file("libs/test-plugin-legacy.jar").get().asFile.absolutePath) }
+
+val registryOutput = layout.buildDirectory.dir("generated/registry-resources")
+val generateRegistryKeys by tasks.registering(Exec::class) {
+    val vanilla = rootProject.projectDir.resolve("../../vanilla/26.3/generated")
+    inputs.file(vanilla.resolve("reports/registries.json"))
+    inputs.dir(vanilla.resolve("data/minecraft/enchantment"))
+    inputs.dir(vanilla.resolve("data/minecraft/worldgen/biome"))
+    outputs.dir(registryOutput)
+    commandLine("python", projectDir.resolve("tools/generate_registry_keys.py"), vanilla, registryOutput.get().file("ferrite/registry-keys.tsv").asFile)
+}
+sourceSets.main { resources.srcDir(registryOutput) }
+tasks.processResources { dependsOn(generateRegistryKeys) }

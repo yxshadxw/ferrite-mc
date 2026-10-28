@@ -3,7 +3,7 @@ package dev.ferrite.server;
 public class FerriteInternalBridge implements io.papermc.paper.InternalAPIBridge {
 public com.destroystokyo.paper.SkinParts.Mutable allSkinParts() { throw new UnsupportedOperationException("Ferrite: not implemented: Server#allSkinParts"); }
 public net.kyori.adventure.text.flattener.ComponentFlattener componentFlattener() { throw new UnsupportedOperationException("Ferrite: not implemented: Server#componentFlattener"); }
-public org.bukkit.block.Biome constructLegacyCustomBiome() { throw new UnsupportedOperationException("Ferrite: not implemented: Server#constructLegacyCustomBiome"); }
+public org.bukkit.block.Biome constructLegacyCustomBiome() { return FerriteRegistryAccess.customBiome(); }
 public io.papermc.paper.world.damagesource.CombatEntry createCombatEntry(org.bukkit.damage.DamageSource a0, float a1, io.papermc.paper.world.damagesource.FallLocationType a2, float a3) { throw new UnsupportedOperationException("Ferrite: not implemented: Server#createCombatEntry"); }
 public io.papermc.paper.world.damagesource.CombatEntry createCombatEntry(org.bukkit.entity.LivingEntity a0, org.bukkit.damage.DamageSource a1, float a2) { throw new UnsupportedOperationException("Ferrite: not implemented: Server#createCombatEntry"); }
 public org.bukkit.damage.DamageSource.Builder createDamageSourceBuilder(org.bukkit.damage.DamageType a0) { throw new UnsupportedOperationException("Ferrite: not implemented: Server#createDamageSourceBuilder"); }

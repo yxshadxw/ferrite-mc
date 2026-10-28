@@ -5,6 +5,33 @@ import java.util.jar.JarFile;
 import org.bukkit.plugin.*;
 import org.bukkit.plugin.java.JavaPlugin;
 final class FerritePluginManager extends PluginManagerStubs {
+    private static String permissionKey(String name) { return name.toLowerCase(Locale.ROOT); }
+    @Override public synchronized org.bukkit.permissions.Permission getPermission(String name) { return server.facade.permissions.get(permissionKey(name)); }
+    @Override public synchronized void addPermission(org.bukkit.permissions.Permission permission) {
+        if (server.facade.permissions.putIfAbsent(permissionKey(permission.getName()), permission) != null) throw new IllegalArgumentException("Permission already registered: " + permission.getName());
+        recalculatePermissionDefaults(permission);
+    }
+    @Override public void addPermissions(List<org.bukkit.permissions.Permission> entries) { entries.forEach(this::addPermission); }
+    @Override public synchronized void removePermission(String name) { var removed = server.facade.permissions.remove(permissionKey(name)); if (removed != null) recalculatePermissionDefaults(removed); }
+    @Override public void removePermission(org.bukkit.permissions.Permission permission) { removePermission(permission.getName()); }
+    @Override public synchronized void clearPermissions() { server.facade.permissions.clear(); for (boolean op : new boolean[]{false, true}) { server.facade.defaultPerms.get(op).clear(); getDefaultPermSubscriptions(op).forEach(org.bukkit.permissions.Permissible::recalculatePermissions); } }
+    @Override public synchronized Set<org.bukkit.permissions.Permission> getPermissions() { return Set.copyOf(server.facade.permissions.values()); }
+    @Override public synchronized Set<org.bukkit.permissions.Permission> getDefaultPermissions(boolean op) { return Set.copyOf(server.facade.defaultPerms.get(op)); }
+    @Override public synchronized void recalculatePermissionDefaults(org.bukkit.permissions.Permission permission) {
+        boolean registered = server.facade.permissions.get(permissionKey(permission.getName())) == permission;
+        for (boolean op : new boolean[]{false, true}) {
+            var defaults = server.facade.defaultPerms.get(op);
+            if (registered && permission.getDefault().getValue(op)) defaults.add(permission); else defaults.remove(permission);
+            getDefaultPermSubscriptions(op).forEach(org.bukkit.permissions.Permissible::recalculatePermissions);
+        }
+        getPermissionSubscriptions(permission.getName()).forEach(org.bukkit.permissions.Permissible::recalculatePermissions);
+    }
+    @Override public synchronized void subscribeToPermission(String name, org.bukkit.permissions.Permissible permissible) { server.facade.permSubs.computeIfAbsent(permissionKey(name), ignored -> new java.util.WeakHashMap<>()).put(permissible, true); }
+    @Override public synchronized void unsubscribeFromPermission(String name, org.bukkit.permissions.Permissible permissible) { var map = server.facade.permSubs.get(permissionKey(name)); if (map != null) map.remove(permissible); }
+    @Override public synchronized Set<org.bukkit.permissions.Permissible> getPermissionSubscriptions(String name) { var map = server.facade.permSubs.get(permissionKey(name)); return map == null ? Set.of() : Set.copyOf(map.keySet()); }
+    @Override public synchronized void subscribeToDefaultPerms(boolean op, org.bukkit.permissions.Permissible permissible) { server.facade.defSubs.computeIfAbsent(op, ignored -> new java.util.WeakHashMap<>()).put(permissible, true); }
+    @Override public synchronized void unsubscribeFromDefaultPerms(boolean op, org.bukkit.permissions.Permissible permissible) { var map = server.facade.defSubs.get(op); if (map != null) map.remove(permissible); }
+    @Override public synchronized Set<org.bukkit.permissions.Permissible> getDefaultPermSubscriptions(boolean op) { var map = server.facade.defSubs.get(op); return map == null ? Set.of() : Set.copyOf(map.keySet()); }
     private record Handler(Class<?> type, org.bukkit.event.EventPriority priority, boolean ignoreCancelled, Plugin owner, java.lang.invoke.MethodHandle method) {}
     private final List<Handler> handlers = new ArrayList<>();
     public synchronized void registerEvents(org.bukkit.event.Listener listener, Plugin owner) {

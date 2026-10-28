@@ -1,5 +1,7 @@
 use ferrite_plugin::{
-    CommandSender, EntityTask, PluginConfig, PluginHost, RegionContext, RegionTask,
+    BlockPosition, BlockSnapshot, ColumnHeight, CommandSender, EntityTask, GameMode, ItemSnapshot,
+    OfflinePlayerSnapshot, PlayerCommand, PlayerLocation, PlayerSnapshot, PluginConfig, PluginHost,
+    RegionContext, RegionTask, ServerCommand, ServerSnapshot, WorldCommand, WorldSnapshot,
 };
 
 #[derive(Default)]
@@ -86,8 +88,33 @@ fn plugin_lifecycle() {
     let called = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = called.clone();
     let regions = std::sync::Arc::new(FakeRegions::default());
+    let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_messages = messages.clone();
+    let world_commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_world_commands = world_commands.clone();
+    let server_commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_server_commands = server_commands.clone();
     let cfg = PluginConfig {
+        server_handler: Some(std::sync::Arc::new(move |command| {
+            captured_server_commands.lock().unwrap().push(command)
+        })),
+        world_handler: Some(std::sync::Arc::new(move |command| {
+            captured_world_commands.lock().unwrap().push(command)
+        })),
+        player_handler: Some(std::sync::Arc::new(move |command| {
+            captured_messages.lock().unwrap().push(command);
+        })),
+
         region_context: Some(regions.clone()),
+        server_snapshot: ServerSnapshot {
+            motd: "Integration MOTD".into(),
+            max_players: 42,
+            port: 25570,
+            view_distance: 8,
+            whitelist: true,
+            online_mode: false,
+            banned_ips: vec!["192.0.2.7".parse().unwrap()],
+        },
         command_handler: Some(std::sync::Arc::new(move |_, line| {
             captured.lock().unwrap().push(line.to_owned());
             true
@@ -96,10 +123,100 @@ fn plugin_lifecycle() {
         java_home: Some(java_home),
     };
     let host = PluginHost::start(dir.path(), cfg).unwrap();
+    assert!(host.is_plugin_enabled("FerriteTest").unwrap());
+    assert!(!host.is_plugin_enabled("Missing").unwrap());
+    let world_id = uuid::Uuid::new_v4();
+    host.register_world(&WorldSnapshot {
+        id: world_id,
+        name: "probe_world".into(),
+        time: 6000,
+        spawn: BlockPosition { x: 0, y: 64, z: 0 },
+        heights: vec![ColumnHeight { x: 1, z: 2, y: 64 }],
+        blocks: vec![BlockSnapshot {
+            position: BlockPosition { x: 1, y: 64, z: 2 },
+            material: "minecraft:stone".into(),
+        }],
+    })
+    .unwrap();
+    let offline_id = uuid::Uuid::from_u128(44);
+    host.register_offline_player(&OfflinePlayerSnapshot {
+        id: offline_id,
+        name: Some("KnownOffline".into()),
+        operator: true,
+    })
+    .unwrap();
+    let player_id = uuid::Uuid::new_v4();
+    host.register_player(&PlayerSnapshot {
+        id: player_id,
+        name: "ProbePlayer".into(),
+        operator: true,
+        health: 16.0,
+        food: 14,
+        mode: GameMode::Creative,
+        inventory: vec![Some(ItemSnapshot {
+            material: "minecraft:stone".into(),
+            amount: 3,
+        })],
+        location: PlayerLocation {
+            world: world_id,
+            x: 1.0,
+            y: 65.0,
+            z: 2.0,
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+    })
+    .unwrap();
+    assert!(
+        host.dispatch_command(CommandSender::Player(player_id), "ferrite-test hello")
+            .unwrap()
+    );
     assert!(
         host.logs()
             .iter()
-            .any(|line| line.contains("FerriteTest enabled"))
+            .any(|line| line.contains("player snapshot 16.0 14 CREATIVE"))
+    );
+    assert!(
+        host.logs()
+            .iter()
+            .any(|line| line.contains("world snapshot probe_world STONE"))
+    );
+    assert!(world_commands.lock().unwrap().iter().any(
+        |command| matches!(command, WorldCommand::SetBlock { world, .. } if *world == world_id)
+    ));
+    assert!(
+        server_commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, ServerCommand::SetWhitelist { enabled: false }))
+    );
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::DisplayName { player, .. } if *player == player_id)));
+    assert!(messages.lock().unwrap().iter().any(
+        |command| matches!(command, PlayerCommand::Title { player, .. } if *player == player_id)
+    ));
+    assert!(messages.lock().unwrap().iter().any(
+        |command| matches!(command, PlayerCommand::Kick { player, .. } if *player == player_id)
+    ));
+    assert!(messages.lock().unwrap().iter().any(
+        |command| matches!(command, PlayerCommand::PlaySound { player, .. } if *player == player_id)
+    ));
+    assert!(server_commands.lock().unwrap().iter().any(|command| matches!(command, ServerCommand::BanIp { address, .. } if *address == "192.0.2.2".parse::<std::net::IpAddr>().unwrap())));
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::SetInventorySlot { player, slot: 0, .. } if *player == player_id)));
+    assert!(messages.lock().unwrap().iter().any(
+        |command| matches!(command, PlayerCommand::Teleport { player, .. } if *player == player_id)
+    ));
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::SetOperator { player, operator: false } if *player == player_id)));
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::SetHealth { player, health } if *player == player_id && *health == 10.0)));
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::SetFood { player, food } if *player == player_id && *food == 9)));
+    assert!(messages.lock().unwrap().iter().any(|command| matches!(command, PlayerCommand::SetGameMode { player, mode: GameMode::Adventure } if *player == player_id)));
+    assert!(messages.lock().unwrap().iter().any(
+        |command| matches!(command, PlayerCommand::Message { player, .. } if *player == player_id)
+    ));
+    assert!(
+        host.logs()
+            .iter()
+            .any(|line| line.contains("FerriteTest settings Integration MOTD 42 25570 8 true"))
     );
     assert!(
         !host
@@ -114,7 +231,10 @@ fn plugin_lifecycle() {
             .unwrap()
     );
     assert!(host.logs().iter().any(|line| line.contains("hello hello")));
-    assert_eq!(&*called.lock().unwrap(), &["bridge-command"]);
+    assert_eq!(
+        &*called.lock().unwrap(),
+        &["bridge-command", "bridge-command"]
+    );
     for _ in 0..3 {
         host.tick().unwrap();
     }
