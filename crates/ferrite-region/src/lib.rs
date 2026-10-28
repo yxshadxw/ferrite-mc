@@ -39,6 +39,22 @@
 //! waits for lower-numbered mutations (finitely many) and for in-flight ticks;
 //! newer mutations queue behind it. Mutations on the same chunk, and nearby
 //! mutations in general, apply in submission order.
+//!
+//! # Scheduling and fairness
+//!
+//! Workers pick the region with the earliest deadline. An overloaded region's
+//! lag is capped at [`SchedulerConfig::max_catchup`] periods (excess periods are
+//! dropped and counted in [`TickStats::skipped_ticks`]), so it never bursts
+//! after load drops; under sustained overload this degrades to round-robin by
+//! last dispatch. Split pieces inherit the parent's deadline, and a merged
+//! region takes the section-weighted mean of its parts' deadlines, which
+//! conserves lag, so merging gives no priority advantage. Fairness is per
+//! *region*: a merged region ticks all its sections as one unit, at the same
+//! rate as any other region but with proportionally longer ticks. When workers
+//! are saturated, sections that keep merging and splitting therefore see their
+//! TPS jitter (by about ±50% at 1 thread in `examples/throughput.rs`) even
+//! though the long-run share is even. Sharing CPU in proportion to section
+//! count would need cost-aware (weighted fair) scheduling, which is not done.
 
 use parking_lot::{Condvar, Mutex};
 use std::cmp::Reverse;
@@ -91,6 +107,59 @@ pub struct TickStats {
     pub last_mspt: f64,
     pub tps_5s: f64,
     pub tps_1m: f64,
+    /// Ticks dropped because the region fell further behind its schedule
+    /// than [`SchedulerConfig::max_catchup`] allows.
+    pub skipped_ticks: u64,
+}
+
+/// Scheduler tuning; `Default` is 20 TPS with one tick of catch-up on all cores.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerConfig {
+    pub threads: usize,
+    /// Target interval between ticks of one region (and of the global region).
+    pub period: Duration,
+    /// How many periods a region's schedule may lag behind real time. When a
+    /// region is overloaded its deadline is advanced in whole periods so that
+    /// afterwards it runs at most `max_catchup` extra back-to-back ticks instead
+    /// of bursting through the whole backlog; dropped periods are counted in
+    /// [`TickStats::skipped_ticks`]. `u32::MAX` disables the cap.
+    pub max_catchup: u32,
+}
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            threads: thread::available_parallelism().map_or(1, |n| n.get()),
+            period: Duration::from_millis(50),
+            max_catchup: 1,
+        }
+    }
+}
+/// Advances a deadline by one period after dispatch at `now`, dropping whole
+/// periods that lag more than `max_catchup` periods. Returns the drop count.
+fn advance(deadline: &mut Instant, now: Instant, config: &SchedulerConfig) -> u64 {
+    *deadline += config.period;
+    let allowed = config.period.saturating_mul(config.max_catchup);
+    let Some(floor) = (now + config.period).checked_sub(allowed) else {
+        return 0;
+    };
+    if *deadline >= floor {
+        return 0;
+    }
+    let period = config.period.as_nanos().max(1);
+    let skipped = (floor - *deadline).as_nanos().div_ceil(period);
+    *deadline += Duration::from_nanos((skipped * period) as u64);
+    skipped as u64
+}
+
+/// Deadline of a merged region: the section-weighted mean of both deadlines.
+/// This conserves total schedule lag across sections, so frequently merging
+/// regions gain no priority (taking the earlier deadline let regions with many
+/// neighbours starve isolated ones under overload) and lose none.
+fn weighted_deadline(a: (Instant, usize), b: (Instant, usize)) -> Instant {
+    let (early, late) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    let total = (early.1 + late.1).max(1) as u128;
+    let offset = (late.0 - early.0).as_nanos() * late.1 as u128 / total;
+    early.0 + Duration::from_nanos(offset as u64)
 }
 
 /// Single-threaded topology; transfer it to a `Scheduler` to start ticking.
@@ -211,6 +280,44 @@ impl<D: RegionData> Regionizer<D> {
         }
         Ok(())
     }
+    /// Whether region `id` is still connected after `removed` left it, proven by
+    /// a search bounded to within twice the merge radius of `removed`: the
+    /// region stays connected iff the removed section's former neighbours are
+    /// still mutually connected, and a local path between them suffices. `false`
+    /// means "not proven" and the caller falls back to a full component search.
+    fn still_connected(&self, id: RegionId, removed: SectionPos) -> bool {
+        let sections = &self.regions[&id].sections;
+        let near: Vec<_> = self
+            .neighborhood(removed)
+            .into_iter()
+            .filter(|n| sections.contains(n))
+            .collect();
+        match near.len() {
+            0 => return false,
+            1 => return true,
+            _ => {}
+        }
+        let bound = i64::from(self.radius) * 2;
+        let local = |s: &SectionPos| {
+            (i64::from(s.0) - i64::from(removed.0)).abs() <= bound
+                && (i64::from(s.1) - i64::from(removed.1)).abs() <= bound
+        };
+        let mut unreached: HashSet<_> = near[1..].iter().copied().collect();
+        let mut seen = HashSet::from([near[0]]);
+        let mut frontier = vec![near[0]];
+        while let Some(s) = frontier.pop() {
+            for n in self.neighborhood(s) {
+                if local(&n) && sections.contains(&n) && seen.insert(n) {
+                    unreached.remove(&n);
+                    if unreached.is_empty() {
+                        return true;
+                    }
+                    frontier.push(n);
+                }
+            }
+        }
+        false
+    }
     pub fn add_chunk(&mut self, chunk: ChunkPos) {
         *self.chunks.entry(chunk).or_default() += 1;
         let section = self.section_of(chunk);
@@ -236,10 +343,12 @@ impl<D: RegionData> Regionizer<D> {
                 self.sections.get_mut(s).unwrap().1 = id;
             }
             let region = self.regions.get_mut(&id).unwrap();
+            region.next_tick = weighted_deadline(
+                (region.next_tick, region.sections.len()),
+                (old.next_tick, old.sections.len()),
+            );
             region.sections.extend(old.sections);
             region.data.as_mut().unwrap().merge(old.data.unwrap());
-            // Keep the more overdue deadline so a merge never loses tick debt.
-            region.next_tick = region.next_tick.min(old.next_tick);
         }
         self.sections.insert(section, (1, id));
         self.regions.get_mut(&id).unwrap().sections.insert(section);
@@ -264,6 +373,9 @@ impl<D: RegionData> Regionizer<D> {
         if self.regions[&id].sections.is_empty() {
             self.retired
                 .push(self.regions.remove(&id).unwrap().data.unwrap());
+            return true;
+        }
+        if self.still_connected(id, section) {
             return true;
         }
         let mut remaining = self.regions[&id].sections.clone();
@@ -380,7 +492,20 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
         tick: impl Fn(&mut D) + Send + Sync + 'static,
         global_tick: impl Fn(&mut G) + Send + Sync + 'static,
     ) -> Self {
-        assert!(threads > 0);
+        let config = SchedulerConfig {
+            threads,
+            ..SchedulerConfig::default()
+        };
+        Self::with_config(topology, global, config, tick, global_tick)
+    }
+    pub fn with_config(
+        topology: Regionizer<D>,
+        global: G,
+        config: SchedulerConfig,
+        tick: impl Fn(&mut D) + Send + Sync + 'static,
+        global_tick: impl Fn(&mut G) + Send + Sync + 'static,
+    ) -> Self {
+        assert!(config.threads > 0 && !config.period.is_zero());
         let now = Instant::now();
         let mut deadlines = BinaryHeap::new();
         for (&id, r) in &topology.regions {
@@ -405,12 +530,12 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
         });
         let tick = Arc::new(tick);
         let global_tick = Arc::new(global_tick);
-        let workers = (0..threads)
+        let workers = (0..config.threads)
             .map(|_| {
                 let shared = shared.clone();
                 let tick = tick.clone();
                 let global_tick = global_tick.clone();
-                thread::spawn(move || worker(shared, tick, global_tick))
+                thread::spawn(move || worker(shared, config, tick, global_tick))
             })
             .collect();
         Self { shared, workers }
@@ -421,10 +546,10 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
         tick: impl Fn(&mut D) + Send + Sync + 'static,
         global_tick: impl Fn(&mut G) + Send + Sync + 'static,
     ) -> Self {
-        Self::new(
+        Self::with_config(
             topology,
             global,
-            thread::available_parallelism().map_or(1, |n| n.get()),
+            SchedulerConfig::default(),
             tick,
             global_tick,
         )
@@ -713,10 +838,10 @@ fn apply_topology<D: RegionData, G>(
 }
 fn worker<D: RegionData, G: Send + 'static>(
     shared: Arc<Shared<D, G>>,
+    config: SchedulerConfig,
     tick: Arc<impl Fn(&mut D) + Send + Sync>,
     global_tick: Arc<impl Fn(&mut G) + Send + Sync>,
 ) {
-    const PERIOD: Duration = Duration::from_millis(50);
     loop {
         let work = {
             let mut s = shared.state.lock();
@@ -746,10 +871,10 @@ fn worker<D: RegionData, G: Send + 'static>(
                 s.deadlines.pop();
                 break if let Some(id) = id {
                     let r = s.topology.regions.get_mut(&id).unwrap();
-                    r.next_tick += PERIOD;
+                    r.stats.skipped_ticks += advance(&mut r.next_tick, now, &config);
                     Work::Region(id, r.data.take().unwrap(), std::mem::take(&mut r.tasks))
                 } else {
-                    s.global_next += PERIOD;
+                    advance(&mut s.global_next, now, &config);
                     Work::Global(
                         s.global.take().unwrap(),
                         std::mem::take(&mut s.global_tasks),
@@ -833,7 +958,8 @@ mod tests {
     }
 
     // Regression: split pieces used to restart at `now`, starving them behind
-    // overdue regions when the scheduler is overloaded.
+    // overdue regions when the scheduler is overloaded; merges used to take the
+    // earlier deadline, favouring regions with many neighbours.
     #[test]
     fn split_and_merge_preserve_overdue_deadlines() {
         let mut r = Regionizer::<Unit>::new(0, 1);
@@ -851,9 +977,51 @@ mod tests {
         let right = r.owner(ChunkPos(2, 0)).unwrap();
         let later = overdue + Duration::from_secs(5);
         r.regions.get_mut(&right).unwrap().next_tick = later;
+        // One section on each side (the bridge is inserted after merging): the
+        // section-weighted mean is halfway.
         r.add_chunk(ChunkPos(1, 0));
         let merged = r.owner(ChunkPos(0, 0)).unwrap();
-        assert_eq!(r.regions[&merged].next_tick, overdue);
+        let expected = overdue + Duration::from_secs(5) / 2;
+        let got = r.regions[&merged].next_tick;
+        assert!(got.max(expected) - got.min(expected) < Duration::from_millis(1));
+        r.check_invariants().unwrap();
+    }
+
+    // The bounded local search must never report a split region as connected,
+    // and splits / non-splits must match a brute-force component count.
+    #[test]
+    fn local_connectivity_check_matches_full_search() {
+        for radius in [1, 2] {
+            let mut r = Regionizer::<Unit>::new(0, radius);
+            let mut held = Vec::new();
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            for _ in 0..800 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let chunk = ChunkPos((seed % 16) as i32, ((seed >> 16) % 16) as i32);
+                if !(seed >> 40).is_multiple_of(3) || held.is_empty() {
+                    r.add_chunk(chunk);
+                    held.push(chunk);
+                } else {
+                    let i = (seed >> 44) as usize % held.len();
+                    r.remove_chunk(held.swap_remove(i));
+                }
+                r.check_invariants().unwrap();
+            }
+        }
+        // A ring: removing one section is only provably safe through the long
+        // way round, so the fallback must keep it as one region.
+        let mut r = Regionizer::<Unit>::new(0, 1);
+        for i in 0..10 {
+            for (x, z) in [(i, 0), (i, 9), (0, i), (9, i)] {
+                r.add_chunk(ChunkPos(x, z));
+            }
+        }
+        r.remove_chunk(ChunkPos(5, 0));
+        assert_eq!(r.region_count(), 1);
+        r.remove_chunk(ChunkPos(5, 9));
+        assert_eq!(r.region_count(), 2);
         r.check_invariants().unwrap();
     }
 }

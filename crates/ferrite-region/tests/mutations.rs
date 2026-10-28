@@ -272,6 +272,7 @@ fn stress(ops_per_thread: usize, area: i32) {
             (checks, max_age)
         })
     };
+    let ops_start = Instant::now();
     let workers: Vec<_> = (0..4)
         .map(|worker| {
             let scheduler = scheduler.clone();
@@ -329,6 +330,7 @@ fn stress(ops_per_thread: usize, area: i32) {
         deferred_adds += deferred;
         held_all.extend(held);
     }
+    let ops_time = ops_start.elapsed();
     // Hold every section in the area so tasks parked on unheld sections run.
     for x in 0..area {
         for z in 0..area {
@@ -358,6 +360,7 @@ fn stress(ops_per_thread: usize, area: i32) {
         assert_eq!(scheduler.owner(*c), Some(owner));
     }
     // Release everything: no region may remain.
+    let teardown = Instant::now();
     for x in 0..area {
         for z in 0..area {
             scheduler.remove_chunk(ChunkPos(x, z));
@@ -369,11 +372,12 @@ fn stress(ops_per_thread: usize, area: i32) {
     let scheduler = Arc::try_unwrap(scheduler).ok().unwrap();
     scheduler.check_invariants().unwrap();
     let result = scheduler.shutdown();
+    let teardown = teardown.elapsed();
     assert!(result.pending_tasks.is_empty());
     assert!(ran.lock().unwrap().values().all(|&n| n == 1));
     assert_eq!(ran.lock().unwrap().len(), total_tasks);
     eprintln!(
-        "stress: {total_tasks} tasks, {} ticks, {checks} invariant checks, >= {deferred_adds} deferred adds, oldest pending mutation {max_age:?}",
+        "stress: {total_tasks} tasks, {} ticks, {checks} invariant checks, >= {deferred_adds} deferred adds, oldest pending mutation {max_age:?}, ops phase {ops_time:?}, teardown {teardown:?}",
         ticks.load(Ordering::Relaxed)
     );
 }
