@@ -171,7 +171,6 @@ async fn run(
         spawn[1] as f64,
         spawn[2] as f64 + 0.5,
     ];
-    let spawn_chunk = ChunkPos(spawn[0].div_euclid(16), spawn[2].div_euclid(16));
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
