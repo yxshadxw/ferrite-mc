@@ -9,7 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Mirrors `RegistryDataLoader.SYNCHRONIZED_REGISTRIES` of 26.3 (32 entries). The client
+/// refuses to finish configuration if one is missing, so keep this in sync on version bumps.
 const SYNCHRONIZED: &[&str] = &[
+    "block_transformer",
+    "decorated_pot_pattern",
+    "worldgen/block_state_provider",
     "banner_pattern",
     "chat_type",
     "damage_type",
@@ -198,6 +203,50 @@ pub fn load_vanilla() -> Result<VanillaData> {
 }
 #[cfg(test)]
 mod tests {
+    /// 26.3 `RegistryDataLoader.SYNCHRONIZED_REGISTRIES`, dumped from the vanilla classes.
+    #[test]
+    fn synchronized_registries_match_vanilla_26_3() {
+        let vanilla = [
+            "worldgen/biome",
+            "chat_type",
+            "trim_pattern",
+            "trim_material",
+            "wolf_variant",
+            "wolf_sound_variant",
+            "pig_variant",
+            "pig_sound_variant",
+            "frog_variant",
+            "cat_variant",
+            "cat_sound_variant",
+            "cow_sound_variant",
+            "cow_variant",
+            "chicken_sound_variant",
+            "chicken_variant",
+            "zombie_nautilus_variant",
+            "painting_variant",
+            "sulfur_cube_archetype",
+            "dimension_type",
+            "damage_type",
+            "banner_pattern",
+            "enchantment",
+            "jukebox_song",
+            "instrument",
+            "test_environment",
+            "test_instance",
+            "dialog",
+            "world_clock",
+            "timeline",
+            "decorated_pot_pattern",
+            "block_transformer",
+            "worldgen/block_state_provider",
+        ];
+        let mut ours: Vec<_> = super::SYNCHRONIZED.to_vec();
+        let mut vanilla = vanilla.to_vec();
+        ours.sort_unstable();
+        vanilla.sort_unstable();
+        assert_eq!(ours, vanilla);
+    }
+
     use super::*;
     #[test]
     fn resolves_nested_and_optional_tags_and_rejects_cycles() {

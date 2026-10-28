@@ -56,7 +56,7 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(Wire::new(stream), config, key).await {
-                tracing::debug!(%peer, %error, "connection closed");
+                tracing::info!(%peer, %error, "connection closed");
             }
         });
     }
@@ -391,6 +391,7 @@ async fn play(
 ) -> Result<()> {
     use ferrite_protocol::packets::play::{PlayDisconnect, PlayKeepAlive};
     use game::{GameMessage, Outbound};
+    tracing::info!(name = %profile.name, "entering play");
     let game = config.game.context("game loop unavailable")?;
     let dimension_type = vanilla.registries["minecraft:dimension_type"]
         .iter()
@@ -421,7 +422,7 @@ async fn play(
         let mut tick=tokio::time::interval(std::time::Duration::from_millis(50));
         let mut keepalive=tokio::time::interval_at(tokio::time::Instant::now()+std::time::Duration::from_secs(10),std::time::Duration::from_secs(10));
         loop {tokio::select! {
-            _=tick.tick()=>{let mut batch=Vec::new();let mut close=false;while let Ok(msg)=queue.try_recv(){match msg {Outbound::Packet(body)=>encoder.encode(&body,&mut batch),Outbound::Disconnect(reason)=>{let mut body=Vec::new();encode_packet(&PlayDisconnect {reason:ferrite_protocol::types::PlainText(reason)},&mut body);encoder.encode(&body,&mut batch);close=true;break;}}} if !batch.is_empty(){stream.write_all(&batch).await?;}
+            _=tick.tick()=>{let mut batch=Vec::new();let mut close=false;while let Ok(msg)=queue.try_recv(){match msg {Outbound::Packet(body)=>{tracing::debug!(id=?ferrite_protocol::VarInt::decode_partial(&body).ok().flatten().map(|v| v.0),len=body.len(),"play packet out");encoder.encode(&body,&mut batch)},Outbound::Disconnect(reason)=>{let mut body=Vec::new();encode_packet(&PlayDisconnect {reason:ferrite_protocol::types::PlainText(reason)},&mut body);encoder.encode(&body,&mut batch);close=true;break;}}} if !batch.is_empty(){stream.write_all(&batch).await?;}
                 if close{return Ok(());}},
             _=keepalive.tick()=>{send_compressed(&mut stream,&encoder,&PlayKeepAlive{id:1}).await?;},
             frame=read_packet(&mut stream,&mut decoder)=>{let frame=frame?;if let Some(packet)=game::decode_play(&frame)?{game.send(GameMessage::Input {session,uuid,packet}).map_err(|_|anyhow::anyhow!("game loop stopped"))?;}}
