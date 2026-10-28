@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-worldgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed Minecraft Java 26.3 world generation data (noise, density functions, biomes, dimensions)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
