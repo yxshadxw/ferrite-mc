@@ -10,10 +10,17 @@ fn plugin_lifecycle() {
             return;
         }
     };
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../java/ferrite-api-impl");
+    // Build a clean path: `cmd.exe` mishandles a cwd that mixes `\`, `/` and `..`.
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate lives in <repo>/crates/<name>")
+        .to_owned();
+    let project = repo_root.join("java").join("ferrite-api-impl");
     let mut command = if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.args(["/C", "gradlew.bat", "build"]);
+        // `cmd` may not search the cwd (NoDefaultCurrentDirectoryInExePath), so be explicit.
+        c.args(["/C", ".\\gradlew.bat", "build"]);
         c
     } else {
         let mut c = Command::new("./gradlew");
@@ -23,17 +30,31 @@ fn plugin_lifecycle() {
     let result = command
         .current_dir(&project)
         .env("JAVA_HOME", &java_home)
-        .status()
+        .output()
         .unwrap();
-    assert!(result.success());
+    assert!(
+        result.status.success(),
+        "gradle build failed in {}:
+{}
+{}",
+        project.display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let dir = tempfile::tempdir().unwrap();
     std::fs::copy(
-        project.join("../test-plugin/build/libs/test-plugin.jar"),
+        repo_root
+            .join("java")
+            .join("test-plugin")
+            .join("build/libs/test-plugin.jar"),
         dir.path().join("test.jar"),
     )
     .unwrap();
     std::fs::copy(
-        project.join("../test-plugin/build/libs/test-plugin-legacy.jar"),
+        repo_root
+            .join("java")
+            .join("test-plugin")
+            .join("build/libs/test-plugin-legacy.jar"),
         dir.path().join("legacy.jar"),
     )
     .unwrap();
