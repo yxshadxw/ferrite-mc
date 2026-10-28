@@ -74,8 +74,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const CACHE_LIMIT: usize = 256;
-const PENDING_LIMIT: usize = 32;
+const CACHE_LIMIT: usize = 4096;
+const PENDING_LIMIT: usize = 128;
 enum Entry {
     Pending(u64),
     Ready(Result<Box<Column>, String>, u64),

@@ -42,6 +42,9 @@ pub enum Signal {
         held: Vec<ChunkPos>,
     },
 }
+/// How many queued chunks to request ahead of the batch being sent.
+const PREFETCH_CHUNKS: usize = 96;
+
 pub struct Player {
     pub uuid: Uuid,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
@@ -172,6 +175,13 @@ impl Player {
     fn chunks_tick(&mut self, generator: &mut FlatGenerator) {
         if self.awaiting_batch || self.queue.is_empty() {
             return;
+        }
+        // Start loading the whole head of the queue at once; `get` hands back chunks that are ready
+        // and spawns background loads for the rest. Without this, chunks became ready one per tick.
+        if let Some(source) = &self.source {
+            for &(x, z) in self.queue.iter().take(PREFETCH_CHUNKS) {
+                let _ = source.get(x, z, self.biome);
+            }
         }
         let mut tracking = self.tracking.lock().unwrap();
         let count = (self.rate.clamp(1.0, 64.0) as usize).min(self.queue.len());
@@ -450,7 +460,19 @@ impl Player {
                 break;
             }
             let msg = match command {
-                Command::Leave => return false,
+                Command::Leave => {
+                    super::playerdata::save(
+                        &self.uuid,
+                        &super::playerdata::Saved::capture(
+                            self.pos,
+                            self.yaw,
+                            self.pitch,
+                            self.gamemode,
+                            &self.inventory,
+                        ),
+                    );
+                    return false;
+                }
                 Command::SetMode(mode) => {
                     self.gamemode = mode;
                     send(
