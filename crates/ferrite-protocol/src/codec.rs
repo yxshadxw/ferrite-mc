@@ -315,4 +315,90 @@ mod tests {
         assert_eq!(VarInt::decode_partial(&[0x80]).unwrap(), None);
         assert!(VarInt::decode_partial(&[0x80; 5]).is_err());
     }
+
+    #[test]
+    fn decode_partial_every_prefix_of_five_byte_varint() {
+        for v in [i32::MIN, -1, i32::MAX, 0x1234_5678] {
+            let mut bytes = Vec::new();
+            VarInt(v).encode(&mut bytes);
+            assert_eq!(bytes.len(), VarInt::MAX_LEN, "{v} should encode to 5 bytes");
+            for n in 0..bytes.len() {
+                assert_eq!(
+                    VarInt::decode_partial(&bytes[..n]).unwrap(),
+                    None,
+                    "prefix of {n} bytes of {v} should need more input"
+                );
+            }
+            assert_eq!(VarInt::decode_partial(&bytes).unwrap(), Some((v, 5)));
+        }
+    }
+
+    #[test]
+    fn varlong_max_len_and_overlong() {
+        for v in [-1, i64::MIN] {
+            let mut bytes = Vec::new();
+            VarLong(v).encode(&mut bytes);
+            assert_eq!(bytes.len(), 10, "{v} should encode to 10 bytes");
+            let mut s = bytes.as_slice();
+            assert_eq!(VarLong::decode(&mut s).unwrap(), VarLong(v));
+            assert!(s.is_empty());
+        }
+
+        // 11 continuation bytes: the decoder must stop after 10 and error.
+        let overlong = [0xffu8; 11];
+        let mut s = overlong.as_slice();
+        assert!(matches!(
+            VarLong::decode(&mut s),
+            Err(DecodeError::VarIntTooLong)
+        ));
+    }
+
+    #[test]
+    fn decode_string_rejects_negative_and_oversized_lengths() {
+        let mut bytes = Vec::new();
+        VarInt(-1).encode(&mut bytes);
+        bytes.extend_from_slice(b"abc");
+        let mut s = bytes.as_slice();
+        assert!(matches!(
+            decode_string(&mut s, 16),
+            Err(DecodeError::Invalid("negative string length"))
+        ));
+
+        let mut bytes = Vec::new();
+        VarInt(100).encode(&mut bytes);
+        let mut s = bytes.as_slice();
+        // 100 bytes is above the wire cap of 3 * max_chars = 30.
+        assert!(matches!(
+            decode_string(&mut s, 10),
+            Err(DecodeError::StringTooLong(100, 30))
+        ));
+    }
+
+    #[test]
+    fn vec_decode_huge_length_short_input_is_eof() {
+        // One-byte elements: the capacity cap means only the 3 buffered bytes are
+        // read before the fourth element hits end of input.
+        let mut bytes = Vec::new();
+        VarInt(i32::MAX).encode(&mut bytes);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let mut s = bytes.as_slice();
+        assert!(matches!(Vec::<u8>::decode(&mut s), Err(DecodeError::Eof)));
+
+        // Multi-byte elements: the first element already runs out of input.
+        let mut bytes = Vec::new();
+        VarInt(i32::MAX).encode(&mut bytes);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let mut s = bytes.as_slice();
+        assert!(matches!(Vec::<u32>::decode(&mut s), Err(DecodeError::Eof)));
+    }
+
+    #[test]
+    fn bool_decode_rejects_non_boolean() {
+        let buf = [2u8];
+        let mut s = buf.as_slice();
+        assert!(matches!(
+            bool::decode(&mut s),
+            Err(DecodeError::Invalid("bool"))
+        ));
+    }
 }

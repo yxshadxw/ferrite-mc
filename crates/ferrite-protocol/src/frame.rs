@@ -138,4 +138,57 @@ mod tests {
         roundtrip(Some(256), b"\x00hello");
         roundtrip(Some(256), &big);
     }
+
+    #[test]
+    fn frame_len_above_max_rejected() {
+        let mut dec = FrameDecoder::default();
+        let mut wire = Vec::new();
+        VarInt(MAX_FRAME_LEN as i32 + 1).encode(&mut wire);
+        dec.feed(&wire);
+        assert!(matches!(
+            dec.next_frame(),
+            Err(DecodeError::Invalid("frame too large"))
+        ));
+
+        // The limit itself is accepted; only the body is still missing.
+        let mut dec = FrameDecoder::default();
+        let mut wire = Vec::new();
+        VarInt(MAX_FRAME_LEN as i32).encode(&mut wire);
+        dec.feed(&wire);
+        assert!(dec.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn compressed_data_len_above_max_rejected() {
+        let mut frame = Vec::new();
+        VarInt(MAX_UNCOMPRESSED_LEN as i32 + 1).encode(&mut frame);
+        frame.extend_from_slice(&[0; 8]);
+
+        let mut dec = FrameDecoder::default();
+        dec.set_compression(Some(0));
+        let mut wire = Vec::new();
+        VarInt(frame.len() as i32).encode(&mut wire);
+        wire.extend_from_slice(&frame);
+        dec.feed(&wire);
+        assert!(matches!(
+            dec.next_frame(),
+            Err(DecodeError::Invalid("decompressed packet too large"))
+        ));
+    }
+
+    #[test]
+    fn corrupt_zlib_payload_errors() {
+        let mut frame = Vec::new();
+        VarInt(64).encode(&mut frame);
+        // Invalid zlib header (CM nibble is 14, not 8).
+        frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33]);
+
+        let mut dec = FrameDecoder::default();
+        dec.set_compression(Some(0));
+        let mut wire = Vec::new();
+        VarInt(frame.len() as i32).encode(&mut wire);
+        wire.extend_from_slice(&frame);
+        dec.feed(&wire);
+        assert!(matches!(dec.next_frame(), Err(DecodeError::Invalid(_))));
+    }
 }
