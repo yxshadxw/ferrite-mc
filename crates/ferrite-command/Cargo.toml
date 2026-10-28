@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Brigadier-style command dispatcher, vanilla argument parsers and Commands packet serialization"
+
+[dependencies]
+ferrite-protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
