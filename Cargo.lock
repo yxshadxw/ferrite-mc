@@ -668,6 +668,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-protocol-translate"
+version = "0.1.0"
+dependencies = [
+ "ferrite-protocol",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "ferrite-recipe"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ferrite-region"
 version = "0.1.0"
 dependencies = [
@@ -681,6 +699,9 @@ name = "ferrite-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ferrite-command",
+ "ferrite-data",
+ "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",
  "ferrite-protocol",

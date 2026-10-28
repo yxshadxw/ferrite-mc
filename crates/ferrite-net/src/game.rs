@@ -7,6 +7,10 @@ use uuid::Uuid;
 /// Messages decoded from a play connection, with no world state in the transport.
 #[derive(Debug, Clone)]
 pub enum ServerboundPlay {
+    PlayerAction(PlayerAction),
+    UseItemOn(UseItemOn),
+    SetHeldItem(SetHeldItem),
+    CreativeSlot(CreativeSlot),
     Position(MovePosition),
     PositionRotation(MovePositionRotation),
     Rotation(MoveRotation),
@@ -70,10 +74,36 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         )),
         32 => Some(ServerboundPlay::Rotation(MoveRotation::decode(&mut b)?)),
         33 => Some(ServerboundPlay::Flags(MoveFlags::decode(&mut b)?)),
+        41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
+        54 => Some(ServerboundPlay::SetHeldItem(SetHeldItem::decode(&mut b)?)),
+        57 => Some(ServerboundPlay::CreativeSlot(CreativeSlot::decode(&mut b)?)),
+        66 => Some(ServerboundPlay::UseItemOn(UseItemOn::decode(&mut b)?)),
         44 => {
             PlayerLoaded::decode(&mut b)?;
             Some(ServerboundPlay::Loaded)
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    #[test]
+    fn routes_interaction_packets() {
+        let mut bytes = Vec::new();
+        encode_packet(
+            &PlayerAction {
+                status: VarInt(0),
+                location: 0,
+                face: 1,
+                sequence: VarInt(3),
+            },
+            &mut bytes,
+        );
+        assert!(matches!(
+            decode_play(&bytes).unwrap(),
+            Some(ServerboundPlay::PlayerAction(_))
+        ));
+    }
 }

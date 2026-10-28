@@ -368,3 +368,126 @@ fn read_palette_value(data: &mut &[u8], entries: usize, max_local_bits: u8, inde
         palette[value]
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_teleport_command_moves_player() {
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.raw(7, "tp 10 70 20").await;
+    let body = bot.until(73).await;
+    let p = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert_eq!([p.x, p.y, p.z], [10.0, 70.0, 20.0]);
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creative_slot_updates_player_inventory() {
+    use ferrite_protocol::packets::play::{ContainerSlot, CreativeSlot, ItemStack};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 3,
+            item_id: 1,
+        },
+    })
+    .await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(3), bot.until(20))
+        .await
+        .unwrap();
+    let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(slot.slot, 36);
+    assert_eq!(
+        slot.item,
+        ItemStack {
+            count: 3,
+            item_id: 1
+        }
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creative_break_broadcasts_to_tracking_player() {
+    use ferrite_protocol::{
+        packets::play::{BlockUpdate, MoveRotation, PlayerAction},
+        types::BlockPos,
+    };
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut miner = Bot::join(addr, "Miner").await;
+    let mut observer = Bot::join(addr, "Observer").await;
+    observer.until(46).await;
+    miner
+        .send(&MoveRotation {
+            yaw: 0.0,
+            pitch: 90.0,
+            flags: 1,
+        })
+        .await;
+    miner
+        .send(&PlayerAction {
+            status: VarInt(0),
+            location: BlockPos::new(0, 64, 0).pack(),
+            face: 1,
+            sequence: VarInt(8),
+        })
+        .await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), observer.until(8))
+        .await
+        .unwrap();
+    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(BlockPos::unpack(update.location), BlockPos::new(0, 64, 0));
+    assert_eq!(update.block_state.0, 0);
+    drop(miner);
+    drop(observer);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

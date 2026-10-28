@@ -14,13 +14,15 @@ use uuid::Uuid;
 pub enum Command {
     Input(ServerboundPlay),
     Leave,
+    SetMode(i32),
+    Teleport([f64; 3]),
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub enum Signal {
     Transfer {
         from: ChunkPos,
         to: ChunkPos,
-        player: Player,
+        player: Box<Player>,
     },
     Hold {
         chunk: ChunkPos,
@@ -51,6 +53,9 @@ pub struct Player {
     pub outbound: UnboundedSender<Outbound>,
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
+    pub gamemode: i32,
+    pub inventory: [ItemStack; 46],
+    pub held_slot: u8,
     pub view: i32,
     pub pending_teleport: Option<i32>,
     pub next_teleport: i32,
@@ -215,10 +220,49 @@ impl Player {
         let start = self.pos;
         let mut changed = false;
         for command in commands {
-            let Command::Input(msg) = command else {
-                return false;
+            let msg = match command {
+                Command::Leave => return false,
+                Command::SetMode(mode) => {
+                    self.gamemode = mode;
+                    send(
+                        self,
+                        &GameEvent {
+                            event: 3,
+                            value: mode as f32,
+                        },
+                    );
+                    continue;
+                }
+                Command::Teleport(pos) => {
+                    if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
+                        self.pos = pos;
+                        self.teleport();
+                        changed = true;
+                    }
+                    continue;
+                }
+                Command::Input(msg) => msg,
             };
             match msg {
+                ServerboundPlay::SetHeldItem(p) => {
+                    if (0..=8).contains(&p.slot) {
+                        self.held_slot = p.slot as u8;
+                    }
+                }
+                ServerboundPlay::CreativeSlot(p) => {
+                    if self.gamemode == 1 && (0..46).contains(&p.slot) {
+                        self.inventory[p.slot as usize] = p.item;
+                        send(
+                            self,
+                            &ContainerSlot {
+                                window: VarInt(0),
+                                state: VarInt(0),
+                                slot: p.slot,
+                                item: p.item,
+                            },
+                        );
+                    }
+                }
                 ServerboundPlay::Confirm(p) => {
                     if self.pending_teleport == Some(p.id.0) {
                         self.pending_teleport = None;
@@ -308,7 +352,7 @@ impl Region {
                 let _ = tx.send(Signal::Transfer {
                     from,
                     to: next,
-                    player: p,
+                    player: Box::new(p),
                 });
                 continue;
             }

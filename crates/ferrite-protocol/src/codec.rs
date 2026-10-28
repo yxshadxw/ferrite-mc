@@ -75,17 +75,49 @@ impl VarInt {
     /// Encoded length in bytes (1..=5).
     #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
-        match self.0 as u32 {
-            0..=0x7f => 1,
-            0x80..=0x3fff => 2,
-            0x4000..=0x1f_ffff => 3,
-            0x20_0000..=0xfff_ffff => 4,
-            _ => 5,
-        }
+        // 7 payload bits per byte; `| 1` keeps zero at one byte without a branch.
+        let bits = 32 - (self.0 as u32).leading_zeros();
+        (bits | 1).div_ceil(7) as usize
     }
 
     /// Decode from a partial buffer: `Ok(None)` means more bytes are needed.
+    #[inline]
     pub fn decode_partial(buf: &[u8]) -> Result<Option<(i32, usize)>, DecodeError> {
+        let Some(&first) = buf.first() else {
+            return Ok(None);
+        };
+        // One- and two-byte values dominate packet data and exit with one test.
+        if first & 0x80 == 0 {
+            return Ok(Some((i32::from(first), 1)));
+        }
+        if let Some(&second) = buf.get(1) {
+            if second & 0x80 == 0 {
+                let value = i32::from(first & 0x7f) | i32::from(second & 0x7f) << 7;
+                return Ok(Some((value, 2)));
+            }
+        }
+        // Fast path: with five bytes available, the terminator position and the
+        // value come from one 32-bit load instead of a branch per byte.
+        if let Some(b) = buf.first_chunk::<5>() {
+            // The continuation bits identify the terminator: one 32-bit compare
+            // instead of a branch per byte.
+            let stop = !u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x8080_8080;
+            let raw = u32::from(b[0] & 0x7f)
+                | u32::from(b[1] & 0x7f) << 7
+                | u32::from(b[2] & 0x7f) << 14
+                | u32::from(b[3] & 0x7f) << 21
+                | u32::from(b[4] & 0x7f) << 28;
+            let len = if stop != 0 {
+                stop.trailing_zeros() as usize / 8 + 1
+            } else if b[4] & 0x80 == 0 {
+                5
+            } else {
+                return Err(DecodeError::VarIntTooLong);
+            };
+            // Discard bytes past the terminator; len == 5 keeps all 32 bits.
+            let mask = u32::MAX >> 32u32.saturating_sub((7 * len) as u32);
+            return Ok(Some(((raw & mask) as i32, len)));
+        }
         let mut value = 0u32;
         for i in 0..Self::MAX_LEN {
             let Some(&b) = buf.get(i) else {
@@ -101,15 +133,29 @@ impl VarInt {
 }
 
 impl Encode for VarInt {
+    #[inline]
     fn encode(&self, out: &mut Vec<u8>) {
         let mut v = self.0 as u32;
+        let mut buf = [0u8; Self::MAX_LEN];
+        let mut len = 0;
         loop {
             if v & !0x7f == 0 {
-                out.push(v as u8);
-                return;
+                buf[len] = v as u8;
+                len += 1;
+                break;
             }
-            out.push((v as u8 & 0x7f) | 0x80);
+            buf[len] = (v as u8 & 0x7f) | 0x80;
+            len += 1;
             v >>= 7;
+        }
+        // One extend per call. Matching on the length keeps every copy a
+        // compile-time size, which inlines to stores instead of a memcpy call.
+        match len {
+            1 => out.extend_from_slice(&buf[..1]),
+            2 => out.extend_from_slice(&buf[..2]),
+            3 => out.extend_from_slice(&buf[..3]),
+            4 => out.extend_from_slice(&buf[..4]),
+            _ => out.extend_from_slice(&buf),
         }
     }
 }
@@ -129,20 +175,64 @@ impl Decode for VarInt {
 pub struct VarLong(pub i64);
 
 impl Encode for VarLong {
+    #[inline]
     fn encode(&self, out: &mut Vec<u8>) {
         let mut v = self.0 as u64;
+        let mut buf = [0u8; 10];
+        let mut len = 0;
         loop {
             if v & !0x7f == 0 {
-                out.push(v as u8);
-                return;
+                buf[len] = v as u8;
+                len += 1;
+                break;
             }
-            out.push((v as u8 & 0x7f) | 0x80);
+            buf[len] = (v as u8 & 0x7f) | 0x80;
+            len += 1;
             v >>= 7;
         }
+        out.extend_from_slice(&buf[..len]);
     }
 }
 impl Decode for VarLong {
+    #[inline]
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let Some(&first) = buf.first() else {
+            return Err(DecodeError::Eof);
+        };
+        if first & 0x80 == 0 {
+            *buf = &buf[1..];
+            return Ok(VarLong(i64::from(first)));
+        }
+        // Fast path: a full ten-byte window exposes the terminator from two
+        // 64-bit loads without a branch per byte.
+        if let Some(b) = buf.first_chunk::<10>() {
+            // The continuation bits identify the terminator: one 64-bit compare
+            // instead of a branch per byte.
+            let stop = !u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                & 0x8080_8080_8080_8080;
+            let raw = u64::from(b[0] & 0x7f)
+                | u64::from(b[1] & 0x7f) << 7
+                | u64::from(b[2] & 0x7f) << 14
+                | u64::from(b[3] & 0x7f) << 21
+                | u64::from(b[4] & 0x7f) << 28
+                | u64::from(b[5] & 0x7f) << 35
+                | u64::from(b[6] & 0x7f) << 42
+                | u64::from(b[7] & 0x7f) << 49
+                | u64::from(b[8] & 0x7f) << 56
+                | u64::from(b[9] & 0x7f) << 63;
+            let len = if stop != 0 {
+                stop.trailing_zeros() as usize / 8 + 1
+            } else if b[8] & 0x80 == 0 {
+                9
+            } else if b[9] & 0x80 == 0 {
+                10
+            } else {
+                return Err(DecodeError::VarIntTooLong);
+            };
+            let mask = u64::MAX >> 64u32.saturating_sub((7 * len) as u32);
+            *buf = &buf[len..];
+            return Ok(VarLong((raw & mask) as i64));
+        }
         let mut value = 0u64;
         for i in 0..10 {
             let b = u8::decode(buf)?;

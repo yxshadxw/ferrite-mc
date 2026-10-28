@@ -13,6 +13,7 @@ pub struct GlobalPlayer {
     pub entity: i32,
     pub name: String,
     pub properties: Vec<Property>,
+    pub game_mode: i32,
     pub outbound: UnboundedSender<Outbound>,
     pub pos: [f64; 3],
     pub yaw: f32,
@@ -32,6 +33,7 @@ impl GlobalPlayer {
             entity,
             name,
             properties,
+            game_mode: 1,
             outbound,
             pos: [0.5, 65.0, 0.5],
             yaw: 0.0,
@@ -44,6 +46,7 @@ impl GlobalPlayer {
             uuid: self.uuid,
             name: self.name.clone(),
             properties: self.properties.clone(),
+            game_mode: VarInt(self.game_mode),
         }
     }
 }
@@ -75,6 +78,21 @@ impl GlobalRegion {
             p.pitch = pitch;
             p.ground = ground;
         }
+    }
+    pub fn set_mode(&mut self, id: Uuid, mode: i32) {
+        if let Some(player) = self.players.get_mut(&id) {
+            player.game_mode = mode;
+        }
+        let update = PlayerGameMode {
+            uuid: id,
+            game_mode: VarInt(mode),
+        };
+        for player in self.players.values() {
+            send(player, &update);
+        }
+    }
+    pub fn say(&self, message: &str) {
+        self.broadcast(message);
     }
     pub fn chat(&mut self, id: Uuid, msg: &str) {
         if let Some(p) = self.players.get(&id) {

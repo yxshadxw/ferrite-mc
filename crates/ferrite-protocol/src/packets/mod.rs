@@ -207,6 +207,7 @@ mod play_tests {
             uuid: uuid::Uuid::nil(),
             name: "Steve".into(),
             properties: vec![],
+            game_mode: VarInt(1),
         });
         rt(PlayLogin {
             entity_id: 1,
@@ -252,10 +253,11 @@ mod multiplayer_tests {
             uuid: uuid::Uuid::nil(),
             name: "Steve".into(),
             properties: vec![],
+            game_mode: VarInt(1),
         };
         let mut b = Vec::new();
         info.encode(&mut b);
-        assert_eq!(b[0], 9);
+        assert_eq!(b[0], 13);
         assert_eq!(b[b.len() - 1], 1);
     }
     #[test]
