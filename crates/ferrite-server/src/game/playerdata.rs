@@ -19,7 +19,17 @@ pub fn init(dir: PathBuf) {
 }
 
 fn dir() -> &'static Path {
-    DIR.get().map_or(Path::new("playerdata"), PathBuf::as_path)
+    if let Some(dir) = DIR.get() {
+        return dir;
+    }
+    if cfg!(test) {
+        // Unit tests must not resume from (or leave behind) a previous run's saved positions.
+        static TEST_DIR: OnceLock<PathBuf> = OnceLock::new();
+        return TEST_DIR.get_or_init(|| {
+            std::env::temp_dir().join(format!("ferrite-test-playerdata-{}", std::process::id()))
+        });
+    }
+    Path::new("playerdata")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
