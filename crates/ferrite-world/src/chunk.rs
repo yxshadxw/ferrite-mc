@@ -11,6 +11,12 @@ pub struct BlockFlags {
 }
 pub trait BlockInfo {
     fn flags(&self, state: u32) -> BlockFlags;
+    fn randomly_ticking(&self, _state: u32) -> bool {
+        false
+    }
+    fn fluid_randomly_ticking(&self, _state: u32) -> bool {
+        false
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -53,6 +59,8 @@ pub struct ChunkSection {
     pub(crate) biomes: PalettedContainer,
     pub(crate) block_count: u16,
     pub(crate) fluid_count: u16,
+    pub(crate) random_blocks: u16,
+    pub(crate) random_fluids: u16,
 }
 impl ChunkSection {
     pub fn new(air: u32, biome: u32, block_bits: u8, biome_bits: u8) -> Result<Self, ChunkError> {
@@ -61,6 +69,8 @@ impl ChunkSection {
             biomes: PalettedContainer::new(PaletteKind::Biomes, biome, biome_bits)?,
             block_count: 0,
             fluid_count: 0,
+            random_blocks: 0,
+            random_fluids: 0,
         })
     }
     pub fn block_count(&self) -> u16 {
@@ -68,6 +78,15 @@ impl ChunkSection {
     }
     pub fn fluid_count(&self) -> u16 {
         self.fluid_count
+    }
+    pub fn randomly_ticking_block_count(&self) -> u16 {
+        self.random_blocks
+    }
+    pub fn randomly_ticking_fluid_count(&self) -> u16 {
+        self.random_fluids
+    }
+    pub fn is_randomly_ticking(&self) -> bool {
+        self.random_blocks != 0 || self.random_fluids != 0
     }
     pub fn blocks(&self) -> &PalettedContainer {
         &self.blocks
@@ -86,6 +105,24 @@ impl ChunkSection {
     ) -> Result<(), ChunkError> {
         let old = self.blocks.get(index).ok_or(ChunkError::Bounds)?;
         self.blocks.set(index, value)?;
+        for (count, was, is) in [
+            (
+                &mut self.random_blocks,
+                info.randomly_ticking(old),
+                info.randomly_ticking(value),
+            ),
+            (
+                &mut self.random_fluids,
+                info.fluid_randomly_ticking(old),
+                info.fluid_randomly_ticking(value),
+            ),
+        ] {
+            match (was, is) {
+                (false, true) => *count += 1,
+                (true, false) => *count -= 1,
+                _ => {}
+            }
+        }
         let old_flags = info.flags(old);
         let new_flags = info.flags(value);
         match (old_flags.fluid, new_flags.fluid) {

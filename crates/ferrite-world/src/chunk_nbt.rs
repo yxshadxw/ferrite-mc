@@ -190,11 +190,19 @@ pub fn chunk_from_nbt(
         let fluid_count = (0..4096)
             .filter(|&i| registry.flags(blocks.get(i).unwrap()).fluid)
             .count() as u16;
+        let random_blocks = (0..4096)
+            .filter(|&i| registry.randomly_ticking(blocks.get(i).unwrap()))
+            .count() as u16;
+        let random_fluids = (0..4096)
+            .filter(|&i| registry.fluid_randomly_ticking(blocks.get(i).unwrap()))
+            .count() as u16;
         chunk.sections[idx as usize] = ChunkSection {
             blocks,
             biomes,
             block_count: count,
             fluid_count,
+            random_blocks,
+            random_fluids,
         };
     }
     if let Some(Tag::List(List::Compound(entities))) = root.get("block_entities") {

@@ -166,6 +166,31 @@ impl BlockStateRegistry for RuntimeRegistry {
 }
 /// Vanilla state properties, indexed by the global state ID.
 impl BlockInfo for RuntimeRegistry {
+    fn randomly_ticking(&self, id: u32) -> bool {
+        u16::try_from(id)
+            .ok()
+            .filter(|&id| {
+                usize::from(id) < ferrite_data::block_props::STATE_COUNT
+                    && self.block_state(u32::from(id)).is_some()
+            })
+            .is_some_and(|id| ferrite_data::block_props::get(id).randomly_ticking)
+    }
+    fn fluid_randomly_ticking(&self, id: u32) -> bool {
+        // The 26.3 server jar overrides Fluid.isRandomlyTicking only in LavaFluid.
+        use ferrite_data::block_props::FluidKind;
+        u16::try_from(id)
+            .ok()
+            .filter(|&id| {
+                usize::from(id) < ferrite_data::block_props::STATE_COUNT
+                    && self.block_state(u32::from(id)).is_some()
+            })
+            .is_some_and(|id| {
+                matches!(
+                    ferrite_data::block_props::get(id).fluid,
+                    Some((FluidKind::Lava | FluidKind::FlowingLava, _, _))
+                )
+            })
+    }
     fn flags(&self, id: u32) -> BlockFlags {
         let Ok(id) = u16::try_from(id) else {
             return BlockFlags::default();

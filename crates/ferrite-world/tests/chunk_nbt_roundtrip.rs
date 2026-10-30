@@ -1,6 +1,7 @@
 use ferrite_nbt::{Compound, List, Tag, binary};
 use ferrite_world::{
-    BlockEntity, BlockStateRegistry, RegionFile, RuntimeRegistry, chunk_from_nbt, chunk_to_nbt,
+    BlockEntity, BlockInfo, BlockStateRegistry, RegionFile, RuntimeRegistry, chunk_from_nbt,
+    chunk_to_nbt,
 };
 
 fn fixture(full: bool) -> (Tag, RuntimeRegistry) {
@@ -51,6 +52,13 @@ fn full_chunk_preserves_entities_biomes_light_and_unknown_metadata() {
         &[("type", "bottom"), ("waterlogged", "true")],
     )
     .unwrap() as u32;
+    let lava = ferrite_data::blocks::default_state("lava").unwrap() as u32;
+    let grass = ferrite_data::blocks::default_state("grass_block").unwrap() as u32;
+    chunk.set_block(0, 300, 0, lava, &registry).unwrap();
+    chunk.set_block(1, 300, 0, grass, &registry).unwrap();
+    assert!(chunk.sections()[22].is_randomly_ticking());
+    assert!(chunk.sections()[22].randomly_ticking_block_count() > 0);
+    assert!(chunk.sections()[22].randomly_ticking_fluid_count() > 0);
     chunk.set_block(0, 319, 0, water, &registry).unwrap();
     chunk.set_block(1, 319, 0, slab, &registry).unwrap();
     assert_eq!(chunk.sections().last().unwrap().fluid_count(), 2);
@@ -94,6 +102,20 @@ fn full_chunk_preserves_entities_biomes_light_and_unknown_metadata() {
             assert_eq!(a.biomes().get(i), b.biomes().get(i));
         }
         assert_eq!(a.fluid_count(), b.fluid_count());
+        assert_eq!(
+            b.block_count(),
+            (0..4096)
+                .filter(|&i| !registry.flags(b.blocks().get(i).unwrap()).air)
+                .count() as u16
+        );
+        let random_blocks = (0..4096)
+            .filter(|&i| registry.randomly_ticking(b.blocks().get(i).unwrap()))
+            .count() as u16;
+        let random_fluids = (0..4096)
+            .filter(|&i| registry.fluid_randomly_ticking(b.blocks().get(i).unwrap()))
+            .count() as u16;
+        assert_eq!(b.randomly_ticking_block_count(), random_blocks);
+        assert_eq!(b.randomly_ticking_fluid_count(), random_fluids);
     }
 }
 
