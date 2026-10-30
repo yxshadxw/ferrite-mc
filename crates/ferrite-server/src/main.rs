@@ -23,6 +23,8 @@ struct Config {
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
     plugin_bridge: Option<std::path::PathBuf>,
+    /// Enforce `whitelist.json` for new connections.
+    whitelist: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +107,7 @@ impl Default for Config {
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
             plugin_bridge: None,
+            whitelist: false,
         }
     }
 }
@@ -129,6 +132,8 @@ async fn main() -> anyhow::Result<()> {
             "online-mode is ignored when player forwarding is enabled; authenticate players on the proxy"
         );
     }
+    let admin =
+        std::sync::Arc::new(ferrite_admin::AdminLists::load(".").context("loading admin lists")?);
     if !config.online_mode && !ops.is_empty() {
         tracing::warn!(
             "operator UUIDs in offline mode must be offline-mode UUIDs; player names are not authenticated"
@@ -162,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
         plugins: plugin_bridge
             .as_ref()
             .map(ferrite_server::plugins::PluginBridge::hooks),
+        admin: Some(admin),
+        whitelist: config.whitelist,
     };
     game::playerdata::init(
         config
@@ -206,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    let mut stopped = world.stop_signal();
     let result = loop {
         tokio::select! {
             result = &mut server => break Some(result),
@@ -215,6 +223,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(false) => {},
                 Err(error) => tracing::warn!(%error, "console command failed"),
             },
+            _ = async {
+                loop {
+                    if *stopped.borrow() { break; }
+                    if stopped.changed().await.is_err() { break; }
+                }
+            } => break None,
         }
     };
     let world_result = world.shutdown().await;

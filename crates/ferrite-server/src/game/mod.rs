@@ -11,6 +11,7 @@ mod chat;
 mod chunk;
 mod commands;
 mod drops;
+mod feedback;
 pub mod interaction;
 mod profile;
 #[cfg(test)]
@@ -41,6 +42,7 @@ use self::{
     global::{GlobalPlayer, GlobalRegion},
     region::{Command, Mailbox, Player, Region, Signal, TickContext},
 };
+use ferrite_admin::AdminLists;
 use ferrite_net::game::{self, GameMessage, Outbound, ServerboundPlay};
 use ferrite_protocol::{Encode, VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, Regionizer, Scheduler};
@@ -64,6 +66,10 @@ pub struct WorldSettings {
     pub ops: Vec<Operator>,
     /// Plugin event and command hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
+    /// Vanilla `ops.json`/`whitelist.json`/ban lists, when the server has a data directory.
+    pub admin: Option<Arc<AdminLists>>,
+    /// Whether the whitelist starts enabled.
+    pub whitelist: bool,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -79,6 +85,8 @@ impl Default for WorldSettings {
             gamemode: 1,
             ops: Vec::new(),
             plugins: None,
+            admin: None,
+            whitelist: false,
         }
     }
 }
@@ -92,6 +100,7 @@ pub struct World {
     profiler: Arc<profile::Profiler>,
     random_tick_speed: Arc<AtomicU32>,
     source: Arc<anvil::AnvilChunkSource>,
+    stop: tokio::sync::watch::Receiver<bool>,
 }
 impl World {
     pub fn start() -> Self {
@@ -119,6 +128,7 @@ impl World {
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
         drops::preload();
+        let (stop_tx, stop) = tokio::sync::watch::channel(false);
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
         let random_tick_speed = Arc::new(AtomicU32::new(3));
@@ -126,6 +136,7 @@ impl World {
             random_tick_speed: Arc::clone(&random_tick_speed),
             tick_samples: tick_samples.clone(),
             profiler: Arc::clone(&profiler),
+            stop: stop_tx,
         };
         let task = tokio::spawn(run(
             Channels {
@@ -148,10 +159,20 @@ impl World {
             profiler,
             random_tick_speed,
             source,
+            stop,
         }
     }
     pub fn set_random_tick_speed(&self, speed: u32) {
         self.random_tick_speed.store(speed, Ordering::Relaxed);
+    }
+
+    /// A signal that becomes `true` once `/stop` (or shutdown) was requested.
+    pub fn stop_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.clone()
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        *self.stop.borrow()
     }
     pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {
         let (complete, done) = oneshot::channel();
@@ -163,15 +184,20 @@ impl World {
             .map_err(anyhow::Error::msg)
     }
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        let (complete, done) = oneshot::channel();
-        self.sender
-            .send(GameMessage::Shutdown { complete })
-            .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
-        let result = done
-            .await
-            .map_err(|_| anyhow::anyhow!("shutdown response lost"))?;
+        let result: anyhow::Result<()> = if *self.stop.borrow() {
+            // `/stop` already queued the shutdown event; just wait for the loop to finish.
+            Ok(())
+        } else {
+            let (complete, done) = oneshot::channel();
+            self.sender
+                .send(GameMessage::Shutdown { complete })
+                .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+            done.await
+                .map_err(|_| anyhow::anyhow!("shutdown response lost"))?
+                .map_err(anyhow::Error::msg)
+        };
         self.task.await?;
-        result.map_err(anyhow::Error::msg)
+        result
     }
 }
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
@@ -231,6 +257,8 @@ struct LoopMetrics {
     /// Raw region tick durations consumed by the load-test example.
     tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
+    /// Set once `/stop` or an explicit shutdown is requested.
+    stop: tokio::sync::watch::Sender<bool>,
 }
 /// Both ends of the world loop's event and region signal channels.
 struct Channels {
@@ -263,6 +291,7 @@ async fn run(
         random_tick_speed,
         tick_samples,
         profiler,
+        stop: stop_tx,
     } = metrics;
     let region_profiler = Arc::clone(&profiler);
     let fluid_tracking = tracking.clone();
@@ -316,6 +345,15 @@ async fn run(
             Err(error) => tracing::warn!(%error, "plugin commands unavailable"),
         }
     }
+    let mut online: HashMap<Uuid, commands::OnlinePlayer> = HashMap::new();
+    let mut admin = settings.admin.clone();
+    let mut whitelist_enabled = settings.whitelist;
+    let mut saving_enabled = true;
+    let mut autosave = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(300),
+    );
+    autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vanilla/26.3/generated/reports");
     let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
@@ -336,7 +374,23 @@ async fn run(
              if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, dimension_type, biome, view_distance, online_mode, secure_chat, chat_type, chat_visibility, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
              continue;
            }
-           let permission = settings.permission(uuid);
+           // Vanilla checks bans before the whitelist (`PlayerList.canPlayerLogin`).
+           if let Some(ban) = admin.as_ref().and_then(|lists| lists.bans.player_ban(uuid)) {
+             // `multiplayer.disconnect.banned.reason`.
+             let _ = outbound.send(Outbound::Disconnect(format!("You are banned from this server!\nReason: {}", ban.reason)));
+             continue;
+           }
+           if whitelist_enabled && let Some(lists) = &admin && !lists.whitelist.contains(uuid) {
+             let _ = outbound.send(Outbound::Disconnect("You are not white-listed on this server!".into()));
+             continue;
+           }
+           let permission = settings
+             .permission(uuid)
+             .max(admin.as_ref().and_then(|lists| lists.ops.level_of(uuid)).unwrap_or(0));
+           if let Some(lists) = &admin {
+               lists.usercache.cache(&name, uuid);
+               if let Err(error) = lists.flush() { tracing::warn!(%error, "failed to save admin lists"); }
+           }
            // Resume where the player left off; a first join (or unreadable data) uses world spawn.
            let saved = playerdata::load(&uuid);
            let start_pos = saved.as_ref().map_or(spawn_pos, |s| s.pos);
@@ -348,13 +402,14 @@ async fn run(
            let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
            }
            emit(&outbound, &ContainerContent { window:VarInt(0), state:VarInt(0), slots:start_inventory.to_vec(), carried:ItemStack::default() });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
+           online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
            let mut player=Player{uuid,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
@@ -388,22 +443,30 @@ async fn run(
           }},
           GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let (actions, mut received) = mpsc::unbounded_channel();
-              let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
-              if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
+              let (origin, yaw, pitch) = online.get(&uuid).map_or(([0.0; 3], 0.0, 0.0), |player| (player.pos, player.yaw, player.pitch));
+              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, actions };
+              if let Err(error) = command_tree.execute(command.trim_start_matches('/'), command_source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
+              let source_name = online.get(&uuid).map_or_else(|| "Server".to_owned(), |player| player.name.clone());
+              let mut runtime = CommandRuntime {
+                  reply: Reply { outbound: Some(outbound) },
+                  source_uuid: Some(uuid),
+                  source_name,
+                  origin,
+                  online: &mut online,
+                  permissions: &mut permissions,
+                  admin: &mut admin,
+                  whitelist: &mut whitelist_enabled,
+                  saving: &mut saving_enabled,
+                  mailboxes: &mailboxes,
+                  positions: &positions,
+                  profiler: &profiler,
+                  source: &source,
+                  events: &event_tx,
+                  stop: &stop_tx,
+              };
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
-                  commands::Action::Teleport(pos) => mailbox.lock().unwrap().push_back(Command::Teleport(pos)),
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
-                  commands::Action::Tps => for line in profiler.tps_lines() { chat(outbound, &line); },
-                  commands::Action::Mspt => for line in profiler.mspt_lines() { chat(outbound, &line); },
-                  commands::Action::ProfileStart => match profiler.start_profile() {
-                      Ok(()) => chat(outbound, "Profiling started; run /profile stop to dump the slowest systems"),
-                      Err(error) => chat(outbound, &format!("Cannot start profiling: {error}")),
-                  },
-                  commands::Action::ProfileStop => match profiler.stop_profile() {
-                      Ok(report) => for line in report.lines() { chat(outbound, &line); },
-                      Err(error) => chat(outbound, &format!("Cannot stop profiling: {error}")),
-                  },
                   commands::Action::Plugin { name, args } => {
                       if let Some(plugins) = &settings.plugins {
                           let line = plugin_command_line(&name, &args);
@@ -415,7 +478,7 @@ async fn run(
                           }
                       }
                   },
-                  commands::Action::Stop => {},
+                  other => { runtime.apply(other).await; }
               }}
           }},
           GameMessage::Input{session,uuid,packet}=>{if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Input(packet));}},
@@ -423,18 +486,28 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let result = command_tree.execute(command.trim().trim_start_matches('/'), commands::Source { permission: 4, console: true, actions }).map_err(|e| e.to_string());
+              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, actions };
+              let result = command_tree.execute(command.trim().trim_start_matches('/'), command_source).map_err(|e| e.to_string());
               let mut stop = false;
+              let mut runtime = CommandRuntime {
+                  reply: Reply { outbound: None },
+                  source_uuid: None,
+                  source_name: "Server".to_owned(),
+                  origin: [0.0; 3],
+                  online: &mut online,
+                  permissions: &mut permissions,
+                  admin: &mut admin,
+                  whitelist: &mut whitelist_enabled,
+                  saving: &mut saving_enabled,
+                  mailboxes: &mailboxes,
+                  positions: &positions,
+                  profiler: &profiler,
+                  source: &source,
+                  events: &event_tx,
+                  stop: &stop_tx,
+              };
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
-                  commands::Action::Stop => stop = true,
-                  commands::Action::Tps => for line in profiler.tps_lines_plain() { tracing::info!("{line}"); },
-                  commands::Action::Mspt => for line in profiler.mspt_lines_plain() { tracing::info!("{line}"); },
-                  commands::Action::ProfileStart => if let Err(error) = profiler.start_profile() { tracing::warn!(%error, "profile start failed"); } else { tracing::info!("profiling started; run profile stop to dump the slowest systems"); },
-                  commands::Action::ProfileStop => match profiler.stop_profile() {
-                      Ok(report) => for line in report.lines() { tracing::info!("{line}"); },
-                      Err(error) => tracing::warn!(%error, "profile stop failed"),
-                  },
                   commands::Action::Plugin { name, args } => {
                       if let Some(plugins) = &settings.plugins {
                           let line = plugin_command_line(&name, &args);
@@ -444,12 +517,18 @@ async fn run(
                           }
                       }
                   },
-                  _ => tracing::warn!("command requires a player"),
+                  commands::Action::GameMode(_) => tracing::warn!("command requires a player"),
+                  other => { if runtime.apply(other).await { stop = true; } }
               }}
               let _ = complete.send(result.map(|_| stop));
           },
-          GameMessage::Shutdown{complete}=>{let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let _stopped = scheduler.shutdown();let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; let _=complete.send(result);break;}
+          GameMessage::Shutdown{complete}=>{let _=stop_tx.send(true);let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let _stopped = scheduler.shutdown();let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; let _=complete.send(result);break;}
          }},
+         _=autosave.tick(), if saving_enabled => {
+             if let Some(source) = &source && let Err(error) = source.flush_all().await {
+                 tracing::error!(%error, "autosave failed");
+             }
+         },
          signal=signals.recv()=>{let Some(signal)=signal else {break}; match signal {
           Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);scheduler.schedule_at_chunk(chunk,move |r|r.hold_chunk(chunk));}else{release_hold(&scheduler, &mut holds, &signal_tx, chunk);},
           Signal::FinishRelease{chunk,flush}=>{scheduler.remove_chunk(chunk);if flush && let Some(source)=source.clone(){tokio::spawn(async move {if let Err(error)=source.flush_chunk(chunk.0,chunk.1).await{tracing::error!(%error,"failed to save unloaded chunk");}});}},
@@ -460,10 +539,10 @@ async fn run(
               if scheduler.owner(chunk).is_some(){scheduler.schedule_at_chunk(chunk,move |r|r.schedule_fluid((x,y,z)));}
             }
           },
-          Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
+          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
           Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
-          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
             let name = names.remove(&uuid).unwrap_or_default();
             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_left(uuid, &name) { tracing::warn!(%error, "player quit event failed"); }
             scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
@@ -493,6 +572,762 @@ fn hand_off(
     scheduler.schedule_at_chunk(to, move |r| {
         r.entities.insert(*entity);
     });
+}
+/// Where command feedback goes: a player's chat, or the console log.
+struct Reply<'a> {
+    outbound: Option<&'a mpsc::UnboundedSender<Outbound>>,
+}
+
+impl Reply<'_> {
+    fn key(&self, key: &str, args: &[&str]) {
+        self.text(&feedback::render(key, args));
+    }
+
+    fn text(&self, text: &str) {
+        match self.outbound {
+            Some(outbound) => chat(outbound, text),
+            None => tracing::info!("{text}"),
+        }
+    }
+}
+
+/// Applies command actions against the live game loop state.
+struct CommandRuntime<'a> {
+    reply: Reply<'a>,
+    source_uuid: Option<Uuid>,
+    source_name: String,
+    origin: [f64; 3],
+    online: &'a mut HashMap<Uuid, commands::OnlinePlayer>,
+    permissions: &'a mut HashMap<Uuid, u8>,
+    admin: &'a mut Option<Arc<AdminLists>>,
+    whitelist: &'a mut bool,
+    saving: &'a mut bool,
+    mailboxes: &'a HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)>,
+    positions: &'a Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
+    profiler: &'a Arc<profile::Profiler>,
+    source: &'a Option<Arc<anvil::AnvilChunkSource>>,
+    events: &'a mpsc::UnboundedSender<GameMessage>,
+    stop: &'a tokio::sync::watch::Sender<bool>,
+}
+
+fn flush_admin(admin: &AdminLists) {
+    if let Err(error) = admin.flush() {
+        tracing::error!(%error, "failed to save admin lists");
+    }
+}
+
+fn valid_teleport(pos: [f64; 3]) -> bool {
+    pos.iter()
+        .all(|value| value.is_finite() && value.abs() <= 30_000_000.0)
+}
+
+fn look_angles(from: [f64; 3], to: [f64; 3]) -> (f32, f32) {
+    let dx = to[0] - from[0];
+    let dy = to[1] - from[1];
+    let dz = to[2] - from[2];
+    let horizontal = (dx * dx + dz * dz).sqrt();
+    let yaw = if dx == 0.0 && dz == 0.0 {
+        0.0
+    } else {
+        dz.atan2(dx).to_degrees() - 90.0
+    };
+    (
+        wrap_yaw(yaw as f32),
+        (-(dy.atan2(horizontal))).to_degrees() as f32,
+    )
+}
+
+fn wrap_yaw(yaw: f32) -> f32 {
+    let mut wrapped = (yaw + 180.0) % 360.0;
+    if wrapped < 0.0 {
+        wrapped += 360.0;
+    }
+    wrapped - 180.0
+}
+
+impl CommandRuntime<'_> {
+    fn profiles(
+        &self,
+        target: &ferrite_command::arguments::EntityTarget,
+    ) -> Result<Vec<commands::ResolvedPlayer>, &'static str> {
+        commands::resolve_profiles(
+            target,
+            self.online,
+            self.admin.as_deref(),
+            self.source_uuid,
+            self.origin,
+        )
+    }
+
+    fn targets(
+        &self,
+        target: &ferrite_command::arguments::EntityTarget,
+    ) -> Result<Vec<commands::ResolvedPlayer>, &'static str> {
+        commands::resolve_online(target, self.online, self.source_uuid, self.origin)
+    }
+
+    fn teleport_player(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) {
+        if let Some(player) = self.online.get_mut(&uuid) {
+            player.pos = pos;
+            player.yaw = yaw;
+            player.pitch = pitch;
+        }
+        self.positions.lock().unwrap().insert(uuid, pos);
+        if let Some((_, mailbox, _)) = self.mailboxes.get(&uuid) {
+            mailbox.lock().unwrap().push_back(Command::Teleport {
+                pos,
+                yaw: Some(yaw),
+                pitch: Some(pitch),
+            });
+        }
+    }
+
+    fn teleport_feedback(
+        &self,
+        targets: &[commands::ResolvedPlayer],
+        pos: [f64; 3],
+        entity: Option<&str>,
+    ) {
+        if let Some(entity) = entity {
+            if targets.len() == 1 {
+                self.reply.key(
+                    "commands.teleport.success.entity.single",
+                    &[&targets[0].name, entity],
+                );
+            } else {
+                let count = targets.len().to_string();
+                self.reply.key(
+                    "commands.teleport.success.entity.multiple",
+                    &[&count, entity],
+                );
+            }
+            return;
+        }
+        let x = ferrite_command::error::java_double(pos[0]);
+        let y = ferrite_command::error::java_double(pos[1]);
+        let z = ferrite_command::error::java_double(pos[2]);
+        if targets.len() == 1 {
+            self.reply.key(
+                "commands.teleport.success.location.single",
+                &[&targets[0].name, &x, &y, &z],
+            );
+        } else {
+            let count = targets.len().to_string();
+            self.reply.key(
+                "commands.teleport.success.location.multiple",
+                &[&count, &x, &y, &z],
+            );
+        }
+    }
+
+    async fn apply(&mut self, action: commands::Action) -> bool {
+        use commands::{Action, TeleportDestination};
+        match action {
+            Action::GameMode(_) | Action::Say(_) => false,
+            // Plugin commands run in the dispatch loops, which own the plugin hooks.
+            Action::Plugin { .. } => false,
+            Action::Teleport {
+                targets,
+                destination,
+            } => {
+                let targets = match self.targets(&targets) {
+                    Ok(targets) => targets,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                match destination {
+                    TeleportDestination::Entity(destination) => {
+                        let destination = match self.targets(&destination) {
+                            Ok(players) if players.len() == 1 => {
+                                players.into_iter().next().unwrap()
+                            }
+                            Ok(_) => {
+                                self.reply.key("argument.entity.notfound.player", &[]);
+                                return false;
+                            }
+                            Err(key) => {
+                                self.reply.key(key, &[]);
+                                return false;
+                            }
+                        };
+                        let Some((pos, yaw, pitch)) = self
+                            .online
+                            .get(&destination.uuid)
+                            .map(|player| (player.pos, player.yaw, player.pitch))
+                        else {
+                            self.reply.key("argument.entity.notfound.player", &[]);
+                            return false;
+                        };
+                        if !valid_teleport(pos) {
+                            self.reply.key("commands.teleport.invalidPosition", &[]);
+                            return false;
+                        }
+                        for target in &targets {
+                            self.teleport_player(target.uuid, pos, yaw, pitch);
+                        }
+                        self.teleport_feedback(&targets, pos, Some(&destination.name));
+                    }
+                    TeleportDestination::Location { pos, yaw, pitch } => {
+                        if !valid_teleport(pos) {
+                            self.reply.key("commands.teleport.invalidPosition", &[]);
+                            return false;
+                        }
+                        for target in &targets {
+                            let (target_yaw, target_pitch) = self
+                                .online
+                                .get(&target.uuid)
+                                .map_or((0.0, 0.0), |player| (player.yaw, player.pitch));
+                            self.teleport_player(
+                                target.uuid,
+                                pos,
+                                yaw.unwrap_or(target_yaw),
+                                pitch.unwrap_or(target_pitch),
+                            );
+                        }
+                        self.teleport_feedback(&targets, pos, None);
+                    }
+                    TeleportDestination::FacingLocation { pos, target } => {
+                        if !valid_teleport(pos) {
+                            self.reply.key("commands.teleport.invalidPosition", &[]);
+                            return false;
+                        }
+                        for player in &targets {
+                            let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], target);
+                            self.teleport_player(player.uuid, pos, yaw, pitch);
+                        }
+                        self.teleport_feedback(&targets, pos, None);
+                    }
+                    TeleportDestination::FacingEntity {
+                        pos,
+                        entity,
+                        anchor,
+                    } => {
+                        if !valid_teleport(pos) {
+                            self.reply.key("commands.teleport.invalidPosition", &[]);
+                            return false;
+                        }
+                        let target = match self.targets(&entity) {
+                            Ok(players) if players.len() == 1 => {
+                                players.into_iter().next().unwrap()
+                            }
+                            Ok(_) => {
+                                self.reply.key("argument.entity.notfound.player", &[]);
+                                return false;
+                            }
+                            Err(key) => {
+                                self.reply.key(key, &[]);
+                                return false;
+                            }
+                        };
+                        let Some(facing) = self.online.get(&target.uuid) else {
+                            self.reply.key("argument.entity.notfound.player", &[]);
+                            return false;
+                        };
+                        let point = [
+                            facing.pos[0],
+                            facing.pos[1] + anchor.offset(),
+                            facing.pos[2],
+                        ];
+                        for player in &targets {
+                            let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], point);
+                            self.teleport_player(player.uuid, pos, yaw, pitch);
+                        }
+                        self.teleport_feedback(&targets, pos, None);
+                    }
+                }
+                false
+            }
+            Action::Message { targets, text } => {
+                let targets = match self.targets(&targets) {
+                    Ok(targets) => targets,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                for target in &targets {
+                    if let Some(player) = self.online.get(&target.uuid) {
+                        chat(
+                            &player.outbound,
+                            &feedback::render(
+                                "commands.message.display.incoming",
+                                &[&self.source_name, &text],
+                            ),
+                        );
+                    }
+                }
+                let names = targets
+                    .iter()
+                    .map(|player| player.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if self.source_uuid.is_some() {
+                    self.reply
+                        .key("commands.message.display.outgoing", &[&names, &text]);
+                } else {
+                    self.reply.text(&feedback::render(
+                        "commands.message.display.outgoing",
+                        &[&names, &text],
+                    ));
+                }
+                false
+            }
+            Action::Kill { targets } => {
+                let targets = match self.targets(&targets) {
+                    Ok(targets) => targets,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                for target in &targets {
+                    if let Some(player) = self.online.get(&target.uuid) {
+                        let _ = player
+                            .outbound
+                            .send(Outbound::Disconnect("You died!".into()));
+                    }
+                }
+                if targets.len() == 1 {
+                    self.reply
+                        .key("commands.kill.success.single", &[&targets[0].name]);
+                } else {
+                    let count = targets.len().to_string();
+                    self.reply.key("commands.kill.success.multiple", &[&count]);
+                }
+                false
+            }
+            Action::Op { targets } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if lists.ops.level_of(player.uuid).is_some() {
+                        self.reply.key("commands.op.failed", &[]);
+                        continue;
+                    }
+                    lists.ops.add_op(player.uuid, &player.name, 4, false);
+                    if let Some(level) = self.permissions.get_mut(&player.uuid) {
+                        *level = 4;
+                    }
+                    self.reply.key("commands.op.success", &[&player.name]);
+                    changed = true;
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::Deop { targets } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if !lists.ops.remove_op(player.uuid) {
+                        self.reply.key("commands.deop.failed", &[]);
+                        continue;
+                    }
+                    if let Some(level) = self.permissions.get_mut(&player.uuid) {
+                        *level = 0;
+                    }
+                    self.reply.key("commands.deop.success", &[&player.name]);
+                    changed = true;
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::WhitelistAdd { targets } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if lists.whitelist.contains(player.uuid) {
+                        self.reply.key("commands.whitelist.add.failed", &[]);
+                        continue;
+                    }
+                    lists.whitelist.add(player.uuid, &player.name);
+                    self.reply
+                        .key("commands.whitelist.add.success", &[&player.name]);
+                    changed = true;
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::WhitelistRemove { targets } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        let removed = match &targets {
+                            ferrite_command::arguments::EntityTarget::Name(name)
+                                if lists.whitelist.remove_name(name) =>
+                            {
+                                self.reply.key("commands.whitelist.remove.success", &[name]);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if removed {
+                            flush_admin(&lists);
+                        } else {
+                            self.reply.key(key, &[]);
+                        }
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if lists.whitelist.remove(player.uuid) {
+                        self.reply
+                            .key("commands.whitelist.remove.success", &[&player.name]);
+                        changed = true;
+                    } else {
+                        self.reply.key("commands.whitelist.remove.failed", &[]);
+                    }
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::WhitelistList => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let names = lists.whitelist.names();
+                if names.is_empty() {
+                    self.reply.key("commands.whitelist.none", &[]);
+                } else {
+                    let count = names.len().to_string();
+                    let joined = names.join(", ");
+                    self.reply
+                        .key("commands.whitelist.list", &[&count, &joined]);
+                }
+                false
+            }
+            Action::WhitelistOn => {
+                if *self.whitelist {
+                    self.reply.key("commands.whitelist.alreadyOn", &[]);
+                } else {
+                    *self.whitelist = true;
+                    self.reply.key("commands.whitelist.enabled", &[]);
+                }
+                false
+            }
+            Action::WhitelistOff => {
+                if !*self.whitelist {
+                    self.reply.key("commands.whitelist.alreadyOff", &[]);
+                } else {
+                    *self.whitelist = false;
+                    self.reply.key("commands.whitelist.disabled", &[]);
+                }
+                false
+            }
+            Action::WhitelistReload => {
+                let Some(dir) = self.admin.as_ref().map(|lists| lists.dir().to_path_buf()) else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                match AdminLists::load(&dir) {
+                    Ok(lists) => {
+                        *self.admin = Some(Arc::new(lists));
+                        self.reply.key("commands.whitelist.reloaded", &[]);
+                    }
+                    Err(error) => self
+                        .reply
+                        .text(&format!("Failed to reload the whitelist: {error}")),
+                }
+                false
+            }
+            Action::Ban { targets, reason } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if lists.bans.is_banned(player.uuid) {
+                        self.reply.key("commands.ban.failed", &[]);
+                        continue;
+                    }
+                    lists
+                        .bans
+                        .ban(player.uuid, &player.name, &reason, &self.source_name, None);
+                    if let Some(online) = self.online.get(&player.uuid) {
+                        let _ = online.outbound.send(Outbound::Disconnect(reason.clone()));
+                    }
+                    self.reply
+                        .key("commands.ban.success", &[&player.name, &reason]);
+                    changed = true;
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::BanIp { target, reason } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let Some(ip) = commands::parse_ip(&target) else {
+                    self.reply.key("commands.banip.invalid", &[]);
+                    return false;
+                };
+                if lists.bans.is_ip_banned(&ip.to_string()) {
+                    self.reply.key("commands.banip.failed", &[]);
+                    return false;
+                }
+                lists
+                    .bans
+                    .ban_ip(&ip.to_string(), &reason, &self.source_name, None);
+                flush_admin(&lists);
+                self.reply
+                    .key("commands.banip.success", &[&ip.to_string(), &reason]);
+                false
+            }
+            Action::Pardon { targets } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let players = match self.profiles(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        let name = match &targets {
+                            ferrite_command::arguments::EntityTarget::Name(name) => Some(name),
+                            _ => None,
+                        };
+                        let removed = name.and_then(|name| {
+                            lists
+                                .bans
+                                .player_bans()
+                                .into_iter()
+                                .find(|ban| ban.name.eq_ignore_ascii_case(name))
+                        });
+                        if let Some(ban) = removed {
+                            lists.bans.unban(ban.uuid);
+                            flush_admin(&lists);
+                            self.reply.key("commands.pardon.success", &[name.unwrap()]);
+                        } else {
+                            self.reply.key(key, &[]);
+                        }
+                        return false;
+                    }
+                };
+                let mut changed = false;
+                for player in players {
+                    if lists.bans.unban(player.uuid) {
+                        self.reply.key("commands.pardon.success", &[&player.name]);
+                        changed = true;
+                    } else {
+                        self.reply.key("commands.pardon.failed", &[]);
+                    }
+                }
+                if changed {
+                    flush_admin(&lists);
+                }
+                false
+            }
+            Action::PardonIp { target } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                let Some(ip) = commands::parse_ip(&target) else {
+                    self.reply.key("commands.pardonip.invalid", &[]);
+                    return false;
+                };
+                if lists.bans.unban_ip(&ip.to_string()) {
+                    flush_admin(&lists);
+                    self.reply
+                        .key("commands.pardonip.success", &[&ip.to_string()]);
+                } else {
+                    self.reply.key("commands.pardonip.failed", &[]);
+                }
+                false
+            }
+            Action::BanList { ips } => {
+                let Some(lists) = self.admin.clone() else {
+                    self.reply.text("Administration lists are unavailable");
+                    return false;
+                };
+                if ips {
+                    let bans = lists.bans.ip_bans();
+                    if bans.is_empty() {
+                        self.reply.key("commands.banlist.none", &[]);
+                    } else {
+                        let count = bans.len().to_string();
+                        self.reply.key("commands.banlist.list", &[&count]);
+                        for ban in bans {
+                            self.reply.key(
+                                "commands.banlist.entry",
+                                &[&ban.ip, &ban.source, &ban.reason],
+                            );
+                        }
+                    }
+                } else {
+                    let bans = lists.bans.player_bans();
+                    if bans.is_empty() {
+                        self.reply.key("commands.banlist.none", &[]);
+                    } else {
+                        let count = bans.len().to_string();
+                        self.reply.key("commands.banlist.list", &[&count]);
+                        for ban in bans {
+                            self.reply.key(
+                                "commands.banlist.entry",
+                                &[&ban.name, &ban.source, &ban.reason],
+                            );
+                        }
+                    }
+                }
+                false
+            }
+            Action::Kick { targets, reason } => {
+                let players = match self.targets(&targets) {
+                    Ok(players) => players,
+                    Err(key) => {
+                        self.reply.key(key, &[]);
+                        return false;
+                    }
+                };
+                for player in players {
+                    if let Some(online) = self.online.get(&player.uuid) {
+                        let _ = online.outbound.send(Outbound::Disconnect(reason.clone()));
+                    }
+                    self.reply
+                        .key("commands.kick.success", &[&player.name, &reason]);
+                }
+                false
+            }
+            Action::Stop => {
+                self.reply.key("commands.stop.stopping", &[]);
+                let _ = self.stop.send(true);
+                let (complete, _) = oneshot::channel();
+                let _ = self.events.send(GameMessage::Shutdown { complete });
+                true
+            }
+            Action::SaveAll { flush: _ } => {
+                self.reply.key("commands.save.saving", &[]);
+                let result = if let Some(source) = self.source {
+                    source.flush_all().await
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => self.reply.key("commands.save.success", &[]),
+                    Err(error) => {
+                        tracing::error!(%error, "save-all failed");
+                        self.reply.key("commands.save.failed", &[]);
+                    }
+                }
+                false
+            }
+            Action::SaveOn => {
+                if *self.saving {
+                    self.reply.key("commands.save.alreadyOn", &[]);
+                } else {
+                    *self.saving = true;
+                    self.reply.key("commands.save.enabled", &[]);
+                }
+                false
+            }
+            Action::SaveOff => {
+                if !*self.saving {
+                    self.reply.key("commands.save.alreadyOff", &[]);
+                } else {
+                    *self.saving = false;
+                    self.reply.key("commands.save.disabled", &[]);
+                }
+                false
+            }
+            Action::Tps => {
+                let lines = if self.reply.outbound.is_some() {
+                    self.profiler.tps_lines()
+                } else {
+                    self.profiler.tps_lines_plain()
+                };
+                for line in lines {
+                    self.reply.text(&line);
+                }
+                false
+            }
+            Action::Mspt => {
+                let lines = if self.reply.outbound.is_some() {
+                    self.profiler.mspt_lines()
+                } else {
+                    self.profiler.mspt_lines_plain()
+                };
+                for line in lines {
+                    self.reply.text(&line);
+                }
+                false
+            }
+            Action::ProfileStart => {
+                match self.profiler.start_profile() {
+                    Ok(()) => self
+                        .reply
+                        .text("Profiling started; run /profile stop to dump the slowest systems"),
+                    Err(error) => self.reply.text(&format!("Cannot start profiling: {error}")),
+                }
+                false
+            }
+            Action::ProfileStop => {
+                match self.profiler.stop_profile() {
+                    Ok(report) => {
+                        for line in report.lines() {
+                            self.reply.text(&line);
+                        }
+                    }
+                    Err(error) => self.reply.text(&format!("Cannot stop profiling: {error}")),
+                }
+                false
+            }
+        }
+    }
 }
 fn release_hold(
     scheduler: &Scheduler<Region, GlobalRegion>,
@@ -605,6 +1440,7 @@ fn operator_permissions_require_the_configured_uuid() {
             level: 3,
         }],
         plugins: None,
+        ..Default::default()
     };
     assert_eq!(settings.permission(Uuid::from_u128(11)), 0);
     assert_eq!(settings.permission(Uuid::from_u128(10)), 3);

@@ -795,6 +795,7 @@ name = "ferrite-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ferrite-admin",
  "ferrite-command",
  "ferrite-data",
  "ferrite-entity",
@@ -811,6 +812,7 @@ dependencies = [
  "ferrite-protocol",
  "ferrite-region",
  "ferrite-world",
+ "md5",
  "mimalloc",
  "rand 0.8.8",
  "rsa",
