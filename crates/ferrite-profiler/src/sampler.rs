@@ -361,7 +361,9 @@ mod tests {
             }
             {
                 let _cold = worker.scope("cold");
-                thread::sleep(Duration::from_millis(5));
+                // The sampler ticks every 2 ms; a 5 ms window can be missed entirely on a busy
+                // machine, so keep this scope wide enough for several ticks.
+                thread::sleep(Duration::from_millis(40));
             }
         });
         handle.join().expect("worker panicked");
