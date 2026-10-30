@@ -1,0 +1,554 @@
+//! Item entities (vanilla `ItemEntity`): physics, merging, pickup and despawning.
+
+use crate::inventory::{self, max_stack_size};
+use crate::metadata::item::ITEM;
+use crate::physics::{self, BlockGetter};
+use crate::rng::Rng;
+use crate::store::{EntityData, EntityRecord, EntityStore, Flags};
+use crate::tracker::{self, Sink};
+use crate::{EntityKey, allocate_id, random_uuid};
+use ferrite_math::{AABB, Vec3};
+use ferrite_protocol::{
+    VarInt,
+    packets::play::{ItemStack, MetaValue, TakeItemEntity},
+};
+use std::sync::OnceLock;
+use uuid::Uuid;
+
+/// Ticks before an item despawns.
+pub const LIFETIME: i32 = 6000;
+/// A pickup delay that never runs out.
+pub const INFINITE_PICKUP_DELAY: i32 = 32767;
+/// An age that never advances, so the item never despawns.
+pub const INFINITE_LIFETIME: i32 = -32768;
+/// Pickup delay of dropped and popped items (`setDefaultPickUpDelay`).
+pub const DEFAULT_PICKUP_DELAY: i32 = 10;
+const GRAVITY: f64 = 0.04;
+const AIR_DRAG: f64 = 0.98;
+const WIDTH: f64 = 0.25;
+const HEIGHT: f64 = 0.25;
+
+/// Item-specific state; the stack itself is the synched `ITEM` data value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemState {
+    pub age: i32,
+    pub pickup_delay: i32,
+    pub health: i32,
+    /// Only this player may pick the item up.
+    pub target: Option<Uuid>,
+}
+
+impl Default for ItemState {
+    fn default() -> Self {
+        Self {
+            age: 0,
+            pickup_delay: 0,
+            health: 5,
+            target: None,
+        }
+    }
+}
+
+/// Entity type id of `minecraft:item`.
+pub fn item_type() -> u16 {
+    static KIND: OnceLock<u16> = OnceLock::new();
+    *KIND.get_or_init(|| {
+        ferrite_data::entity_props::by_name("item")
+            .expect("vanilla has an item entity type")
+            .id
+    })
+}
+
+/// The stack an item entity carries.
+pub fn stack(data: &EntityData) -> ItemStack {
+    match data.metadata.get(ITEM) {
+        Some(MetaValue::ItemStack(stack)) => *stack,
+        _ => ItemStack::default(),
+    }
+}
+
+/// Replaces the stack, marking it dirty for trackers when it changed.
+pub fn set_stack(data: &mut EntityData, stack: ItemStack) {
+    let stack = if stack.count <= 0 {
+        ItemStack::default()
+    } else {
+        stack
+    };
+    data.metadata.set(ITEM, MetaValue::ItemStack(stack));
+}
+
+/// A new item entity (vanilla `new ItemEntity(level, x, y, z, stack, dx, dy, dz)`).
+pub fn new_item(pos: Vec3, vel: Vec3, stack: ItemStack, rng: &mut Rng) -> EntityRecord {
+    let mut data = EntityData::new(allocate_id(), random_uuid(), item_type(), WIDTH, HEIGHT);
+    data.yaw = rng.next_f32() * 360.0;
+    data.metadata
+        .define(ITEM, MetaValue::ItemStack(ItemStack::default()));
+    set_stack(&mut data, stack);
+    data.item = Some(ItemState::default());
+    EntityRecord {
+        pos,
+        vel,
+        flags: Flags::default(),
+        data,
+    }
+}
+
+/// An item dropped from a broken block (vanilla `Block.popResource`): a random spot inside the
+/// block, a small random push and the default pickup delay.
+pub fn pop_resource(block: [i32; 3], stack: ItemStack, rng: &mut Rng) -> EntityRecord {
+    let half = HEIGHT / 2.0;
+    let pos = Vec3::new(
+        f64::from(block[0]) + 0.5 + rng.range(-0.25, 0.25),
+        f64::from(block[1]) + 0.5 + rng.range(-0.25, 0.25) - half,
+        f64::from(block[2]) + 0.5 + rng.range(-0.25, 0.25),
+    );
+    let vel = Vec3::new(rng.next_f64() * 0.2 - 0.1, 0.2, rng.next_f64() * 0.2 - 0.1);
+    let mut record = new_item(pos, vel, stack, rng);
+    if let Some(item) = &mut record.data.item {
+        item.pickup_delay = DEFAULT_PICKUP_DELAY;
+    }
+    record
+}
+
+fn is_mergeable(store: &EntityStore, key: EntityKey) -> bool {
+    let (Some(data), Some(flags)) = (store.data(key), store.flags(key)) else {
+        return false;
+    };
+    let Some(item) = &data.item else { return false };
+    let stack = stack(data);
+    !flags.has(Flags::REMOVED)
+        && item.pickup_delay != INFINITE_PICKUP_DELAY
+        && item.age != INFINITE_LIFETIME
+        && item.age < LIFETIME
+        && stack.count < max_stack_size(stack.item_id)
+}
+
+/// Moves items from `from` onto `to` (vanilla `ItemEntity.merge`).
+fn merge(store: &mut EntityStore, to: EntityKey, from: EntityKey) {
+    let (Some(to_data), Some(from_data)) = (store.data(to), store.data(from)) else {
+        return;
+    };
+    let (mut to_stack, mut from_stack) = (stack(to_data), stack(from_data));
+    let (Some(to_item), Some(from_item)) = (to_data.item.clone(), from_data.item.clone()) else {
+        return;
+    };
+    let moved = (max_stack_size(to_stack.item_id).min(64) - to_stack.count).min(from_stack.count);
+    to_stack.count += moved;
+    from_stack.count -= moved;
+    let to_data = store.data_mut(to).unwrap();
+    set_stack(to_data, to_stack);
+    let item = to_data.item.as_mut().unwrap();
+    item.pickup_delay = to_item.pickup_delay.max(from_item.pickup_delay);
+    item.age = to_item.age.min(from_item.age);
+    set_stack(store.data_mut(from).unwrap(), from_stack);
+    if from_stack.count <= 0 {
+        store.flags_mut(from).unwrap().set(Flags::REMOVED, true);
+    }
+}
+
+fn try_merge(store: &mut EntityStore, this: EntityKey, other: EntityKey) {
+    let (Some(a), Some(b)) = (store.data(this), store.data(other)) else {
+        return;
+    };
+    let (this_stack, other_stack) = (stack(a), stack(b));
+    let same_target = a.item.as_ref().map(|i| i.target) == b.item.as_ref().map(|i| i.target);
+    // `areMergable`: the same item (stacks carry no components yet) and room in `other`.
+    if !same_target
+        || this_stack.item_id != other_stack.item_id
+        || other_stack.count + this_stack.count > max_stack_size(other_stack.item_id)
+    {
+        return;
+    }
+    if other_stack.count < this_stack.count {
+        merge(store, this, other);
+    } else {
+        merge(store, other, this);
+    }
+}
+
+fn merge_with_neighbours(store: &mut EntityStore, key: EntityKey) {
+    let Some(bbox) = store.bbox(key) else { return };
+    let kind = item_type();
+    for other in store.query_vec(bbox.inflate(0.5, 0.0, 0.5)) {
+        if other == key || store.data(other).is_none_or(|d| d.kind != kind) {
+            continue;
+        }
+        if !is_mergeable(store, key) {
+            break;
+        }
+        if is_mergeable(store, other) {
+            try_merge(store, key, other);
+            if store.flags(key).is_none_or(|f| f.has(Flags::REMOVED)) {
+                break;
+            }
+        }
+    }
+}
+
+/// Ticks every item entity in the store (vanilla `ItemEntity.tick`).
+pub fn tick_items(store: &mut EntityStore, blocks: &impl BlockGetter, rng: &mut Rng) {
+    let kind = item_type();
+    let keys = store.keys().to_vec();
+    for key in keys {
+        let Some(data) = store.data_mut(key) else {
+            continue;
+        };
+        if data.kind != kind || data.item.is_none() {
+            continue;
+        }
+        if store.flags(key).unwrap().has(Flags::REMOVED) {
+            continue;
+        }
+        tick_item(store, key, blocks, rng);
+    }
+}
+
+fn tick_item(store: &mut EntityStore, key: EntityKey, blocks: &impl BlockGetter, rng: &mut Rng) {
+    let data = store.data_mut(key).unwrap();
+    if stack(data).count <= 0 {
+        store.flags_mut(key).unwrap().set(Flags::REMOVED, true);
+        return;
+    }
+    // The level increments tickCount before ticking (`ServerLevel.tickNonPassenger`).
+    data.tick_count += 1;
+    let tick_count = data.tick_count;
+    let id = data.id;
+    let item = data.item.as_mut().unwrap();
+    if item.pickup_delay > 0 && item.pickup_delay != INFINITE_PICKUP_DELAY {
+        item.pickup_delay -= 1;
+    }
+    let old_pos = store.pos(key).unwrap();
+    let old_vel = store.vel(key).unwrap();
+    let bbox = store.bbox(key).unwrap();
+    let no_gravity = store.flags(key).unwrap().has(Flags::NO_GRAVITY);
+    let mut vel = old_vel;
+    if physics::fluid_height(blocks, bbox, false) > 0.1 {
+        vel = Vec3::new(
+            vel.x * 0.99,
+            vel.y + if vel.y < 0.06 { 5.0E-4 } else { 0.0 },
+            vel.z * 0.99,
+        );
+    } else if physics::fluid_height(blocks, bbox, true) > 0.1 {
+        vel = Vec3::new(
+            vel.x * 0.95,
+            vel.y + if vel.y < 0.06 { 5.0E-4 } else { 0.0 },
+            vel.z * 0.95,
+        );
+    } else if !no_gravity {
+        vel.y -= GRAVITY;
+    }
+    store.set_vel(key, vel);
+    let stuck = !physics::no_collision(blocks, bbox.deflate_all(1.0E-7));
+    store.flags_mut(key).unwrap().set(Flags::NO_PHYSICS, stuck);
+    if stuck {
+        let center = Vec3::new(old_pos.x, (bbox.min.y + bbox.max.y) / 2.0, old_pos.z);
+        physics::move_towards_closest_space(store, key, center, blocks, rng);
+    }
+    let on_ground = store.flags(key).unwrap().has(Flags::ON_GROUND);
+    let vel = store.vel(key).unwrap();
+    let resting = on_ground
+        && vel.horizontal_distance_sqr() <= f64::from(1.0E-5_f32)
+        && (tick_count as i64 + i64::from(id)) % 4 != 0;
+    if !resting {
+        physics::move_entity(store, key, vel, blocks);
+        let pos = store.pos(key).unwrap();
+        let on_ground = store.flags(key).unwrap().has(Flags::ON_GROUND);
+        let ground = if on_ground {
+            AIR_DRAG * physics::friction(blocks, physics::on_pos(pos, 0.999_999))
+        } else {
+            AIR_DRAG
+        };
+        let mut vel = store.vel(key).unwrap();
+        vel = Vec3::new(vel.x * ground, vel.y * AIR_DRAG, vel.z * ground);
+        if on_ground && vel.y < 0.0 {
+            vel.y *= -0.5;
+        }
+        store.set_vel(key, vel);
+    }
+    let pos = store.pos(key).unwrap();
+    let moved = old_pos.x.floor() != pos.x.floor()
+        || old_pos.y.floor() != pos.y.floor()
+        || old_pos.z.floor() != pos.z.floor();
+    let rate = if moved { 2 } else { 40 };
+    if tick_count.is_multiple_of(rate) && is_mergeable(store, key) {
+        merge_with_neighbours(store, key);
+    }
+    let Some(data) = store.data_mut(key) else {
+        return;
+    };
+    let item = data.item.as_mut().unwrap();
+    if item.age != INFINITE_LIFETIME {
+        item.age += 1;
+    }
+    let expired = item.age >= LIFETIME;
+    let vel = store.vel(key).unwrap();
+    let flags = store.flags_mut(key).unwrap();
+    if (vel - old_vel).length_sqr() > 0.01 {
+        flags.set(Flags::NEEDS_SYNC, true);
+    }
+    if expired {
+        flags.set(Flags::REMOVED, true);
+    }
+}
+
+/// A player that can pick items up.
+pub struct Picker<'a> {
+    pub uuid: Uuid,
+    /// Network entity id, the collector in `take_item_entity`.
+    pub entity_id: i32,
+    pub pos: Vec3,
+    /// Inventory menu slots (see [`inventory`]).
+    pub inventory: &'a mut [ItemStack; 46],
+    /// Selected hotbar slot, 0..=8.
+    pub selected: usize,
+    /// Creative players take stacks that do not fit.
+    pub infinite: bool,
+}
+
+/// Picks up the items a player touches (vanilla `Player.touch` + `ItemEntity.playerTouch`):
+/// items in the player's box widened by 1 x 0.5 x 1 whose pickup delay ran out. Sends
+/// `take_item_entity` to everyone tracking each item and returns the changed menu slots.
+pub fn pick_up(
+    store: &mut EntityStore,
+    picker: &mut Picker<'_>,
+    sink: &mut Sink<'_>,
+) -> Vec<usize> {
+    let p = picker.pos;
+    let area = AABB::new(p.x - 0.3, p.y, p.z - 0.3, p.x + 0.3, p.y + 1.8, p.z + 0.3)
+        .inflate(1.0, 0.5, 1.0);
+    let kind = item_type();
+    let mut changed = Vec::new();
+    for key in store.query_vec(area) {
+        let (Some(data), Some(flags)) = (store.data(key), store.flags(key)) else {
+            continue;
+        };
+        let Some(item) = &data.item else { continue };
+        if data.kind != kind
+            || flags.has(Flags::REMOVED)
+            || item.pickup_delay != 0
+            || item.target.is_some_and(|t| t != picker.uuid)
+        {
+            continue;
+        }
+        let mut taken = stack(data);
+        let original = taken.count;
+        let (added, slots) = inventory::add(
+            picker.inventory,
+            picker.selected,
+            &mut taken,
+            picker.infinite,
+        );
+        if !added {
+            continue;
+        }
+        for slot in slots {
+            if !changed.contains(&slot) {
+                changed.push(slot);
+            }
+        }
+        tracker::broadcast(
+            store,
+            key,
+            &TakeItemEntity {
+                item: VarInt(data.id),
+                collector: VarInt(picker.entity_id),
+                amount: VarInt(original),
+            },
+            sink,
+        );
+        if taken.count <= 0 {
+            store.flags_mut(key).unwrap().set(Flags::REMOVED, true);
+        } else {
+            set_stack(store.data_mut(key).unwrap(), taken);
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::physics::tests::TestWorld;
+
+    fn dirt(count: i32) -> ItemStack {
+        ItemStack {
+            count,
+            item_id: ferrite_data::registries::id("minecraft:item", "minecraft:dirt").unwrap(),
+        }
+    }
+
+    #[test]
+    fn dropped_item_falls_and_comes_to_rest_on_the_ground() {
+        let world = TestWorld::flat(64);
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(7);
+        let key = store.insert(pop_resource([0, 64, 0], dirt(1), &mut rng));
+        let start = store.pos(key).unwrap();
+        assert!(start.y > 64.0 && start.y < 65.0);
+        let mut peak = start.y;
+        for _ in 0..60 {
+            tick_items(&mut store, &world, &mut rng);
+            peak = peak.max(store.pos(key).unwrap().y);
+        }
+        let pos = store.pos(key).unwrap();
+        assert!(peak > start.y, "the item is thrown upward first");
+        assert!(
+            (pos.y - 64.0).abs() < 1e-9,
+            "rests on the stone top: {pos:?}"
+        );
+        assert!(store.flags(key).unwrap().has(Flags::ON_GROUND));
+        // Ground friction (0.6 * 0.98 per tick) has stopped it.
+        assert!(store.vel(key).unwrap().horizontal_distance() < 1e-3);
+        assert_eq!(
+            store.data(key).unwrap().item.as_ref().unwrap().pickup_delay,
+            0
+        );
+    }
+
+    #[test]
+    fn falls_through_air_with_vanilla_gravity_and_drag() {
+        let world = TestWorld::flat(0);
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(1);
+        let key = store.insert(new_item(
+            Vec3::new(0.5, 100.0, 0.5),
+            Vec3::ZERO,
+            dirt(1),
+            &mut rng,
+        ));
+        tick_items(&mut store, &world, &mut rng);
+        // v = (0 - 0.04) * 0.98 after moving by -0.04.
+        assert!((store.pos(key).unwrap().y - 99.96).abs() < 1e-12);
+        assert!((store.vel(key).unwrap().y + 0.0392).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stuck_items_are_pushed_out() {
+        let world = TestWorld::flat(64);
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(3);
+        let key = store.insert(new_item(
+            Vec3::new(0.5, 63.3, 0.5),
+            Vec3::ZERO,
+            dirt(1),
+            &mut rng,
+        ));
+        for _ in 0..20 {
+            tick_items(&mut store, &world, &mut rng);
+        }
+        assert!(store.pos(key).unwrap().y >= 64.0 - 1e-9);
+    }
+
+    #[test]
+    fn nearby_items_merge_and_keep_the_longer_delay() {
+        let world = TestWorld::flat(64);
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(5);
+        let a = store.insert(new_item(
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::ZERO,
+            dirt(3),
+            &mut rng,
+        ));
+        let b = store.insert(new_item(
+            Vec3::new(0.9, 64.0, 0.5),
+            Vec3::ZERO,
+            dirt(5),
+            &mut rng,
+        ));
+        store
+            .data_mut(a)
+            .unwrap()
+            .item
+            .as_mut()
+            .unwrap()
+            .pickup_delay = 30;
+        for _ in 0..40 {
+            tick_items(&mut store, &world, &mut rng);
+        }
+        let flags_a = store.flags(a).unwrap();
+        assert!(flags_a.has(Flags::REMOVED));
+        let survivor = store.data(b).unwrap();
+        assert_eq!(stack(survivor).count, 8);
+        assert!(survivor.item.as_ref().unwrap().pickup_delay > 0);
+        // Different items never merge.
+        let stone = ItemStack {
+            count: 1,
+            item_id: ferrite_data::registries::id("minecraft:item", "minecraft:stone").unwrap(),
+        };
+        let c = store.insert(new_item(
+            Vec3::new(0.7, 64.0, 0.5),
+            Vec3::ZERO,
+            stone,
+            &mut rng,
+        ));
+        for _ in 0..80 {
+            tick_items(&mut store, &world, &mut rng);
+        }
+        assert!(!store.flags(c).unwrap().has(Flags::REMOVED));
+    }
+
+    #[test]
+    fn items_despawn_after_their_lifetime() {
+        let world = TestWorld::flat(64);
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(9);
+        let key = store.insert(new_item(
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::ZERO,
+            dirt(1),
+            &mut rng,
+        ));
+        store.data_mut(key).unwrap().item.as_mut().unwrap().age = LIFETIME - 2;
+        tick_items(&mut store, &world, &mut rng);
+        assert!(!store.flags(key).unwrap().has(Flags::REMOVED));
+        tick_items(&mut store, &world, &mut rng);
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(store.sweep_removed().len(), 1);
+    }
+
+    #[test]
+    fn pickup_respects_delay_range_and_fills_the_inventory() {
+        let mut store = EntityStore::default();
+        let mut rng = Rng::new(2);
+        let key = store.insert(new_item(
+            Vec3::new(1.0, 64.0, 0.5),
+            Vec3::ZERO,
+            dirt(2),
+            &mut rng,
+        ));
+        store
+            .data_mut(key)
+            .unwrap()
+            .item
+            .as_mut()
+            .unwrap()
+            .pickup_delay = 1;
+        let mut inventory = [ItemStack::default(); 46];
+        let mut sent = Vec::new();
+        let mut sink = |_: tracker::ViewerKey, packet: &[u8]| sent.push(packet.to_vec());
+        let mut picker = Picker {
+            uuid: Uuid::from_u128(1),
+            entity_id: 77,
+            pos: Vec3::new(0.0, 64.0, 0.5),
+            inventory: &mut inventory,
+            selected: 0,
+            infinite: false,
+        };
+        assert!(pick_up(&mut store, &mut picker, &mut sink).is_empty());
+        store
+            .data_mut(key)
+            .unwrap()
+            .item
+            .as_mut()
+            .unwrap()
+            .pickup_delay = 0;
+        // Too far away: the box reaches 1.3 blocks sideways.
+        picker.pos = Vec3::new(3.0, 64.0, 0.5);
+        assert!(pick_up(&mut store, &mut picker, &mut sink).is_empty());
+        picker.pos = Vec3::new(0.0, 64.0, 0.5);
+        assert_eq!(pick_up(&mut store, &mut picker, &mut sink), vec![36]);
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(inventory[36], dirt(2));
+    }
+}

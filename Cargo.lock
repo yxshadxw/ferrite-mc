@@ -597,6 +597,7 @@ name = "ferrite-entity"
 version = "0.1.0"
 dependencies = [
  "ferrite-data",
+ "ferrite-item",
  "ferrite-math",
  "ferrite-protocol",
  "uuid",

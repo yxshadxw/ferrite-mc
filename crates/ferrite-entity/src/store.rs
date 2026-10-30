@@ -17,6 +17,7 @@
 
 use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
+use crate::item::ItemState;
 use crate::metadata::Metadata;
 use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
@@ -76,6 +77,8 @@ pub struct EntityData {
     pub metadata: Metadata,
     /// Tracker state; travels with the entity between regions.
     pub tracker: TrackerState,
+    /// Item entity state, for `minecraft:item`.
+    pub item: Option<ItemState>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -97,6 +100,7 @@ impl EntityData {
             tick_count: 0,
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
+            item: None,
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }
