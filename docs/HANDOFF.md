@@ -84,3 +84,37 @@ ALL vanilla features incl. every command; Rust-first, Java only when unavoidable
 7. Multi-version translation layer (wip/day2 has the start).
 8. Plugin API breadth (Server 26/206 implemented), EssentialsX needs CraftBukkit shim; compat-report.md on the WIP branch has probe results.
 9. **GitHub release prep**: LICENSE-MIT/LICENSE-APACHE, README polish, CI check on Linux (rust-toolchain.toml pins MSVC — CI overrides), confirm no vanilla/ or Mojang data committed (`git ls-files | grep -i vanilla`), choose repo name, push.
+
+
+---
+# Day 4 (2026-10-30) end
+Relicensed to GPL-3.0-or-later; work coordinated by one Claude coordinator through Orca orchestration (run `run_57911c7b3e38`, sessions in `docs/sessions.md`).
+**No new dispatches were made after the user said to stop for the day.** Sessions keep finishing what they were already doing.
+
+## On main today
+- Optimization survey of 20 projects with licenses and 26.x support (`docs/OPTIMIZATIONS.md`, FB5).
+- `ferrite-world`: per-section random-tick/fluid-tick counters, recounted from palette frequencies (Lithium-style; Terra).
+- `ferrite-fluid` (new): fluid state codec, new-liquid rules, scheduled ticks and slope spreading, directional collision faces, lava/water reactions and waterlogging; wired into the server so each region simulates only chunks it owns (`docs/handoff/fluid-ownership.md`; Terra).
+- `ferrite-net`: AES-NI CFB8 cipher (decrypt ~4-8x faster, FB5); Velocity modern forwarding + BungeeCord legacy forwarding (OC1).
+- `ferrite-server`: real /tps /mspt /profile (FB3). `ferrite-plugin` offline-player registry salvage (FB2). VarInt decode fast path, protocol-translate handoff notes (FB1).
+- `tools/make_fixture_world.py` regenerates the vanilla fixture world (seed `ferrite-fixture`, spawn pinned to 0,80,112).
+
+## Unmerged work (worktrees under C:/Users/taegy/orca/workspaces/ferrite-mc-ref/)
+| Worktree | State |
+|---|---|
+| fb1 | `31b00a1` libdeflate default frame compression (2.6-3.4x compress, 1.7-2.2x decompress), reviewed OK - merge it. Next task (compression/encryption off the tick thread) is pasted in its input but was never submitted. |
+| terra2 | `a634351` density-function evaluator (noise-free nodes), `f87df53` seeded noise + splines; W1c (Java differential vs the 26.3 jar) uncommitted. Then W2 (noise chunk fill) and W3 (surface rules); brief in task `task_295171c6e46d` / `docs/handoff/worldgen-26-3.md` (26.3 API names differ from the brief: use the jar). |
+| claude-worker | `b408f74` ferrite-entity M1 (region-local store, section index, region hand-off) committed; M2 (tracking packets) and M3 (item entities) in progress, uncommitted. Edits `game/region.rs` and `game/mod.rs` - rebase after the fluid merge. |
+| terra | random ticks R1/R2 started, 2 files uncommitted. |
+| fb2 / fb3 / fb4 / fb5 / oc1 / oc2 | uncommitted work: plugin onEnable end-to-end test / commands 2 (tp, msg, kill, op, ban, kick, stop, save-*) / signed chat (never committed) / chunk packet cache / light-fixture fix / commands 1 (gamemode, time, weather, ...). |
+
+## Known issues
+- `ferrite-light` `compare_fixture_light_when_available` fails on the regenerated fixture: 14/3,207,168 sky-light values (0.00044%) at the outer ring of comparable chunks; block light 0 mismatches. Suspected fixture-edge artifact, not an engine bug (OC1 is investigating; CI skips it because the fixture is absent). Run workspace tests with `-- --skip compare_fixture_light_when_available` until fixed.
+- Codex (Terra, Terra-2) is out of quota until 2026-10-31 00:00. Freebuff sessions end hourly and need a manual resume.
+- Long instructions sent to Codex/Freebuff terminals land as a "pasted content" chip; press Enter (and check for `Working (` / `working...`) or the task never starts.
+- Many concurrent cargo builds slow everything and make benchmarks noisy.
+
+## Next steps
+1. Merge fb1 (31b00a1) and terra2 W1a/W1b after the full workspace test passes; push.
+2. Resume Terra/Terra-2 after the quota reset; collect FB/OC results as they commit, review, merge.
+3. Remaining backlog: entity M2/M3, worldgen W1c-W3, random ticks, plugin onEnable end-to-end (M3 of the plan), signed chat, chunk packet cache, commands, tick-thread-free compression.
