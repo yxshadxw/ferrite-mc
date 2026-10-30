@@ -19,3 +19,9 @@ view-distance = 10
 
 # 이 크기(바이트) 이상인 패킷을 압축합니다.
 compression-threshold = 256
+
+# 플레이어 정보 전달 방식: "none", "velocity", "bungee".
+# 프록시 뒤에서 online-mode 인증은 프록시가 담당하므로 서버의 online-mode는 무시됩니다.
+# velocity를 사용할 때는 프록시의 forwarding.secret 값과 forwarding-secret을 맞추세요.
+forwarding = "none"
+forwarding-secret = ""

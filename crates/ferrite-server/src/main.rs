@@ -15,6 +15,8 @@ struct Config {
     max_players: u32,
     view_distance: u8,
     compression_threshold: usize,
+    forwarding: ForwardingMode,
+    forwarding_secret: String,
     world: Option<std::path::PathBuf>,
     gamemode: GameMode,
     ops: Vec<OpConfig>,
@@ -32,6 +34,24 @@ enum OpConfig {
 }
 fn default_op_level() -> u8 {
     4
+}
+fn build_forwarding(
+    mode: ForwardingMode,
+    secret: &str,
+) -> anyhow::Result<ferrite_net::forwarding::Forwarding> {
+    Ok(match mode {
+        ForwardingMode::None => ferrite_net::forwarding::Forwarding::None,
+        ForwardingMode::Bungee => ferrite_net::forwarding::Forwarding::Bungee,
+        ForwardingMode::Velocity => {
+            anyhow::ensure!(
+                !secret.is_empty(),
+                "forwarding-secret must be set when forwarding = 'velocity'"
+            );
+            ferrite_net::forwarding::Forwarding::Velocity {
+                secret: secret.to_owned(),
+            }
+        }
+    })
 }
 fn parse_ops(ops: Vec<OpConfig>) -> anyhow::Result<Vec<game::Operator>> {
     ops.into_iter()
@@ -57,6 +77,14 @@ enum GameMode {
     #[default]
     Creative,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ForwardingMode {
+    #[default]
+    None,
+    Velocity,
+    Bungee,
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -66,6 +94,8 @@ impl Default for Config {
             max_players: 20,
             view_distance: 10,
             compression_threshold: 256,
+            forwarding: ForwardingMode::None,
+            forwarding_secret: String::new(),
             world: None,
             gamemode: GameMode::Creative,
             ops: Vec::new(),
@@ -87,6 +117,12 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error).context("reading ferrite.toml"),
     };
     let ops = parse_ops(config.ops)?;
+    let forwarding = build_forwarding(config.forwarding, &config.forwarding_secret)?;
+    if forwarding.is_proxy() && config.online_mode {
+        tracing::warn!(
+            "online-mode is ignored when player forwarding is enabled; authenticate players on the proxy"
+        );
+    }
     if !config.online_mode && !ops.is_empty() {
         tracing::warn!(
             "operator UUIDs in offline mode must be offline-mode UUIDs; player names are not authenticated"
@@ -128,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
             encrypt_offline: false,
             compression_threshold: config.compression_threshold,
             view_distance: config.view_distance,
+            forwarding,
             game: Some(world.sender.clone()),
         },
     ));
@@ -173,7 +210,20 @@ mod tests {
         assert_eq!(defaults.bind_address, "0.0.0.0:25565");
         assert_eq!(defaults.max_players, 20);
         assert_eq!(defaults.compression_threshold, 256);
+        assert_eq!(defaults.forwarding, ForwardingMode::None);
+        assert!(defaults.forwarding_secret.is_empty());
         assert_eq!(defaults.world, None);
+        assert!(matches!(
+            build_forwarding(ForwardingMode::None, "").unwrap(),
+            ferrite_net::forwarding::Forwarding::None
+        ));
+        assert!(build_forwarding(ForwardingMode::Velocity, "").is_err());
+        assert_eq!(
+            build_forwarding(ForwardingMode::Velocity, "hunter2").unwrap(),
+            ferrite_net::forwarding::Forwarding::Velocity {
+                secret: "hunter2".into()
+            }
+        );
         assert!(parse_ops(vec![OpConfig::Uuid("Alice".into())]).is_err());
         let parsed = parse_ops(vec![OpConfig::Detailed {
             uuid: "00000000-0000-0000-0000-00000000000a".into(),

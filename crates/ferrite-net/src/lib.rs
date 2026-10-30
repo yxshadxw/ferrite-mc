@@ -1,6 +1,7 @@
 pub mod cfb8;
+pub mod forwarding;
 mod wire;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use ferrite_protocol::{
     Decode, FrameDecoder, FrameEncoder, Packet, VarInt, encode_packet,
     packets::{
@@ -22,6 +23,7 @@ pub struct ServerConfig {
     pub encrypt_offline: bool,
     pub compression_threshold: usize,
     pub view_distance: u8,
+    pub forwarding: forwarding::Forwarding,
     pub game: Option<tokio::sync::mpsc::UnboundedSender<game::GameMessage>>,
 }
 impl Default for ServerConfig {
@@ -33,6 +35,7 @@ impl Default for ServerConfig {
             encrypt_offline: false,
             compression_threshold: 256,
             view_distance: 10,
+            forwarding: forwarding::Forwarding::None,
             game: None,
         }
     }
@@ -42,7 +45,9 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
     i32::try_from(config.compression_threshold)
         .context("compression threshold exceeds protocol limit")?;
     i32::try_from(config.max_players).context("max players exceeds protocol limit")?;
-    let key = if config.online_mode || config.encrypt_offline {
+    // A proxy already authenticated the player; never run Mojang session auth on
+    // a forwarded connection.
+    let key = if !config.forwarding.is_proxy() && (config.online_mode || config.encrypt_offline) {
         Some(std::sync::Arc::new(
             tokio::task::spawn_blocking(|| rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024))
                 .await??,
@@ -105,7 +110,19 @@ async fn handle_connection(
     }
     let handshake = Intention::decode(&mut body)?;
     if handshake.intent != Intent::Status {
-        return offline_login(stream, decoder, config, key).await;
+        // BungeeCord legacy forwarding is appended to the handshake host. Paper's
+        // Spigot patch in ServerHandshakePacketListenerImpl parses it before the
+        // login listener is created; do the same here.
+        let legacy = if matches!(&config.forwarding, forwarding::Forwarding::Bungee) {
+            Some(
+                forwarding::parse_legacy_host(&handshake.server_address)?.context(
+                    "BungeeCord forwarding is enabled but the handshake has no forwarding data",
+                )?,
+            )
+        } else {
+            None
+        };
+        return offline_login(stream, decoder, config, key, legacy).await;
     }
     let packet = read_packet(&mut stream, &mut decoder).await?;
     let mut body = packet.as_slice();
@@ -141,6 +158,7 @@ async fn offline_login(
     mut decoder: FrameDecoder,
     config: ServerConfig,
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
+    legacy: Option<forwarding::LegacyForwarding>,
 ) -> Result<()> {
     use ferrite_protocol::packets::login::{LoginStart, LoginSuccess, SetCompression};
 
@@ -150,27 +168,53 @@ async fn offline_login(
         bail!("expected login start");
     }
     let start = LoginStart::decode(&mut body)?;
-    if start.name.is_empty()
-        || start.name.len() > 16
-        || !start
-            .name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !valid_username(&start.name) {
         bail!("invalid player name");
     }
-    // Java's nameUUIDFromBytes hashes the input directly, without a namespace.
-    let (uuid, name, properties) = if let Some(key) = key {
-        authenticate(
-            &mut stream,
-            &mut decoder,
-            &key,
-            &start.name,
-            config.online_mode,
-        )
-        .await?
-    } else {
-        (offline_uuid(&start.name), start.name.clone(), vec![])
+    let profile = match &config.forwarding {
+        forwarding::Forwarding::None => {
+            // Java's nameUUIDFromBytes hashes the input directly, without a namespace.
+            let (uuid, name, properties) = if let Some(key) = key {
+                authenticate(
+                    &mut stream,
+                    &mut decoder,
+                    &key,
+                    &start.name,
+                    config.online_mode,
+                )
+                .await?
+            } else {
+                (offline_uuid(&start.name), start.name.clone(), vec![])
+            };
+            Profile {
+                uuid,
+                name,
+                properties,
+                address: None,
+            }
+        }
+        forwarding::Forwarding::Velocity { secret } => {
+            let forwarded = query_velocity(&mut stream, &mut decoder, secret).await?;
+            Profile {
+                uuid: forwarded.uuid,
+                name: forwarded.name,
+                properties: forwarded.properties,
+                address: Some(forwarded.address),
+            }
+        }
+        forwarding::Forwarding::Bungee => {
+            let legacy = legacy.context(
+                "BungeeCord forwarding is enabled but the handshake has no forwarding data",
+            )?;
+            // BungeeCord's legacy payload omits the name; LoginStart supplies it,
+            // exactly as Paper's createOfflineProfile does.
+            Profile {
+                uuid: legacy.uuid,
+                name: start.name.clone(),
+                properties: legacy.properties,
+                address: Some(legacy.address),
+            }
+        }
     };
     send_packet(
         &mut stream,
@@ -185,9 +229,9 @@ async fn offline_login(
     let mut body = Vec::new();
     encode_packet(
         &LoginSuccess {
-            uuid,
-            name: name.clone(),
-            properties: properties.clone(),
+            uuid: profile.uuid,
+            name: profile.name.clone(),
+            properties: profile.properties.clone(),
             session_id: uuid::Uuid::new_v4(),
         },
         &mut body,
@@ -195,18 +239,48 @@ async fn offline_login(
     let mut wire = Vec::new();
     encoder.encode(&body, &mut wire);
     stream.write_all(&wire).await?;
-    configure(
-        stream,
-        decoder,
-        encoder,
-        config,
-        Profile {
-            uuid,
-            name,
-            properties,
-        },
-    )
-    .await
+    configure(stream, decoder, encoder, config, profile).await
+}
+
+/// Ask Velocity for its modern-forwarding payload and verify the HMAC.
+///
+/// Paper sends `ClientboundCustomQueryPacket` on `velocity:player_info` with one
+/// byte containing `MAX_SUPPORTED_FORWARDING_VERSION`; see
+/// `ServerLoginPacketListenerImpl.java.patch` and `VelocityProxy.java`.
+async fn query_velocity(
+    stream: &mut Wire,
+    decoder: &mut FrameDecoder,
+    secret: &str,
+) -> Result<forwarding::VelocityProfile> {
+    use ferrite_protocol::packets::login::CustomQueryAnswer;
+
+    let message_id = rand::random::<i32>();
+    let query = forwarding::CustomQuery {
+        message_id: VarInt(message_id),
+        channel: forwarding::VELOCITY_PLAYER_INFO_CHANNEL.into(),
+        data: ferrite_protocol::RestBytes(vec![
+            u8::try_from(forwarding::VELOCITY_MAX_FORWARDING_VERSION)
+                .context("forwarding version byte")?,
+        ]),
+    };
+    send_packet(stream, &query)
+        .await
+        .context("send Velocity forwarding query")?;
+    let packet = read_packet(stream, decoder).await?;
+    let mut body = packet.as_slice();
+    ensure!(
+        VarInt::decode(&mut body)?.0 == CustomQueryAnswer::ID,
+        "expected Velocity forwarding answer"
+    );
+    let answer = CustomQueryAnswer::decode(&mut body)?;
+    ensure!(
+        answer.message_id.0 == message_id,
+        "unexpected Velocity forwarding message id"
+    );
+    let data = answer
+        .data
+        .context("client did not answer the Velocity forwarding query")?;
+    forwarding::parse_velocity_payload(secret.as_bytes(), &data.0)
 }
 async fn send_compressed<P: Packet, W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
@@ -224,6 +298,8 @@ struct Profile {
     uuid: uuid::Uuid,
     name: String,
     properties: Vec<ferrite_protocol::packets::login::Property>,
+    /// Address forwarded by the proxy, when one is configured.
+    address: Option<std::net::IpAddr>,
 }
 async fn configure(
     mut stream: Wire,
@@ -392,7 +468,7 @@ async fn play(
 ) -> Result<()> {
     use ferrite_protocol::packets::play::{PlayDisconnect, PlayKeepAlive};
     use game::{GameMessage, Outbound};
-    tracing::info!(name = %profile.name, "entering play");
+    tracing::info!(name = %profile.name, address = ?profile.address, "entering play");
     let game = config.game.context("game loop unavailable")?;
     let dimension_type = vanilla.registries["minecraft:dimension_type"]
         .iter()
@@ -529,6 +605,11 @@ async fn authenticate(
         }
     }
     Ok((uuid, authenticated.into(), properties))
+}
+fn valid_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 16
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 fn offline_uuid(name: &str) -> uuid::Uuid {
     let digest = md5::compute(format!("OfflinePlayer:{name}"));
@@ -685,6 +766,113 @@ mod login_test {
             profile.uuid.to_string(),
             "5627dd98-e6be-3c21-b8a8-e92344183641"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn velocity_forwarding_replaces_the_login_profile() {
+        use ferrite_protocol::packets::login::CustomQueryAnswer;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secret = "hunter2";
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                forwarding: forwarding::Forwarding::Velocity {
+                    secret: secret.into(),
+                },
+                ..Default::default()
+            },
+        ));
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut wire = Vec::new();
+        for body in [
+            {
+                let mut b = Vec::new();
+                encode_packet(
+                    &Intention {
+                        protocol_version: 777,
+                        server_address: "localhost".into(),
+                        server_port: addr.port(),
+                        intent: Intent::Login,
+                    },
+                    &mut b,
+                );
+                b
+            },
+            {
+                let mut b = Vec::new();
+                encode_packet(
+                    &LoginStart {
+                        name: "Steve".into(),
+                        uuid: uuid::Uuid::nil(),
+                    },
+                    &mut b,
+                );
+                b
+            },
+        ] {
+            FrameEncoder::default().encode(&body, &mut wire);
+        }
+        stream.write_all(&wire).await.unwrap();
+        let mut decoder = FrameDecoder::default();
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut body = packet.as_slice();
+        assert_eq!(
+            VarInt::decode(&mut body).unwrap().0,
+            forwarding::CustomQuery::ID
+        );
+        let query = forwarding::CustomQuery::decode(&mut body).unwrap();
+        assert_eq!(query.channel, forwarding::VELOCITY_PLAYER_INFO_CHANNEL);
+        assert_eq!(query.data.0, vec![4]);
+        let uuid = uuid::Uuid::parse_str("069a79f4-44e9-4726-a5be-fca90e38aaf5").unwrap();
+        let payload = forwarding::signed_velocity_payload(
+            secret.as_bytes(),
+            4,
+            "203.0.113.7",
+            uuid,
+            "Notch",
+            &[],
+        );
+        send_packet(
+            &mut stream,
+            &CustomQueryAnswer {
+                message_id: query.message_id,
+                data: Some(ferrite_protocol::RestBytes(payload)),
+            },
+        )
+        .await
+        .unwrap();
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, SetCompression::ID);
+        decoder.set_compression(Some(256));
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, LoginSuccess::ID);
+        let profile = LoginSuccess::decode(&mut body).unwrap();
+        assert_eq!(profile.uuid, uuid);
+        assert_eq!(profile.name, "Notch");
         server.abort();
     }
 }
