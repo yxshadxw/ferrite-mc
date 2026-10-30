@@ -8,7 +8,10 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, MovePosition, PositionSync, SystemChat},
+        play::{
+            ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, LastSeenUpdate,
+            MovePosition, PositionSync, ServerboundChat, SystemChat,
+        },
     },
 };
 use tokio::{
@@ -36,6 +39,16 @@ impl Bot {
         let mut wire = Vec::new();
         self.encoder.encode(&body, &mut wire);
         self.stream.write_all(&wire).await.unwrap();
+    }
+    async fn chat(&mut self, text: &str) {
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp: 1_700_000_000_000,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
+        })
+        .await;
     }
     async fn read(&mut self) -> Vec<u8> {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -202,15 +215,12 @@ async fn two_bots_move_stream_chat_and_disconnect() {
             }
         }
     }
-    a.raw(9, "hello from Alice").await;
-    loop {
-        let body = b.until(124).await;
-        let mut s = body.as_slice();
-        let msg = SystemChat::decode(&mut s).unwrap();
-        if msg.content.0 == "<Alice> hello from Alice" {
-            break;
-        }
-    }
+    a.chat("hello from Alice").await;
+    let body = b.until(ClientboundPlayerChat::ID).await;
+    let msg = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(msg.body.content, "hello from Alice");
+    assert!(msg.signature.is_none());
+    assert!(msg.body.last_seen.is_empty());
     drop(a);
     let mut remove_info = false;
     let mut remove_entity = false;
@@ -220,6 +230,51 @@ async fn two_bots_move_stream_chat_and_disconnect() {
         remove_entity |= id == 78;
     }
     drop(b);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_chat_broadcasts_unsigned_player_chat_to_others() {
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut alice = Bot::join(addr, "Alice").await;
+    let mut bob = Bot::join(addr, "Bob").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    alice.chat("hello offline").await;
+
+    // Both the sender and the other player receive a vanilla-shaped unsigned player_chat.
+    for bot in [&mut bob, &mut alice] {
+        let body = bot.until(ClientboundPlayerChat::ID).await;
+        let msg = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+        assert_eq!(msg.body.content, "hello offline");
+        assert!(!msg.sender.is_nil()); // offline-mode UUID derived from the name
+        assert_eq!(msg.index.0, 0);
+        assert!(msg.signature.is_none());
+        assert!(msg.unsigned_content.is_none());
+        assert!(msg.body.timestamp >= before);
+        assert_eq!(msg.body.salt, 0);
+        assert!(msg.body.last_seen.is_empty());
+        assert_eq!(msg.chat_type.chat_type.0, 0);
+        assert_eq!(msg.chat_type.name.0, "Alice");
+        assert!(msg.chat_type.target_name.is_none());
+    }
+    drop(alice);
+    drop(bob);
     world.shutdown().await.unwrap();
     server.abort();
 }
@@ -246,14 +301,10 @@ async fn duplicate_login_kicks_old_session_and_keeps_new_session() {
     let reason =
         ferrite_protocol::packets::play::PlayDisconnect::decode(&mut body.as_slice()).unwrap();
     assert_eq!(reason.reason.0, "You logged in from another location");
-    new.raw(9, "still here").await;
-    loop {
-        let body = new.until(124).await;
-        let msg = SystemChat::decode(&mut body.as_slice()).unwrap();
-        if msg.content.0 == "<Alice> still here" {
-            break;
-        }
-    }
+    new.chat("still here").await;
+    let body = new.until(ClientboundPlayerChat::ID).await;
+    let msg = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(msg.body.content, "still here");
     drop(new);
     world.shutdown().await.unwrap();
     server.abort();
@@ -282,10 +333,10 @@ async fn crossing_region_boundary_keeps_chat_and_movement_routed() {
             flags: 1,
         })
         .await;
-        bot.raw(9, "walking").await;
+        bot.chat("walking").await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
-    bot.raw(9, "across").await;
+    bot.chat("across").await;
     let mut reached = false;
     let mut chatted = false;
     while !(reached && chatted) {
@@ -294,9 +345,9 @@ async fn crossing_region_boundary_keeps_chat_and_movement_routed() {
             let mut body = body.as_slice();
             reached |= VarInt::decode(&mut body).unwrap().0 == 18;
         }
-        if id == 124 {
-            let message = SystemChat::decode(&mut body.as_slice()).unwrap();
-            chatted |= message.content.0 == "<Walker> across";
+        if id == ClientboundPlayerChat::ID {
+            let message = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+            chatted |= message.body.content == "across";
         }
     }
     drop(bot);
@@ -417,7 +468,10 @@ async fn operator_teleport_command_moves_player() {
         },
     ));
     let mut bot = Bot::join(addr, "Alice").await;
-    bot.raw(7, "tp 10 70 20").await;
+    bot.send(&ferrite_protocol::packets::play::ServerboundChatCommand {
+        command: "tp 10 70 20".into(),
+    })
+    .await;
     let body = bot.until(73).await;
     let p = PositionSync::decode(&mut body.as_slice()).unwrap();
     assert_eq!([p.x, p.y, p.z], [10.0, 70.0, 20.0]);

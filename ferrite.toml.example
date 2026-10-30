@@ -8,6 +8,10 @@ bind-address = "0.0.0.0:25565"
 # true면 Mojang 인증(정품) 사용, false면 오프라인 모드로 로컬 테스트 가능.
 online-mode = true
 
+# 정품 서버에서 서명된 채팅(프로필 키)을 요구합니다.
+# 오프라인 모드에서는 항상 무시되고 서명 없는 채팅이 허용됩니다.
+enforce-secure-profile = true
+
 # 서버 목록에 표시되는 설명 문구.
 motd = "A Ferrite server"
 

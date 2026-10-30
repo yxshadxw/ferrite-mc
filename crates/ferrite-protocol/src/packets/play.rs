@@ -108,32 +108,38 @@ impl Packet for ChunkData {
     const STATE: State = State::Play;
     const BOUND: Bound = Bound::Clientbound;
 }
+/// `ADD_PLAYER | INITIALIZE_CHAT | UPDATE_GAME_MODE | UPDATE_LISTED`: the actions every player
+/// needs for the tab list and for validating chat signatures.
+const PLAYER_INFO_ACTIONS: u8 = 1 | 2 | 4 | 8;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerInfo {
     pub uuid: Uuid,
     pub name: String,
     pub properties: Vec<Property>,
+    pub chat_session: Option<RemoteChatSessionData>,
     pub game_mode: VarInt,
 }
 impl Encode for PlayerInfo {
     fn encode(&self, out: &mut Vec<u8>) {
-        13u8.encode(out);
+        PLAYER_INFO_ACTIONS.encode(out);
         VarInt(1).encode(out);
         self.uuid.encode(out);
         self.name.encode(out);
         self.properties.encode(out);
+        self.chat_session.encode(out);
         self.game_mode.encode(out);
         true.encode(out);
     }
 }
 impl Decode for PlayerInfo {
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
-        if u8::decode(buf)? != 13 || VarInt::decode(buf)?.0 != 1 {
+        if u8::decode(buf)? != PLAYER_INFO_ACTIONS || VarInt::decode(buf)?.0 != 1 {
             return Err(DecodeError::Invalid("player info actions"));
         }
         let uuid = Uuid::decode(buf)?;
         let name = String::decode(buf)?;
         let properties = Vec::decode(buf)?;
+        let chat_session = Option::decode(buf)?;
         let game_mode = VarInt::decode(buf)?;
         if !bool::decode(buf)? {
             return Err(DecodeError::Invalid("unlisted player"));
@@ -142,6 +148,7 @@ impl Decode for PlayerInfo {
             uuid,
             name,
             properties,
+            chat_session,
             game_mode,
         })
     }
@@ -413,6 +420,580 @@ impl Decode for ItemStack {
             return Err(DecodeError::Invalid("item components unsupported"));
         }
         Ok(Self { count, item_id })
+    }
+}
+
+/// A 256-byte `SHA256withRSA` chat signature (`MessageSignature` in vanilla). ED25519 was never
+/// used for Java chat: profile keys are 2048-bit RSA keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageSignature(pub [u8; 256]);
+impl Encode for MessageSignature {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0);
+    }
+}
+impl Decode for MessageSignature {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = crate::codec::take(buf, 256)?;
+        Ok(Self(bytes.try_into().expect("exactly 256 bytes")))
+    }
+}
+
+/// `LastSeenMessages.Update`: offset into the acknowledged queue, a 20-bit bitset (three bytes,
+/// little-endian) of acknowledged entries, and the checksum (zero means unchecked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastSeenUpdate {
+    pub offset: VarInt,
+    pub acknowledged: [u8; 3],
+    pub checksum: i8,
+}
+impl LastSeenUpdate {
+    pub fn is_acknowledged(&self, index: usize) -> bool {
+        index < 20 && self.acknowledged[index / 8] & (1 << (index % 8)) != 0
+    }
+    pub fn new(offset: i32, acknowledged: &[usize], checksum: i8) -> Self {
+        let mut bits = [0u8; 3];
+        for &index in acknowledged {
+            bits[index / 8] |= 1 << (index % 8);
+        }
+        Self {
+            offset: VarInt(offset),
+            acknowledged: bits,
+            checksum,
+        }
+    }
+}
+impl Encode for LastSeenUpdate {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.offset.encode(out);
+        out.extend_from_slice(&self.acknowledged);
+        self.checksum.encode(out);
+    }
+}
+impl Decode for LastSeenUpdate {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            offset: VarInt::decode(buf)?,
+            acknowledged: crate::codec::take(buf, 3)?
+                .try_into()
+                .expect("exactly 3 bytes"),
+            checksum: i8::decode(buf)?,
+        })
+    }
+}
+
+/// `ProfilePublicKey.Data`: expiry (epoch millis), X.509 RSA key, and Mojang's signature over both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileKeyData {
+    pub expires_at: i64,
+    pub key: Vec<u8>,
+    pub key_signature: Vec<u8>,
+}
+impl Encode for ProfileKeyData {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.expires_at.encode(out);
+        self.key.encode(out);
+        self.key_signature.encode(out);
+    }
+}
+impl Decode for ProfileKeyData {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let expires_at = i64::decode(buf)?;
+        let key = decode_byte_array(buf, 512)?;
+        let key_signature = decode_byte_array(buf, 4096)?;
+        Ok(Self {
+            expires_at,
+            key,
+            key_signature,
+        })
+    }
+}
+fn decode_byte_array(buf: &mut &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
+    let len = VarInt::decode(buf)?.0;
+    let len = usize::try_from(len).map_err(|_| DecodeError::Invalid("negative array length"))?;
+    if len > max {
+        return Err(DecodeError::Invalid("byte array too long"));
+    }
+    Ok(crate::codec::take(buf, len)?.to_vec())
+}
+
+/// `RemoteChatSession.Data`: the session UUID plus the profile public key. Sent by the client in
+/// `chat_session_update` and echoed to every client in `player_info` so it can verify signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteChatSessionData {
+    pub session_id: Uuid,
+    pub profile_key: ProfileKeyData,
+}
+impl Encode for RemoteChatSessionData {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.session_id.encode(out);
+        self.profile_key.encode(out);
+    }
+}
+impl Decode for RemoteChatSessionData {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            session_id: Uuid::decode(buf)?,
+            profile_key: ProfileKeyData::decode(buf)?,
+        })
+    }
+}
+
+/// `ClientboundPlayerInfoUpdatePacket` carrying only `INITIALIZE_CHAT`, broadcast when a player's
+/// chat session changes after joining.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerInfoChatSession {
+    pub uuid: Uuid,
+    pub chat_session: Option<RemoteChatSessionData>,
+}
+impl Encode for PlayerInfoChatSession {
+    fn encode(&self, out: &mut Vec<u8>) {
+        2u8.encode(out);
+        VarInt(1).encode(out);
+        self.uuid.encode(out);
+        self.chat_session.encode(out);
+    }
+}
+impl Decode for PlayerInfoChatSession {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        if u8::decode(buf)? != 2 || VarInt::decode(buf)?.0 != 1 {
+            return Err(DecodeError::Invalid("chat session update actions"));
+        }
+        Ok(Self {
+            uuid: Uuid::decode(buf)?,
+            chat_session: Option::decode(buf)?,
+        })
+    }
+}
+impl Packet for PlayerInfoChatSession {
+    const ID: i32 = 71;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+/// Argument signature used by signed chat commands (`ArgumentSignatures.Entry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentSignature {
+    pub name: String,
+    pub signature: MessageSignature,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundChat {
+    pub message: String,
+    /// Epoch milliseconds.
+    pub timestamp: i64,
+    pub salt: i64,
+    pub signature: Option<MessageSignature>,
+    pub last_seen: LastSeenUpdate,
+}
+impl Encode for ServerboundChat {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.message.encode(out);
+        self.timestamp.encode(out);
+        self.salt.encode(out);
+        self.signature.encode(out);
+        self.last_seen.encode(out);
+    }
+}
+impl Decode for ServerboundChat {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            message: crate::codec::decode_string(buf, 256)?,
+            timestamp: i64::decode(buf)?,
+            salt: i64::decode(buf)?,
+            signature: Option::decode(buf)?,
+            last_seen: LastSeenUpdate::decode(buf)?,
+        })
+    }
+}
+impl Packet for ServerboundChat {
+    const ID: i32 = 9;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundChatAck {
+    pub offset: VarInt,
+}
+impl Encode for ServerboundChatAck {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.offset.encode(out);
+    }
+}
+impl Decode for ServerboundChatAck {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            offset: VarInt::decode(buf)?,
+        })
+    }
+}
+impl Packet for ServerboundChatAck {
+    const ID: i32 = 6;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundChatCommand {
+    pub command: String,
+}
+impl Encode for ServerboundChatCommand {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.command.encode(out);
+    }
+}
+impl Decode for ServerboundChatCommand {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            command: String::decode(buf)?,
+        })
+    }
+}
+impl Packet for ServerboundChatCommand {
+    const ID: i32 = 7;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundChatCommandSigned {
+    pub command: String,
+    pub timestamp: i64,
+    pub salt: i64,
+    pub argument_signatures: Vec<ArgumentSignature>,
+    pub last_seen: LastSeenUpdate,
+}
+impl Encode for ServerboundChatCommandSigned {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.command.encode(out);
+        self.timestamp.encode(out);
+        self.salt.encode(out);
+        VarInt(self.argument_signatures.len() as i32).encode(out);
+        for entry in &self.argument_signatures {
+            entry.name.encode(out);
+            entry.signature.encode(out);
+        }
+        self.last_seen.encode(out);
+    }
+}
+impl Decode for ServerboundChatCommandSigned {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let command = String::decode(buf)?;
+        let timestamp = i64::decode(buf)?;
+        let salt = i64::decode(buf)?;
+        let len = VarInt::decode(buf)?.0;
+        let len =
+            usize::try_from(len).map_err(|_| DecodeError::Invalid("negative array length"))?;
+        if len > 8 {
+            return Err(DecodeError::Invalid("too many argument signatures"));
+        }
+        let mut argument_signatures = Vec::with_capacity(len);
+        for _ in 0..len {
+            argument_signatures.push(ArgumentSignature {
+                name: crate::codec::decode_string(buf, 16)?,
+                signature: MessageSignature::decode(buf)?,
+            });
+        }
+        Ok(Self {
+            command,
+            timestamp,
+            salt,
+            argument_signatures,
+            last_seen: LastSeenUpdate::decode(buf)?,
+        })
+    }
+}
+impl Packet for ServerboundChatCommandSigned {
+    const ID: i32 = 8;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerboundChatSessionUpdate {
+    pub chat_session: RemoteChatSessionData,
+}
+impl Encode for ServerboundChatSessionUpdate {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.chat_session.encode(out);
+    }
+}
+impl Decode for ServerboundChatSessionUpdate {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            chat_session: RemoteChatSessionData::decode(buf)?,
+        })
+    }
+}
+impl Packet for ServerboundChatSessionUpdate {
+    const ID: i32 = 10;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+/// The chat-type registry holder (`VarInt` id + 1, 0 meaning an inline definition), the sender
+/// name shown by the chat decoration, and an optional recipient name for private messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatTypeBound {
+    pub chat_type: VarInt,
+    pub name: crate::types::PlainText,
+    pub target_name: Option<crate::types::PlainText>,
+}
+impl Encode for ChatTypeBound {
+    fn encode(&self, out: &mut Vec<u8>) {
+        VarInt(self.chat_type.0 + 1).encode(out);
+        self.name.encode(out);
+        self.target_name.encode(out);
+    }
+}
+impl Decode for ChatTypeBound {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let id = VarInt::decode(buf)?.0;
+        if id == 0 {
+            return Err(DecodeError::Invalid("inline chat types unsupported"));
+        }
+        Ok(Self {
+            chat_type: VarInt(id - 1),
+            name: crate::types::PlainText::decode(buf)?,
+            target_name: Option::decode(buf)?,
+        })
+    }
+}
+
+/// `SignedMessageBody.Packed`: content, epoch-millisecond timestamp, salt, and the signature
+/// chain's last-seen entries (encoded as full signatures).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignedMessageBody {
+    pub content: String,
+    pub timestamp: i64,
+    pub salt: i64,
+    pub last_seen: Vec<MessageSignature>,
+}
+impl Encode for SignedMessageBody {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.content.encode(out);
+        self.timestamp.encode(out);
+        self.salt.encode(out);
+        VarInt(self.last_seen.len() as i32).encode(out);
+        for signature in &self.last_seen {
+            // `MessageSignature.Packed` id -1: the full 256-byte signature follows.
+            VarInt(0).encode(out);
+            signature.encode(out);
+        }
+    }
+}
+impl Decode for SignedMessageBody {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let content = crate::codec::decode_string(buf, 256)?;
+        let timestamp = i64::decode(buf)?;
+        let salt = i64::decode(buf)?;
+        let len = VarInt::decode(buf)?.0;
+        let len =
+            usize::try_from(len).map_err(|_| DecodeError::Invalid("negative array length"))?;
+        if len > 20 {
+            return Err(DecodeError::Invalid("too many last-seen signatures"));
+        }
+        let mut last_seen = Vec::with_capacity(len);
+        for _ in 0..len {
+            if VarInt::decode(buf)?.0 != 0 {
+                return Err(DecodeError::Invalid("packed signature cache unsupported"));
+            }
+            last_seen.push(MessageSignature::decode(buf)?);
+        }
+        Ok(Self {
+            content,
+            timestamp,
+            salt,
+            last_seen,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundPlayerChat {
+    /// Per-recipient chat index (the client's acknowledgement counter).
+    pub global_index: VarInt,
+    pub sender: Uuid,
+    /// The sender's signature-chain index.
+    pub index: VarInt,
+    pub signature: Option<MessageSignature>,
+    pub body: SignedMessageBody,
+    pub unsigned_content: Option<crate::types::PlainText>,
+    /// `FilterMask` type id; 0 is pass-through.
+    pub filter_mask: VarInt,
+    pub chat_type: ChatTypeBound,
+}
+impl Encode for ClientboundPlayerChat {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.global_index.encode(out);
+        self.sender.encode(out);
+        self.index.encode(out);
+        self.signature.encode(out);
+        self.body.encode(out);
+        self.unsigned_content.encode(out);
+        self.filter_mask.encode(out);
+        self.chat_type.encode(out);
+    }
+}
+impl Decode for ClientboundPlayerChat {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            global_index: VarInt::decode(buf)?,
+            sender: Uuid::decode(buf)?,
+            index: VarInt::decode(buf)?,
+            signature: Option::decode(buf)?,
+            body: SignedMessageBody::decode(buf)?,
+            unsigned_content: Option::decode(buf)?,
+            filter_mask: VarInt::decode(buf)?,
+            chat_type: ChatTypeBound::decode(buf)?,
+        })
+    }
+}
+impl Packet for ClientboundPlayerChat {
+    const ID: i32 = 66;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundDisguisedChat {
+    pub message: crate::types::PlainText,
+    pub chat_type: ChatTypeBound,
+}
+impl Encode for ClientboundDisguisedChat {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.message.encode(out);
+        self.chat_type.encode(out);
+    }
+}
+impl Decode for ClientboundDisguisedChat {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            message: crate::types::PlainText::decode(buf)?,
+            chat_type: ChatTypeBound::decode(buf)?,
+        })
+    }
+}
+impl Packet for ClientboundDisguisedChat {
+    const ID: i32 = 33;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+    fn roundtrip<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
+        let mut bytes = Vec::new();
+        value.encode(&mut bytes);
+        let mut data = bytes.as_slice();
+        assert_eq!(T::decode(&mut data).unwrap(), value);
+        assert!(data.is_empty());
+    }
+    fn signature(seed: u8) -> MessageSignature {
+        MessageSignature([seed; 256])
+    }
+    fn profile_key() -> ProfileKeyData {
+        ProfileKeyData {
+            expires_at: 1_700_000_000_000,
+            key: vec![1, 2, 3],
+            key_signature: vec![4, 5],
+        }
+    }
+    fn session() -> RemoteChatSessionData {
+        RemoteChatSessionData {
+            session_id: Uuid::from_u128(7),
+            profile_key: profile_key(),
+        }
+    }
+    fn chat_type() -> ChatTypeBound {
+        ChatTypeBound {
+            chat_type: VarInt(0),
+            name: crate::types::PlainText("Steve".into()),
+            target_name: None,
+        }
+    }
+    #[test]
+    fn chat_packets_roundtrip() {
+        roundtrip(ServerboundChat {
+            message: "hello".into(),
+            timestamp: 1_700_000_000_123,
+            salt: 42,
+            signature: Some(signature(3)),
+            last_seen: LastSeenUpdate::new(2, &[0, 4], 9),
+        });
+        roundtrip(ServerboundChatAck { offset: VarInt(3) });
+        roundtrip(ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        });
+        roundtrip(ServerboundChatCommandSigned {
+            command: "say hi".into(),
+            timestamp: 1,
+            salt: 2,
+            argument_signatures: vec![ArgumentSignature {
+                name: "message".into(),
+                signature: signature(4),
+            }],
+            last_seen: LastSeenUpdate::new(0, &[], 1),
+        });
+        roundtrip(ServerboundChatSessionUpdate {
+            chat_session: session(),
+        });
+        roundtrip(PlayerInfoChatSession {
+            uuid: Uuid::from_u128(9),
+            chat_session: Some(session()),
+        });
+        roundtrip(PlayerInfoChatSession {
+            uuid: Uuid::from_u128(9),
+            chat_session: None,
+        });
+        roundtrip(ClientboundPlayerChat {
+            global_index: VarInt(5),
+            sender: Uuid::from_u128(9),
+            index: VarInt(2),
+            signature: Some(signature(8)),
+            body: SignedMessageBody {
+                content: "hello".into(),
+                timestamp: 1_700_000_000_123,
+                salt: 42,
+                last_seen: vec![signature(1), signature(2)],
+            },
+            unsigned_content: None,
+            filter_mask: VarInt(0),
+            chat_type: chat_type(),
+        });
+        roundtrip(ClientboundDisguisedChat {
+            message: crate::types::PlainText("hi".into()),
+            chat_type: chat_type(),
+        });
+    }
+    #[test]
+    fn chat_type_uses_holder_id_plus_one() {
+        let mut bytes = Vec::new();
+        chat_type().encode(&mut bytes);
+        assert_eq!(bytes[0], 1);
+    }
+    #[test]
+    fn last_seen_bitset_is_three_bytes() {
+        let update = LastSeenUpdate::new(0, &[0, 7, 19], 0);
+        assert!(update.is_acknowledged(0));
+        assert!(update.is_acknowledged(7));
+        assert!(update.is_acknowledged(19));
+        assert!(!update.is_acknowledged(1));
+        let mut bytes = Vec::new();
+        LastSeenUpdate::new(0, &[], 0).encode(&mut bytes);
+        assert_eq!(bytes, [0, 0, 0, 0, 0]);
+    }
+    #[test]
+    fn rejects_oversized_profile_key() {
+        let mut bytes = Vec::new();
+        Uuid::nil().encode(&mut bytes);
+        0i64.encode(&mut bytes);
+        VarInt(513).encode(&mut bytes);
+        bytes.extend(std::iter::repeat_n(0u8, 513));
+        assert!(RemoteChatSessionData::decode(&mut bytes.as_slice()).is_err());
     }
 }
 

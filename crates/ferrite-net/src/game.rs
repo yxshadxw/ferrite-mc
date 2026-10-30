@@ -18,8 +18,13 @@ pub enum ServerboundPlay {
     Confirm(ConfirmTeleport),
     Loaded,
     ChunkBatchReceived(f32),
-    Chat(String),
-    Command(String),
+    /// Boxed: `ServerboundChat` carries the 256-byte signature, which would otherwise dominate
+    /// every `GameMessage::Input`.
+    Chat(Box<ServerboundChat>),
+    ChatAck(ServerboundChatAck),
+    ChatCommand(ServerboundChatCommand),
+    ChatCommandSigned(ServerboundChatCommandSigned),
+    ChatSessionUpdate(ServerboundChatSessionUpdate),
 }
 #[derive(Debug)]
 pub enum GameMessage {
@@ -32,6 +37,13 @@ pub enum GameMessage {
         biome: i32,
         view_distance: u8,
         online_mode: bool,
+        /// Whether the client must prove chat messages with profile-key signatures
+        /// (`enforce-secure-profile` on an authenticated server).
+        secure_chat: bool,
+        /// The registry id of `minecraft:chat` in the synchronized `chat_type` registry.
+        chat_type: i32,
+        /// Client chat visibility: 0 = shown, 1 = commands only, 2 = hidden.
+        chat_visibility: u8,
         max_players: u32,
         outbound: mpsc::UnboundedSender<Outbound>,
     },
@@ -67,8 +79,21 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
     let id = VarInt::decode(&mut b)?.0;
     Ok(match id {
         0 => Some(ServerboundPlay::Confirm(ConfirmTeleport::decode(&mut b)?)),
-        7 | 8 => Some(ServerboundPlay::Command(String::decode(&mut b)?)),
-        9 => Some(ServerboundPlay::Chat(String::decode(&mut b)?)),
+        6 => Some(ServerboundPlay::ChatAck(ServerboundChatAck::decode(
+            &mut b,
+        )?)),
+        7 => Some(ServerboundPlay::ChatCommand(
+            ServerboundChatCommand::decode(&mut b)?,
+        )),
+        8 => Some(ServerboundPlay::ChatCommandSigned(
+            ServerboundChatCommandSigned::decode(&mut b)?,
+        )),
+        9 => Some(ServerboundPlay::Chat(Box::new(ServerboundChat::decode(
+            &mut b,
+        )?))),
+        10 => Some(ServerboundPlay::ChatSessionUpdate(
+            ServerboundChatSessionUpdate::decode(&mut b)?,
+        )),
         11 => Some(ServerboundPlay::ChunkBatchReceived(
             ChunkBatchReceived::decode(&mut b)?.chunks_per_tick,
         )),
@@ -108,6 +133,35 @@ mod interaction_tests {
         assert!(matches!(
             decode_play(&bytes).unwrap(),
             Some(ServerboundPlay::PlayerAction(_))
+        ));
+    }
+    #[test]
+    fn routes_signed_chat_and_acknowledgements() {
+        use ferrite_protocol::packets::play::{LastSeenUpdate, MessageSignature};
+        let mut bytes = Vec::new();
+        encode_packet(
+            &ServerboundChat {
+                message: "hello".into(),
+                timestamp: 1,
+                salt: 2,
+                signature: Some(MessageSignature([7; 256])),
+                last_seen: LastSeenUpdate::new(0, &[1], 0),
+            },
+            &mut bytes,
+        );
+        let Some(ServerboundPlay::Chat(chat)) = decode_play(&bytes).unwrap() else {
+            panic!("expected chat");
+        };
+        assert_eq!(chat.message, "hello");
+        assert!(chat.signature.is_some());
+
+        let mut bytes = Vec::new();
+        encode_packet(&ServerboundChatAck { offset: VarInt(4) }, &mut bytes);
+        assert!(matches!(
+            decode_play(&bytes).unwrap(),
+            Some(ServerboundPlay::ChatAck(ServerboundChatAck {
+                offset: VarInt(4)
+            }))
         ));
     }
 }
