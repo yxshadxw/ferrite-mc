@@ -94,3 +94,34 @@ fn network_section_counts_water_and_waterlogged_blocks() {
     s.set_block(0, air, &Vanilla).unwrap();
     assert_eq!(&s.encode_network()[..4], &[0, 1, 0, 1]);
 }
+
+#[test]
+fn section_random_tick_counts_follow_block_replacements() {
+    use ferrite_world::ChunkSection;
+    struct Ticking;
+    impl BlockInfo for Ticking {
+        fn flags(&self, id: u32) -> BlockFlags {
+            BlockFlags {
+                air: id == 0,
+                fluid: id == 2,
+                ..Default::default()
+            }
+        }
+        fn randomly_ticking(&self, id: u32) -> bool {
+            id == 1
+        }
+        fn fluid_randomly_ticking(&self, id: u32) -> bool {
+            id == 2
+        }
+    }
+    let mut s = ChunkSection::new(0, 0, 16, 6).unwrap();
+    assert!(!s.is_randomly_ticking());
+    s.set_block(0, 1, &Ticking).unwrap();
+    s.set_block(1, 2, &Ticking).unwrap();
+    assert_eq!(s.randomly_ticking_block_count(), 1);
+    assert_eq!(s.randomly_ticking_fluid_count(), 1);
+    s.set_block(0, 0, &Ticking).unwrap();
+    assert!(s.is_randomly_ticking());
+    s.set_block(1, 0, &Ticking).unwrap();
+    assert!(!s.is_randomly_ticking());
+}
