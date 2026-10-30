@@ -117,7 +117,8 @@ impl Bot {
         .await
         .expect("expected chat message")
     }
-    async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+    /// Completes login and configuration but stops before the play position packet.
+    async fn begin_join(addr: std::net::SocketAddr, name: &str) -> Self {
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut b = Self {
             stream,
@@ -157,6 +158,11 @@ impl Bot {
             }
         }
         b.send(&AcknowledgeFinishConfiguration).await;
+        b
+    }
+    /// Joins and waits until the server positions the player in play state.
+    async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+        let mut b = Self::begin_join(addr, name).await;
         b.until(73).await;
         b
     }
@@ -455,6 +461,7 @@ async fn operator_teleport_command_moves_player() {
                 level: 4,
             }],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -475,7 +482,21 @@ async fn operator_teleport_command_moves_player() {
     .await;
     let body = bot.until(73).await;
     let p = PositionSync::decode(&mut body.as_slice()).unwrap();
-    assert_eq!([p.x, p.y, p.z], [10.0, 70.0, 20.0]);
+    // Vec3 centers absolute integer x/z on the block center, like vanilla.
+    assert_eq!([p.x, p.y, p.z], [10.5, 70.0, 20.5]);
+
+    bot.raw(7, "tp @s ~ ~5 ~ rotation 90 10").await;
+    let body = bot.until(73).await;
+    let p = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert_eq!([p.x, p.y, p.z], [10.5, 75.0, 20.5]);
+    assert_eq!((p.yaw, p.pitch), (90.0, 10.0));
+
+    bot.raw(7, "tp @s 10 70 20 facing 10 70 30").await;
+    let body = bot.until(73).await;
+    let p = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert!((p.yaw - 0.0).abs() < 1e-4, "yaw {}", p.yaw);
+    assert!(p.pitch > 0.0, "looks down at the facing point: {}", p.pitch);
+
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
@@ -694,6 +715,7 @@ async fn survival_break_requires_elapsed_ticks() {
             gamemode: 0,
             ops: vec![],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -762,6 +784,272 @@ async fn console_stop_is_dispatched() {
     assert!(world.console_command("/stop".into()).await.unwrap());
     assert!(world.console_command("unknown".into()).await.is_err());
     world.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_command_reaches_target_and_sender() {
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut alice = Bot::join(addr, "Alice").await;
+    let mut bob = Bot::join(addr, "Bob").await;
+    alice.until(46).await;
+    bob.until(46).await;
+
+    alice.raw(7, "msg Bob hello there").await;
+    assert_eq!(
+        bob.chat_containing("Alice whispers to you: hello there")
+            .await,
+        "Alice whispers to you: hello there"
+    );
+    assert_eq!(
+        alice
+            .chat_containing("You whisper to Bob: hello there")
+            .await,
+        "You whisper to Bob: hello there"
+    );
+
+    drop((alice, bob));
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_command_disconnects_the_target() {
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut alice = Bot::join(addr, "Alice").await;
+    let mut bob = Bot::join(addr, "Bob").await;
+    alice.until(46).await;
+    bob.until(46).await;
+
+    alice.raw(7, "kill Bob").await;
+    let body = bob.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(disconnect.reason.0, "You died!");
+    alice.chat_containing("Killed Bob").await;
+
+    drop((alice, bob));
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_stop_shuts_the_world_down() {
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.until(46).await;
+    bot.raw(7, "stop").await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), world.shutdown())
+        .await
+        .expect("world stops after /stop")
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn admin_commands_persist_to_the_lists() {
+    use ferrite_admin::AdminLists;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-admin-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    let alice = uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap();
+    let bob = uuid::Uuid::parse_str("22e0d6a0-1f4a-3a9e-8a2e-8f7a5d9d3b0e").unwrap();
+    lists.usercache.cache("Alice", alice);
+    lists.usercache.cache("Bob", bob);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists.clone()),
+            ..Default::default()
+        },
+    );
+    for command in [
+        "op Alice",
+        "op Ghost",
+        "deop Ghost",
+        "whitelist add Bob",
+        "whitelist remove Bob",
+        "whitelist add Bob",
+        "ban Bob griefing",
+        "banlist players",
+        "ban-ip 10.0.0.1",
+        "banlist ips",
+        "pardon-ip 10.0.0.1",
+        "pardon Bob",
+        "whitelist on",
+        "whitelist off",
+        "save-all",
+        "save-off",
+        "save-on",
+        "kick Ghost",
+        "deop Alice",
+        "whitelist reload",
+    ] {
+        world
+            .console_command(command.into())
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+    }
+
+    assert_eq!(lists.ops.level_of(alice), None);
+    assert_eq!(
+        lists.ops.level_of(super::commands::offline_uuid("Ghost")),
+        None
+    );
+    assert!(lists.bans.player_bans().is_empty());
+    assert!(!lists.bans.is_ip_banned("10.0.0.1"));
+    // The reload reads whitelist.json back; Bob was added before it.
+    let reloaded = AdminLists::load(&dir).unwrap();
+    assert!(reloaded.whitelist.contains(bob));
+    world.shutdown().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn banned_player_is_disconnected_before_play() {
+    use ferrite_admin::AdminLists;
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-ban-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    let alice = uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap();
+    lists.bans.ban(alice, "Alice", "griefing", "Server", None);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::begin_join(addr, "Alice").await;
+    let body = bot.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        disconnect.reason.0,
+        "You are banned from this server!\nReason: griefing"
+    );
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ip_banned_player_is_disconnected_before_play() {
+    use ferrite_admin::AdminLists;
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-ban-ip-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    lists.bans.ban_ip("127.0.0.1", "proxies", "Server", None);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::begin_join(addr, "Bob").await;
+    let body = bot.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        disconnect.reason.0,
+        "Your IP address is banned from this server!\nReason: proxies"
+    );
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -838,18 +1126,48 @@ async fn commands_packet_decodes_and_filters_permissions() {
     let bot = Bot::join(addr, "Guest").await;
     let bytes = bot.commands.as_ref().expect("commands packet");
     let mut input = bytes.as_slice();
-    // The guest may only see the unrestricted root commands: tps and mspt.
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 3);
+    // The guest sees the unrestricted root commands and the argument nodes under `msg`.
+    assert_eq!(VarInt::decode(&mut input).unwrap().0, 8);
     assert_eq!(u8::decode(&mut input).unwrap(), 0);
     assert_eq!(
         Vec::<VarInt>::decode(&mut input).unwrap(),
-        vec![VarInt(1), VarInt(2)]
+        (1..=5).map(VarInt).collect::<Vec<_>>()
     );
-    for name in ["tps", "mspt"] {
-        assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
-        assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
-        assert_eq!(String::decode(&mut input).unwrap(), name);
+    let mut names = Vec::new();
+    for _ in 0..7 {
+        let flags = u8::decode(&mut input).unwrap();
+        let children = Vec::<VarInt>::decode(&mut input).unwrap();
+        let redirect = if flags & 0x08 != 0 {
+            Some(VarInt::decode(&mut input).unwrap().0)
+        } else {
+            None
+        };
+        let name = String::decode(&mut input).unwrap();
+        if flags & 3 == 2 {
+            let parser = VarInt::decode(&mut input).unwrap().0;
+            match parser {
+                6 => {
+                    // minecraft:entity properties: single, players-only.
+                    assert_eq!(u8::decode(&mut input).unwrap(), 2);
+                }
+                20 => {}
+                other => panic!("unexpected parser {other} for {name}"),
+            }
+        }
+        if matches!(name.as_str(), "tps" | "mspt" | "tell" | "w") {
+            assert!(children.is_empty(), "literal {name}");
+        }
+        if name == "tell" || name == "w" {
+            assert_eq!(redirect, Some(1), "{name} redirects to msg");
+        } else {
+            assert_eq!(redirect, None, "{name}");
+        }
+        names.push(name);
     }
+    assert_eq!(
+        names,
+        ["msg", "tell", "w", "tps", "mspt", "targets", "message"]
+    );
     assert_eq!(VarInt::decode(&mut input).unwrap().0, 0);
     assert!(input.is_empty());
     drop(bot);
@@ -1279,6 +1597,7 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
             gamemode: 0,
             ops: vec![],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

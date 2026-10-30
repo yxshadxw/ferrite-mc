@@ -33,6 +33,8 @@ pub enum GameMessage {
         uuid: Uuid,
         name: String,
         properties: Vec<Property>,
+        /// The forwarded address behind a proxy, otherwise the peer's address.
+        address: Option<std::net::IpAddr>,
         dimension_type: i32,
         biome: i32,
         view_distance: u8,
