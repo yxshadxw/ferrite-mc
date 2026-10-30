@@ -90,6 +90,7 @@ pub struct World {
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
     random_tick_speed: Arc<AtomicU32>,
+    source: Arc<anvil::AnvilChunkSource>,
 }
 impl World {
     pub fn start() -> Self {
@@ -100,6 +101,10 @@ impl World {
     pub fn profiler(&self) -> Arc<profile::Profiler> {
         Arc::clone(&self.profiler)
     }
+    /// Chunk packet cache counters (encodes, hit rate) for this world.
+    pub fn cache_stats(&self) -> anvil::CacheStats {
+        self.source.cache_stats()
+    }
     pub fn start_with(source: Option<Arc<anvil::AnvilChunkSource>>, spawn: [i32; 3]) -> Self {
         Self::start_configured(source, spawn, WorldSettings::default())
     }
@@ -109,7 +114,7 @@ impl World {
         settings: WorldSettings,
     ) -> Self {
         let flat = source.is_none();
-        let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
+        let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
         drops::preload();
@@ -141,6 +146,7 @@ impl World {
             tick_samples,
             profiler,
             random_tick_speed,
+            source,
         }
     }
     pub fn set_random_tick_speed(&self, speed: u32) {
