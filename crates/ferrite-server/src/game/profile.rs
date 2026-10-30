@@ -399,11 +399,13 @@ mod tests {
         profiler.start_profile().unwrap();
         {
             let _slow = profiler.timings().scope("slow");
-            thread::sleep(Duration::from_millis(15));
+            // Keep a wide gap: on a loaded test runner a 15 ms/2 ms pair can invert when one
+            // scope's thread is preempted.
+            thread::sleep(Duration::from_millis(100));
         }
         {
             let _fast = profiler.timings().scope("fast");
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(1));
         }
         let report = profiler.stop_profile().unwrap();
 
