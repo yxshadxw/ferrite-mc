@@ -87,6 +87,30 @@ impl TickMonitor {
         self.global.push(duration);
     }
 
+    /// Records one regional tick without touching the global window.
+    ///
+    /// Region threads of a regionized server record their own durations with
+    /// this and leave the global window to the global region's tick loop, so
+    /// global TPS stays a rate rather than a mix of every region's durations.
+    /// Out-of-range region ids are ignored.
+    pub fn record_region(&self, region: u32, duration: Duration) {
+        if let Some(ring) = self.regions.get(region as usize) {
+            ring.push(duration);
+        }
+    }
+
+    /// Clears one region window, for example before a slot is handed to a new
+    /// region.
+    ///
+    /// Call this while no thread records into the slot, so the next owner
+    /// starts its own window instead of inheriting samples from the previous
+    /// one. Out-of-range region ids are ignored.
+    pub fn reset_region(&self, region: u32) {
+        if let Some(ring) = self.regions.get(region as usize) {
+            ring.clear();
+        }
+    }
+
     /// Total number of ticks recorded globally.
     pub fn ticks(&self) -> u64 {
         self.global.len()
@@ -149,6 +173,16 @@ impl TickRing {
 
     fn len(&self) -> u64 {
         self.head.load(Ordering::Acquire)
+    }
+
+    /// Forgets every sample. Readers see an empty window even if they load the
+    /// old head before the slots are zeroed, because a zero duration is read as
+    /// a full-TPS tick.
+    fn clear(&self) {
+        self.head.store(0, Ordering::Release);
+        for slot in self.slots.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Copies the newest `window` durations, oldest first, into `out`.
@@ -306,6 +340,38 @@ mod tests {
         );
         assert_eq!(minute.min, 1.0);
         assert_eq!(minute.max, 200.0);
+    }
+
+    #[test]
+    fn regional_recording_leaves_the_global_window_alone() {
+        let monitor = TickMonitor::with_regions(2);
+        monitor.record_region(1, Duration::from_millis(100));
+        monitor.record_region(9, Duration::from_millis(100));
+
+        assert_eq!(monitor.ticks(), 0);
+        assert_eq!(monitor.tps(), Tps::uniform(MAX_TPS));
+        assert_eq!(monitor.mspt().last_10s.samples, 0);
+
+        assert_eq!(monitor.region_ticks(1), Some(1));
+        assert_eq!(monitor.tps_of(1).unwrap().last_5s, 10.0);
+        assert_eq!(monitor.mspt_of(1).unwrap().last_10s.samples, 1);
+        assert_eq!(monitor.region_ticks(0), Some(0));
+    }
+
+    #[test]
+    fn reset_region_clears_only_that_slot() {
+        let monitor = TickMonitor::with_regions(2);
+        monitor.record_region(0, Duration::from_millis(100));
+        monitor.record_region(1, Duration::from_millis(100));
+
+        monitor.reset_region(0);
+        monitor.reset_region(7);
+
+        assert_eq!(monitor.region_ticks(0), Some(0));
+        assert_eq!(monitor.mspt_of(0).unwrap().last_10s.samples, 0);
+        assert_eq!(monitor.tps_of(0).unwrap().last_5s, MAX_TPS);
+        assert_eq!(monitor.region_ticks(1), Some(1));
+        assert_eq!(monitor.mspt_of(1).unwrap().last_10s.samples, 1);
     }
 
     #[test]

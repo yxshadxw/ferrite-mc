@@ -3,6 +3,7 @@ use super::{
     valid_move,
 };
 use ferrite_net::game::{Outbound, ServerboundPlay, packet};
+use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, RegionData, SectionPos};
 use std::{
@@ -75,6 +76,10 @@ pub struct Player {
 pub struct Region {
     pub players: HashMap<Uuid, Player>,
     generator: FlatGenerator,
+    /// Tick monitor slot, assigned by the game loop on this region's first tick.
+    pub profile_slot: Option<u32>,
+    /// Scope tree attached by the game loop; `None` until the first tick.
+    pub timings: Option<Arc<Timings>>,
 }
 impl RegionData for Region {
     fn merge(&mut self, other: Self) {
@@ -91,6 +96,8 @@ impl RegionData for Region {
         let mut result = Self {
             players: HashMap::new(),
             generator: self.generator.split(sections),
+            profile_slot: None,
+            timings: self.timings.clone(),
         };
         for id in ids {
             if let Some(p) = self.players.remove(&id) {
@@ -644,10 +651,19 @@ impl Player {
 }
 impl Region {
     pub fn tick(&mut self) {
+        let timings = self.timings.clone();
+        let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in ids {
             let mut p = self.players.remove(&id).unwrap();
-            if !p.update() {
+            let updated = match &timings {
+                Some(timings) => {
+                    let _scope = timings.scope("player-update");
+                    p.update()
+                }
+                None => p.update(),
+            };
+            if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
                     uuid: p.uuid,
@@ -672,7 +688,13 @@ impl Region {
                 });
                 continue;
             }
-            p.chunks_tick(&mut self.generator);
+            match &timings {
+                Some(timings) => {
+                    let _scope = timings.scope("chunk-stream");
+                    p.chunks_tick(&mut self.generator);
+                }
+                None => p.chunks_tick(&mut self.generator),
+            }
             self.players.insert(id, p);
         }
     }
@@ -680,6 +702,21 @@ impl Region {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tick_records_a_region_scope_when_timings_are_attached() {
+        let mut region = Region::default();
+        let timings = Arc::new(Timings::new());
+        region.timings = Some(timings.clone());
+
+        region.tick();
+
+        let report = timings.report_all(50.0);
+        assert!(
+            report.rows.iter().any(|row| row.path == "region-tick"),
+            "{report}"
+        );
+    }
+
     #[test]
     fn window_is_sorted_and_unloads_outside() {
         let old = std::collections::HashSet::from([(0, 0), (1, 0), (-1, 0)]);
