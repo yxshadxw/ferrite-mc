@@ -19,8 +19,8 @@ use ferrite_protocol::{
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
         play::{
-            BlockUpdate, ChunkBatchReceived, ConfirmTeleport, MovePosition, MoveRotation,
-            PlayerAction, PositionSync, SystemChat, UseItemOn,
+            BlockUpdate, ChunkBatchReceived, ConfirmTeleport, CreativeSlot, ItemStack, MovePosition,
+            MoveRotation, PlayerAction, PositionSync, SystemChat, UseItemOn,
         },
     },
     types::BlockPos,
@@ -538,6 +538,11 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     });
     wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
     wait_for_prefix(&events, "break 0 64 0", &stdout, &stderr);
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
+        0,
+        "a creative break did not clear the block"
+    );
     bot.move_to(1.5, 65.0, 0.5);
     wait_for_prefix(&events, "move Bot 1 65 0", &stdout, &stderr);
     bot.send(&PlayerAction {
@@ -552,6 +557,32 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
         wait_for_block_state(&mut bot, BlockPos::new(1, 64, 0), &stdout, &stderr, &events),
         grass,
         "a cancelled break did not restore the block"
+    );
+    bot.move_to(0.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 0 65 0", &stdout, &stderr);
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: ferrite_data::registries::id("minecraft:item", "minecraft:stone").unwrap(),
+        },
+    });
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(33),
+    });
+    wait_for_prefix(&events, "place-cancel 0 64 0", &stdout, &stderr);
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
+        0,
+        "a cancelled placement was not rolled back on the client"
     );
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);

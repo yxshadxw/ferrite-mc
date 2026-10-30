@@ -510,6 +510,21 @@ impl Player {
             };
             state
         };
+        if !self.plugin_allows(|plugins| {
+            plugins.block_placed(
+                self.uuid,
+                &self.name,
+                ferrite_plugin::BlockPosition {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                },
+                u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+            )
+        }) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         let positions = self.positions.lock().unwrap();
         let offset = ferrite_math::Vec3::new(target.x as f64, target.y as f64, target.z as f64);
         if positions.iter().any(|(uuid, pos)| {

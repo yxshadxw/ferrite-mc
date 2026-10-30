@@ -103,6 +103,15 @@ public final class Bootstrap {
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled();
     }
+    /** Fires Bukkit's {@code BlockPlaceEvent}; false means a listener cancelled the placement. */
+    public static boolean fireBlockPlace(String id, String name, int x, int y, int z, int face) {
+        var block = FerriteEventObjects.block(x, y, z);
+        var blockFace = FerriteEventObjects.face(face);
+        var against = FerriteEventObjects.block(x - blockFace.getModX(), y - blockFace.getModY(), z - blockFace.getModZ());
+        var event = new org.bukkit.event.block.BlockPlaceEvent(block, FerriteEventObjects.state(block), against, null, ensurePlayer(id, name), true, org.bukkit.inventory.EquipmentSlot.HAND);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled() && event.canBuild();
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();

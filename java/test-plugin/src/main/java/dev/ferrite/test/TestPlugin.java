@@ -31,6 +31,12 @@ public final class TestPlugin extends JavaPlugin implements Listener {
         appendEvent("break " + block.getX() + " " + block.getY() + " " + block.getZ());
         if (block.getX() == 1) { appendEvent("break-cancel " + block.getX() + " " + block.getY() + " " + block.getZ()); event.setCancelled(true); }
     }
+    @EventHandler public void onPlace(org.bukkit.event.block.BlockPlaceEvent event) {
+        var block = event.getBlockPlaced();
+        appendEvent("place " + block.getX() + " " + block.getY() + " " + block.getZ());
+        appendEvent("place-cancel " + block.getX() + " " + block.getY() + " " + block.getZ());
+        event.setCancelled(true);
+    }
     @EventHandler public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
         String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
         appendEvent("chat " + message);
