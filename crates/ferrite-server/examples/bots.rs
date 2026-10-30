@@ -247,11 +247,15 @@ async fn run_world(path: Option<std::path::PathBuf>, n: usize) {
     samples.sort_by(f64::total_cmp);
     let avg = samples.iter().sum::<f64>() / samples.len() as f64;
     let p99 = samples[((samples.len() - 1) as f64 * 0.99) as usize];
+    let cache = world.cache_stats();
     println!(
-        "{label}: bots={n}, avg_mspt={avg:.3}, p99_mspt={p99:.3}, rss_mb={:.1}, cpu_percent={:.1}, samples={}",
+        "{label}: bots={n}, avg_mspt={avg:.3}, p99_mspt={p99:.3}, rss_mb={:.1}, cpu_percent={:.1}, samples={}, cache_hit_rate={:.1}%, encodes={}, lookups={}",
         rss as f64 / 1048576.0,
         (cpu_end - cpu_start) as f64 / 10_000_000.0 / elapsed * 100.0,
-        samples.len()
+        samples.len(),
+        cache.hit_rate() * 100.0,
+        cache.encodes,
+        cache.lookups
     );
     world.shutdown().await.unwrap();
     server.abort();

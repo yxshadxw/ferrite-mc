@@ -71,20 +71,62 @@ use ferrite_protocol::{Encode, Packet, VarInt, packets::play::ChunkData};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const CACHE_LIMIT: usize = 4096;
 const PENDING_LIMIT: usize = 128;
+/// Emit the cache hit rate to the debug log every this many lookups.
+const CACHE_LOG_INTERVAL: u64 = 4096;
+
+/// Counters backing [`CacheStats`]. They are atomic so a lookup only bumps a
+/// counter and the background encode task can count its own work.
+#[derive(Default)]
+struct Stats {
+    lookups: AtomicU64,
+    hits: AtomicU64,
+    encodes: AtomicU64,
+    invalidations: AtomicU64,
+}
+
+/// How the encoded chunk packet cache is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// `get`/`prefetch` calls.
+    pub lookups: u64,
+    /// Lookups answered with an already encoded packet.
+    pub hits: u64,
+    /// `level_chunk_with_light` packets built.
+    pub encodes: u64,
+    /// Cached packets dropped because the chunk changed.
+    pub invalidations: u64,
+}
+
+impl CacheStats {
+    /// Share of lookups served from cache, `0.0..=1.0`.
+    pub fn hit_rate(&self) -> f64 {
+        if self.lookups == 0 {
+            0.0
+        } else {
+            self.hits as f64 / self.lookups as f64
+        }
+    }
+}
+
 enum Entry {
     Pending(u64),
     Ready(Result<Box<Column>, String>, u64),
 }
-#[derive(Clone)]
 struct Column {
     chunk: Chunk,
     light: LightData,
-    packet: Vec<u8>,
+    /// Complete `level_chunk_with_light` body (packet id + payload). Shared by
+    /// every player that receives this chunk, exactly like Paper's packet
+    /// cache: encoded once, copied only when it is handed to a connection.
+    packet: Arc<[u8]>,
 }
 struct Cache {
     entries: HashMap<(i32, i32, i32), Entry>,
@@ -94,13 +136,22 @@ struct Cache {
 struct Dirty {
     chunk: ferrite_world::Chunk,
     light: LightData,
-    packet: Vec<u8>,
+    packet: Arc<[u8]>,
     version: u64,
 }
+
+/// What a cache lookup found.
+enum Lookup {
+    Ready(Arc<[u8]>),
+    Failed(String),
+    Loading,
+}
+
 pub struct AnvilChunkSource {
     path: Option<PathBuf>,
     registry: Arc<RuntimeRegistry>,
     cache: Mutex<Cache>,
+    stats: Stats,
     runtime: tokio::runtime::Handle,
     flush_lock: tokio::sync::Mutex<()>,
     flat: Mutex<HashMap<i32, (Chunk, LightData)>>,
@@ -115,6 +166,7 @@ impl AnvilChunkSource {
                 clock: 0,
                 dirty: HashMap::new(),
             }),
+            stats: Stats::default(),
             runtime: tokio::runtime::Handle::current(),
             flush_lock: tokio::sync::Mutex::new(()),
             flat: Mutex::new(HashMap::new()),
@@ -141,6 +193,7 @@ impl AnvilChunkSource {
                 clock: 0,
                 dirty: HashMap::new(),
             }),
+            stats: Stats::default(),
             runtime: tokio::runtime::Handle::current(),
             flush_lock: tokio::sync::Mutex::new(()),
             flat: Mutex::new(HashMap::new()),
@@ -152,7 +205,17 @@ impl AnvilChunkSource {
             .unwrap()
             .dirty
             .get(&(x, z))
-            .map(|dirty| dirty.packet.clone())
+            .map(|dirty| dirty.packet.to_vec())
+    }
+    /// Snapshot of the packet cache counters. The game loop and load tests
+    /// report the hit rate from here.
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            lookups: self.stats.lookups.load(Ordering::Relaxed),
+            hits: self.stats.hits.load(Ordering::Relaxed),
+            encodes: self.stats.encodes.load(Ordering::Relaxed),
+            invalidations: self.stats.invalidations.load(Ordering::Relaxed),
+        }
     }
     pub(super) fn with_loaded_chunk<R>(
         &self,
@@ -283,13 +346,11 @@ impl AnvilChunkSource {
             state,
             &*self.registry,
         )?;
-        let body = encode_chunk_packet(key.0, key.1, &chunk, &light)?;
-        let mut packet = Vec::new();
-        VarInt(ChunkData::ID).encode(&mut packet);
-        packet.extend(body);
+        self.stats.encodes.fetch_add(1, Ordering::Relaxed);
+        let packet = encode_column_packet(key.0, key.1, &chunk, &light)?;
         cache.clock += 1;
         let version = cache.clock;
-        cache.entries.retain(|&(cx, cz, _), _| (cx, cz) != key);
+        invalidate(&mut cache, &self.stats, key.0, key.1);
         cache.dirty.insert(
             key,
             Dirty {
@@ -310,10 +371,8 @@ impl AnvilChunkSource {
         chunk: ferrite_world::Chunk,
         light: &LightData,
     ) -> anyhow::Result<()> {
-        let body = encode_chunk_packet(x, z, &chunk, light)?;
-        let mut packet = Vec::new();
-        VarInt(ChunkData::ID).encode(&mut packet);
-        packet.extend(body);
+        self.stats.encodes.fetch_add(1, Ordering::Relaxed);
+        let packet = encode_column_packet(x, z, &chunk, light)?;
         let mut cache = self.cache.lock().unwrap();
         anyhow::ensure!(
             self.path.is_none()
@@ -323,7 +382,7 @@ impl AnvilChunkSource {
         );
         cache.clock += 1;
         let version = cache.clock;
-        cache.entries.retain(|&(cx, cz, _), _| (cx, cz) != (x, z));
+        invalidate(&mut cache, &self.stats, x, z);
         cache.dirty.insert(
             (x, z),
             Dirty {
@@ -401,24 +460,52 @@ impl AnvilChunkSource {
             self.flush_chunk(x, z).await?;
         }
     }
-    pub fn get(self: &Arc<Self>, x: i32, z: i32, biome: i32) -> Option<Result<Vec<u8>, String>> {
+    /// Encoded `level_chunk_with_light` body for `(x, z)`, starting a
+    /// background load on first use. `None` means the chunk is still loading.
+    pub fn get(self: &Arc<Self>, x: i32, z: i32, biome: i32) -> Option<Result<Arc<[u8]>, String>> {
+        match self.lookup(x, z, biome) {
+            Lookup::Ready(packet) => Some(Ok(packet)),
+            Lookup::Failed(error) => Some(Err(error)),
+            Lookup::Loading => None,
+        }
+    }
+    /// Ensure `(x, z)` is being loaded without copying its packet. Prefetching
+    /// must not go through [`Self::get`]: that copied the whole body for every
+    /// player while holding the cache lock, only to throw it away.
+    pub fn prefetch(self: &Arc<Self>, x: i32, z: i32, biome: i32) {
+        let _ = self.lookup(x, z, biome);
+    }
+    fn lookup(self: &Arc<Self>, x: i32, z: i32, biome: i32) -> Lookup {
         let key = (x, z, biome);
         let mut cache = self.cache.lock().unwrap();
         cache.clock += 1;
         let now = cache.clock;
+        let lookups = self.stats.lookups.fetch_add(1, Ordering::Relaxed) + 1;
+        if lookups.is_multiple_of(CACHE_LOG_INTERVAL) {
+            let stats = self.cache_stats();
+            tracing::debug!(
+                lookups = stats.lookups,
+                hits = stats.hits,
+                hit_rate = stats.hit_rate(),
+                encodes = stats.encodes,
+                invalidations = stats.invalidations,
+                "chunk packet cache"
+            );
+        }
         if let Some(dirty) = cache.dirty.get(&(x, z)) {
-            return Some(Ok(dirty.packet.clone()));
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Lookup::Ready(Arc::clone(&dirty.packet));
         }
         if let Some(entry) = cache.entries.get_mut(&key) {
             return match entry {
-                Entry::Pending(_) => None,
+                Entry::Pending(_) => Lookup::Loading,
                 Entry::Ready(data, used) => {
                     *used = now;
-                    Some(
-                        data.as_ref()
-                            .map(|column| column.packet.clone())
-                            .map_err(Clone::clone),
-                    )
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    match data {
+                        Ok(column) => Lookup::Ready(Arc::clone(&column.packet)),
+                        Err(error) => Lookup::Failed(error.clone()),
+                    }
                 }
             };
         }
@@ -429,10 +516,10 @@ impl AnvilChunkSource {
             .count()
             >= PENDING_LIMIT
         {
-            return None;
+            return Lookup::Loading;
         }
         if cache.entries.len() >= CACHE_LIMIT {
-            let oldest = cache
+            let Some(oldest) = cache
                 .entries
                 .iter()
                 .filter_map(|(k, v)| {
@@ -443,7 +530,10 @@ impl AnvilChunkSource {
                     }
                 })
                 .min_by_key(|(_, used)| *used)
-                .map(|(k, _)| k)?;
+                .map(|(k, _)| k)
+            else {
+                return Lookup::Loading;
+            };
             cache.entries.remove(&oldest);
         }
         cache.entries.insert(key, Entry::Pending(now));
@@ -452,18 +542,70 @@ impl AnvilChunkSource {
         let request = now;
         self.runtime.spawn_blocking(move || {
             let result = (|| -> anyhow::Result<Column> {
-                let loaded = match &source.path { Some(path) => read_column(path, &source.registry, x, z)?, None => None };
-                let (chunk, light) = match loaded { Some(column) => column, None => { let mut flat = source.flat.lock().unwrap(); if let Some(column) = flat.get(&biome) { column.clone() } else { let column = (flat_chunk(&source.registry, biome)?, LightData { sky: vec![LightSection::Empty;26], block: vec![LightSection::Empty;26] }); flat.insert(biome, column.clone()); column } } };
-                let body = encode_chunk_packet(x, z, &chunk, &light)?;
-                let mut packet = Vec::new(); VarInt(ChunkData::ID).encode(&mut packet); packet.extend(body);
-                Ok(Column { chunk, light, packet })
-            })().map_err(|e| format!("{e:#}"));
+                let loaded = match &source.path {
+                    Some(path) => read_column(path, &source.registry, x, z)?,
+                    None => None,
+                };
+                let (chunk, light) = match loaded {
+                    Some(column) => column,
+                    None => {
+                        let mut flat = source.flat.lock().unwrap();
+                        if let Some(column) = flat.get(&biome) {
+                            column.clone()
+                        } else {
+                            let column = (
+                                flat_chunk(&source.registry, biome)?,
+                                LightData {
+                                    sky: vec![LightSection::Empty; 26],
+                                    block: vec![LightSection::Empty; 26],
+                                },
+                            );
+                            flat.insert(biome, column.clone());
+                            column
+                        }
+                    }
+                };
+                source.stats.encodes.fetch_add(1, Ordering::Relaxed);
+                let packet = encode_column_packet(x, z, &chunk, &light)?;
+                Ok(Column {
+                    chunk,
+                    light,
+                    packet,
+                })
+            })()
+            .map_err(|e| format!("{e:#}"));
             let mut cache = source.cache.lock().unwrap();
             cache.clock += 1;
             let now = cache.clock;
-            if matches!(cache.entries.get(&key), Some(Entry::Pending(version)) if *version == request) { cache.entries.insert(key, Entry::Ready(result.map(Box::new), now)); }
+            if matches!(cache.entries.get(&key), Some(Entry::Pending(version)) if *version == request)
+            {
+                cache.entries.insert(key, Entry::Ready(result.map(Box::new), now));
+            }
         });
-        None
+        Lookup::Loading
+    }
+}
+/// Encode the complete `level_chunk_with_light` body (packet id + payload) once
+/// so every recipient can share the same bytes.
+fn encode_column_packet(
+    x: i32,
+    z: i32,
+    chunk: &Chunk,
+    light: &LightData,
+) -> anyhow::Result<Arc<[u8]>> {
+    let body = encode_chunk_packet(x, z, chunk, light)?;
+    let mut packet = Vec::new();
+    VarInt(ChunkData::ID).encode(&mut packet);
+    packet.extend(body);
+    Ok(Arc::from(packet))
+}
+/// Drop every cached packet for chunk `(x, z)` after a block or light change.
+fn invalidate(cache: &mut Cache, stats: &Stats, x: i32, z: i32) {
+    let before = cache.entries.len();
+    cache.entries.retain(|&(cx, cz, _), _| (cx, cz) != (x, z));
+    if cache.entries.len() < before {
+        stats.invalidations.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(x, z, "chunk packet cache invalidated");
     }
 }
 pub fn read_spawn(world: &Path) -> anyhow::Result<[i32; 3]> {
@@ -551,4 +693,108 @@ fn flat_chunk(registry: &RuntimeRegistry, biome: i32) -> anyhow::Result<Chunk> {
     }
     chunk.recompute_heightmaps(registry);
     Ok(chunk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn ready(source: &Arc<AnvilChunkSource>, x: i32, z: i32, biome: i32) -> Arc<[u8]> {
+        for _ in 0..500 {
+            match source.get(x, z, biome) {
+                Some(Ok(packet)) => return packet,
+                Some(Err(error)) => panic!("chunk ({x}, {z}) failed: {error}"),
+                None => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+            }
+        }
+        panic!("chunk ({x}, {z}) never loaded");
+    }
+
+    /// What a caller that skipped the cache would build for a flat chunk.
+    fn encode_uncached(source: &AnvilChunkSource, x: i32, z: i32, biome: i32) -> Vec<u8> {
+        let chunk = flat_chunk(&source.registry, biome).unwrap();
+        let light = LightData {
+            sky: vec![LightSection::Empty; 26],
+            block: vec![LightSection::Empty; 26],
+        };
+        let body = encode_chunk_packet(x, z, &chunk, &light).unwrap();
+        let mut packet = Vec::new();
+        VarInt(ChunkData::ID).encode(&mut packet);
+        packet.extend(body);
+        packet
+    }
+
+    #[tokio::test]
+    async fn two_players_share_one_encoded_packet() {
+        let source = AnvilChunkSource::new_memory();
+        source.prefetch(0, 0, 0);
+        let first = ready(&source, 0, 0, 0).await;
+        let second = ready(&source, 0, 0, 0).await;
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both players must receive the same cached bytes"
+        );
+        assert_eq!(&*first, encode_uncached(&source, 0, 0, 0));
+        let stats = source.cache_stats();
+        assert_eq!(stats.encodes, 1, "{stats:?}");
+        assert!(stats.hits >= 2, "{stats:?}");
+        assert_eq!(stats.invalidations, 0, "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn block_change_invalidates_only_the_edited_chunk() {
+        let source = AnvilChunkSource::new_memory();
+        let edited_before = ready(&source, 0, 0, 0).await;
+        let neighbour = ready(&source, 1, 0, 0).await;
+        assert_eq!(source.cache_stats().encodes, 2);
+
+        let stone = source
+            .registry
+            .block_id("minecraft:stone", &Default::default())
+            .unwrap();
+        source.set_block(0, 64, 0, stone).unwrap();
+
+        let stats = source.cache_stats();
+        assert_eq!(stats.invalidations, 1, "{stats:?}");
+        assert_eq!(stats.encodes, 3, "{stats:?}");
+        assert_eq!(source.block(0, 64, 0), Some(stone));
+
+        let edited_after = ready(&source, 0, 0, 0).await;
+        assert_ne!(
+            &*edited_before, &*edited_after,
+            "an edited chunk must not keep serving its old packet"
+        );
+        let neighbour_after = ready(&source, 1, 0, 0).await;
+        assert!(Arc::ptr_eq(&neighbour, &neighbour_after));
+        assert_eq!(
+            source.cache_stats().encodes,
+            3,
+            "neighbour must not re-encode"
+        );
+    }
+
+    #[tokio::test]
+    async fn light_change_invalidates_the_cached_packet() {
+        let source = AnvilChunkSource::new_memory();
+        let before = ready(&source, 3, 3, 0).await;
+        assert_eq!(source.cache_stats().encodes, 1);
+
+        let mut light = LightData {
+            sky: vec![LightSection::Empty; 26],
+            block: vec![LightSection::Empty; 26],
+        };
+        light.sky[8] = LightSection::Data(Box::new([0x5a; 2048]));
+        let chunk = flat_chunk(&source.registry, 0).unwrap();
+        source.mark_modified(3, 3, chunk, &light).unwrap();
+
+        let stats = source.cache_stats();
+        assert_eq!(stats.invalidations, 1, "{stats:?}");
+        assert_eq!(stats.encodes, 2, "{stats:?}");
+        let after = ready(&source, 3, 3, 0).await;
+        assert_ne!(
+            &*before, &*after,
+            "a light change must re-encode the chunk packet"
+        );
+    }
 }
