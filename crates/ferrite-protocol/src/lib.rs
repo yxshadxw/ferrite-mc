@@ -4,6 +4,7 @@
 //! handled by a translation layer in front of it.
 
 pub mod codec;
+mod compress;
 pub mod frame;
 pub mod packets;
 pub mod types;

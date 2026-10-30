@@ -28,6 +28,32 @@ Frame wins are structural: reusable libdeflate state (no per-packet compressor
 allocation), and plain-frame decode copies a slice instead of
 `drain().skip().collect()`.
 
+## Compression backend comparison (2026-10-30)
+
+`cargo bench -p ferrite-protocol --bench protocol -- compression_256KiB`
+compares the framing backend (libdeflate, level 6) with flate2 driven the way
+the old frame code drove it (`ZlibEncoder`/`ZlibDecoder`, level 6, fresh object
+per call) on a 256 KiB chunk-shaped payload. Two runs, medians:
+
+| backend | compress | decompress |
+|---|---:|---:|
+| libdeflate (frame API, reused state) | 4.62 ms (54.1 MiB/s) | 267 µs (935 MiB/s) |
+| flate2 (`ZlibEncoder`/`ZlibDecoder`) | 15.83 ms (15.8 MiB/s) | 447 µs (559 MiB/s) |
+| ratio | 2.6–3.4x faster | 1.7–2.2x faster |
+
+Run two, on a busier machine, agreed on direction: 5.43 ms vs 14.29 ms
+compress, 275 µs vs 598 µs decompress. libdeflate is kept as the default.
+
+flate2 remains the fallback behind the same `FrameEncoder`/`FrameDecoder` API:
+`cargo test -p ferrite-protocol --no-default-features` runs the whole frame
+suite on the flate2 backend. Both backends reuse their zlib object per
+connection and size the decompression buffer from the declared length.
+
+One behavior fix came out of the empty-payload test: a body of length zero now
+always uses the `data_length == 0` (uncompressed) marker. Previously a
+threshold of 0 compressed it into a zlib stream that the decoder read back as
+the packet body, because `data_length == 0` is the marker for "not compressed".
+
 ## VarInt fast paths (2026-10-30)
 
 The day-2 branch carried three VarInt/VarLong changes: a windowed decoder (one
@@ -66,6 +92,9 @@ Criterion `varint/*` through the crate, median of five separate runs:
   predictable branches, so it is accepted rather than treated as a proven win.
 - VarLong gets no change: it is rare on the wire and the windowed decoder it
   would inherit measured slower.
+- Compression stays on libdeflate: it beats flate2 by 2.6-3.4x on compression
+  and 1.7-2.2x on decompression for chunk-sized packets. The flate2 path is
+  kept buildable as the `--no-default-features` fallback.
 - Black-box note: the machine is shared with other agents, and criterion
   comparisons across runs are unusable for small deltas (unchanged frame
   benchmarks once swung 3-8x between consecutive runs). Only same-binary A/Bs
