@@ -29,6 +29,7 @@ pub const ASYNC_CHAT_EVENT: &str = "io.papermc.paper.event.player.AsyncChatEvent
 pub const ASYNC_PLAYER_CHAT_EVENT: &str = "org.bukkit.event.player.AsyncPlayerChatEvent";
 pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
 pub const PLAYER_INTERACT_EVENT: &str = "org.bukkit.event.player.PlayerInteractEvent";
+pub const BLOCK_BREAK_EVENT: &str = "org.bukkit.event.block.BlockBreakEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -331,6 +332,13 @@ pub trait ServerHooks: Send + Sync {
         action: InteractAction,
         block: BlockPosition,
         face: u8,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `BlockBreakEvent` before a block is removed; `false` means cancelled.
+    fn block_broken(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
     ) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
@@ -939,6 +947,47 @@ extern "system" fn player_interact(
     }));
     u8::from(matches!(allowed, Ok(Some(true))))
 }
+extern "system" fn block_break(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "fireBlockBreak",
+            "(Ljava/lang/String;Ljava/lang/String;III)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
 extern "system" fn schedule_global(_: JNIEnv, _: JClass, id: i64, delay: i64) {
     REGION_QUEUE
         .get_or_init(Default::default)
@@ -1139,6 +1188,11 @@ impl PluginHost {
                     "playerInteract",
                     "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
                     player_interact as *mut _,
+                ),
+                NativeMethod::new(
+                    "blockBreak",
+                    "(Ljava/lang/String;Ljava/lang/String;III)Z",
+                    block_break as *mut _,
                 ),
                 NativeMethod::new("scheduleGlobal", "(JJ)V", schedule_global as *mut _),
                 NativeMethod::new("currentTick", "()J", current_tick as *mut _),
@@ -1701,6 +1755,37 @@ impl PluginHost {
         })?)
     }
 
+    /// Fires Bukkit's `BlockBreakEvent`; no JNI call without a registered listener.
+    pub fn fire_block_break(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(BLOCK_BREAK_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireBlockBreak",
+                    "(Ljava/lang/String;Ljava/lang/String;III)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(block.x),
+                        JValue::Int(block.y),
+                        JValue::Int(block.z),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
     /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
     ///
     /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
@@ -1776,6 +1861,14 @@ impl ServerHooks for PluginHost {
         face: u8,
     ) -> Result<bool, Error> {
         self.fire_player_interact(id, name, action, block, face)
+    }
+    fn block_broken(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+    ) -> Result<bool, Error> {
+        self.fire_block_break(id, name, block)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()

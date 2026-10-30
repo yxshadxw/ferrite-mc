@@ -26,6 +26,11 @@ public final class TestPlugin extends JavaPlugin implements Listener {
         var clicked = event.getClickedBlock();
         appendEvent("interact " + (event.getAction() == org.bukkit.event.block.Action.LEFT_CLICK_BLOCK ? "left" : "right") + " " + clicked.getX() + " " + clicked.getY() + " " + clicked.getZ());
     }
+    @EventHandler public void onBreak(org.bukkit.event.block.BlockBreakEvent event) {
+        var block = event.getBlock();
+        appendEvent("break " + block.getX() + " " + block.getY() + " " + block.getZ());
+        if (block.getX() == 1) { appendEvent("break-cancel " + block.getX() + " " + block.getY() + " " + block.getZ()); event.setCancelled(true); }
+    }
     @EventHandler public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
         String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
         appendEvent("chat " + message);

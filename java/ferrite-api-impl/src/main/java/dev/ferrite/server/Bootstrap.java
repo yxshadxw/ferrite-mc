@@ -97,6 +97,12 @@ public final class Bootstrap {
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled() && event.useInteractedBlock() != org.bukkit.event.Event.Result.DENY;
     }
+    /** Fires Bukkit's {@code BlockBreakEvent}; false means a listener cancelled the break. */
+    public static boolean fireBlockBreak(String id, String name, int x, int y, int z) {
+        var event = new org.bukkit.event.block.BlockBreakEvent(FerriteEventObjects.block(x, y, z), ensurePlayer(id, name));
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();

@@ -660,7 +660,11 @@ impl Player {
                                     .and_then(|s| s.block(pos.x, pos.y, pos.z));
                                 if let Some(state) = state {
                                     if self.gamemode == 1 {
-                                        self.change_block(p.location, state, 0);
+                                        if self.plugin_allows(|plugins| {
+                                            plugins.block_broken(self.uuid, &self.name, clicked)
+                                        }) {
+                                            self.change_block(p.location, state, 0);
+                                        }
                                     } else if self.gamemode == 0 {
                                         // Zero hardness breaks on the first hit (vanilla: destroy
                                         // progress >= 1 on START), so no finish action follows.
@@ -687,6 +691,17 @@ impl Player {
                                     .ok()
                                     .and_then(super::interaction::break_ticks)
                                     .is_some_and(|ticks| elapsed >= ticks)
+                                && self.plugin_allows(|plugins| {
+                                    plugins.block_broken(
+                                        self.uuid,
+                                        &self.name,
+                                        ferrite_plugin::BlockPosition {
+                                            x: pos.x,
+                                            y: pos.y,
+                                            z: pos.z,
+                                        },
+                                    )
+                                })
                                 && self.change_block(location, state, 0)
                             {
                                 self.broken.push((pos, state));

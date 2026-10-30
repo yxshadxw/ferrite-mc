@@ -19,8 +19,8 @@ use ferrite_protocol::{
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
         play::{
-            ChunkBatchReceived, ConfirmTeleport, MovePosition, MoveRotation, PlayerAction,
-            PositionSync, SystemChat, UseItemOn,
+            BlockUpdate, ChunkBatchReceived, ConfirmTeleport, MovePosition, MoveRotation,
+            PlayerAction, PositionSync, SystemChat, UseItemOn,
         },
     },
     types::BlockPos,
@@ -366,6 +366,34 @@ fn wait_for_prefix(
     }
 }
 
+fn wait_for_block_state(
+    bot: &mut Bot,
+    position: BlockPos,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+    events: &Path,
+) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no block update for {:?}\nevents:\n{}\n{}\n{}",
+            position,
+            fs::read_to_string(events).unwrap_or_default(),
+            stdout.lock().unwrap(),
+            stderr.lock().unwrap()
+        );
+        if let Some((id, body)) = bot.next_play()
+            && id == BlockUpdate::ID
+        {
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            if BlockPos::unpack(update.location) == position {
+                return update.block_state.0;
+            }
+        }
+    }
+}
+
 fn wait_for_chat(
     bot: &mut Bot,
     needle: &str,
@@ -509,6 +537,22 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
         sequence: VarInt(31),
     });
     wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
+    wait_for_prefix(&events, "break 0 64 0", &stdout, &stderr);
+    bot.move_to(1.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 1 65 0", &stdout, &stderr);
+    bot.send(&PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(1, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(32),
+    });
+    wait_for_prefix(&events, "break-cancel 1 64 0", &stdout, &stderr);
+    let grass = i32::from(ferrite_data::blocks::default_state("grass_block").unwrap());
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(1, 64, 0), &stdout, &stderr, &events),
+        grass,
+        "a cancelled break did not restore the block"
+    );
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);
 

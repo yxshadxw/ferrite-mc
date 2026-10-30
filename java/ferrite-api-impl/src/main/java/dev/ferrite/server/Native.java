@@ -39,6 +39,7 @@ public final class Native {
     static boolean playerTeleport(String player, String world, double x, double y, double z, float yaw, float pitch) { return !enabled() || Bindings.playerTeleport(player, world, x, y, z, yaw, pitch); }
     static boolean playerMove(String player, String name, double fromX, double fromY, double fromZ, float fromYaw, float fromPitch, double toX, double toY, double toZ, float toYaw, float toPitch) { return enabled() ? Bindings.playerMove(player, name, fromX, fromY, fromZ, fromYaw, fromPitch, toX, toY, toZ, toYaw, toPitch) : Bootstrap.firePlayerMove(player, name, fromX, fromY, fromZ, fromYaw, fromPitch, toX, toY, toZ, toYaw, toPitch); }
     static boolean playerInteract(String player, String name, int action, int x, int y, int z, int face) { return enabled() ? Bindings.playerInteract(player, name, action, x, y, z, face) : Bootstrap.firePlayerInteract(player, name, action, x, y, z, face); }
+    static boolean blockBreak(String player, String name, int x, int y, int z) { return enabled() ? Bindings.blockBreak(player, name, x, y, z) : Bootstrap.fireBlockBreak(player, name, x, y, z); }
     static boolean worldSetBlock(String world, int x, int y, int z, String material) { return !enabled() || Bindings.worldSetBlock(world, x, y, z, material); }
     static void playerState(String player, int kind, double value) { if (enabled()) Bindings.playerState(player, kind, value); }
     static void playerMessage(String player, String message, boolean component) { if (enabled()) Bindings.playerMessage(player, message, component); }
@@ -72,6 +73,7 @@ public final class Native {
         static native boolean playerTeleport(String player, String world, double x, double y, double z, float yaw, float pitch);
         static native boolean playerMove(String player, String name, double fromX, double fromY, double fromZ, float fromYaw, float fromPitch, double toX, double toY, double toZ, float toYaw, float toPitch);
         static native boolean playerInteract(String player, String name, int action, int x, int y, int z, int face);
+        static native boolean blockBreak(String player, String name, int x, int y, int z);
         static native boolean worldSetBlock(String world, int x, int y, int z, String material);
         static native void playerState(String player, int kind, double value);
         static native void playerMessage(String player, String message, boolean component);
