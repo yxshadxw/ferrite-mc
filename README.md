@@ -13,7 +13,7 @@
 > Target: Minecraft Java 26.3, protocol 777. Build with Rust stable + Java 25, generate
 > vanilla data with `python tools/fetch_vanilla.py`, then `cargo test --workspace`.
 > No Mojang code or assets are distributed here; see the legal note below.
-> Licensed under MIT OR Apache-2.0.
+> Licensed under GPL-3.0-or-later (see `LICENSE`).
 
 Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(region) 기반 멀티스레딩을
 목표로 하며, 최종적으로는 내장 JVM을 통해 Bukkit/Spigot/Paper/Folia 플러그인을 그대로
@@ -119,4 +119,6 @@ CI(GitHub Actions)에서도 같은 스크립트로 데이터를 생성한 뒤 �
 
 ## 라이선스
 
-MIT OR Apache-2.0 중 원하는 라이선스를 선택할 수 있습니다.
+GPL-3.0-or-later. 전체 내용은 [`LICENSE`](LICENSE)에 있습니다.
+Paper, Folia, Lithium 등 GPL/LGPL 프로젝트의 코드를 직접 포팅하기 위해 MIT/Apache에서 GPLv3로 바꿨습니다.
+포팅한 코드의 출처는 [`NOTICE.md`](NOTICE.md)와 각 소스 파일 주석에 적습니다.

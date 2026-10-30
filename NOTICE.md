@@ -15,3 +15,16 @@ or sponsored by Mojang Studios or Microsoft. "Minecraft" is a trademark of Mojan
 - Compatibility target for plugins is the public Bukkit/Spigot/Paper API (a separate project,
   licensed by its own authors). The Paper API artifact is downloaded by the Gradle build and not
   vendored here.
+
+## License and ported code
+
+Ferrite is licensed under **GPL-3.0-or-later** (`LICENSE`). It was MIT OR Apache-2.0 up to
+commit `6b5b191`; it moved to GPLv3 so that code from GPL/LGPL projects can be ported directly.
+Ported code keeps a comment naming the upstream project and file. Upstream projects:
+
+| Project | License | Used for |
+|---|---|---|
+| [Folia](https://github.com/PaperMC/Folia) / [Paper](https://github.com/PaperMC/Paper) | GPL-3.0 (patches), MIT (some API) | regionizer, chunk system, schedulers |
+| [Lithium](https://github.com/CaffeineMC/lithium) | LGPL-3.0 | game-logic optimizations |
+
+Other optimization projects are listed with their licenses in `docs/OPTIMIZATIONS.md`.
