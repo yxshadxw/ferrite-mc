@@ -112,6 +112,12 @@ public final class Bootstrap {
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled() && event.canBuild();
     }
+    /** Fires Bukkit's {@code PlayerCommandPreprocessEvent}; false means a listener cancelled it. */
+    public static boolean firePlayerCommand(String id, String name, String message) {
+        var event = new org.bukkit.event.player.PlayerCommandPreprocessEvent(ensurePlayer(id, name), message);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();

@@ -31,6 +31,7 @@ pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
 pub const PLAYER_INTERACT_EVENT: &str = "org.bukkit.event.player.PlayerInteractEvent";
 pub const BLOCK_BREAK_EVENT: &str = "org.bukkit.event.block.BlockBreakEvent";
 pub const BLOCK_PLACE_EVENT: &str = "org.bukkit.event.block.BlockPlaceEvent";
+pub const PLAYER_COMMAND_PREPROCESS_EVENT: &str = "org.bukkit.event.player.PlayerCommandPreprocessEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -349,6 +350,8 @@ pub trait ServerHooks: Send + Sync {
         block: BlockPosition,
         face: u8,
     ) -> Result<bool, Error>;
+    /// Fires Bukkit's `PlayerCommandPreprocessEvent`; `false` means cancelled.
+    fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
     /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
@@ -1040,6 +1043,48 @@ extern "system" fn block_place(
     }));
     u8::from(matches!(allowed, Ok(Some(true))))
 }
+extern "system" fn player_command(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    message: JString,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let Ok(message) = env.get_string(&message) else {
+        return 1;
+    };
+    let message: String = message.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        let message = env.new_string(message).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerCommand",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Object(message.as_ref()),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
 extern "system" fn schedule_global(_: JNIEnv, _: JClass, id: i64, delay: i64) {
     REGION_QUEUE
         .get_or_init(Default::default)
@@ -1250,6 +1295,11 @@ impl PluginHost {
                     "blockPlace",
                     "(Ljava/lang/String;Ljava/lang/String;IIII)Z",
                     block_place as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerCommand",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    player_command as *mut _,
                 ),
                 NativeMethod::new("scheduleGlobal", "(JJ)V", schedule_global as *mut _),
                 NativeMethod::new("currentTick", "()J", current_tick as *mut _),
@@ -1876,6 +1926,36 @@ impl PluginHost {
         })?)
     }
 
+    /// Fires Bukkit's `PlayerCommandPreprocessEvent`; no JNI call without a registered listener.
+    pub fn fire_player_command(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        message: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_COMMAND_PREPROCESS_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let message = env.new_string(message)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerCommand",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Object(message.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
     /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
     ///
     /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
@@ -1968,6 +2048,9 @@ impl ServerHooks for PluginHost {
         face: u8,
     ) -> Result<bool, Error> {
         self.fire_block_place(id, name, block, face)
+    }
+    fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error> {
+        self.fire_player_command(id, name, message)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()

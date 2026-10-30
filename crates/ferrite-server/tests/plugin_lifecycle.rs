@@ -505,6 +505,7 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     bot.raw(7, "testping");
     let pong = wait_for_chat(&mut bot, "pong", &stdout, &stderr, &events);
     assert_eq!(pong, "pong");
+    wait_for_prefix(&events, "command /testping", &stdout, &stderr);
     bot.move_to(2.5, 65.0, 0.5);
     wait_for_prefix(&events, "move Bot 2 65 0", &stdout, &stderr);
     bot.move_to(2.5, 100.0, 0.5);
@@ -583,6 +584,15 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
         wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
         0,
         "a cancelled placement was not rolled back on the client"
+    );
+    bot.raw(7, "testping nope");
+    wait_for_prefix(&events, "command /testping nope", &stdout, &stderr);
+    let after_command_cancel = bot.collect_chats(Duration::from_millis(1200));
+    assert!(
+        !after_command_cancel
+            .iter()
+            .any(|message| message.contains("pong")),
+        "a cancelled command still ran: {after_command_cancel:?}"
     );
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);

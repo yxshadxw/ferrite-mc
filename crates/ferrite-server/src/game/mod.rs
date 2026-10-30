@@ -387,6 +387,14 @@ async fn run(
               let _ = event_tx.send(GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(ServerboundChatCommand{command})});
           }},
           GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
+              let message = format!("/{}", command.trim_start_matches('/'));
+              if let (Some(plugins), Some(name)) = (&settings.plugins, names.get(&uuid)) {
+                  match plugins.player_command(uuid, name, &message) {
+                      Ok(true) => {}
+                      Ok(false) => continue,
+                      Err(error) => tracing::warn!(%error, "command preprocess event failed"),
+                  }
+              }
               let (actions, mut received) = mpsc::unbounded_channel();
               let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
