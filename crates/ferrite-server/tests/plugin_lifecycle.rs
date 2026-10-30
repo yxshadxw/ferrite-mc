@@ -18,7 +18,10 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, PositionSync, SystemChat},
+        play::{
+            ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, LastSeenUpdate,
+            PositionSync, ServerboundChat, SystemChat,
+        },
     },
 };
 
@@ -242,6 +245,16 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
+    fn chat(&mut self, text: &str) {
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp: 1_700_000_000_000,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
+        });
+    }
+
     fn raw(&mut self, id: i32, text: &str) {
         let mut body = Vec::new();
         VarInt(id).encode(&mut body);
@@ -318,10 +331,17 @@ impl Bot {
         let deadline = Instant::now() + duration;
         let mut messages = Vec::new();
         while Instant::now() < deadline {
-            if let Some((id, body)) = self.next_play()
-                && id == 124
-            {
-                messages.push(SystemChat::decode(&mut body.as_slice()).unwrap().content.0);
+            match self.next_play() {
+                Some((124, body)) => {
+                    messages.push(SystemChat::decode(&mut body.as_slice()).unwrap().content.0)
+                }
+                Some((id, body)) if id == ClientboundPlayerChat::ID => messages.push(
+                    ClientboundPlayerChat::decode(&mut body.as_slice())
+                        .unwrap()
+                        .body
+                        .content,
+                ),
+                _ => {}
             }
         }
         messages
@@ -346,10 +366,17 @@ fn wait_for_chat(
                 stderr.lock().unwrap()
             );
         }
-        if let Some((id, body)) = bot.next_play()
-            && id == 124
-        {
-            let message = SystemChat::decode(&mut body.as_slice()).unwrap().content.0;
+        if let Some((id, body)) = bot.next_play() {
+            let message = if id == 124 {
+                SystemChat::decode(&mut body.as_slice()).unwrap().content.0
+            } else if id == ClientboundPlayerChat::ID {
+                ClientboundPlayerChat::decode(&mut body.as_slice())
+                    .unwrap()
+                    .body
+                    .content
+            } else {
+                continue;
+            };
             if message.contains(needle) {
                 return message;
             }
@@ -422,18 +449,18 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
-    bot.raw(9, "hello plugins");
+    bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
-    let broadcast = wait_for_chat(&mut bot, "<Bot> hello plugins", &stdout, &stderr, &events);
+    let broadcast = wait_for_chat(&mut bot, "hello plugins", &stdout, &stderr, &events);
     assert!(broadcast.contains("hello plugins"), "{broadcast}");
-    bot.raw(9, "cancel this");
+    bot.chat("cancel this");
     wait_for_line(&events, "chat cancel this", &stdout, &stderr);
     let after_cancel = bot.collect_chats(Duration::from_millis(1500));
     assert!(
         !after_cancel
             .iter()
-            .any(|message| message.contains("<Bot> cancel this")),
+            .any(|message| message.contains("cancel this")),
         "a cancelled chat event was still broadcast: {after_cancel:?}"
     );
     bot.raw(7, "testping");
