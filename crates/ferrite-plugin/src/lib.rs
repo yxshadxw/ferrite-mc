@@ -27,6 +27,7 @@ pub const PLAYER_JOIN_EVENT: &str = "org.bukkit.event.player.PlayerJoinEvent";
 pub const PLAYER_QUIT_EVENT: &str = "org.bukkit.event.player.PlayerQuitEvent";
 pub const ASYNC_CHAT_EVENT: &str = "io.papermc.paper.event.player.AsyncChatEvent";
 pub const ASYNC_PLAYER_CHAT_EVENT: &str = "org.bukkit.event.player.AsyncPlayerChatEvent";
+pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -46,6 +47,16 @@ pub struct BlockPosition {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+/// Where a player was and where a movement packet takes it; Bukkit's `PlayerMoveEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerMove {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    pub from_yaw: f32,
+    pub from_pitch: f32,
+    pub to_yaw: f32,
+    pub to_pitch: f32,
 }
 #[derive(Clone, Debug)]
 pub struct BlockSnapshot {
@@ -297,6 +308,13 @@ pub trait ServerHooks: Send + Sync {
     ///
     /// Returns the message after listeners ran, or `None` when one cancelled chat.
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error>;
+    /// Fires Bukkit's `PlayerMoveEvent`; `false` means a listener cancelled the move.
+    fn player_moved(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
     /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
@@ -795,6 +813,70 @@ extern "system" fn dispatch_back(mut env: JNIEnv, _: JClass, sender: JString, li
             )
         })
 }
+extern "system" fn player_move(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    from_x: f64,
+    from_y: f64,
+    from_z: f64,
+    from_yaw: f32,
+    from_pitch: f32,
+    to_x: f64,
+    to_y: f64,
+    to_z: f64,
+    to_yaw: f32,
+    to_pitch: f32,
+) -> u8 {
+    if [from_x, from_y, from_z, to_x, to_y, to_z]
+        .iter()
+        .any(|v| !v.is_finite())
+        || [from_yaw, from_pitch, to_yaw, to_pitch]
+            .iter()
+            .any(|v| !v.is_finite())
+    {
+        return 1;
+    }
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerMove",
+            "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Double(from_x),
+                JValue::Double(from_y),
+                JValue::Double(from_z),
+                JValue::Float(from_yaw),
+                JValue::Float(from_pitch),
+                JValue::Double(to_x),
+                JValue::Double(to_y),
+                JValue::Double(to_z),
+                JValue::Float(to_yaw),
+                JValue::Float(to_pitch),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
 extern "system" fn schedule_global(_: JNIEnv, _: JClass, id: i64, delay: i64) {
     REGION_QUEUE
         .get_or_init(Default::default)
@@ -985,6 +1067,11 @@ impl PluginHost {
                     "dispatchCommand",
                     "(Ljava/lang/String;Ljava/lang/String;)Z",
                     dispatch_back as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerMove",
+                    "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+                    player_move as *mut _,
                 ),
                 NativeMethod::new("scheduleGlobal", "(JJ)V", schedule_global as *mut _),
                 NativeMethod::new("currentTick", "()J", current_tick as *mut _),
@@ -1474,6 +1561,44 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Fires Bukkit's `PlayerMoveEvent`; no JNI call without a registered listener.
+    pub fn fire_player_move(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_MOVE_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerMove",
+                    "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Double(movement.from[0]),
+                        JValue::Double(movement.from[1]),
+                        JValue::Double(movement.from[2]),
+                        JValue::Float(movement.from_yaw),
+                        JValue::Float(movement.from_pitch),
+                        JValue::Double(movement.to[0]),
+                        JValue::Double(movement.to[1]),
+                        JValue::Double(movement.to[2]),
+                        JValue::Float(movement.to_yaw),
+                        JValue::Float(movement.to_pitch),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
     /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
     ///
     /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
@@ -1531,6 +1656,14 @@ impl ServerHooks for PluginHost {
     }
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error> {
         self.fire_chat(id, name, message)
+    }
+    fn player_moved(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error> {
+        self.fire_player_move(id, name, movement)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()

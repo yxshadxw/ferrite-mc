@@ -97,6 +97,9 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    pub name: String,
+    /// Plugin event hooks; `None` when the server runs without plugins.
+    pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -554,6 +557,23 @@ impl Player {
             );
         }
     }
+    /// Runs an event hook; a missing bridge or a failed call allows the action.
+    fn plugin_allows(
+        &self,
+        event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
+    ) -> bool {
+        let Some(plugins) = &self.plugins else {
+            return true;
+        };
+        match event(plugins.as_ref()) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::warn!(%error, "plugin event failed");
+                true
+            }
+        }
+    }
+
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
@@ -725,6 +745,23 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) {
+                            // Bukkit fires `PlayerMoveEvent` only when the position changes.
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: self.yaw,
+                                to_pitch: self.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.ground = p.flags & 1 != 0;
                             changed = true;
@@ -737,6 +774,22 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) && p.yaw.is_finite() && p.pitch.is_finite() {
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: p.yaw,
+                                to_pitch: p.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.yaw = p.yaw;
                             self.pitch = p.pitch;

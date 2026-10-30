@@ -18,7 +18,7 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, PositionSync, SystemChat},
+        play::{ChunkBatchReceived, ConfirmTeleport, MovePosition, PositionSync, SystemChat},
     },
 };
 
@@ -314,6 +314,15 @@ impl Bot {
         }
     }
 
+    fn move_to(&mut self, x: f64, y: f64, z: f64) {
+        self.send(&MovePosition {
+            x,
+            y,
+            z,
+            flags: 1,
+        });
+    }
+
     fn collect_chats(&mut self, duration: Duration) -> Vec<String> {
         let deadline = Instant::now() + duration;
         let mut messages = Vec::new();
@@ -325,6 +334,31 @@ impl Bot {
             }
         }
         messages
+    }
+}
+
+fn wait_for_prefix(
+    path: &Path,
+    prefix: &str,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(content) = fs::read_to_string(path)
+            && content.lines().any(|line| line.starts_with(prefix))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin never wrote a {prefix:?} line to {}:\n{}\n{}\n{}",
+            path.display(),
+            fs::read_to_string(path).unwrap_or_default(),
+            stdout.lock().unwrap(),
+            stderr.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -439,6 +473,12 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     bot.raw(7, "testping");
     let pong = wait_for_chat(&mut bot, "pong", &stdout, &stderr, &events);
     assert_eq!(pong, "pong");
+    bot.move_to(2.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 2 65 0", &stdout, &stderr);
+    bot.move_to(2.5, 100.0, 0.5);
+    wait_for_prefix(&events, "move-cancel Bot", &stdout, &stderr);
+    let rejected = PositionSync::decode(&mut bot.until(73).as_slice()).unwrap();
+    assert_eq!((rejected.x, rejected.y, rejected.z), (2.5, 65.0, 0.5));
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);
 

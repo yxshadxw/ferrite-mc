@@ -85,6 +85,12 @@ public final class Bootstrap {
         }
         return result;
     }
+    /** Fires Bukkit's {@code PlayerMoveEvent}; false means a listener cancelled the move. */
+    public static boolean firePlayerMove(String id, String name, double fromX, double fromY, double fromZ, float fromYaw, float fromPitch, double toX, double toY, double toZ, float toYaw, float toPitch) {
+        var event = new org.bukkit.event.player.PlayerMoveEvent(ensurePlayer(id, name), new org.bukkit.Location(null, fromX, fromY, fromZ, fromYaw, fromPitch), new org.bukkit.Location(null, toX, toY, toZ, toYaw, toPitch));
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();
