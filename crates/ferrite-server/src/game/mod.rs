@@ -7,6 +7,7 @@ pub fn new_anvil_source(
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
 }
+mod chat;
 mod chunk;
 mod commands;
 mod drops;
@@ -133,7 +134,7 @@ impl World {
                 signal_tx: signals.clone(),
                 signals: signal_rx,
             },
-            source,
+            Some(Arc::clone(&source)),
             flat,
             spawn,
             metrics,
@@ -328,11 +329,11 @@ async fn run(
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
-          GameMessage::Joined{session,uuid,name,properties,dimension_type,biome,view_distance,online_mode,max_players,outbound}=>{
+          GameMessage::Joined{session,uuid,name,properties,dimension_type,biome,view_distance,online_mode,secure_chat,chat_type,chat_visibility,max_players,outbound}=>{
            if let Some((_, mailbox, old)) = mailboxes.get(&uuid) {
              let _ = old.send(Outbound::Disconnect("You logged in from another location".into()));
              mailbox.lock().unwrap().push_back(Command::Leave);
-             if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, dimension_type, biome, view_distance, online_mode, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
+             if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, dimension_type, biome, view_distance, online_mode, secure_chat, chat_type, chat_visibility, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
              continue;
            }
            let permission = settings.permission(uuid);
@@ -345,7 +346,7 @@ async fn run(
            let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
            permissions.insert(uuid, permission);
            let entity=ferrite_entity::allocate_id();
-           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
+           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
            if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
@@ -360,20 +361,32 @@ async fn run(
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
-           let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
+           let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound,secure_chat,chat_type,chat_visibility); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {
-              let mut message = Some(text);
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(chat)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && chat.message.chars().count()<=256 {
+              let mut chat = chat;
+              let mut deliver = true;
               if let Some(plugins) = &settings.plugins {
                   let name = names.get(&uuid).cloned().unwrap_or_default();
-                  match plugins.chat(uuid, &name, message.as_deref().unwrap_or_default()) {
-                      Ok(allowed) => message = allowed,
+                  match plugins.chat(uuid, &name, &chat.message) {
+                      Ok(Some(text)) => {
+                          // A plugin-edited message no longer matches the client signature.
+                          if text != chat.message { chat.message = text; chat.signature = None; }
+                      }
+                      Ok(None) => deliver = false,
                       Err(error) => tracing::warn!(%error, "chat event failed"),
                   }
               }
-              if let Some(text) = message { scheduler.schedule_global(move |g|g.chat(uuid,&text)); }
+              if deliver { scheduler.schedule_global(move |g|g.chat(uuid,&chat)); }
           }},
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::Command(command)}=>{if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatAck(ack)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) {scheduler.schedule_global(move |g|g.chat_ack(uuid,ack.offset.0));}},
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatSessionUpdate(update)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) {scheduler.schedule_global(move |g|g.chat_session(uuid,update.chat_session));}},
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommandSigned(signed)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) {
+              let ServerboundChatCommandSigned { command, last_seen, .. } = signed;
+              scheduler.schedule_global(move |g|g.apply_chat_update(uuid,&last_seen));
+              let _ = event_tx.send(GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(ServerboundChatCommand{command})});
+          }},
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let (actions, mut received) = mpsc::unbounded_channel();
               let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }

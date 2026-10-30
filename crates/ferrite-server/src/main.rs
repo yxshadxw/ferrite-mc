@@ -11,6 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Config {
     bind_address: String,
     online_mode: bool,
+    enforce_secure_profile: bool,
     motd: String,
     max_players: u32,
     view_distance: u8,
@@ -92,6 +93,7 @@ impl Default for Config {
         Self {
             bind_address: "0.0.0.0:25565".into(),
             online_mode: true,
+            enforce_secure_profile: true,
             motd: "A Ferrite server".into(),
             max_players: 20,
             view_distance: 10,
@@ -183,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
             max_players: config.max_players,
             online_mode: config.online_mode,
             encrypt_offline: false,
+            enforce_secure_profile: config.enforce_secure_profile,
             compression_threshold: config.compression_threshold,
             view_distance: config.view_distance,
             forwarding,

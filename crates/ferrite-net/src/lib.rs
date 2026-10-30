@@ -21,6 +21,9 @@ pub struct ServerConfig {
     pub max_players: u32,
     pub online_mode: bool,
     pub encrypt_offline: bool,
+    /// Require signed chat from players whose profile key can be validated. Vanilla only
+    /// enforces this on authenticated servers and when Mojang's services keys are available.
+    pub enforce_secure_profile: bool,
     pub compression_threshold: usize,
     pub view_distance: u8,
     pub forwarding: forwarding::Forwarding,
@@ -33,6 +36,7 @@ impl Default for ServerConfig {
             max_players: 20,
             online_mode: true,
             encrypt_offline: false,
+            enforce_secure_profile: true,
             compression_threshold: 256,
             view_distance: 10,
             forwarding: forwarding::Forwarding::None,
@@ -191,6 +195,7 @@ async fn offline_login(
                 name,
                 properties,
                 address: None,
+                chat_visibility: 0,
             }
         }
         forwarding::Forwarding::Velocity { secret } => {
@@ -200,6 +205,7 @@ async fn offline_login(
                 name: forwarded.name,
                 properties: forwarded.properties,
                 address: Some(forwarded.address),
+                chat_visibility: 0,
             }
         }
         forwarding::Forwarding::Bungee => {
@@ -213,6 +219,7 @@ async fn offline_login(
                 name: start.name.clone(),
                 properties: legacy.properties,
                 address: Some(legacy.address),
+                chat_visibility: 0,
             }
         }
     };
@@ -300,13 +307,15 @@ struct Profile {
     properties: Vec<ferrite_protocol::packets::login::Property>,
     /// Address forwarded by the proxy, when one is configured.
     address: Option<std::net::IpAddr>,
+    /// The client's chat visibility from configuration (`0` shown, `1` commands only, `2` hidden).
+    chat_visibility: u8,
 }
 async fn configure(
     mut stream: Wire,
     mut decoder: FrameDecoder,
     encoder: FrameEncoder,
     config: ServerConfig,
-    profile: Profile,
+    mut profile: Profile,
 ) -> Result<()> {
     use ferrite_protocol::{
         Encode, RestBytes,
@@ -352,7 +361,14 @@ async fn configure(
         std::time::Duration::from_secs(10),
     );
     loop {
-        let packet = read_config_packet(&mut stream, &mut decoder, &encoder, &mut timer).await?;
+        let packet = read_config_packet(
+            &mut stream,
+            &mut decoder,
+            &encoder,
+            &mut timer,
+            Some(&mut profile),
+        )
+        .await?;
         let mut body = packet.as_slice();
         let id = VarInt::decode(&mut body)?.0;
         if id == ServerboundKnownPacks::ID {
@@ -380,11 +396,23 @@ async fn configure(
     send_compressed(&mut stream, &encoder, &vanilla.tags).await?;
     send_compressed(&mut stream, &encoder, &FinishConfiguration).await?;
     loop {
-        let packet = read_config_packet(&mut stream, &mut decoder, &encoder, &mut timer).await?;
+        let packet = read_config_packet(
+            &mut stream,
+            &mut decoder,
+            &encoder,
+            &mut timer,
+            Some(&mut profile),
+        )
+        .await?;
         let mut body = packet.as_slice();
         if VarInt::decode(&mut body)?.0 == AcknowledgeFinishConfiguration::ID {
             break;
         }
+    }
+    if !config.online_mode && config.enforce_secure_profile {
+        tracing::warn!(
+            "enforce-secure-profile is ignored in offline mode: unsigned chat is accepted"
+        );
     }
     play(stream, decoder, encoder, config, profile, vanilla).await
 }
@@ -393,6 +421,7 @@ async fn read_config_packet(
     decoder: &mut FrameDecoder,
     encoder: &FrameEncoder,
     timer: &mut tokio::time::Interval,
+    mut profile: Option<&mut Profile>,
 ) -> Result<Vec<u8>> {
     use ferrite_protocol::packets::configuration::{
         ClientInformation, ClientboundKeepAlive, ServerboundCustomPayload, ServerboundKeepAlive,
@@ -401,7 +430,7 @@ async fn read_config_packet(
         tokio::select! {
             _=timer.tick()=>{send_compressed(stream,encoder,&ClientboundKeepAlive{id:1}).await?;}
             packet=read_packet(stream,decoder)=>{let packet=packet?;let mut body=packet.as_slice();let id=VarInt::decode(&mut body)?.0;
-                match id {0=>{ClientInformation::decode(&mut body)?;},2=>{ServerboundCustomPayload::decode(&mut body)?;},4=>{ServerboundKeepAlive::decode(&mut body)?;},_=>return Ok(packet)}
+                match id {0=>{let info=ClientInformation::decode(&mut body)?;if let Some(profile)=profile.as_deref_mut(){profile.chat_visibility=match info.chat_mode.0{1=>1,2=>2,_=>0};}},2=>{ServerboundCustomPayload::decode(&mut body)?;},4=>{ServerboundKeepAlive::decode(&mut body)?;},_=>return Ok(packet)}
             }
         }
     }
@@ -478,6 +507,10 @@ async fn play(
         .iter()
         .position(|v| v == "minecraft:plains")
         .context("missing plains")? as i32;
+    let chat_type = vanilla.registries["minecraft:chat_type"]
+        .iter()
+        .position(|v| v == "minecraft:chat")
+        .context("missing chat type")? as i32;
     static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uuid = profile.uuid;
@@ -491,6 +524,10 @@ async fn play(
         biome,
         view_distance: config.view_distance.clamp(2, 32),
         online_mode: config.online_mode,
+        // Vanilla: enforce-secure-profile only applies to authenticated servers.
+        secure_chat: config.enforce_secure_profile && config.online_mode,
+        chat_type,
+        chat_visibility: profile.chat_visibility,
         max_players: config.max_players,
         outbound,
     })
@@ -1282,7 +1319,7 @@ mod keepalive_tests {
             let mut decoder = FrameDecoder::default();
             let encoder = FrameEncoder::default();
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(20));
-            read_config_packet(&mut wire, &mut decoder, &encoder, &mut timer)
+            read_config_packet(&mut wire, &mut decoder, &encoder, &mut timer, None)
                 .await
                 .unwrap()
         });
