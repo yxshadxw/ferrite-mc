@@ -18,7 +18,10 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, PositionSync, SystemChat},
+        play::{
+            ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, LastSeenUpdate,
+            PositionSync, ServerboundChat, SystemChat,
+        },
     },
 };
 
@@ -242,6 +245,20 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
+    /// Unsigned chat, the offline-mode path: no profile key and an empty last-seen update.
+    fn chat(&mut self, text: &str) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
+        });
+    }
+
     fn raw(&mut self, id: i32, text: &str) {
         let mut body = Vec::new();
         VarInt(id).encode(&mut body);
@@ -319,12 +336,27 @@ impl Bot {
         let mut messages = Vec::new();
         while Instant::now() < deadline {
             if let Some((id, body)) = self.next_play()
-                && id == 124
+                && let Some(message) = chat_text(id, &body)
             {
-                messages.push(SystemChat::decode(&mut body.as_slice()).unwrap().content.0);
+                messages.push(message);
             }
         }
         messages
+    }
+}
+
+/// Text of a chat packet: `player_chat` for player messages and `system_chat` for command output.
+fn chat_text(id: i32, body: &[u8]) -> Option<String> {
+    let mut body = body;
+    match id {
+        ClientboundPlayerChat::ID => Some(
+            ClientboundPlayerChat::decode(&mut body)
+                .unwrap()
+                .body
+                .content,
+        ),
+        SystemChat::ID => Some(SystemChat::decode(&mut body).unwrap().content.0),
+        _ => None,
     }
 }
 
@@ -347,9 +379,8 @@ fn wait_for_chat(
             );
         }
         if let Some((id, body)) = bot.next_play()
-            && id == 124
+            && let Some(message) = chat_text(id, &body)
         {
-            let message = SystemChat::decode(&mut body.as_slice()).unwrap().content.0;
             if message.contains(needle) {
                 return message;
             }
@@ -422,18 +453,19 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
-    bot.raw(9, "hello plugins");
+    bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
-    let broadcast = wait_for_chat(&mut bot, "<Bot> hello plugins", &stdout, &stderr, &events);
+    // Signed chat carries the bare content plus the sender's chat type; the client renders the name.
+    let broadcast = wait_for_chat(&mut bot, "hello plugins", &stdout, &stderr, &events);
     assert!(broadcast.contains("hello plugins"), "{broadcast}");
-    bot.raw(9, "cancel this");
+    bot.chat("cancel this");
     wait_for_line(&events, "chat cancel this", &stdout, &stderr);
     let after_cancel = bot.collect_chats(Duration::from_millis(1500));
     assert!(
         !after_cancel
             .iter()
-            .any(|message| message.contains("<Bot> cancel this")),
+            .any(|message| message.contains("cancel this")),
         "a cancelled chat event was still broadcast: {after_cancel:?}"
     );
     bot.raw(7, "testping");
