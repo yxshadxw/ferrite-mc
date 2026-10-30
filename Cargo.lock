@@ -628,6 +628,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-entity"
+version = "0.1.0"
+dependencies = [
+ "ferrite-data",
+ "ferrite-item",
+ "ferrite-math",
+ "ferrite-protocol",
+ "uuid",
+]
+
+[[package]]
 name = "ferrite-fluid"
 version = "0.1.0"
 dependencies = [
@@ -786,8 +797,11 @@ dependencies = [
  "anyhow",
  "ferrite-command",
  "ferrite-data",
+ "ferrite-entity",
  "ferrite-fluid",
+ "ferrite-item",
  "ferrite-jvm",
+ "ferrite-loot",
  "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",

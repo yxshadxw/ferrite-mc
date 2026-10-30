@@ -1,5 +1,5 @@
 use super::login::Property;
-use crate::{Bound, Decode, DecodeError, Encode, Packet, State, VarInt};
+use crate::{Bound, Decode, DecodeError, Encode, Packet, State, VarInt, VarLong, types::LpVec3};
 use uuid::Uuid;
 macro_rules! fields { ($name:ident {$($f:ident:$t:ty),* $(,)?})=>{ #[derive(Debug,Clone,PartialEq)] pub struct $name {$(pub $f:$t),*} impl Encode for $name {fn encode(&self,out:&mut Vec<u8>){$(self.$f.encode(out);)*}} impl Decode for $name {fn decode(buf:&mut &[u8])->Result<Self,DecodeError>{Ok(Self{$($f:<$t>::decode(buf)?),*})}} }; }
 macro_rules! packet {($name:ident,$id:expr,$bound:ident,{$($f:ident:$t:ty),* $(,)?})=>{ fields!($name {$($f:$t),*}); impl Packet for $name {const ID:i32=$id;const STATE:State=State::Play;const BOUND:Bound=Bound::$bound;} };}
@@ -190,6 +190,7 @@ pub struct AddEntity {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    pub velocity: LpVec3,
     pub pitch: u8,
     pub yaw: u8,
     pub head_yaw: u8,
@@ -203,7 +204,7 @@ impl Encode for AddEntity {
         self.x.encode(out);
         self.y.encode(out);
         self.z.encode(out);
-        0u8.encode(out);
+        self.velocity.encode(out);
         self.pitch.encode(out);
         self.yaw.encode(out);
         self.head_yaw.encode(out);
@@ -218,9 +219,6 @@ impl Decode for AddEntity {
         let x = f64::decode(buf)?;
         let y = f64::decode(buf)?;
         let z = f64::decode(buf)?;
-        if u8::decode(buf)? != 0 {
-            return Err(DecodeError::Invalid("nonzero velocity unsupported"));
-        }
         Ok(Self {
             id,
             uuid,
@@ -228,6 +226,7 @@ impl Decode for AddEntity {
             x,
             y,
             z,
+            velocity: LpVec3::decode(buf)?,
             pitch: u8::decode(buf)?,
             yaw: u8::decode(buf)?,
             head_yaw: u8::decode(buf)?,
@@ -267,6 +266,108 @@ impl Decode for PlayerGameMode {
 }
 impl Packet for PlayerGameMode {
     const ID: i32 = 71;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+packet!(SetEntityMotion,103,Clientbound,{id:VarInt,velocity:LpVec3});
+packet!(TakeItemEntity,127,Clientbound,{item:VarInt,collector:VarInt,amount:VarInt});
+// `teleport_entity`: an explicit teleport (`PositionMoveRotation`, relative flags as an int bit
+// set, on-ground). Movement updates use `entity_position_sync` (`EntityTeleport`).
+packet!(TeleportEntity,128,Clientbound,{id:VarInt,x:f64,y:f64,z:f64,velocity_x:f64,velocity_y:f64,velocity_z:f64,yaw:f32,pitch:f32,relatives:i32,on_ground:bool});
+
+/// One synched entity data value, tagged with its `EntityDataSerializers` id on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaValue {
+    Byte(i8),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    String(String),
+    ItemStack(ItemStack),
+    Boolean(bool),
+    Pose(i32),
+}
+impl MetaValue {
+    /// Serializer id in `EntityDataSerializers` registration order (26.3).
+    pub fn serializer(&self) -> i32 {
+        match self {
+            Self::Byte(_) => 0,
+            Self::Int(_) => 1,
+            Self::Long(_) => 2,
+            Self::Float(_) => 3,
+            Self::String(_) => 4,
+            Self::ItemStack(_) => 7,
+            Self::Boolean(_) => 8,
+            Self::Pose(_) => 20,
+        }
+    }
+}
+/// A data value at its accessor index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaEntry {
+    pub index: u8,
+    pub value: MetaValue,
+}
+impl Encode for MetaEntry {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.index.encode(out);
+        VarInt(self.value.serializer()).encode(out);
+        match &self.value {
+            MetaValue::Byte(v) => v.encode(out),
+            MetaValue::Int(v) | MetaValue::Pose(v) => VarInt(*v).encode(out),
+            MetaValue::Long(v) => VarLong(*v).encode(out),
+            MetaValue::Float(v) => v.encode(out),
+            MetaValue::String(v) => v.encode(out),
+            MetaValue::ItemStack(v) => v.encode(out),
+            MetaValue::Boolean(v) => v.encode(out),
+        }
+    }
+}
+impl MetaEntry {
+    fn decode_at(index: u8, buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let value = match VarInt::decode(buf)?.0 {
+            0 => MetaValue::Byte(i8::decode(buf)?),
+            1 => MetaValue::Int(VarInt::decode(buf)?.0),
+            2 => MetaValue::Long(VarLong::decode(buf)?.0),
+            3 => MetaValue::Float(f32::decode(buf)?),
+            4 => MetaValue::String(String::decode(buf)?),
+            7 => MetaValue::ItemStack(ItemStack::decode(buf)?),
+            8 => MetaValue::Boolean(bool::decode(buf)?),
+            20 => MetaValue::Pose(VarInt::decode(buf)?.0),
+            _ => return Err(DecodeError::Invalid("unsupported entity data serializer")),
+        };
+        Ok(Self { index, value })
+    }
+}
+/// `set_entity_data`: changed data values, terminated by index 255.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetEntityData {
+    pub id: VarInt,
+    pub values: Vec<MetaEntry>,
+}
+impl Encode for SetEntityData {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        for value in &self.values {
+            value.encode(out);
+        }
+        out.push(0xFF);
+    }
+}
+impl Decode for SetEntityData {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let id = VarInt::decode(buf)?;
+        let mut values = Vec::new();
+        loop {
+            match u8::decode(buf)? {
+                0xFF => return Ok(Self { id, values }),
+                index => values.push(MetaEntry::decode_at(index, buf)?),
+            }
+        }
+    }
+}
+impl Packet for SetEntityData {
+    const ID: i32 = 101;
     const STATE: State = State::Play;
     const BOUND: Bound = Bound::Clientbound;
 }
@@ -381,5 +482,75 @@ mod interaction_tests {
             slot: 36,
             item: ItemStack::default(),
         });
+    }
+    #[test]
+    fn entity_packets_roundtrip() {
+        roundtrip(AddEntity {
+            id: VarInt(5),
+            uuid: Uuid::from_u128(7),
+            entity_type: VarInt(71),
+            x: 0.5,
+            y: 64.0,
+            z: -3.25,
+            velocity: LpVec3::ZERO,
+            pitch: 0,
+            yaw: 200,
+            head_yaw: 200,
+            data: VarInt(0),
+        });
+        roundtrip(SetEntityMotion {
+            id: VarInt(5),
+            velocity: LpVec3::ZERO,
+        });
+        roundtrip(TakeItemEntity {
+            item: VarInt(5),
+            collector: VarInt(1),
+            amount: VarInt(3),
+        });
+        roundtrip(TeleportEntity {
+            id: VarInt(5),
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            velocity_x: 0.0,
+            velocity_y: -0.1,
+            velocity_z: 0.0,
+            yaw: 90.0,
+            pitch: 0.0,
+            relatives: 0,
+            on_ground: true,
+        });
+        let values = [
+            (0, MetaValue::Byte(0x20)),
+            (1, MetaValue::Int(300)),
+            (
+                8,
+                MetaValue::ItemStack(ItemStack {
+                    count: 2,
+                    item_id: 28,
+                }),
+            ),
+            (6, MetaValue::Pose(1)),
+            (9, MetaValue::Long(-5)),
+            (10, MetaValue::String("x".into())),
+            (11, MetaValue::Boolean(true)),
+            (12, MetaValue::Float(0.5)),
+        ];
+        roundtrip(SetEntityData {
+            id: VarInt(5),
+            values: values
+                .into_iter()
+                .map(|(index, value)| MetaEntry { index, value })
+                .collect(),
+        });
+        // A non-zero velocity survives within LpVec3 precision.
+        let mut bytes = Vec::new();
+        SetEntityMotion {
+            id: VarInt(1),
+            velocity: LpVec3([0.1, 0.2, -0.05]),
+        }
+        .encode(&mut bytes);
+        let back = SetEntityMotion::decode(&mut bytes.as_slice()).unwrap();
+        assert!((back.velocity.0[1] - 0.2).abs() < 1e-4);
     }
 }
