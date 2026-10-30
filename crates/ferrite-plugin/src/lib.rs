@@ -31,7 +31,8 @@ pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
 pub const PLAYER_INTERACT_EVENT: &str = "org.bukkit.event.player.PlayerInteractEvent";
 pub const BLOCK_BREAK_EVENT: &str = "org.bukkit.event.block.BlockBreakEvent";
 pub const BLOCK_PLACE_EVENT: &str = "org.bukkit.event.block.BlockPlaceEvent";
-pub const PLAYER_COMMAND_PREPROCESS_EVENT: &str = "org.bukkit.event.player.PlayerCommandPreprocessEvent";
+pub const PLAYER_COMMAND_PREPROCESS_EVENT: &str =
+    "org.bukkit.event.player.PlayerCommandPreprocessEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -336,12 +337,8 @@ pub trait ServerHooks: Send + Sync {
         face: u8,
     ) -> Result<bool, Error>;
     /// Fires Bukkit's `BlockBreakEvent` before a block is removed; `false` means cancelled.
-    fn block_broken(
-        &self,
-        id: uuid::Uuid,
-        name: &str,
-        block: BlockPosition,
-    ) -> Result<bool, Error>;
+    fn block_broken(&self, id: uuid::Uuid, name: &str, block: BlockPosition)
+    -> Result<bool, Error>;
     /// Fires Bukkit's `BlockPlaceEvent` before a block is placed; `false` means cancelled.
     fn block_placed(
         &self,

@@ -688,7 +688,10 @@ impl Player {
                                                 && ferrite_data::block_props::get(s).hardness == 0.0
                                         });
                                         if instant {
-                                            if self.change_block(p.location, state, 0) {
+                                            if self.plugin_allows(|plugins| {
+                                                plugins.block_broken(self.uuid, &self.name, clicked)
+                                            }) && self.change_block(p.location, state, 0)
+                                            {
                                                 self.broken.push((pos, state));
                                             }
                                         } else {
@@ -697,6 +700,7 @@ impl Player {
                                     }
                                 }
                             }
+                        }
                         1 => self.breaking = None,
                         2 => {
                             if let Some((location, state, elapsed)) = self.breaking.take()

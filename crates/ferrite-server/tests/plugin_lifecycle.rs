@@ -19,8 +19,9 @@ use ferrite_protocol::{
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
         play::{
-            BlockUpdate, ChunkBatchReceived, ConfirmTeleport, CreativeSlot, ItemStack, MovePosition,
-            MoveRotation, PlayerAction, PositionSync, SystemChat, UseItemOn,
+            BlockUpdate, ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, CreativeSlot,
+            ItemStack, LastSeenUpdate, MovePosition, MoveRotation, PlayerAction, PositionSync,
+            ServerboundChat, SystemChat, UseItemOn,
         },
     },
     types::BlockPos,
@@ -318,13 +319,18 @@ impl Bot {
         }
     }
 
-    fn move_to(&mut self, x: f64, y: f64, z: f64) {
-        self.send(&MovePosition {
-            x,
-            y,
-            z,
-            flags: 1,
+    fn chat(&mut self, text: &str) {
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp: 0,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
         });
+    }
+
+    fn move_to(&mut self, x: f64, y: f64, z: f64) {
+        self.send(&MovePosition { x, y, z, flags: 1 });
     }
 
     fn collect_chats(&mut self, duration: Duration) -> Vec<String> {
@@ -332,12 +338,26 @@ impl Bot {
         let mut messages = Vec::new();
         while Instant::now() < deadline {
             if let Some((id, body)) = self.next_play()
-                && id == 124
+                && let Some(text) = chat_text(id, &body)
             {
-                messages.push(SystemChat::decode(&mut body.as_slice()).unwrap().content.0);
+                messages.push(text);
             }
         }
         messages
+    }
+}
+
+/// Chat reaches the client as `player_chat` (signed) or `system_chat` (plain).
+fn chat_text(id: i32, mut body: &[u8]) -> Option<String> {
+    match id {
+        124 => Some(SystemChat::decode(&mut body).unwrap().content.0),
+        66 => Some(
+            ClientboundPlayerChat::decode(&mut body)
+                .unwrap()
+                .body
+                .content,
+        ),
+        _ => None,
     }
 }
 
@@ -413,9 +433,8 @@ fn wait_for_chat(
             );
         }
         if let Some((id, body)) = bot.next_play()
-            && id == 124
+            && let Some(message) = chat_text(id, &body)
         {
-            let message = SystemChat::decode(&mut body.as_slice()).unwrap().content.0;
             if message.contains(needle) {
                 return message;
             }
@@ -488,18 +507,18 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
-    bot.raw(9, "hello plugins");
+    bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
-    let broadcast = wait_for_chat(&mut bot, "<Bot> hello plugins", &stdout, &stderr, &events);
+    let broadcast = wait_for_chat(&mut bot, "hello plugins", &stdout, &stderr, &events);
     assert!(broadcast.contains("hello plugins"), "{broadcast}");
-    bot.raw(9, "cancel this");
+    bot.chat("cancel this");
     wait_for_line(&events, "chat cancel this", &stdout, &stderr);
     let after_cancel = bot.collect_chats(Duration::from_millis(1500));
     assert!(
         !after_cancel
             .iter()
-            .any(|message| message.contains("<Bot> cancel this")),
+            .any(|message| message.contains("cancel this")),
         "a cancelled chat event was still broadcast: {after_cancel:?}"
     );
     bot.raw(7, "testping");
