@@ -63,6 +63,7 @@ pub struct Operator {
 #[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
+    pub max_players: i32,
     pub ops: Vec<Operator>,
     /// Plugin event and command hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -83,6 +84,7 @@ impl Default for WorldSettings {
     fn default() -> Self {
         Self {
             gamemode: 1,
+            max_players: 20,
             ops: Vec::new(),
             plugins: None,
             admin: None,
@@ -356,9 +358,17 @@ async fn run(
     autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vanilla/26.3/generated/reports");
-    let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
+    let parser_registry = ferrite_command::ParserRegistry::load(&registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let positions = Arc::new(Mutex::new(HashMap::new()));
+    commands::load_lang(&registry_dir);
+    let command_state = Arc::new(Mutex::new(commands::GameState::new(
+        settings.gamemode,
+        0,
+        settings.max_players,
+    )));
+    let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
         spawn[1] as f64,
@@ -400,14 +410,16 @@ async fn run(
            let saved = playerdata::load(&uuid);
            let start_pos = saved.as_ref().map_or(spawn_pos, |s| s.pos);
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
-           let start_mode = saved.as_ref().map_or(settings.gamemode, |s| s.gamemode);
+           let start_mode = saved.as_ref().map_or_else(|| command_state.lock().unwrap().default_gamemode, |s| s.gamemode);
+           command_state.lock().unwrap().join(uuid, name.clone(), start_mode, max_players as i32);
+           let seed = command_state.lock().unwrap().seed;
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
            permissions.insert(uuid, permission);
            let entity=ferrite_entity::allocate_id();
-           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
+           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), state: command_state.clone(), actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
            }
            emit(&outbound, &ContainerContent { window:VarInt(0), state:VarInt(0), slots:start_inventory.to_vec(), carried:ItemStack::default() });
@@ -446,7 +458,7 @@ async fn run(
               scheduler.schedule_global(move |g|g.apply_chat_update(uuid,&last_seen));
               let _ = event_tx.send(GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(ServerboundChatCommand{command})});
           }},
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, _mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let message = format!("/{}", command.trim_start_matches('/'));
               if let (Some(plugins), Some(name)) = (&settings.plugins, names.get(&uuid)) {
                   match plugins.player_command(uuid, name, &message) {
@@ -457,7 +469,8 @@ async fn run(
               }
               let (actions, mut received) = mpsc::unbounded_channel();
               let (origin, yaw, pitch) = online.get(&uuid).map_or(([0.0; 3], 0.0, 0.0), |player| (player.pos, player.yaw, player.pitch));
-              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, actions };
+              let name = command_state.lock().unwrap().players.iter().find(|p| p.uuid == uuid).map(|p| p.name.clone());
+              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, state: command_state.clone(), actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), command_source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               let source_name = online.get(&uuid).map_or_else(|| "Server".to_owned(), |player| player.name.clone());
               let mut runtime = CommandRuntime {
@@ -478,8 +491,15 @@ async fn run(
                   stop: &stop_tx,
               };
               while let Ok(action) = received.try_recv() { match action {
-                  commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
-                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::GameMode { mode, targets } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { target_mailbox.lock().unwrap().push_back(Command::SetMode(mode)); } scheduler.schedule_global(move |g| g.set_mode(target, mode)); } },
+                  commands::Action::DefaultGameMode(mode) => tracing::info!(mode, "default game mode changed"),
+                  commands::Action::Difficulty(value) => tracing::info!(value, "difficulty changed"),
+                  commands::Action::TimeSet(ticks) => tracing::info!(ticks, "time set"),
+                  commands::Action::TimeAdd(ticks) => tracing::info!(ticks, "time added"),
+                  commands::Action::Weather { kind, duration } => tracing::info!(?kind, ?duration, "weather changed"),
+                  commands::Action::Feedback(feedback) => emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(feedback.text), overlay:false }),
+                  commands::Action::PlayerFeedback { uuid: target, feedback } => { if let Some((_, _, target_outbound)) = mailboxes.get(&target) { emit(target_outbound, &SystemChat { content:ferrite_protocol::types::PlainText(feedback.text), overlay:false }); } },
+                  commands::Action::Broadcast(feedback) => { let text = feedback.text; scheduler.schedule_global(move |g| g.broadcast_text(&text)); },
                   commands::Action::Plugin { name, args } => {
                       if let Some(plugins) = &settings.plugins {
                           let line = plugin_command_line(&name, &args);
@@ -499,7 +519,7 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, actions };
+              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, state: command_state.clone(), actions };
               let result = command_tree.execute(command.trim().trim_start_matches('/'), command_source).map_err(|e| e.to_string());
               let mut stop = false;
               let mut runtime = CommandRuntime {
@@ -520,7 +540,21 @@ async fn run(
                   stop: &stop_tx,
               };
               while let Ok(action) = received.try_recv() { match action {
-                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::DefaultGameMode(mode) => tracing::info!(mode, "default game mode changed"),
+                  commands::Action::Difficulty(value) => tracing::info!(value, "difficulty changed"),
+                  commands::Action::TimeSet(ticks) => tracing::info!(ticks, "time set"),
+                  commands::Action::TimeAdd(ticks) => tracing::info!(ticks, "time added"),
+                  commands::Action::Weather { kind, duration } => tracing::info!(?kind, ?duration, "weather changed"),
+                  commands::Action::Feedback(feedback) => tracing::info!("{}", feedback.text),
+                  commands::Action::Broadcast(feedback) => { let text = feedback.text; scheduler.schedule_global(move |g| g.broadcast_text(&text)); },
+                  commands::Action::Stop => stop = true,
+                  commands::Action::Tps => for line in profiler.tps_lines_plain() { tracing::info!("{line}"); },
+                  commands::Action::Mspt => for line in profiler.mspt_lines_plain() { tracing::info!("{line}"); },
+                  commands::Action::ProfileStart => if let Err(error) = profiler.start_profile() { tracing::warn!(%error, "profile start failed"); } else { tracing::info!("profiling started; run profile stop to dump the slowest systems"); },
+                  commands::Action::ProfileStop => match profiler.stop_profile() {
+                      Ok(report) => for line in report.lines() { tracing::info!("{line}"); },
+                      Err(error) => tracing::warn!(%error, "profile stop failed"),
+                  },
                   commands::Action::Plugin { name, args } => {
                       if let Some(plugins) = &settings.plugins {
                           let line = plugin_command_line(&name, &args);
@@ -530,7 +564,7 @@ async fn run(
                           }
                       }
                   },
-                  commands::Action::GameMode(_) => tracing::warn!("command requires a player"),
+                  commands::Action::GameMode { .. } | commands::Action::PlayerFeedback { .. } => tracing::warn!("command requires a player"),
                   other => { if runtime.apply(other).await { stop = true; } }
               }}
               let _ = complete.send(result.map(|_| stop));
@@ -555,11 +589,12 @@ async fn run(
           Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
           Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
-          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);command_state.lock().unwrap().leave(uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
             let name = names.remove(&uuid).unwrap_or_default();
             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_left(uuid, &name) { tracing::warn!(%error, "player quit event failed"); }
             scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
-         }}
+         }},
+         _tick = clock.tick() => { command_state.lock().unwrap().tick(); }
         }
     }
 }
@@ -736,7 +771,15 @@ impl CommandRuntime<'_> {
     async fn apply(&mut self, action: commands::Action) -> bool {
         use commands::{Action, TeleportDestination};
         match action {
-            Action::GameMode(_) | Action::Say(_) => false,
+            Action::GameMode { .. }
+            | Action::DefaultGameMode(_)
+            | Action::Difficulty(_)
+            | Action::TimeSet(_)
+            | Action::TimeAdd(_)
+            | Action::Weather { .. }
+            | Action::Feedback(_)
+            | Action::PlayerFeedback { .. }
+            | Action::Broadcast(_) => false,
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
@@ -1448,6 +1491,7 @@ async fn modified_chunk_is_written_on_flush() {
 fn operator_permissions_require_the_configured_uuid() {
     let settings = WorldSettings {
         gamemode: 1,
+        max_players: 20,
         ops: vec![Operator {
             uuid: Uuid::from_u128(10),
             level: 3,
