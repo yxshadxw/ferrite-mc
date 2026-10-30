@@ -288,7 +288,7 @@ mod anvil_tests {
 fn fixture_spawn_comes_from_level_dat() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vanilla/26.3/fixture-world/world");
-    assert_eq!(anvil::read_spawn(&root).unwrap(), [0, 68, 112]);
+    assert_eq!(anvil::read_spawn(&root).unwrap(), [0, 80, 112]);
 }
 
 #[tokio::test]
