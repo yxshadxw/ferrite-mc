@@ -119,3 +119,84 @@ fn source_conversion_precedes_water_above_and_solid_walls_block_flow() {
         FluidKind::Empty
     );
 }
+
+#[test]
+fn collision_faces_combine_across_shared_boundary() {
+    use ferrite_fluid::{Direction, can_pass_face};
+    let slab = |half| {
+        u32::from(
+            blocks::state_id("stone_slab", &[("type", half), ("waterlogged", "false")]).unwrap(),
+        )
+    };
+    let bottom = slab("bottom");
+    let top = slab("top");
+    let air = block("air");
+    assert!(can_pass_face(bottom, air, Direction::East));
+    assert!(!can_pass_face(bottom, top, Direction::East));
+    assert!(!can_pass_face(bottom, air, Direction::Down));
+    assert!(can_pass_face(bottom, air, Direction::Up));
+}
+
+#[test]
+fn door_stairs_and_fence_collision_faces_are_directional() {
+    use ferrite_fluid::{Direction, can_pass_face};
+    let door = u32::from(
+        blocks::state_id(
+            "oak_door",
+            &[
+                ("facing", "north"),
+                ("half", "lower"),
+                ("hinge", "left"),
+                ("open", "false"),
+                ("powered", "false"),
+            ],
+        )
+        .unwrap(),
+    );
+    let stairs = u32::from(
+        blocks::state_id(
+            "oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "bottom"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        )
+        .unwrap(),
+    );
+    let fence = block("oak_fence");
+    let air = block("air");
+    assert!(!can_pass_face(door, air, Direction::South));
+    assert!(can_pass_face(door, air, Direction::East));
+    assert!(!can_pass_face(stairs, air, Direction::Down));
+    assert!(can_pass_face(fence, air, Direction::East));
+}
+
+#[test]
+fn world_can_supply_contextual_collision_shapes() {
+    use ferrite_fluid::{Direction, can_pass_at};
+    struct Dynamic;
+    impl FluidWorld for Dynamic {
+        fn block(&self, _: i32, _: i32, _: i32) -> u32 {
+            block("air")
+        }
+        fn set_block(&mut self, _: i32, _: i32, _: i32, _: u32) {}
+        fn ultrawarm(&self) -> bool {
+            false
+        }
+        fn collision_shape(&self, x: i32, _: i32, _: i32) -> Vec<[f64; 6]> {
+            if x == 0 {
+                vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
+            } else {
+                vec![]
+            }
+        }
+    }
+    assert!(!can_pass_at(
+        &Dynamic,
+        (0, 0, 0),
+        (1, 0, 0),
+        Direction::East
+    ));
+}

@@ -10,6 +10,14 @@ pub trait FluidWorld {
     fn block(&self, x: i32, y: i32, z: i32) -> u32;
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32);
     fn ultrawarm(&self) -> bool;
+    /// Collision boxes in block-local coordinates; override for dynamic shapes.
+    fn collision_shape(&self, x: i32, y: i32, z: i32) -> Vec<[f64; 6]> {
+        u16::try_from(self.block(x, y, z))
+            .ok()
+            .filter(|&id| usize::from(id) < block_props::STATE_COUNT)
+            .map(|id| block_props::collision_shape(id).to_vec())
+            .unwrap_or_else(|| vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,16 +137,118 @@ pub fn can_hold_fluid(state: u32, kind: FluidKind) -> bool {
             })
 }
 
-/// Approximation of `FlowingFluid.java#canPassThroughWall`: a full collision cube
-/// blocks every face. Partial shapes and their direction-specific occlusion are
-/// treated as passable, including combinations whose faces would jointly seal.
+/// Direction from the first block to its neighbor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    West,
+    East,
+    Down,
+    Up,
+    North,
+    South,
+}
+impl Direction {
+    fn face(self) -> (usize, bool) {
+        match self {
+            Self::West => (0, false),
+            Self::East => (0, true),
+            Self::Down => (1, false),
+            Self::Up => (1, true),
+            Self::North => (2, false),
+            Self::South => (2, true),
+        }
+    }
+}
+
+/// Checks the union of the two collision faces as in
+/// `FlowingFluid.java#canPassThroughWall` and `Shapes.mergedFaceOccludes`.
+/// Static shapes are extracted using the vanilla empty block getter; blocks
+/// with context-dependent collision shapes need world-aware shape data.
+pub fn can_pass_face(from: u32, to: u32, direction: Direction) -> bool {
+    let (Ok(from), Ok(to)) = (u16::try_from(from), u16::try_from(to)) else {
+        return false;
+    };
+    if usize::from(from) >= block_props::STATE_COUNT || usize::from(to) >= block_props::STATE_COUNT
+    {
+        return false;
+    }
+    faces_pass(
+        block_props::collision_shape(from),
+        block_props::collision_shape(to),
+        direction,
+    )
+}
+/// World-aware version, allowing collision shapes to depend on position and neighbours.
+pub fn can_pass_at(
+    world: &impl FluidWorld,
+    from: (i32, i32, i32),
+    to: (i32, i32, i32),
+    direction: Direction,
+) -> bool {
+    faces_pass(
+        &world.collision_shape(from.0, from.1, from.2),
+        &world.collision_shape(to.0, to.1, to.2),
+        direction,
+    )
+}
+fn faces_pass(from: &[[f64; 6]], to: &[[f64; 6]], direction: Direction) -> bool {
+    let (axis, positive) = direction.face();
+    let mut rectangles = Vec::new();
+    for (shape, high) in [(from, positive), (to, !positive)] {
+        for b in shape {
+            let face = if high {
+                b[axis + 3] >= 1.0 && b[axis] < 1.0
+            } else {
+                b[axis] <= 0.0 && b[axis + 3] > 0.0
+            };
+            if face {
+                let (a, c) = match axis {
+                    0 => (1, 2),
+                    1 => (0, 2),
+                    _ => (0, 1),
+                };
+                let rect = [
+                    b[a].max(0.0),
+                    b[c].max(0.0),
+                    b[a + 3].min(1.0),
+                    b[c + 3].min(1.0),
+                ];
+                if rect[0] < rect[2] && rect[1] < rect[3] {
+                    rectangles.push(rect);
+                }
+            }
+        }
+    }
+    let mut xs = vec![0.0, 1.0];
+    let mut ys = vec![0.0, 1.0];
+    for r in &rectangles {
+        xs.extend([r[0], r[2]]);
+        ys.extend([r[1], r[3]]);
+    }
+    xs.sort_by(f64::total_cmp);
+    xs.dedup();
+    ys.sort_by(f64::total_cmp);
+    ys.dedup();
+    for x in xs.windows(2) {
+        for y in ys.windows(2) {
+            let (x, y) = ((x[0] + x[1]) / 2.0, (y[0] + y[1]) / 2.0);
+            if !rectangles
+                .iter()
+                .any(|r| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3])
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+/// Compatibility helper for the east face. Prefer [`can_pass_face`].
 pub fn can_pass_through(from: u32, to: u32) -> bool {
-    props(from).is_some_and(|p| !p.full_collision) && props(to).is_some_and(|p| !p.full_collision)
+    can_pass_face(from, to, Direction::East)
 }
 
 /// Compute `FlowingFluid.java#getNewLiquid` without changing the world. Source
-/// support uses `blocks_motion` as a conservative approximation of vanilla's
-/// `BlockState.isSolid`; face occlusion uses [`can_pass_through`].
+/// support uses the extracted vanilla `BlockState.isSolid`; face occlusion uses [`can_pass_face`].
 /// `lava_conversion` is the lava source-conversion game rule.
 pub fn get_new_liquid(
     world: &impl FluidWorld,
@@ -157,7 +267,6 @@ pub fn get_new_liquid(
     if kind == FluidKind::Empty {
         return empty;
     }
-    let current = world.block(x, y, z);
     let mut max_amount = 0;
     let mut sources = 0;
     for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
@@ -166,7 +275,13 @@ pub fn get_new_liquid(
         };
         let adjacent = world.block(nx, y, nz);
         let fluid = fluid_state(adjacent);
-        if fluid.kind == kind && can_pass_through(current, adjacent) {
+        let direction = match (dx, dz) {
+            (1, 0) => Direction::East,
+            (-1, 0) => Direction::West,
+            (0, 1) => Direction::South,
+            _ => Direction::North,
+        };
+        if fluid.kind == kind && can_pass_at(world, (x, y, z), (nx, y, nz), direction) {
             max_amount = max_amount.max(fluid.amount);
             sources += u8::from(fluid.source);
         }
@@ -190,7 +305,9 @@ pub fn get_new_liquid(
     }
     if let Some(above_y) = y.checked_add(1) {
         let above = world.block(x, above_y, z);
-        if fluid_state(above).kind == kind && can_pass_through(current, above) {
+        if fluid_state(above).kind == kind
+            && can_pass_at(world, (x, y, z), (x, above_y, z), Direction::Up)
+        {
             return FluidState {
                 kind,
                 amount: 8,

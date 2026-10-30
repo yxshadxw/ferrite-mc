@@ -1,9 +1,8 @@
 //! Scheduled fluid simulation, based on `FlowingFluid.java#tick`, `#spread`,
-//! `#getSpread` and `#getSlopeDistance`. Partial collision faces use the
-//! approximation documented by `can_pass_through`.
+//! `#getSpread` and `#getSlopeDistance`.
 use crate::{
-    FluidKind, FluidState, FluidWorld, block_for, can_hold_fluid, can_pass_through, fluid_state,
-    get_new_liquid, tick_delay,
+    Direction, FluidKind, FluidState, FluidWorld, block_for, can_hold_fluid, can_pass_at,
+    fluid_state, get_new_liquid, tick_delay,
 };
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -24,6 +23,21 @@ fn offset(p: Position, d: Position) -> Option<Position> {
         p.1.checked_add(d.1)?,
         p.2.checked_add(d.2)?,
     ))
+}
+fn direction(from: Position, to: Position) -> Direction {
+    if to.0 < from.0 {
+        Direction::West
+    } else if to.0 > from.0 {
+        Direction::East
+    } else if to.1 < from.1 {
+        Direction::Down
+    } else if to.1 > from.1 {
+        Direction::Up
+    } else if to.2 < from.2 {
+        Direction::North
+    } else {
+        Direction::South
+    }
 }
 fn block(w: &impl FluidWorld, p: Position) -> u32 {
     w.block(p.0, p.1, p.2)
@@ -199,7 +213,7 @@ impl FluidTicks {
         let target = block(w, to);
         fluid_state(target).kind == FluidKind::Empty
             && can_hold_fluid(target, kind)
-            && can_pass_through(block(w, from), target)
+            && can_pass_at(w, from, to, direction(from, to))
     }
     fn can_explore(
         &self,
@@ -212,14 +226,14 @@ impl FluidTicks {
         let fluid = fluid_state(target);
         (fluid.kind == FluidKind::Empty || (fluid.kind == kind && !fluid.source))
             && can_hold_fluid(target, kind)
-            && can_pass_through(block(w, from), target)
+            && can_pass_at(w, from, to, direction(from, to))
     }
     fn hole(&self, w: &impl FluidWorld, pos: Position, kind: FluidKind) -> bool {
         let Some(below) = offset(pos, (0, -1, 0)) else {
             return false;
         };
         let target = block(w, below);
-        can_pass_through(block(w, pos), target)
+        can_pass_at(w, pos, below, Direction::Down)
             && (fluid_state(target).kind == kind || can_hold_fluid(target, kind))
     }
     fn slope(
