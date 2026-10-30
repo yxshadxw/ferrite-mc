@@ -10,6 +10,9 @@ pub trait FunctionContext {
     fn sample_noise(&self, id: &ResourceId, _x: f64, _y: f64, _z: f64) -> f32 {
         panic!("noise sampler not available for {id}")
     }
+    fn sample_blended(&self, _settings: [f64; 5], _x: i32, _y: i32, _z: i32) -> f32 {
+        panic!("blended noise sampler not available")
+    }
 }
 
 impl DensityFunction {
@@ -141,6 +144,9 @@ impl DensityFunction {
                             f64::from(ctx.block_y()) * 0.25,
                             f64::from(ctx.block_z()) * 0.25,
                         ) * 4.0
+                    }
+                    DensityNode::OldBlendedNoise { xz_scale, y_scale, xz_factor, y_factor, smear_scale_multiplier } => {
+                        ctx.sample_blended([*xz_scale, *y_scale, *xz_factor, *y_factor, *smear_scale_multiplier], ctx.block_x(), ctx.block_y(), ctx.block_z())
                     }
                     DensityNode::Spline { spline } => spline.compute_float(ctx),
                     _ => panic!("density node requires a sampler: {node:?}"),
