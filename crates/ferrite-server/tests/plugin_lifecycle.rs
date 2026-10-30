@@ -18,8 +18,12 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, MovePosition, PositionSync, SystemChat},
+        play::{
+            ChunkBatchReceived, ConfirmTeleport, MovePosition, MoveRotation, PlayerAction,
+            PositionSync, SystemChat, UseItemOn,
+        },
     },
+    types::BlockPos,
 };
 
 fn repo_root() -> PathBuf {
@@ -479,6 +483,32 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     wait_for_prefix(&events, "move-cancel Bot", &stdout, &stderr);
     let rejected = PositionSync::decode(&mut bot.until(73).as_slice()).unwrap();
     assert_eq!((rejected.x, rejected.y, rejected.z), (2.5, 65.0, 0.5));
+    bot.move_to(0.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 0 65 0", &stdout, &stderr);
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    });
+    bot.send(&PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(30),
+    });
+    wait_for_prefix(&events, "interact left 0 64 0", &stdout, &stderr);
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(31),
+    });
+    wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);
 

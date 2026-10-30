@@ -91,6 +91,12 @@ public final class Bootstrap {
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled();
     }
+    /** Fires Bukkit's {@code PlayerInteractEvent} for a block click; false means cancelled. */
+    public static boolean firePlayerInteract(String id, String name, int action, int x, int y, int z, int face) {
+        var event = new org.bukkit.event.player.PlayerInteractEvent(ensurePlayer(id, name), action == 0 ? org.bukkit.event.block.Action.LEFT_CLICK_BLOCK : org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK, null, FerriteEventObjects.block(x, y, z), FerriteEventObjects.face(face), org.bukkit.inventory.EquipmentSlot.HAND);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled() && event.useInteractedBlock() != org.bukkit.event.Event.Result.DENY;
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();

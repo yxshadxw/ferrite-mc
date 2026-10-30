@@ -22,6 +22,10 @@ public final class TestPlugin extends JavaPlugin implements Listener {
         appendEvent("move " + event.getPlayer().getName() + " " + event.getTo().getBlockX() + " " + event.getTo().getBlockY() + " " + event.getTo().getBlockZ());
         if (event.getTo().getY() > 90.0) { appendEvent("move-cancel " + event.getPlayer().getName()); event.setCancelled(true); }
     }
+    @EventHandler public void onInteract(org.bukkit.event.player.PlayerInteractEvent event) {
+        var clicked = event.getClickedBlock();
+        appendEvent("interact " + (event.getAction() == org.bukkit.event.block.Action.LEFT_CLICK_BLOCK ? "left" : "right") + " " + clicked.getX() + " " + clicked.getY() + " " + clicked.getZ());
+    }
     @EventHandler public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
         String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
         appendEvent("chat " + message);

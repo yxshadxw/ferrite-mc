@@ -28,6 +28,7 @@ pub const PLAYER_QUIT_EVENT: &str = "org.bukkit.event.player.PlayerQuitEvent";
 pub const ASYNC_CHAT_EVENT: &str = "io.papermc.paper.event.player.AsyncChatEvent";
 pub const ASYNC_PLAYER_CHAT_EVENT: &str = "org.bukkit.event.player.AsyncPlayerChatEvent";
 pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
+pub const PLAYER_INTERACT_EVENT: &str = "org.bukkit.event.player.PlayerInteractEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -47,6 +48,13 @@ pub struct BlockPosition {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+/// Which mouse button touched a block; Bukkit's `PlayerInteractEvent.Action`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum InteractAction {
+    LeftClickBlock = 0,
+    RightClickBlock = 1,
 }
 /// Where a player was and where a movement packet takes it; Bukkit's `PlayerMoveEvent`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -314,6 +322,15 @@ pub trait ServerHooks: Send + Sync {
         id: uuid::Uuid,
         name: &str,
         movement: &PlayerMove,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `PlayerInteractEvent` for a block click; `false` means cancelled.
+    fn player_interacted(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
     ) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
@@ -877,6 +894,51 @@ extern "system" fn player_move(
     }));
     u8::from(matches!(allowed, Ok(Some(true))))
 }
+extern "system" fn player_interact(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    action: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: i32,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerInteract",
+            "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Int(action),
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+                JValue::Int(face),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
 extern "system" fn schedule_global(_: JNIEnv, _: JClass, id: i64, delay: i64) {
     REGION_QUEUE
         .get_or_init(Default::default)
@@ -1072,6 +1134,11 @@ impl PluginHost {
                     "playerMove",
                     "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
                     player_move as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerInteract",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+                    player_interact as *mut _,
                 ),
                 NativeMethod::new("scheduleGlobal", "(JJ)V", schedule_global as *mut _),
                 NativeMethod::new("currentTick", "()J", current_tick as *mut _),
@@ -1599,6 +1666,41 @@ impl PluginHost {
         })?)
     }
 
+    /// Fires Bukkit's `PlayerInteractEvent`; no JNI call without a registered listener.
+    pub fn fire_player_interact(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_INTERACT_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerInteract",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(action as i32),
+                        JValue::Int(block.x),
+                        JValue::Int(block.y),
+                        JValue::Int(block.z),
+                        JValue::Int(i32::from(face)),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
     /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
     ///
     /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
@@ -1664,6 +1766,16 @@ impl ServerHooks for PluginHost {
         movement: &PlayerMove,
     ) -> Result<bool, Error> {
         self.fire_player_move(id, name, movement)
+    }
+    fn player_interacted(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
+    ) -> Result<bool, Error> {
+        self.fire_player_interact(id, name, action, block, face)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()
