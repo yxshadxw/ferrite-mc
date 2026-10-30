@@ -16,7 +16,11 @@ pub enum Command {
     Input(ServerboundPlay),
     Leave,
     SetMode(i32),
-    Teleport([f64; 3]),
+    Teleport {
+        pos: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
@@ -491,9 +495,15 @@ impl Player {
                     );
                     continue;
                 }
-                Command::Teleport(pos) => {
+                Command::Teleport { pos, yaw, pitch } => {
                     if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
                         self.pos = pos;
+                        if let Some(yaw) = yaw {
+                            self.yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch {
+                            self.pitch = pitch;
+                        }
                         self.teleport();
                         changed = true;
                     }

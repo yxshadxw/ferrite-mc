@@ -18,6 +18,8 @@ struct Config {
     world: Option<std::path::PathBuf>,
     gamemode: GameMode,
     ops: Vec<OpConfig>,
+    /// Enforce `whitelist.json` for new connections.
+    whitelist: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +71,7 @@ impl Default for Config {
             world: None,
             gamemode: GameMode::Creative,
             ops: Vec::new(),
+            whitelist: false,
         }
     }
 }
@@ -87,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error).context("reading ferrite.toml"),
     };
     let ops = parse_ops(config.ops)?;
+    let admin =
+        std::sync::Arc::new(ferrite_admin::AdminLists::load(".").context("loading admin lists")?);
     if !config.online_mode && !ops.is_empty() {
         tracing::warn!(
             "operator UUIDs in offline mode must be offline-mode UUIDs; player names are not authenticated"
@@ -103,6 +108,8 @@ async fn main() -> anyhow::Result<()> {
             GameMode::Creative => 1,
         },
         ops,
+        admin: Some(admin),
+        whitelist: config.whitelist,
     };
     game::playerdata::init(
         config
@@ -145,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    let mut stopped = world.stop_signal();
     let result = loop {
         tokio::select! {
             result = &mut server => break Some(result),
@@ -154,6 +162,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(false) => {},
                 Err(error) => tracing::warn!(%error, "console command failed"),
             },
+            _ = async {
+                loop {
+                    if *stopped.borrow() { break; }
+                    if stopped.changed().await.is_err() { break; }
+                }
+            } => break None,
         }
     };
     world.shutdown().await?;

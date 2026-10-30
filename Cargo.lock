@@ -746,6 +746,7 @@ name = "ferrite-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ferrite-admin",
  "ferrite-command",
  "ferrite-data",
  "ferrite-math",
