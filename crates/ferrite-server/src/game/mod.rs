@@ -159,6 +159,45 @@ impl World {
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
     let _ = tx.send(game::packet(p));
 }
+fn plugin_command_line(name: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} {}", args.join(" "))
+    }
+}
+fn plugin_message_text(content: &ferrite_plugin::MessageContent) -> String {
+    match content {
+        ferrite_plugin::MessageContent::Plain(text) => text.clone(),
+        ferrite_plugin::MessageContent::AdventureJson(json) => json_text(json),
+    }
+}
+fn json_text(json: &str) -> String {
+    fn collect(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::String(text) => out.push_str(text),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(value) = map.get("text") {
+                    collect(value, out);
+                }
+                if let Some(value) = map.get("extra") {
+                    collect(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    if let Ok(value) = serde_json::from_str(json) {
+        collect(&value, &mut out);
+    }
+    if out.is_empty() { json.to_owned() } else { out }
+}
 fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
     emit(
         tx,
@@ -236,7 +275,13 @@ async fn run(
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
     let mut names: HashMap<Uuid, String> = HashMap::new();
-    let command_tree = commands::dispatcher();
+    let mut command_tree = commands::dispatcher();
+    if let Some(plugins) = &settings.plugins {
+        match plugins.plugin_commands() {
+            Ok(commands) => commands::register_plugin_commands(&mut command_tree, &commands),
+            Err(error) => tracing::warn!(%error, "plugin commands unavailable"),
+        }
+    }
     let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vanilla/26.3/generated/reports");
     let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
@@ -314,6 +359,17 @@ async fn run(
                       Ok(report) => for line in report.lines() { chat(outbound, &line); },
                       Err(error) => chat(outbound, &format!("Cannot stop profiling: {error}")),
                   },
+                  commands::Action::Plugin { name, args } => {
+                      if let Some(plugins) = &settings.plugins {
+                          let line = plugin_command_line(&name, &args);
+                          match plugins.run_plugin_command(ferrite_plugin::CommandSender::Player(uuid), &line) {
+                              Ok(result) => for message in result.messages {
+                                  if message.player == uuid { chat(outbound, &plugin_message_text(&message.content)); }
+                              },
+                              Err(error) => tracing::warn!(%error, "plugin command failed"),
+                          }
+                      }
+                  },
                   commands::Action::Stop => {},
               }}
           }},
@@ -333,6 +389,15 @@ async fn run(
                   commands::Action::ProfileStop => match profiler.stop_profile() {
                       Ok(report) => for line in report.lines() { tracing::info!("{line}"); },
                       Err(error) => tracing::warn!(%error, "profile stop failed"),
+                  },
+                  commands::Action::Plugin { name, args } => {
+                      if let Some(plugins) = &settings.plugins {
+                          let line = plugin_command_line(&name, &args);
+                          match plugins.run_plugin_command(ferrite_plugin::CommandSender::Console, &line) {
+                              Ok(result) => for message in result.messages { tracing::info!("{}", plugin_message_text(&message.content)); },
+                              Err(error) => tracing::warn!(%error, "plugin command failed"),
+                          }
+                      }
                   },
                   _ => tracing::warn!("command requires a player"),
               }}

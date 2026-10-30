@@ -20,6 +20,7 @@ static WORLD_HANDLER: OnceLock<Option<WorldHandler>> = OnceLock::new();
 static PLAYER_HANDLER: OnceLock<Option<PlayerHandler>> = OnceLock::new();
 static COMMAND_HANDLER: OnceLock<Option<CommandHandler>> = OnceLock::new();
 thread_local! { static REGION: std::cell::RefCell<Option<(String, i32, i32)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static CAPTURED_MESSAGES: std::cell::RefCell<Option<Vec<PluginMessage>>> = const { std::cell::RefCell::new(None) }; }
 const BOOTSTRAP: &str = "dev/ferrite/server/Bootstrap";
 /// Bukkit event classes the server forwards; keep in sync with the Java bridge.
 pub const PLAYER_JOIN_EVENT: &str = "org.bukkit.event.player.PlayerJoinEvent";
@@ -260,9 +261,31 @@ pub enum Error {
     #[error("invalid offline player snapshot")]
     InvalidOfflinePlayerSnapshot,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandSender {
     Console,
     Player(uuid::Uuid),
+}
+/// A command declared by a plugin's `plugin.yml` or `paper-plugin.yml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginCommand {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub permission: Option<String>,
+    pub usage: Option<String>,
+}
+/// A message a plugin sent to one player during a callback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginMessage {
+    pub player: uuid::Uuid,
+    pub content: MessageContent,
+}
+/// Result of dispatching a line to a plugin `CommandExecutor`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PluginCommandResult {
+    pub handled: bool,
+    /// Messages captured from `CommandSender.sendMessage` during the call.
+    pub messages: Vec<PluginMessage>,
 }
 /// Server hooks the game loop forwards to plugins.
 pub trait ServerHooks: Send + Sync {
@@ -274,6 +297,14 @@ pub trait ServerHooks: Send + Sync {
     ///
     /// Returns the message after listeners ran, or `None` when one cancelled chat.
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error>;
+    /// Commands declared by enabled plugins.
+    fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
+    /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
+    fn run_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error>;
 }
 pub struct PluginHost {
     jvm: Jvm,
@@ -426,6 +457,20 @@ extern "system" fn player_message(
     } else {
         MessageContent::AdventureJson(message)
     };
+    let captured = CAPTURED_MESSAGES.with(|captured| {
+        let mut captured = captured.borrow_mut();
+        let Some(messages) = captured.as_mut() else {
+            return false;
+        };
+        messages.push(PluginMessage {
+            player,
+            content: content.clone(),
+        });
+        true
+    });
+    if captured {
+        return;
+    }
     if let Some(handler) = PLAYER_HANDLER.get().and_then(Option::as_ref) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handler(PlayerCommand::Message { player, content })
@@ -1290,6 +1335,100 @@ impl PluginHost {
         REGION.with(|region| *region.borrow_mut() = previous);
         Ok(result?)
     }
+    /// Commands declared by enabled plugins in their descriptor.
+    pub fn declared_commands(&self) -> Result<Vec<PluginCommand>, Error> {
+        let encoded: String = self.jvm.with_env(|env| {
+            let value = env
+                .call_static_method(BOOTSTRAP, "pluginCommands", "()Ljava/lang/String;", &[])?
+                .l()?;
+            if value.is_null() {
+                return Ok(String::new());
+            }
+            let value = JString::from(value);
+            let value: String = env.get_string(&value)?.into();
+            Ok(value)
+        })?;
+        Ok(encoded
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let name = fields.next().filter(|name| !name.is_empty())?;
+                let aliases = fields
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|alias| !alias.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let permission = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let usage = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                Some(PluginCommand {
+                    name: name.to_owned(),
+                    aliases,
+                    permission,
+                    usage,
+                })
+            })
+            .collect())
+    }
+
+    /// Executes a plugin command through its Bukkit `CommandExecutor`.
+    ///
+    /// Messages the plugin sends with `CommandSender.sendMessage` on this thread are captured
+    /// and returned so the game loop can deliver them to the player.
+    pub fn execute_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error> {
+        let line = line.trim().trim_start_matches('/');
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            return Ok(PluginCommandResult::default());
+        };
+        let label = label.to_owned();
+        let args: Vec<String> = parts.map(str::to_owned).collect();
+        let sender = match sender {
+            CommandSender::Console => "console".to_owned(),
+            CommandSender::Player(id) => id.to_string(),
+        };
+        let previous = CAPTURED_MESSAGES.with(|captured| captured.replace(Some(Vec::new())));
+        let result = self.jvm.with_env(|env| {
+            let sender = env.new_string(sender)?;
+            let label = env.new_string(&label)?;
+            let array =
+                env.new_object_array(args.len() as i32, "java/lang/String", JObject::null())?;
+            for (index, arg) in args.iter().enumerate() {
+                let arg = env.new_string(arg)?;
+                env.set_object_array_element(&array, index as i32, arg)?;
+            }
+            let status = env.call_static_method(
+                BOOTSTRAP,
+                "runPluginCommand",
+                "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)I",
+                &[
+                    JValue::Object(sender.as_ref()),
+                    JValue::Object(label.as_ref()),
+                    JValue::Object(array.as_ref()),
+                ],
+            )?;
+            status.i()
+        });
+        let messages = CAPTURED_MESSAGES
+            .with(|captured| captured.replace(previous))
+            .unwrap_or_default();
+        Ok(PluginCommandResult {
+            handled: result? == 1,
+            messages,
+        })
+    }
+
     /// Whether at least one plugin listener is registered for `event_class`.
     pub fn listens_for(&self, event_class: &str) -> bool {
         listened_events()
@@ -1392,6 +1531,16 @@ impl ServerHooks for PluginHost {
     }
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error> {
         self.fire_chat(id, name, message)
+    }
+    fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
+        self.declared_commands()
+    }
+    fn run_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error> {
+        self.execute_plugin_command(sender, line)
     }
 }
 fn consume_task<T: PartialEq>(issued: &Mutex<Vec<T>>, task: &T) -> Result<(), Error> {

@@ -151,7 +151,12 @@ struct Bot {
 }
 
 impl Bot {
-    fn join(addr: SocketAddr, name: &str) -> Self {
+    fn join(
+        addr: SocketAddr,
+        name: &str,
+        stdout: &Arc<Mutex<String>>,
+        stderr: &Arc<Mutex<String>>,
+    ) -> Self {
         let deadline = Instant::now() + Duration::from_secs(60);
         let stream = loop {
             match TcpStream::connect(addr) {
@@ -181,15 +186,36 @@ impl Bot {
             name: name.into(),
             uuid: uuid::Uuid::nil(),
         });
-        let first = bot.read_frame().expect("set compression packet");
+        let first = match bot.read_frame() {
+            Some(frame) => frame,
+            None => panic!(
+                "no set compression packet:\n{}\n{}",
+                stdout.lock().unwrap(),
+                stderr.lock().unwrap()
+            ),
+        };
         assert_eq!(VarInt::decode(&mut first.as_slice()).unwrap().0, 3);
         bot.encoder.set_compression(Some(256), 6);
         bot.decoder.set_compression(Some(256));
-        let login = bot.read_frame().expect("login success packet");
+        let login = match bot.read_frame() {
+            Some(frame) => frame,
+            None => panic!(
+                "no login success packet:\n{}\n{}",
+                stdout.lock().unwrap(),
+                stderr.lock().unwrap()
+            ),
+        };
         assert_eq!(VarInt::decode(&mut login.as_slice()).unwrap().0, 2);
         bot.send(&LoginAcknowledged);
         loop {
-            let frame = bot.read_frame().expect("finish configuration packet");
+            let frame = match bot.read_frame() {
+                Some(frame) => frame,
+                None => panic!(
+                    "no finish configuration packet:\n{}\n{}",
+                    stdout.lock().unwrap(),
+                    stderr.lock().unwrap()
+                ),
+            };
             let mut body = frame.as_slice();
             let id = VarInt::decode(&mut body).unwrap().0;
             if id == ClientboundKnownPacks::ID {
@@ -394,7 +420,7 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     }
     let events = plugins.join("TestPlugin/events.txt");
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut bot = Bot::join(addr, "Bot");
+    let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
     bot.raw(9, "hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
@@ -410,6 +436,9 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
             .any(|message| message.contains("<Bot> cancel this")),
         "a cancelled chat event was still broadcast: {after_cancel:?}"
     );
+    bot.raw(7, "testping");
+    let pong = wait_for_chat(&mut bot, "pong", &stdout, &stderr, &events);
+    assert_eq!(pong, "pong");
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);
 

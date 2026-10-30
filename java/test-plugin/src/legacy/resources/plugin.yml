@@ -8,4 +8,8 @@ commands:
     aliases: [ft]
     description: Test command
     permission: ferrite.test
+  testping:
+    aliases: [tping]
+    description: Replies pong
+    usage: /testping
 folia-supported: true

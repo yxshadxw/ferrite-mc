@@ -11,6 +11,7 @@ pub enum Action {
     ProfileStart,
     ProfileStop,
     Stop,
+    Plugin { name: String, args: Vec<String> },
 }
 #[derive(Clone)]
 pub struct Source {
@@ -24,6 +25,53 @@ fn send(source: &Source, action: Action) -> Result<i32, CommandError> {
         .send(action)
         .map_err(|_| CommandError::failed("command target unavailable"))?;
     Ok(1)
+}
+/// Adds every command a plugin declared in its descriptor, including aliases.
+///
+/// Bukkit resolves the name and every alias to the same `PluginCommand`, so each literal is
+/// registered on its own and runs the plugin under the label the sender actually typed.
+pub fn register_plugin_commands(
+    tree: &mut CommandDispatcher<Source>,
+    commands: &[ferrite_plugin::PluginCommand],
+) {
+    for command in commands {
+        tree.register(plugin_command_node(&command.name));
+        for alias in &command.aliases {
+            tree.register(plugin_command_node(alias));
+        }
+    }
+}
+/// One literal (a plugin command name or alias); the plugin sees it as the label.
+fn plugin_command_node(literal_name: &str) -> ferrite_command::NodeBuilder<Source> {
+    let bare = literal_name.to_owned();
+    let with_args = literal_name.to_owned();
+    literal::<Source>(literal_name)
+        .executes(move |ctx| {
+            send(
+                ctx.source(),
+                Action::Plugin {
+                    name: bare.clone(),
+                    args: Vec::new(),
+                },
+            )
+        })
+        .then(
+            argument::<Source>("args", ArgumentType::greedy_string()).executes(move |ctx| {
+                let args = ctx
+                    .string("args")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+                send(
+                    ctx.source(),
+                    Action::Plugin {
+                        name: with_args.clone(),
+                        args,
+                    },
+                )
+            }),
+        )
 }
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
@@ -123,5 +171,41 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Action::ProfileStart));
         tree.execute("profile stop", operator).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Action::ProfileStop));
+    }
+
+    #[test]
+    fn plugin_commands_register_aliases_and_forward_arguments() {
+        let mut tree = dispatcher();
+        register_plugin_commands(
+            &mut tree,
+            &[ferrite_plugin::PluginCommand {
+                name: "testping".into(),
+                aliases: vec!["tping".into()],
+                permission: None,
+                usage: Some("/testping".into()),
+            }],
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let source = Source {
+            permission: 0,
+            console: false,
+            actions: tx,
+        };
+        tree.execute("testping", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Plugin {
+                name: "testping".into(),
+                args: Vec::new()
+            }
+        );
+        tree.execute("tping one two", source).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Plugin {
+                name: "tping".into(),
+                args: vec!["one".into(), "two".into()]
+            }
+        );
     }
 }

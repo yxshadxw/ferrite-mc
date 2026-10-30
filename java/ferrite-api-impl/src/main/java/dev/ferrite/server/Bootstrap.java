@@ -85,4 +85,38 @@ public final class Bootstrap {
         }
         return result;
     }
+    /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
+    public static String pluginCommands() {
+        StringBuilder out = new StringBuilder();
+        for (org.bukkit.plugin.Plugin plugin : server.plugins.getPlugins()) {
+            if (!plugin.isEnabled()) continue;
+            var commands = plugin.getDescription().getCommands();
+            if (commands == null) continue;
+            for (var entry : commands.entrySet()) {
+                var properties = entry.getValue() == null ? java.util.Collections.<String, Object>emptyMap() : entry.getValue();
+                Object aliases = properties.get("aliases");
+                String aliasList = "";
+                if (aliases instanceof java.util.Collection<?> list) aliasList = list.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+                else if (aliases instanceof String alias) aliasList = alias;
+                out.append(entry.getKey()).append('\t').append(aliasList).append('\t').append(properties.getOrDefault("permission", "")).append('\t').append(properties.getOrDefault("usage", "")).append('\n');
+            }
+        }
+        return out.toString();
+    }
+    /** Runs a declared plugin command; 0 = unknown, 1 = handled, 2 = no permission. */
+    public static int runPluginCommand(String sender, String label, String[] args) {
+        org.bukkit.command.CommandSender resolved;
+        if ("console".equals(sender)) resolved = server.getConsoleSender();
+        else {
+            try { resolved = server.getPlayer(java.util.UUID.fromString(sender)); }
+            catch (IllegalArgumentException e) { return 0; }
+        }
+        if (resolved == null) return 0;
+        var command = server.getPluginCommand(label);
+        if (command == null) return 0;
+        synchronized (LEGACY_LOCK) {
+            if (!command.testPermission(resolved)) return 2;
+            return command.execute(resolved, label, args) ? 1 : 0;
+        }
+    }
 }
