@@ -593,6 +593,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-fluid"
+version = "0.1.0"
+dependencies = [
+ "ferrite-data",
+]
+
+[[package]]
 name = "ferrite-item"
 version = "0.1.0"
 dependencies = [
