@@ -85,7 +85,20 @@ impl VarInt {
     }
 
     /// Decode from a partial buffer: `Ok(None)` means more bytes are needed.
+    #[inline]
     pub fn decode_partial(buf: &[u8]) -> Result<Option<(i32, usize)>, DecodeError> {
+        // One- and two-byte values dominate packet data and exit with one test.
+        if let Some(&first) = buf.first() {
+            if first & 0x80 == 0 {
+                return Ok(Some((i32::from(first), 1)));
+            }
+            if let Some(&second) = buf.get(1)
+                && second & 0x80 == 0
+            {
+                let value = i32::from(first & 0x7f) | i32::from(second & 0x7f) << 7;
+                return Ok(Some((value, 2)));
+            }
+        }
         let mut value = 0u32;
         for i in 0..Self::MAX_LEN {
             let Some(&b) = buf.get(i) else {
@@ -114,6 +127,7 @@ impl Encode for VarInt {
     }
 }
 impl Decode for VarInt {
+    #[inline]
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
         match Self::decode_partial(buf)? {
             Some((v, n)) => {
@@ -308,6 +322,27 @@ mod tests {
         roundtrip(None::<i32>);
         roundtrip(vec![1u8, 2, 3]);
         roundtrip(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
+    }
+
+    #[test]
+    fn varint_decode_fast_path_consumes_exactly_one_or_two_bytes() {
+        let tail = [0xab, 0xcd];
+        for (value, encoded) in [
+            (127i32, &[0x7f][..]),
+            (128, &[0x80, 0x01]),
+            (16_383, &[0xff, 0x7f]),
+            (i32::MAX, &[0xff, 0xff, 0xff, 0xff, 0x07]),
+        ] {
+            let mut bytes = encoded.to_vec();
+            bytes.extend_from_slice(&tail);
+            let mut s = bytes.as_slice();
+            assert_eq!(VarInt::decode(&mut s).unwrap(), VarInt(value));
+            assert_eq!(s, &tail, "{value} should consume {} bytes", encoded.len());
+            assert_eq!(
+                VarInt::decode_partial(&bytes).unwrap(),
+                Some((value, encoded.len()))
+            );
+        }
     }
 
     #[test]
