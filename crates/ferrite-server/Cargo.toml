@@ -23,5 +23,10 @@ ferrite-nbt.workspace = true
 ferrite-command = { path = "../ferrite-command" }
 ferrite-data.workspace = true
 ferrite-math = { path = "../ferrite-math" }
+ferrite-plugin = { path = "../ferrite-plugin" }
 ferrite-profiler = { path = "../ferrite-profiler" }
 ferrite-fluid = { path = "../ferrite-fluid" }
+
+[dev-dependencies]
+ferrite-jvm = { path = "../ferrite-jvm" }
+tempfile = "3"

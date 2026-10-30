@@ -118,3 +118,29 @@ Relicensed to GPL-3.0-or-later; work coordinated by one Claude coordinator throu
 1. (done) fb1 libdeflate and terra2 W1a/W1b merged after ferrite-protocol/net/worldgen tests, clippy and fmt passed; main before them passed the full workspace (minus the light test).
 2. Resume Terra/Terra-2 after the quota reset; collect FB/OC results as they commit, review, merge.
 3. Remaining backlog: entity M2/M3, worldgen W1c-W3, random ticks, plugin onEnable end-to-end (M3 of the plan), signed chat, chunk packet cache, commands, tick-thread-free compression.
+
+## Hand-over for 2026-10-31 (read this first)
+All usage quotas ran out on 2026-10-30 (Codex until 2026-10-31 00:00, opencode2 exceeded, Freebuff hourly), so the unfinished work was frozen and handed to whoever continues next. Nothing was dispatched after that point.
+
+**Every unfinished worktree is snapshotted on GitHub as `wip/day4-<name>`** (a commit on top of the worktree's branch with all its uncommitted files; may not compile). To continue: `git fetch origin && git switch -c <name> origin/wip/day4-<name>`, finish, run the checks, open it against `main`.
+
+| Branch | What is inside | To finish |
+|---|---|---|
+| `wip/day4-claude-worker` | ferrite-entity M1 committed (store, section index, region hand-off) + M2/M3 WIP (tracking packets, item entities) | M2: spawn/move/remove packets per tracker range, run `tools/wirecheck`; M3: item entity physics, pickup, block-break drops; bot integration test |
+| `wip/day4-terra` | random ticks R1/R2 in ferrite-server (`game/random_tick.rs`), uses the section counters | R1 per-region random-tick framework (randomTickSpeed), R2 grass spread + leaf decay; tests |
+| `wip/day4-terra2` | worldgen W1c WIP (Java differential for density functions: `tests/java/DensityRouterDump.java`, `tests/java_differential.rs`) on top of W1a/W1b already on main | finish W1c (max error 1e-9), then W2 noise chunk fill (>=99% solid mask match on fixture chunks), W3 surface rules (>=98% top block); see `docs/handoff/worldgen-26-3.md` (26.3 API names differ from older versions: follow the jar) |
+| `wip/day4-fb3` | commands 2: tp/teleport, msg, kill, op/deop, whitelist, ban/pardon/kick, stop, save-* (+2.4k lines, `game/feedback.rs`) | build, fix, test per command (success + permission-denied) |
+| `wip/day4-fb4` | signed chat (`game/chat.rs`, `docs/handoff/signed-chat.md`, +1k lines) | run wirecheck after packet changes; test that player_chat reaches another player; signature/last-seen unit test |
+| `wip/day4-fb5` | chunk packet cache (encode once, reuse across players, invalidate on change) | byte-identical-output test, invalidation test, bots example MSPT before/after |
+| `wip/day4-oc1` | light-fixture fix (`ferrite-light` vanilla differential) | see the diagnosis below |
+| `wip/day4-oc2` | commands 1: gamemode, defaultgamemode, difficulty, time, weather, seed, list, say, me | build, fix, test per command |
+
+Main also has FB2's M3 (plugins/*.jar loaded at startup, onEnable/onDisable, end-to-end test `crates/ferrite-server/tests/plugin_lifecycle.rs`; needs JAVA_HOME=Temurin 25 and a gradle build).
+
+### Light differential failure: likely cause
+`tools/make_fixture_world.py` waits only `GENERATE_SECONDS = 30` after the forceload before `save-all`; FB2 found that stale sky light can be saved with that and regenerated its fixture with a 120 s wait. Raise `GENERATE_SECONDS` to 120, regenerate (`python tools/make_fixture_world.py`), and re-run `cargo test -p ferrite-light --test vanilla`. If mismatches remain, check the outer ring of comparable chunks.
+
+### Coordination notes
+- Orca run `run_57911c7b3e38`; session table and terminal handles are in `docs/sessions.md` (handles die with the Orca runtime).
+- Routing used: hard tasks to Claude workers and Terra (as commit-sized milestones), small ones to Freebuff/opencode2. Terra gives up fast on big specs ("incomplete" within a minute) but reliably finishes one-commit steps.
+- Sending a long task to Codex/Freebuff lands as a pasted chip; press Enter and verify `Working (` / `working...`.
