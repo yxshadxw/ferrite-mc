@@ -791,6 +791,7 @@ dependencies = [
  "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",
+ "ferrite-noise",
  "ferrite-plugin",
  "ferrite-profiler",
  "ferrite-protocol",

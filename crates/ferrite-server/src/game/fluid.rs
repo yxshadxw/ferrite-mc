@@ -21,6 +21,13 @@ impl<'a> RegionFluidWorld<'a> {
             tracking,
         }
     }
+    pub(super) fn brightness(&self, x: i32, y: i32, z: i32) -> u8 {
+        if self.owns(x, z) {
+            self.source.brightness(x, y, z).unwrap_or(0)
+        } else {
+            0
+        }
+    }
     fn owns(&self, x: i32, z: i32) -> bool {
         self.held
             .contains_key(&ChunkPos(x.div_euclid(16), z.div_euclid(16)))

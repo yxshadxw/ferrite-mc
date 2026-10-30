@@ -981,3 +981,76 @@ async fn water_bucket_spread_reaches_tracking_bot_on_fixture_world() {
     assert_eq!(resolved.parent(), Some(temp_root.as_path()));
     std::fs::remove_dir_all(resolved).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = std::env::temp_dir().join(format!("ferrite-grass-{}", uuid::Uuid::new_v4()));
+    let dir = temp.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.clone(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let y = (64..318)
+        .find(|y| source.brightness(8, y + 1, 8).unwrap_or(0) >= 9)
+        .expect("fixture contains lit position");
+    let air = u32::from(ferrite_data::blocks::default_state("air").unwrap());
+    let grass = u32::from(ferrite_data::blocks::default_state("grass_block").unwrap());
+    let dirt = u32::from(ferrite_data::blocks::default_state("dirt").unwrap());
+    for x in 7..=9 {
+        for z in 7..=9 {
+            source
+                .set_block(x, y, z, if (x, z) == (8, 8) { dirt } else { grass })
+                .unwrap();
+            source.set_block(x, y + 1, z, air).unwrap();
+        }
+    }
+    let world = World::start_with(Some(source), [8, y + 1, 8]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "GrassTester").await;
+    bot.until(46).await;
+    world.set_random_tick_speed(256);
+    let got = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            let body = bot.until(8).await;
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            let p = BlockPos::unpack(update.location);
+            if (p.x, p.y, p.z) == (8, y, 8) && update.block_state.0 as u32 == grass {
+                break;
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(got.is_ok(), "tracking bot did not receive grass spread");
+    let resolved = temp.canonicalize().unwrap();
+    assert_eq!(
+        resolved.parent(),
+        Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+    );
+    std::fs::remove_dir_all(resolved).unwrap();
+}
