@@ -148,3 +148,31 @@ fn slope_search_can_look_through_existing_flowing_fluid() {
     ticks.run_until(&mut w, 0);
     assert_eq!(fluid_state(w.block(-1, 0, 0)).kind, FluidKind::Empty);
 }
+
+#[test]
+fn moving_pending_ticks_preserves_remaining_delay() {
+    let mut w = world();
+    w.set_block(0, 0, 0, id("water"));
+    let mut from = FluidTicks::default();
+    from.schedule((0, 0, 0), 10);
+    from.run_until(&mut w, 4);
+    let mut to = FluidTicks::default();
+    to.run_until(&mut w, 50);
+    from.transfer_to(&mut to, |_| true);
+    to.run_until(&mut w, 55);
+    assert_eq!(fluid_state(w.block(1, 0, 0)).kind, FluidKind::Empty);
+    to.run_until(&mut w, 56);
+    assert_eq!(fluid_state(w.block(1, 0, 0)).kind, FluidKind::Water);
+}
+
+#[test]
+fn advance_processes_one_relative_tick() {
+    let mut w = world();
+    w.set_block(0, 0, 0, id("water"));
+    let mut ticks = FluidTicks::default();
+    ticks.schedule((0, 0, 0), 2);
+    ticks.advance(&mut w);
+    assert_eq!(fluid_state(w.block(1, 0, 0)).kind, FluidKind::Empty);
+    ticks.advance(&mut w);
+    assert_eq!(fluid_state(w.block(1, 0, 0)).kind, FluidKind::Water);
+}

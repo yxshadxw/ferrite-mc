@@ -1,0 +1,129 @@
+//! Region-bounded fluid access to loaded chunk columns.
+use super::{anvil::AnvilChunkSource, region::Tracking};
+use ferrite_fluid::FluidWorld;
+use ferrite_region::ChunkPos;
+use std::collections::HashMap;
+
+pub(super) struct RegionFluidWorld<'a> {
+    source: &'a AnvilChunkSource,
+    held: &'a HashMap<ChunkPos, usize>,
+    tracking: &'a Tracking,
+}
+impl<'a> RegionFluidWorld<'a> {
+    pub fn new(
+        source: &'a AnvilChunkSource,
+        held: &'a HashMap<ChunkPos, usize>,
+        tracking: &'a Tracking,
+    ) -> Self {
+        Self {
+            source,
+            held,
+            tracking,
+        }
+    }
+    fn owns(&self, x: i32, z: i32) -> bool {
+        self.held
+            .contains_key(&ChunkPos(x.div_euclid(16), z.div_euclid(16)))
+    }
+}
+impl FluidWorld for RegionFluidWorld<'_> {
+    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
+        if self.owns(x, z)
+            && let Some(state) = self.source.block(x, y, z)
+        {
+            return state;
+        }
+        u32::from(ferrite_data::blocks::default_state("stone").expect("vanilla stone"))
+    }
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
+        if !self.owns(x, z) {
+            return;
+        }
+        let Some(old) = self.source.block(x, y, z) else {
+            return;
+        };
+        if old == state {
+            return;
+        }
+        if let Err(error) = self.source.compare_set_block(x, y, z, Some(old), state) {
+            tracing::warn!(x,y,z,%error,"fluid block update failed");
+            return;
+        }
+        let packet = ferrite_protocol::packets::play::BlockUpdate {
+            location: ferrite_protocol::types::BlockPos::new(x, y, z).pack(),
+            block_state: ferrite_protocol::VarInt(state as i32),
+        };
+        let chunk = (x.div_euclid(16), z.div_euclid(16));
+        for (loaded, tx) in self.tracking.lock().unwrap().values() {
+            if loaded.contains(&chunk) {
+                let _ = tx.send(ferrite_net::game::packet(&packet));
+            }
+        }
+    }
+    fn ultrawarm(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrite_fluid::FluidWorld;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    #[tokio::test]
+    async fn missing_and_unowned_chunks_are_solid_and_not_loaded() {
+        let source = super::super::anvil::AnvilChunkSource::new_memory();
+        let held = HashMap::from([(ferrite_region::ChunkPos(0, 0), 1)]);
+        let tracking = Arc::new(Mutex::new(HashMap::new()));
+        let mut world = RegionFluidWorld::new(&source, &held, &tracking);
+        let stone = u32::from(ferrite_data::blocks::default_state("stone").unwrap());
+        assert_eq!(world.block(0, 65, 0), stone);
+        assert_eq!(world.block(16, 65, 0), stone);
+        world.set_block(16, 65, 0, 0);
+        assert_eq!(source.block(16, 65, 0), None);
+        // A previously loaded but unheld cached chunk must remain inaccessible.
+        loop {
+            if let Some(result) = source.get(1, 0, 0) {
+                result.unwrap();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let before = source.block(16, 65, 0).unwrap();
+        assert_eq!(world.block(16, 65, 0), stone);
+        world.set_block(
+            16,
+            65,
+            0,
+            u32::from(ferrite_data::blocks::default_state("water").unwrap()),
+        );
+        assert_eq!(source.block(16, 65, 0), Some(before));
+    }
+    #[tokio::test]
+    async fn fluid_tick_never_loads_unheld_neighbor() {
+        let source = super::super::anvil::AnvilChunkSource::new_memory();
+        loop {
+            if let Some(result) = source.get(0, 0, 0) {
+                result.unwrap();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let water = u32::from(ferrite_data::blocks::default_state("water").unwrap());
+        let stone = u32::from(ferrite_data::blocks::default_state("stone").unwrap());
+        source.set_block(15, 65, 0, water).unwrap();
+        source.set_block(15, 64, 0, stone).unwrap();
+        assert_eq!(source.block(16, 65, 0), None);
+        let held = HashMap::from([(ChunkPos(0, 0), 1)]);
+        let tracking = Arc::new(Mutex::new(HashMap::new()));
+        let mut world = RegionFluidWorld::new(&source, &held, &tracking);
+        let mut ticks = ferrite_fluid::FluidTicks::default();
+        ticks.schedule((15, 65, 0), 0);
+        ticks.run_until(&mut world, 20);
+        assert_eq!(source.block(16, 65, 0), None);
+        assert_eq!(world.block(16, 65, 0), stone);
+    }
+}

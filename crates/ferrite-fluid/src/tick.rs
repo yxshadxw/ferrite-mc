@@ -62,6 +62,25 @@ impl FluidTicks {
         self.pending.insert(pos, (due, seq));
         self.queue.push(Reverse((due, seq, pos)));
     }
+    /// Transfer selected positions while preserving remaining delay and order.
+    /// Existing destination entries retain their original due time.
+    pub fn transfer_to(&mut self, destination: &mut Self, select: impl Fn(Position) -> bool) {
+        let mut entries: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(pos, _)| select(**pos))
+            .map(|(&pos, &(due, seq))| (due, seq, pos))
+            .collect();
+        entries.sort_unstable();
+        for (due, _, pos) in entries {
+            self.pending.remove(&pos);
+            destination.schedule(pos, due.saturating_sub(self.now));
+        }
+    }
+    /// Advance this region's clock by one game tick.
+    pub fn advance(&mut self, world: &mut impl FluidWorld) {
+        self.run_until(world, self.now.saturating_add(1));
+    }
     /// Processes due work in due-time then insertion order; later work remains queued.
     pub fn run_until(&mut self, world: &mut impl FluidWorld, tick: u64) {
         assert!(tick >= self.now, "cannot rewind fluid ticks");

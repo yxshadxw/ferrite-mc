@@ -30,6 +30,15 @@ pub enum Signal {
         chunk: ChunkPos,
         add: bool,
     },
+    FluidChange {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    FinishRelease {
+        chunk: ChunkPos,
+        flush: bool,
+    },
     Update {
         uuid: Uuid,
         pos: [f64; 3],
@@ -76,13 +85,21 @@ pub struct Player {
 pub struct Region {
     pub players: HashMap<Uuid, Player>,
     generator: FlatGenerator,
+    fluid_ticks: ferrite_fluid::FluidTicks,
+    held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
 }
 impl RegionData for Region {
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, mut other: Self) {
+        other
+            .fluid_ticks
+            .transfer_to(&mut self.fluid_ticks, |_| true);
+        for (chunk, count) in other.held_chunks {
+            *self.held_chunks.entry(chunk).or_default() += count;
+        }
         self.players.extend(other.players);
         self.generator.merge(other.generator);
     }
@@ -96,9 +113,29 @@ impl RegionData for Region {
         let mut result = Self {
             players: HashMap::new(),
             generator: self.generator.split(sections),
+            fluid_ticks: ferrite_fluid::FluidTicks::default(),
+            held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
         };
+        let moving: Vec<_> = self
+            .held_chunks
+            .keys()
+            .copied()
+            .filter(|c| sections.contains(&SectionPos(c.0 >> 4, c.1 >> 4)))
+            .collect();
+        for c in moving {
+            result
+                .held_chunks
+                .insert(c, self.held_chunks.remove(&c).unwrap());
+        }
+        self.fluid_ticks
+            .transfer_to(&mut result.fluid_ticks, |(x, _, z)| {
+                sections.contains(&SectionPos(
+                    (x.div_euclid(16)) >> 4,
+                    (z.div_euclid(16)) >> 4,
+                ))
+            });
         for id in ids {
             if let Some(p) = self.players.remove(&id) {
                 result.players.insert(id, p);
@@ -341,6 +378,11 @@ impl Player {
                     }));
                 }
             }
+            let _ = self.signals.send(Signal::FluidChange {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+            });
             true
         } else {
             false
@@ -397,10 +439,21 @@ impl Player {
         if item.count <= 0 {
             return;
         }
-        let Some(state) =
-            super::interaction::placement_state(item.item_id, p.face.0, p.cursor_y, self.yaw, old)
-        else {
-            return;
+        let water_bucket = ferrite_data::registries::id("minecraft:item", "minecraft:water_bucket")
+            == Some(item.item_id);
+        let state = if water_bucket {
+            ferrite_data::blocks::default_state("water").expect("vanilla water")
+        } else {
+            let Some(state) = super::interaction::placement_state(
+                item.item_id,
+                p.face.0,
+                p.cursor_y,
+                self.yaw,
+                old,
+            ) else {
+                return;
+            };
+            state
         };
         let positions = self.positions.lock().unwrap();
         let offset = ferrite_math::Vec3::new(target.x as f64, target.y as f64, target.z as f64);
@@ -427,9 +480,17 @@ impl Player {
         let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
         drop(positions);
         if placed && self.gamemode == 0 {
-            self.inventory[slot].count -= 1;
-            if self.inventory[slot].count == 0 {
-                self.inventory[slot] = ItemStack::default();
+            if water_bucket {
+                self.inventory[slot] = ItemStack {
+                    count: 1,
+                    item_id: ferrite_data::registries::id("minecraft:item", "minecraft:bucket")
+                        .expect("vanilla bucket"),
+                };
+            } else {
+                self.inventory[slot].count -= 1;
+                if self.inventory[slot].count == 0 {
+                    self.inventory[slot] = ItemStack::default();
+                }
             }
             send(
                 self,
@@ -650,6 +711,27 @@ impl Player {
     }
 }
 impl Region {
+    pub fn hold_chunk(&mut self, chunk: ChunkPos) {
+        *self.held_chunks.entry(chunk).or_default() += 1;
+    }
+    pub fn release_chunk(&mut self, chunk: ChunkPos) {
+        if let Some(count) = self.held_chunks.get_mut(&chunk) {
+            *count -= 1;
+            if *count == 0 {
+                self.held_chunks.remove(&chunk);
+            }
+        }
+    }
+    pub fn schedule_fluid(&mut self, pos: (i32, i32, i32)) {
+        let chunk = ChunkPos(pos.0.div_euclid(16), pos.2.div_euclid(16));
+        if self.held_chunks.contains_key(&chunk) {
+            self.fluid_ticks.schedule(pos, 0);
+        }
+    }
+    pub fn tick_fluids(&mut self, source: &super::anvil::AnvilChunkSource, tracking: &Tracking) {
+        let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
+        self.fluid_ticks.advance(&mut world);
+    }
     pub fn tick(&mut self) {
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
@@ -725,4 +807,65 @@ mod tests {
         assert_eq!(new.first(), Some(&(3, 0)));
         assert!(!new.contains(&(1, 0)));
     }
+}
+
+#[cfg(test)]
+mod fluid_ownership_tests {
+    use super::*;
+    use ferrite_fluid::{FluidKind, FluidWorld, fluid_state};
+    use std::collections::HashMap;
+
+    struct Grid(HashMap<(i32, i32, i32), u32>);
+    impl FluidWorld for Grid {
+        fn block(&self, x: i32, y: i32, z: i32) -> u32 {
+            *self.0.get(&(x, y, z)).unwrap_or(&0)
+        }
+        fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
+            self.0.insert((x, y, z), state);
+        }
+        fn ultrawarm(&self) -> bool {
+            false
+        }
+    }
+    #[test]
+    fn fluid_ticks_survive_merge_and_split() {
+        let mut left = Region::default();
+        let mut right = Region::default();
+        left.fluid_ticks.schedule((0, 0, 0), 7);
+        right.fluid_ticks.schedule((512, 0, 0), 9);
+        left.merge(right);
+        let mut right = left.split(&HashSet::from([SectionPos(2, 0)]));
+        let water = u32::from(ferrite_data::blocks::default_state("water").unwrap());
+        let stone = u32::from(ferrite_data::blocks::default_state("stone").unwrap());
+        let mut grid = Grid(HashMap::from([
+            ((0, 0, 0), water),
+            ((512, 0, 0), water),
+            ((0, -1, 0), stone),
+            ((512, -1, 0), stone),
+        ]));
+        left.fluid_ticks.run_until(&mut grid, 6);
+        right.fluid_ticks.run_until(&mut grid, 8);
+        assert_eq!(fluid_state(grid.block(0, 0, 1)).kind, FluidKind::Empty);
+        assert_eq!(fluid_state(grid.block(512, 0, 1)).kind, FluidKind::Empty);
+        left.fluid_ticks.run_until(&mut grid, 7);
+        right.fluid_ticks.run_until(&mut grid, 9);
+        assert_eq!(fluid_state(grid.block(0, 0, 1)).kind, FluidKind::Water);
+        assert_eq!(fluid_state(grid.block(512, 0, 1)).kind, FluidKind::Water);
+    }
+}
+
+#[test]
+fn chunk_holders_follow_region_merge_and_split() {
+    let mut left = Region::default();
+    let mut right = Region::default();
+    left.hold_chunk(ChunkPos(0, 0));
+    left.hold_chunk(ChunkPos(0, 0));
+    right.hold_chunk(ChunkPos(32, 0));
+    left.merge(right);
+    let mut right = left.split(&HashSet::from([SectionPos(2, 0)]));
+    assert_eq!(left.held_chunks.get(&ChunkPos(0, 0)), Some(&2));
+    assert!(!left.held_chunks.contains_key(&ChunkPos(32, 0)));
+    assert_eq!(right.held_chunks.get(&ChunkPos(32, 0)), Some(&1));
+    right.release_chunk(ChunkPos(32, 0));
+    assert!(right.held_chunks.is_empty());
 }

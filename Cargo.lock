@@ -786,6 +786,7 @@ dependencies = [
  "anyhow",
  "ferrite-command",
  "ferrite-data",
+ "ferrite-fluid",
  "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",

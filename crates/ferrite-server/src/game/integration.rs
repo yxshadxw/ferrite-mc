@@ -883,3 +883,101 @@ async fn profile_start_and_stop_collect_tick_scopes() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn water_bucket_spread_reaches_tracking_bot_on_fixture_world() {
+    use ferrite_protocol::{
+        packets::play::{BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = std::env::temp_dir().join(format!("ferrite-fluid-{}", uuid::Uuid::new_v4()));
+    let dir = temp.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.clone(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let air = u32::from(ferrite_data::blocks::default_state("air").unwrap());
+    let stone = u32::from(ferrite_data::blocks::default_state("stone").unwrap());
+    for x in 0..=2 {
+        for z in 0..=2 {
+            source.set_block(x, 64, z, stone).unwrap();
+            source.set_block(x, 65, z, air).unwrap();
+            source.set_block(x, 66, z, air).unwrap();
+        }
+    }
+    let world = World::start_with(Some(source), [0, 65, 0]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "FluidTester").await;
+    bot.until(46).await;
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    let item = ferrite_data::registries::id("minecraft:item", "minecraft:water_bucket").unwrap();
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: item,
+        },
+    })
+    .await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+    let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let body = bot.until(8).await;
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            let p = BlockPos::unpack(update.location);
+            if (p.x, p.y, p.z) == (1, 65, 0)
+                && ferrite_fluid::fluid_state(update.block_state.0 as u32).kind
+                    == ferrite_fluid::FluidKind::Water
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(got.is_ok(), "tracking bot did not receive the spread water");
+    let temp_root = std::env::temp_dir().canonicalize().unwrap();
+    let resolved = temp.canonicalize().unwrap();
+    assert_eq!(resolved.parent(), Some(temp_root.as_path()));
+    std::fs::remove_dir_all(resolved).unwrap();
+}

@@ -30,6 +30,7 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
             .sum::<f64>()
             <= 10_000.0
 }
+mod fluid;
 mod global;
 mod region;
 
@@ -173,6 +174,9 @@ async fn run(
         profiler,
     } = metrics;
     let region_profiler = Arc::clone(&profiler);
+    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
+    let fluid_tracking = tracking.clone();
+    let fluid_source = source.clone();
     let scheduler = Scheduler::with_default_threads(
         Regionizer::<Region>::default(),
         GlobalRegion::default(),
@@ -183,6 +187,9 @@ async fn run(
                 .timings
                 .get_or_insert_with(|| Arc::clone(region_profiler.timings()));
             Region::tick(region);
+            if let Some(source) = &fluid_source {
+                region.tick_fluids(source, &fluid_tracking);
+            }
             let elapsed = now.elapsed();
             region_profiler.record_region(slot, elapsed);
             let mut samples = tick_samples.lock().unwrap();
@@ -212,7 +219,6 @@ async fn run(
         .join("../../vanilla/26.3/generated/reports");
     let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
-    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(HashMap::new()));
     let mut next_entity = 1i32;
     let spawn_pos = [
@@ -252,7 +258,7 @@ async fn run(
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
            let mut player=Player{uuid,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
-           scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.players.insert(uuid,player);});
+           scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
           GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {scheduler.schedule_global(move |g|g.chat(uuid,&text));}},
@@ -301,34 +307,49 @@ async fn run(
           GameMessage::Shutdown{complete}=>{let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let _stopped = scheduler.shutdown();let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; let _=complete.send(result);break;}
          }},
          signal=signals.recv()=>{let Some(signal)=signal else {break}; match signal {
-          Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);}else{release_hold(&scheduler, &mut holds, &source, chunk);},
+          Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);scheduler.schedule_at_chunk(chunk,move |r|r.hold_chunk(chunk));}else{release_hold(&scheduler, &mut holds, &signal_tx, chunk);},
+          Signal::FinishRelease{chunk,flush}=>{scheduler.remove_chunk(chunk);if flush && let Some(source)=source.clone(){tokio::spawn(async move {if let Err(error)=source.flush_chunk(chunk.0,chunk.1).await{tracing::error!(%error,"failed to save unloaded chunk");}});}},
+          Signal::FluidChange{x,y,z}=>{
+            for (dx,dy,dz) in [(0,0,0),(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
+              let (Some(x),Some(y),Some(z))=(x.checked_add(dx),y.checked_add(dy),z.checked_add(dz)) else {continue;};
+              let chunk=ChunkPos(x.div_euclid(16),z.div_euclid(16));
+              if scheduler.owner(chunk).is_some(){scheduler.schedule_at_chunk(chunk,move |r|r.schedule_fluid((x,y,z)));}
+            }
+          },
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
-          Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.players.insert(id,*player);});scheduler.remove_chunk(from);},
-          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
+          Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }}
         }
     }
 }
+fn defer_release(
+    scheduler: &Scheduler<Region, GlobalRegion>,
+    signals: &mpsc::UnboundedSender<Signal>,
+    chunk: ChunkPos,
+    flush: bool,
+) {
+    let signals = signals.clone();
+    scheduler.schedule_at_chunk(chunk, move |region| {
+        region.release_chunk(chunk);
+        let _ = signals.send(Signal::FinishRelease { chunk, flush });
+    });
+}
 fn release_hold(
     scheduler: &Scheduler<Region, GlobalRegion>,
     holds: &mut HashMap<ChunkPos, usize>,
-    source: &Option<Arc<anvil::AnvilChunkSource>>,
+    signals: &mpsc::UnboundedSender<Signal>,
     chunk: ChunkPos,
 ) {
-    scheduler.remove_chunk(chunk);
+    let mut flush = false;
     if let Some(count) = holds.get_mut(&chunk) {
         *count -= 1;
         if *count == 0 {
             holds.remove(&chunk);
-            if let Some(source) = source.clone() {
-                tokio::spawn(async move {
-                    if let Err(error) = source.flush_chunk(chunk.0, chunk.1).await {
-                        tracing::error!(%error, "failed to save unloaded chunk");
-                    }
-                });
-            }
+            flush = true;
         }
     }
+    defer_release(scheduler, signals, chunk, flush);
 }
 #[cfg(test)]
 mod integration;
