@@ -360,6 +360,8 @@ mod tests {
                 thread::sleep(Duration::from_millis(250));
             }
             {
+                // Windows wakes the sampler's 2 ms `recv_timeout` at its ~15 ms
+                // timer granularity, so this scope must outlive one sampling tick.
                 let _cold = worker.scope("cold");
                 // Windows' scheduler granularity is ~15 ms, so 5 ms was not reliably
                 // long enough for even one 2 ms sampler pass to observe this scope.
