@@ -2,6 +2,7 @@ use super::{
     chunk::{ChunkSource, FlatGenerator},
     valid_move,
 };
+use ferrite_entity::{EntityRecord, EntityStore};
 use ferrite_net::game::{Outbound, ServerboundPlay, packet};
 use ferrite_protocol::{VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, RegionData, SectionPos};
@@ -41,6 +42,17 @@ pub enum Signal {
         chunk: ChunkPos,
         held: Vec<ChunkPos>,
     },
+    /// An entity walked into another region section; the main loop hands it to the region
+    /// owning `to` through that region's task queue (Folia: only the owner touches it).
+    EntityTransfer {
+        to: ChunkPos,
+        entity: Box<EntityRecord>,
+    },
+}
+/// What a region tick needs from the world loop.
+#[derive(Clone)]
+pub struct TickContext {
+    pub signals: UnboundedSender<Signal>,
 }
 /// How many queued chunks to request ahead of the batch being sent.
 const PREFETCH_CHUNKS: usize = 96;
@@ -74,11 +86,13 @@ pub struct Player {
 #[derive(Default)]
 pub struct Region {
     pub players: HashMap<Uuid, Player>,
+    pub entities: EntityStore,
     generator: FlatGenerator,
 }
 impl RegionData for Region {
     fn merge(&mut self, other: Self) {
         self.players.extend(other.players);
+        self.entities.merge(other.entities);
         self.generator.merge(other.generator);
     }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
@@ -90,6 +104,9 @@ impl RegionData for Region {
             .collect();
         let mut result = Self {
             players: HashMap::new(),
+            entities: self
+                .entities
+                .split(|(x, z)| sections.contains(&SectionPos(x >> 4, z >> 4))),
             generator: self.generator.split(sections),
         };
         for id in ids {
@@ -643,7 +660,7 @@ impl Player {
     }
 }
 impl Region {
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self, ctx: &TickContext) {
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in ids {
             let mut p = self.players.remove(&id).unwrap();
@@ -674,6 +691,13 @@ impl Region {
             }
             p.chunks_tick(&mut self.generator);
             self.players.insert(id, p);
+        }
+        for entity in self.entities.take_crossing() {
+            let (x, z) = entity.chunk();
+            let _ = ctx.signals.send(Signal::EntityTransfer {
+                to: ChunkPos(x, z),
+                entity: Box::new(entity),
+            });
         }
     }
 }

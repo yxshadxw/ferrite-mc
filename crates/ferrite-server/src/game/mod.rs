@@ -34,7 +34,7 @@ mod region;
 
 use self::{
     global::{GlobalPlayer, GlobalRegion},
-    region::{Command, Mailbox, Player, Region, Signal},
+    region::{Command, Mailbox, Player, Region, Signal, TickContext},
 };
 use ferrite_net::game::{self, GameMessage, Outbound, ServerboundPlay};
 use ferrite_protocol::{Encode, VarInt, packets::play::*};
@@ -140,12 +140,16 @@ async fn run(
     tick_samples: Arc<Mutex<Vec<f64>>>,
     settings: WorldSettings,
 ) {
+    let (signal_tx, mut signals) = mpsc::unbounded_channel();
+    let ctx = TickContext {
+        signals: signal_tx.clone(),
+    };
     let scheduler = Scheduler::with_default_threads(
         Regionizer::<Region>::default(),
         GlobalRegion::default(),
         move |region| {
             let now = std::time::Instant::now();
-            Region::tick(region);
+            region.tick(&ctx);
             let mut samples = tick_samples.lock().unwrap();
             if samples.len() < 100_000 {
                 samples.push(now.elapsed().as_secs_f64() * 1000.0);
@@ -153,7 +157,6 @@ async fn run(
         },
         GlobalRegion::tick,
     );
-    let (signal_tx, mut signals) = mpsc::unbounded_channel();
     let mut mailboxes: HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)> =
         HashMap::new();
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
@@ -165,7 +168,6 @@ async fn run(
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(HashMap::new()));
-    let mut next_entity = 1i32;
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
         spawn[1] as f64,
@@ -190,7 +192,7 @@ async fn run(
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
            permissions.insert(uuid, permission);
-           let entity=next_entity;next_entity+=1;
+           let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
            let (actions, _) = mpsc::unbounded_channel();
            if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
@@ -240,10 +242,22 @@ async fn run(
           Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);}else{release_hold(&scheduler, &mut holds, &source, chunk);},
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.players.insert(id,*player);});scheduler.remove_chunk(from);},
+          Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
           Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }}
         }
     }
+}
+/// Hands an entity to the region owning `to`. A chunk nobody holds parks the entity in the
+/// scheduler until a region takes that chunk.
+fn hand_off(
+    scheduler: &Scheduler<Region, GlobalRegion>,
+    to: ChunkPos,
+    entity: Box<ferrite_entity::EntityRecord>,
+) {
+    scheduler.schedule_at_chunk(to, move |r| {
+        r.entities.insert(*entity);
+    });
 }
 fn release_hold(
     scheduler: &Scheduler<Region, GlobalRegion>,

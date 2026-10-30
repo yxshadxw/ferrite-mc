@@ -780,3 +780,110 @@ async fn commands_packet_decodes_and_filters_permissions() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+/// Runs `f` inside the region owning `chunk` and returns its result, handing off entities that
+/// regions report as crossing (the world loop's job) while waiting.
+fn in_region<T: Send + 'static>(
+    scheduler: &ferrite_region::Scheduler<super::Region, super::GlobalRegion>,
+    signals: &mut tokio::sync::mpsc::UnboundedReceiver<super::Signal>,
+    chunk: ferrite_region::ChunkPos,
+    f: impl FnOnce(&mut super::Region) -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    scheduler.schedule_at_chunk(chunk, move |r| {
+        let _ = tx.send(f(r));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        while let Ok(signal) = signals.try_recv() {
+            if let super::Signal::EntityTransfer { to, entity } = signal {
+                super::hand_off(scheduler, to, entity);
+            }
+        }
+        if let Ok(value) = rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "region task timed out"
+        );
+    }
+}
+
+#[test]
+fn entities_follow_region_merges_splits_and_hand_offs() {
+    use ferrite_entity::{EntityData, EntityRecord, Flags, allocate_id, random_uuid};
+    use ferrite_math::Vec3;
+    use ferrite_region::{ChunkPos, Regionizer, Scheduler};
+    let (tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = super::TickContext { signals: tx };
+    let scheduler = Scheduler::new(
+        Regionizer::<super::Region>::default(),
+        super::GlobalRegion::default(),
+        2,
+        move |r| r.tick(&ctx),
+        super::GlobalRegion::tick,
+    );
+    let west = ChunkPos(0, 0);
+    let east = ChunkPos(200, 0);
+    scheduler.add_chunk(west);
+    scheduler.add_chunk(east);
+    assert_eq!(scheduler.region_count(), 2);
+    let spawn = |x: f64| EntityRecord {
+        pos: Vec3::new(x, 64.0, 8.0),
+        vel: Vec3::ZERO,
+        flags: Flags::default(),
+        data: EntityData::new(allocate_id(), random_uuid(), 71, 0.25, 0.25),
+    };
+    let (walker, stayer, resident) = (spawn(8.0), spawn(9.0), spawn(3208.0));
+    let ids = [walker.data.id, stayer.data.id, resident.data.id];
+    in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.insert(walker);
+        r.entities.insert(stayer);
+    });
+    in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.insert(resident);
+    });
+    // The walker crosses into the east region; the west region hands it off.
+    in_region(&scheduler, &mut signals, west, move |r| {
+        let key = r.entities.key_of(ids[0]).unwrap();
+        r.entities.set_pos(key, Vec3::new(3210.0, 64.0, 8.0));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.key_of(ids[0]).is_some()
+    }) {
+        assert!(std::time::Instant::now() < deadline, "walker never arrived");
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.key_of(ids[0]).is_none() && r.entities.key_of(ids[1]).is_some()
+    }));
+    // Bridge the gap: both regions merge and so do their entities.
+    let bridge: Vec<_> = (1..7).map(|i| ChunkPos(i * 30, 0)).collect();
+    for chunk in &bridge {
+        scheduler.add_chunk(*chunk);
+    }
+    while scheduler.region_count() != 1 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.check_invariants().unwrap();
+        ids.iter().all(|id| r.entities.key_of(*id).is_some())
+    }));
+    // Remove the bridge: the region splits and entities follow their sections.
+    for chunk in &bridge {
+        scheduler.remove_chunk(*chunk);
+    }
+    while scheduler.region_count() != 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.len() == 1 && r.entities.key_of(ids[1]).is_some()
+    }));
+    assert!(in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.len() == 2 && r.entities.key_of(ids[0]).is_some()
+    }));
+    let stopped = scheduler.shutdown();
+    let total: usize = stopped.regions.iter().map(|r| r.entities.len()).sum();
+    assert_eq!(total, 3);
+}
