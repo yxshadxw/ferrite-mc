@@ -10,6 +10,7 @@ pub fn new_anvil_source(
 mod chunk;
 mod commands;
 pub mod interaction;
+mod profile;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,10 +76,16 @@ pub struct World {
     pub sender: mpsc::UnboundedSender<GameMessage>,
     task: tokio::task::JoinHandle<()>,
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
+    profiler: Arc<profile::Profiler>,
 }
 impl World {
     pub fn start() -> Self {
         Self::start_with(None, [0, 65, 0])
+    }
+
+    /// Tick statistics and profiling sessions recorded by this world.
+    pub fn profiler(&self) -> Arc<profile::Profiler> {
+        Arc::clone(&self.profiler)
     }
     pub fn start_with(source: Option<Arc<anvil::AnvilChunkSource>>, spawn: [i32; 3]) -> Self {
         Self::start_configured(source, spawn, WorldSettings::default())
@@ -92,19 +99,25 @@ impl World {
         let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
         let (sender, rx) = mpsc::unbounded_channel();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
+        let profiler = Arc::new(profile::Profiler::new());
+        let metrics = LoopMetrics {
+            tick_samples: tick_samples.clone(),
+            profiler: Arc::clone(&profiler),
+        };
         let task = tokio::spawn(run(
             rx,
             sender.clone(),
             source,
             flat,
             spawn,
-            tick_samples.clone(),
+            metrics,
             settings,
         ));
         Self {
             sender,
             task,
             tick_samples,
+            profiler,
         }
     }
     pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {
@@ -131,27 +144,63 @@ impl World {
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
     let _ = tx.send(game::packet(p));
 }
+fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
+    emit(
+        tx,
+        &SystemChat {
+            content: ferrite_protocol::types::PlainText(text.into()),
+            overlay: false,
+        },
+    );
+}
+/// Per-tick measurements owned by the game loop's instrumentation.
+struct LoopMetrics {
+    /// Raw region tick durations consumed by the load-test example.
+    tick_samples: Arc<Mutex<Vec<f64>>>,
+    profiler: Arc<profile::Profiler>,
+}
 async fn run(
     mut events: mpsc::UnboundedReceiver<GameMessage>,
     event_tx: mpsc::UnboundedSender<GameMessage>,
     source: Option<Arc<anvil::AnvilChunkSource>>,
     flat: bool,
     spawn: [i32; 3],
-    tick_samples: Arc<Mutex<Vec<f64>>>,
+    metrics: LoopMetrics,
     settings: WorldSettings,
 ) {
+    let LoopMetrics {
+        tick_samples,
+        profiler,
+    } = metrics;
+    let region_profiler = Arc::clone(&profiler);
     let scheduler = Scheduler::with_default_threads(
         Regionizer::<Region>::default(),
         GlobalRegion::default(),
         move |region| {
             let now = std::time::Instant::now();
+            let slot = region_profiler.region_slot(&mut region.profile_slot);
+            region
+                .timings
+                .get_or_insert_with(|| Arc::clone(region_profiler.timings()));
             Region::tick(region);
+            let elapsed = now.elapsed();
+            region_profiler.record_region(slot, elapsed);
             let mut samples = tick_samples.lock().unwrap();
             if samples.len() < 100_000 {
-                samples.push(now.elapsed().as_secs_f64() * 1000.0);
+                samples.push(elapsed.as_secs_f64() * 1000.0);
             }
         },
-        GlobalRegion::tick,
+        {
+            let profiler = Arc::clone(&profiler);
+            move |global| {
+                let now = std::time::Instant::now();
+                global
+                    .timings
+                    .get_or_insert_with(|| Arc::clone(profiler.timings()));
+                GlobalRegion::tick(global);
+                profiler.record_global(now.elapsed());
+            }
+        },
     );
     let (signal_tx, mut signals) = mpsc::unbounded_channel();
     let mut mailboxes: HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)> =
@@ -215,7 +264,16 @@ async fn run(
                   commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
                   commands::Action::Teleport(pos) => mailbox.lock().unwrap().push_back(Command::Teleport(pos)),
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
-                  commands::Action::Tps => emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText("TPS unavailable".into()), overlay:false }),
+                  commands::Action::Tps => for line in profiler.tps_lines() { chat(outbound, &line); },
+                  commands::Action::Mspt => for line in profiler.mspt_lines() { chat(outbound, &line); },
+                  commands::Action::ProfileStart => match profiler.start_profile() {
+                      Ok(()) => chat(outbound, "Profiling started; run /profile stop to dump the slowest systems"),
+                      Err(error) => chat(outbound, &format!("Cannot start profiling: {error}")),
+                  },
+                  commands::Action::ProfileStop => match profiler.stop_profile() {
+                      Ok(report) => for line in report.lines() { chat(outbound, &line); },
+                      Err(error) => chat(outbound, &format!("Cannot stop profiling: {error}")),
+                  },
                   commands::Action::Stop => {},
               }}
           }},
@@ -229,7 +287,13 @@ async fn run(
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
                   commands::Action::Stop => stop = true,
-                  commands::Action::Tps => tracing::info!("TPS unavailable"),
+                  commands::Action::Tps => for line in profiler.tps_lines_plain() { tracing::info!("{line}"); },
+                  commands::Action::Mspt => for line in profiler.mspt_lines_plain() { tracing::info!("{line}"); },
+                  commands::Action::ProfileStart => if let Err(error) = profiler.start_profile() { tracing::warn!(%error, "profile start failed"); } else { tracing::info!("profiling started; run profile stop to dump the slowest systems"); },
+                  commands::Action::ProfileStop => match profiler.stop_profile() {
+                      Ok(report) => for line in report.lines() { tracing::info!("{line}"); },
+                      Err(error) => tracing::warn!(%error, "profile stop failed"),
+                  },
                   _ => tracing::warn!("command requires a player"),
               }}
               let _ = complete.send(result.map(|_| stop));

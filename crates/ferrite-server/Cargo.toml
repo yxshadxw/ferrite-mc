@@ -23,3 +23,4 @@ ferrite-nbt.workspace = true
 ferrite-command = { path = "../ferrite-command" }
 ferrite-data.workspace = true
 ferrite-math = { path = "../ferrite-math" }
+ferrite-profiler = { path = "../ferrite-profiler" }

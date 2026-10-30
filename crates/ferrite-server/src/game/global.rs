@@ -1,10 +1,12 @@
 use ferrite_net::game::{Outbound, packet};
+use ferrite_profiler::Timings;
 use ferrite_protocol::{
     VarInt,
     packets::{login::Property, play::*},
     types::PlainText,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 #[derive(Clone)]
@@ -54,6 +56,8 @@ impl GlobalPlayer {
 pub struct GlobalRegion {
     players: HashMap<Uuid, GlobalPlayer>,
     visible: HashMap<(Uuid, Uuid), GlobalPlayer>,
+    /// Scope tree attached by the game loop; `None` until the first tick.
+    pub timings: Option<Arc<Timings>>,
 }
 fn send<P: ferrite_protocol::Packet>(to: &GlobalPlayer, p: &P) {
     let _ = to.outbound.send(packet(p));
@@ -135,6 +139,9 @@ impl GlobalRegion {
         }
     }
     pub fn tick(&mut self) {
+        let timings = self.timings.clone();
+        let _tick = timings.as_ref().map(|t| t.scope("global-tick"));
+        let _tracking = timings.as_ref().map(|t| t.scope("entity-tracking"));
         let players: Vec<_> = self.players.values().cloned().collect();
         for observer in &players {
             for target in &players {
@@ -263,6 +270,28 @@ impl GlobalRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tick_records_global_and_tracking_scopes_when_timings_are_attached() {
+        let mut g = GlobalRegion::default();
+        let timings = Arc::new(Timings::new());
+        g.timings = Some(timings.clone());
+
+        g.tick();
+
+        let report = timings.report_all(50.0);
+        assert!(
+            report.rows.iter().any(|row| row.path == "global-tick"),
+            "{report}"
+        );
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.path == "global-tick/entity-tracking"),
+            "{report}"
+        );
+    }
+
     #[test]
     fn visibility_and_chat_follow_positions() {
         let mut g = GlobalRegion::default();

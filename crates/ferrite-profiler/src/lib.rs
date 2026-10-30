@@ -46,7 +46,8 @@ mod tick;
 mod timings;
 
 pub use paper::{
-    mspt_line, mspt_line_colored, mspt_lines, mspt_lines_colored, tps_line, tps_line_colored,
+    mspt_line, mspt_line_colored, mspt_lines, mspt_lines_colored, region_tps_line,
+    region_tps_line_colored, tps_line, tps_line_colored,
 };
 pub use sampler::{SampleNode, SampleTree, Sampler};
 pub use stats::{MAX_TPS, Mspt, MsptStats, Tps};

@@ -90,6 +90,20 @@ impl Bot {
             }
         }
     }
+    /// Waits for the next `SystemChat` whose text contains `needle`.
+    async fn chat_containing(&mut self, needle: &str) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let body = self.until(124).await;
+                let message = SystemChat::decode(&mut body.as_slice()).unwrap();
+                if message.content.0.contains(needle) {
+                    return message.content.0;
+                }
+            }
+        })
+        .await
+        .expect("expected chat message")
+    }
     async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut b = Self {
@@ -768,14 +782,103 @@ async fn commands_packet_decodes_and_filters_permissions() {
     let bot = Bot::join(addr, "Guest").await;
     let bytes = bot.commands.as_ref().expect("commands packet");
     let mut input = bytes.as_slice();
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 2);
+    // The guest may only see the unrestricted root commands: tps and mspt.
+    assert_eq!(VarInt::decode(&mut input).unwrap().0, 3);
     assert_eq!(u8::decode(&mut input).unwrap(), 0);
-    assert_eq!(Vec::<VarInt>::decode(&mut input).unwrap(), vec![VarInt(1)]);
-    assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
-    assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
-    assert_eq!(String::decode(&mut input).unwrap(), "tps");
+    assert_eq!(
+        Vec::<VarInt>::decode(&mut input).unwrap(),
+        vec![VarInt(1), VarInt(2)]
+    );
+    for name in ["tps", "mspt"] {
+        assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
+        assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
+        assert_eq!(String::decode(&mut input).unwrap(), name);
+    }
     assert_eq!(VarInt::decode(&mut input).unwrap().0, 0);
     assert!(input.is_empty());
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tps_and_mspt_commands_report_live_tick_statistics() {
+    let world = World::start();
+    let profiler = world.profiler();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Profiler").await;
+    bot.until(46).await;
+    assert!(profiler.monitor().ticks() > 0, "global tick was recorded");
+    let region_slots = (0..profiler.monitor().regions() as u32)
+        .filter(|slot| profiler.monitor().region_ticks(*slot).unwrap_or(0) > 0)
+        .count();
+    assert!(region_slots > 0, "a region tick was recorded");
+
+    bot.raw(7, "tps").await;
+    let global = bot.chat_containing("TPS from last 1m, 5m, 15m:").await;
+    assert!(global.starts_with("§6TPS"), "{global}");
+    let region = bot.chat_containing("Region ").await;
+    assert!(
+        region.contains("Region 0 TPS from last 5s, 1m, 5m:"),
+        "{region}"
+    );
+
+    bot.raw(7, "mspt").await;
+    let ten_seconds = bot.chat_containing("MSPT from last 10s:").await;
+    assert!(ten_seconds.contains("avg "), "{ten_seconds}");
+    let minute = bot.chat_containing("MSPT from last 1m:").await;
+    assert!(minute.contains("p99 "), "{minute}");
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_start_and_stop_collect_tick_scopes() {
+    let world = World::start();
+    let profiler = world.profiler();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let bot = Bot::join(addr, "Profiler").await;
+
+    assert!(!profiler.profile_running());
+    world.console_command("profile start".into()).await.unwrap();
+    assert!(profiler.profile_running());
+    // Starting twice is refused, but the console command itself still runs.
+    world.console_command("profile start".into()).await.unwrap();
+    assert!(profiler.profile_running());
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    world.console_command("profile stop".into()).await.unwrap();
+    assert!(!profiler.profile_running());
+
+    let report = profiler.timings().report_all(50.0);
+    let paths: Vec<&str> = report.rows.iter().map(|row| row.path.as_str()).collect();
+    assert!(paths.contains(&"region-tick"), "{paths:?}");
+    assert!(paths.contains(&"global-tick"), "{paths:?}");
+    assert!(paths.contains(&"global-tick/entity-tracking"), "{paths:?}");
+
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();

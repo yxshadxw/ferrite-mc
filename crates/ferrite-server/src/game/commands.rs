@@ -7,6 +7,9 @@ pub enum Action {
     Teleport([f64; 3]),
     Say(String),
     Tps,
+    Mspt,
+    ProfileStart,
+    ProfileStop,
     Stop,
 }
 #[derive(Clone)]
@@ -66,6 +69,17 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
             ),
     );
     tree.register(literal::<Source>("tps").executes(|ctx| send(ctx.source(), Action::Tps)));
+    tree.register(literal::<Source>("mspt").executes(|ctx| send(ctx.source(), Action::Mspt)));
+    tree.register(
+        literal::<Source>("profile")
+            .requires(|s| s.permission >= 2)
+            .then(
+                literal::<Source>("start").executes(|ctx| send(ctx.source(), Action::ProfileStart)),
+            )
+            .then(
+                literal::<Source>("stop").executes(|ctx| send(ctx.source(), Action::ProfileStop)),
+            ),
+    );
     tree.register(
         literal::<Source>("stop")
             .requires(|s| s.console && s.permission >= 4)
@@ -86,7 +100,13 @@ mod tests {
             console: false,
             actions: tx.clone(),
         };
-        assert!(tree.execute("gamemode survival", guest).is_err());
+        assert!(tree.execute("gamemode survival", guest.clone()).is_err());
+        assert!(tree.execute("profile start", guest.clone()).is_err());
+        tree.execute("tps", guest.clone()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Action::Tps));
+        tree.execute("mspt", guest).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Action::Mspt));
+
         let operator = Source {
             permission: 2,
             console: false,
@@ -94,10 +114,14 @@ mod tests {
         };
         tree.execute("gamemode survival", operator.clone()).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Action::GameMode(0)));
-        tree.execute("tp 12 70 -4", operator).unwrap();
+        tree.execute("tp 12 70 -4", operator.clone()).unwrap();
         assert!(matches!(
             rx.try_recv().unwrap(),
             Action::Teleport([12.0, 70.0, -4.0])
         ));
+        tree.execute("profile start", operator.clone()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Action::ProfileStart));
+        tree.execute("profile stop", operator).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Action::ProfileStop));
     }
 }

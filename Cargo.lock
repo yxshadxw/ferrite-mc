@@ -744,6 +744,7 @@ dependencies = [
  "ferrite-math",
  "ferrite-nbt",
  "ferrite-net",
+ "ferrite-profiler",
  "ferrite-protocol",
  "ferrite-region",
  "ferrite-world",

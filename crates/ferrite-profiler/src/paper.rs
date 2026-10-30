@@ -60,6 +60,47 @@ pub fn tps_line_colored(tps: &Tps) -> String {
     line
 }
 
+/// Folia-style per-region `/tps` line without formatting codes.
+///
+/// ```
+/// use ferrite_profiler::paper::region_tps_line;
+/// use ferrite_profiler::Tps;
+///
+/// assert_eq!(
+///     region_tps_line(3, &Tps::uniform(20.0)),
+///     "Region 3 TPS from last 5s, 1m, 5m: 20.0, 20.0, 20.0"
+/// );
+/// ```
+pub fn region_tps_line(region: u32, tps: &Tps) -> String {
+    format!(
+        "Region {region} TPS from last 5s, 1m, 5m: {:.1}, {:.1}, {:.1}",
+        tps.last_5s, tps.last_1m, tps.last_5m
+    )
+}
+
+/// Folia-style per-region `/tps` line with `§` color codes.
+///
+/// Values are colored like the global line: green at 18 TPS or more, yellow at
+/// 15 TPS and red below.
+pub fn region_tps_line_colored(region: u32, tps: &Tps) -> String {
+    let mut line = String::with_capacity(120);
+    line.push_str(LABEL);
+    line.push_str(&format!("Region {region} TPS from last 5s, 1m, 5m: "));
+    for (index, value) in [tps.last_5s, tps.last_1m, tps.last_5m]
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            line.push_str(MUTED);
+            line.push_str(", ");
+        }
+        line.push_str(tps_color(value));
+        line.push_str(&format!("{value:.1}"));
+    }
+    line.push_str(RESET);
+    line
+}
+
 /// One `/mspt` line without formatting codes.
 ///
 /// `window` is the human-readable window label, for example `10s` or `1m`.
@@ -193,6 +234,31 @@ mod tests {
         assert!(line.contains("§a20.0"), "{line}");
         assert!(line.contains("§e16.0"), "{line}");
         assert!(line.contains("§c10.0"), "{line}");
+        assert!(line.ends_with("§r"), "{line}");
+    }
+
+    #[test]
+    fn region_tps_line_shows_the_short_windows() {
+        let tps = Tps {
+            last_5s: 20.0,
+            last_1m: 18.0,
+            last_5m: 15.0,
+            last_15m: 12.0,
+        };
+        assert_eq!(
+            region_tps_line(7, &tps),
+            "Region 7 TPS from last 5s, 1m, 5m: 20.0, 18.0, 15.0"
+        );
+
+        let line = region_tps_line_colored(7, &tps);
+        assert!(
+            line.starts_with("§6Region 7 TPS from last 5s, 1m, 5m: "),
+            "{line}"
+        );
+        assert!(line.contains("§a20.0"), "{line}");
+        assert!(line.contains("§a18.0"), "{line}");
+        assert!(line.contains("§e15.0"), "{line}");
+        assert!(!line.contains("12.0"), "{line}");
         assert!(line.ends_with("§r"), "{line}");
     }
 
