@@ -137,12 +137,29 @@ async fn main() -> anyhow::Result<()> {
         .context("binding server listener")?;
     tracing::info!(address = %listener.local_addr()?, online_mode = config.online_mode, view_distance = config.view_distance, "Ferrite listener started");
 
+    let plugin_bridge =
+        ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
+            directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
+            bridge_jar: config.plugin_bridge.unwrap_or_else(|| {
+                "java/ferrite-api-impl/build/libs/ferrite-api-impl-all.jar".into()
+            }),
+            motd: config.motd.clone(),
+            max_players: u16::try_from(config.max_players).unwrap_or(u16::MAX),
+            port: listener.local_addr()?.port(),
+            view_distance: config.view_distance,
+            online_mode: config.online_mode,
+            whitelist: false,
+        })
+        .context("starting plugins")?;
     let settings = game::WorldSettings {
         gamemode: match config.gamemode {
             GameMode::Survival => 0,
             GameMode::Creative => 1,
         },
         ops,
+        plugins: plugin_bridge
+            .as_ref()
+            .map(ferrite_server::plugins::PluginBridge::hooks),
     };
     game::playerdata::init(
         config
@@ -159,20 +176,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         game::World::start_configured(None, [0, 65, 0], settings)
     };
-    let plugin_bridge =
-        ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
-            directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
-            bridge_jar: config.plugin_bridge.unwrap_or_else(|| {
-                "java/ferrite-api-impl/build/libs/ferrite-api-impl-all.jar".into()
-            }),
-            motd: config.motd.clone(),
-            max_players: u16::try_from(config.max_players).unwrap_or(u16::MAX),
-            port: listener.local_addr()?.port(),
-            view_distance: config.view_distance,
-            online_mode: config.online_mode,
-            whitelist: false,
-        })
-        .context("starting plugins")?;
     let mut server = tokio::spawn(ferrite_net::serve(
         listener,
         ferrite_net::ServerConfig {

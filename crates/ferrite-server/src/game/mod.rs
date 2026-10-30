@@ -56,10 +56,12 @@ pub struct Operator {
     pub uuid: Uuid,
     pub level: u8,
 }
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
     pub ops: Vec<Operator>,
+    /// Plugin event and command hooks; `None` when the server runs without plugins.
+    pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -74,6 +76,7 @@ impl Default for WorldSettings {
         Self {
             gamemode: 1,
             ops: Vec::new(),
+            plugins: None,
         }
     }
 }
@@ -232,6 +235,7 @@ async fn run(
         HashMap::new();
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
+    let mut names: HashMap<Uuid, String> = HashMap::new();
     let command_tree = commands::dispatcher();
     let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../vanilla/26.3/generated/reports");
@@ -277,9 +281,21 @@ async fn run(
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
            let mut player=Player{uuid,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
+           names.insert(uuid, name.clone());
+           if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
            let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {scheduler.schedule_global(move |g|g.chat(uuid,&text));}},
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {
+              let mut message = Some(text);
+              if let Some(plugins) = &settings.plugins {
+                  let name = names.get(&uuid).cloned().unwrap_or_default();
+                  match plugins.chat(uuid, &name, message.as_deref().unwrap_or_default()) {
+                      Ok(allowed) => message = allowed,
+                      Err(error) => tracing::warn!(%error, "chat event failed"),
+                  }
+              }
+              if let Some(text) = message { scheduler.schedule_global(move |g|g.chat(uuid,&text)); }
+          }},
           GameMessage::Input{session,uuid,packet:ServerboundPlay::Command(command)}=>{if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let (actions, mut received) = mpsc::unbounded_channel();
               let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
@@ -336,7 +352,10 @@ async fn run(
           },
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
-          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
+            let name = names.remove(&uuid).unwrap_or_default();
+            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_left(uuid, &name) { tracing::warn!(%error, "player quit event failed"); }
+            scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }}
         }
     }
@@ -463,6 +482,7 @@ fn operator_permissions_require_the_configured_uuid() {
             uuid: Uuid::from_u128(10),
             level: 3,
         }],
+        plugins: None,
     };
     assert_eq!(settings.permission(Uuid::from_u128(11)), 0);
     assert_eq!(settings.permission(Uuid::from_u128(10)), 3);

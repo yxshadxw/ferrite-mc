@@ -12,6 +12,7 @@ public final class Bootstrap {
     private Bootstrap() {}
     public static void start(String[] paths) { start(paths, null); }
     public static void start(String[] paths, boolean[] regionAware) {
+        Native.link();
         if (!"false".equals(System.getProperty("ferrite.native"))) java.util.logging.Logger.getLogger("").addHandler(new java.util.logging.Handler() {
             public void publish(java.util.logging.LogRecord record) { Native.log(record.getMessage()); }
             public void flush() {} public void close() {}
@@ -43,4 +44,45 @@ public final class Bootstrap {
     public static void runEntityTask(long id) { server.entitySchedulers.execute(id); }
     public static void runRegionTask(long id) { server.regionScheduler.execute(id); }
     public static void shutdown() { synchronized (LEGACY_LOCK) { server.getPluginManager().disablePlugins(); server.asyncScheduler.shutdown(); } }
+    /** Resolves the live player object, registering a snapshot when the server has none yet. */
+    private static org.bukkit.entity.Player ensurePlayer(String id, String name) {
+        var uuid = java.util.UUID.fromString(id);
+        var player = server.getPlayer(uuid);
+        if (player == null) { player = FerritePlayer.create(server, uuid, name, false, 20.0, 20, 1, null); server.registerPlayer(player); }
+        return player;
+    }
+    /** Fires Bukkit's {@code PlayerJoinEvent}. */
+    public static void firePlayerJoin(String id, String name) {
+        var player = ensurePlayer(id, name);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.player.PlayerJoinEvent(player, net.kyori.adventure.text.Component.empty())); }
+    }
+    /** Fires Bukkit's {@code PlayerQuitEvent} and forgets the disconnected player. */
+    public static void firePlayerQuit(String id) {
+        var player = server.getPlayer(java.util.UUID.fromString(id));
+        if (player == null) return;
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.player.PlayerQuitEvent(player, net.kyori.adventure.text.Component.empty(), org.bukkit.event.player.PlayerQuitEvent.QuitReason.DISCONNECTED)); }
+        server.unregisterPlayer(player.getUniqueId());
+    }
+    /** Fires Paper's {@code AsyncChatEvent} then Bukkit's {@code AsyncPlayerChatEvent}; null means cancelled. */
+    public static String fireChat(String id, String name, String message) {
+        var player = ensurePlayer(id, name);
+        String result = message;
+        synchronized (LEGACY_LOCK) {
+            if (server.plugins.hasListeners(io.papermc.paper.event.player.AsyncChatEvent.class)) {
+                java.util.Set<net.kyori.adventure.audience.Audience> viewers = new java.util.LinkedHashSet<>(server.getOnlinePlayers());
+                var text = net.kyori.adventure.text.Component.text(message);
+                var event = new io.papermc.paper.event.player.AsyncChatEvent(true, player, viewers, io.papermc.paper.chat.ChatRenderer.defaultRenderer(), text, text, null);
+                server.plugins.callEvent(event);
+                if (event.isCancelled()) return null;
+                result = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
+            }
+            if (server.plugins.hasListeners(org.bukkit.event.player.AsyncPlayerChatEvent.class)) {
+                var event = new org.bukkit.event.player.AsyncPlayerChatEvent(true, player, result, new java.util.LinkedHashSet<>(server.getOnlinePlayers()));
+                server.plugins.callEvent(event);
+                if (event.isCancelled()) return null;
+                result = event.getMessage();
+            }
+        }
+        return result;
+    }
 }

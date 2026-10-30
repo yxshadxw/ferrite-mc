@@ -40,6 +40,11 @@ public final class Native {
     static boolean worldSetBlock(String world, int x, int y, int z, String material) { return !enabled() || Bindings.worldSetBlock(world, x, y, z, material); }
     static void playerState(String player, int kind, double value) { if (enabled()) Bindings.playerState(player, kind, value); }
     static void playerMessage(String player, String message, boolean component) { if (enabled()) Bindings.playerMessage(player, message, component); }
+    private static volatile boolean linked;
+    /** Marks the native bridge as available; the host registers natives before Bootstrap.start. */
+    static void link() { linked = enabled(); }
+    static void eventRegistered(String type) { if (linked) Bindings.eventRegistered(type); }
+    static void eventsCleared() { if (linked) Bindings.eventsCleared(); }
     public static void log(String message) { if (enabled()) Bindings.log(message); else System.out.println(message); }
     public static void scheduleGlobal(long taskId, long delay) { if (enabled()) Bindings.scheduleGlobal(taskId, delay); else synchronized (fallbackGlobals) { fallbackGlobals.add(new FallbackGlobal(taskId, fallbackTick + Math.max(1, delay))); } }
     public static void scheduleRegion(long taskId, String world, int chunkX, int chunkZ, long delay, String plugin) { if (enabled()) Bindings.scheduleRegion(taskId, world, chunkX, chunkZ, delay, plugin); else synchronized (fallbackRegions) { fallbackRegions.add(new FallbackRegion(taskId, fallbackTick + Math.max(1, delay), world, chunkX, chunkZ)); } }
@@ -66,6 +71,8 @@ public final class Native {
         static native boolean worldSetBlock(String world, int x, int y, int z, String material);
         static native void playerState(String player, int kind, double value);
         static native void playerMessage(String player, String message, boolean component);
+        static native void eventRegistered(String type);
+        static native void eventsCleared();
         static native void scheduleGlobal(long taskId, long delay);
         static native void scheduleRegion(long taskId, String world, int chunkX, int chunkZ, long delay, String plugin);
         static native void scheduleEntity(long taskId, String entity, long delay, String plugin);

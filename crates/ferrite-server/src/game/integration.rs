@@ -403,6 +403,7 @@ async fn operator_teleport_command_moves_player() {
                 uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
                 level: 4,
             }],
+            plugins: None,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -638,6 +639,7 @@ async fn survival_break_requires_elapsed_ticks() {
         super::WorldSettings {
             gamemode: 0,
             ops: vec![],
+            plugins: None,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

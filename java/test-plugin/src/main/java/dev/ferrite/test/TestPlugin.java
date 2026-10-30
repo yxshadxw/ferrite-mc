@@ -9,6 +9,24 @@ public final class TestPlugin extends JavaPlugin implements Listener {
             java.nio.file.Files.writeString(new java.io.File(folder, name).toPath(), "ok");
         } catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
     }
+    private void appendEvent(String line) {
+        try {
+            var folder = new java.io.File(getDataFolder().getParentFile(), "TestPlugin");
+            java.nio.file.Files.createDirectories(folder.toPath());
+            java.nio.file.Files.writeString(new java.io.File(folder, "events.txt").toPath(), line + "\n", java.nio.charset.StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+    }
+    @EventHandler public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) { appendEvent("join " + event.getPlayer().getName()); }
+    @EventHandler public void onQuit(org.bukkit.event.player.PlayerQuitEvent event) { appendEvent("quit " + event.getPlayer().getName()); }
+    @EventHandler public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
+        String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
+        appendEvent("chat " + message);
+        if (message.startsWith("cancel")) event.setCancelled(true);
+    }
+    @EventHandler public void onLegacyChat(org.bukkit.event.player.AsyncPlayerChatEvent event) {
+        appendEvent("legacy-chat " + event.getMessage());
+        if (event.getMessage().startsWith("cancel")) event.setCancelled(true);
+    }
     @Override public void onEnable() {
         getLogger().info("FerriteTest enabled");
         getLogger().info("server name " + getServer().getName());
