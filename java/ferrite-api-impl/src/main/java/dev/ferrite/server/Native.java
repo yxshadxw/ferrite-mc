@@ -30,6 +30,16 @@ public final class Native {
         }
     }
     static boolean enabled() { return !"false".equals(System.getProperty("ferrite.native")); }
+    static boolean serverBan(String ip, String reason, long expires, String source, boolean ban) { return !enabled() || Bindings.serverBan(ip, reason, expires, source, ban); }
+    static boolean serverWhitelist(boolean enabled) { return !enabled() || Bindings.serverWhitelist(enabled); }
+    static boolean playerSound(String player, String world, String sound, int category, double x, double y, double z, float volume, float pitch, boolean seeded, long seed) { return !enabled() || Bindings.playerSound(player, world, sound, category, x, y, z, volume, pitch, seeded, seed); }
+    static boolean playerVisual(String player, int kind, String first, String second, int fade, int stay, int out) { return !enabled() || Bindings.playerVisual(player, kind, first, second, fade, stay, out); }
+    static boolean playerOperator(String player, boolean operator) { return !enabled() || Bindings.playerOperator(player, operator); }
+    static boolean playerInventory(String player, int slot, String material, int amount) { return !enabled() || Bindings.playerInventory(player, slot, material, amount); }
+    static boolean playerTeleport(String player, String world, double x, double y, double z, float yaw, float pitch) { return !enabled() || Bindings.playerTeleport(player, world, x, y, z, yaw, pitch); }
+    static boolean worldSetBlock(String world, int x, int y, int z, String material) { return !enabled() || Bindings.worldSetBlock(world, x, y, z, material); }
+    static void playerState(String player, int kind, double value) { if (enabled()) Bindings.playerState(player, kind, value); }
+    static void playerMessage(String player, String message, boolean component) { if (enabled()) Bindings.playerMessage(player, message, component); }
     public static void log(String message) { if (enabled()) Bindings.log(message); else System.out.println(message); }
     public static void scheduleGlobal(long taskId, long delay) { if (enabled()) Bindings.scheduleGlobal(taskId, delay); else synchronized (fallbackGlobals) { fallbackGlobals.add(new FallbackGlobal(taskId, fallbackTick + Math.max(1, delay))); } }
     public static void scheduleRegion(long taskId, String world, int chunkX, int chunkZ, long delay, String plugin) { if (enabled()) Bindings.scheduleRegion(taskId, world, chunkX, chunkZ, delay, plugin); else synchronized (fallbackRegions) { fallbackRegions.add(new FallbackRegion(taskId, fallbackTick + Math.max(1, delay), world, chunkX, chunkZ)); } }
@@ -46,6 +56,16 @@ public final class Native {
     }
     static final class Bindings {
         static native void log(String message);
+        static native boolean serverBan(String ip, String reason, long expires, String source, boolean ban);
+        static native boolean serverWhitelist(boolean enabled);
+        static native boolean playerSound(String player, String world, String sound, int category, double x, double y, double z, float volume, float pitch, boolean seeded, long seed);
+        static native boolean playerVisual(String player, int kind, String first, String second, int fade, int stay, int out);
+        static native boolean playerOperator(String player, boolean operator);
+        static native boolean playerInventory(String player, int slot, String material, int amount);
+        static native boolean playerTeleport(String player, String world, double x, double y, double z, float yaw, float pitch);
+        static native boolean worldSetBlock(String world, int x, int y, int z, String material);
+        static native void playerState(String player, int kind, double value);
+        static native void playerMessage(String player, String message, boolean component);
         static native void scheduleGlobal(long taskId, long delay);
         static native void scheduleRegion(long taskId, String world, int chunkX, int chunkZ, long delay, String plugin);
         static native void scheduleEntity(long taskId, String entity, long delay, String plugin);

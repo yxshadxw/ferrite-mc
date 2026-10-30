@@ -38,11 +38,11 @@ class BootstrapTest {
             output.write("name: PaperOnly\nversion: '1.0'\nmain: dev.ferrite.dependency.DependencyPlugin\napi-version: '26.3'\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
             output.closeEntry();
         }
-        var manager = (FerritePluginManager) new FerriteServer().getPluginManager();
+        var manager = new FerriteServer().plugins;
         manager.loadOrdered(new String[]{jar.toString()}, null);
         assertTrue(manager.isPluginEnabled("PaperOnly"));
         manager.disablePlugins();
-        var failing = (FerritePluginManager) new FerriteServer().getPluginManager();
+        var failing = new FerriteServer().plugins;
         assertThrows(IllegalStateException.class, () -> failing.loadOrdered(new String[]{jar.toString(), jar + ".missing"}, null));
         assertEquals(0, failing.getPlugins().length);
     }
@@ -56,10 +56,74 @@ class BootstrapTest {
         System.setProperty("ferrite.native", "false");
         Bootstrap.start(new String[]{System.getProperty("test.plugin.jar"), System.getProperty("test.dependency.jar"), System.getProperty("test.legacy.jar")});
         assertEquals("Ferrite", Bukkit.getServer().getName());
+        assertInstanceOf(org.bukkit.craftbukkit.CraftServer.class, Bukkit.getServer());
         assertNotNull(Bukkit.getServicesManager());
+        assertInstanceOf(org.bukkit.plugin.SimplePluginManager.class, Bukkit.getPluginManager());
+        var permission = new org.bukkit.permissions.Permission("ferrite.example", org.bukkit.permissions.PermissionDefault.TRUE);
+        Bukkit.getPluginManager().addPermission(permission);
+        assertSame(permission, Bukkit.getPluginManager().getPermission("FERRITE.EXAMPLE"));
+        assertTrue(Bukkit.getPluginManager().getDefaultPermissions(false).contains(permission));
+        Bukkit.getPluginManager().removePermission(permission);
+        assertNull(Bukkit.getPluginManager().getPermission("ferrite.example"));
+        assertTrue(Bukkit.getConsoleSender().equals(Bukkit.getConsoleSender()));
+        assertDoesNotThrow(() -> Bukkit.getConsoleSender().hashCode());
+        assertTrue(Bukkit.getOnlineMode());
+        Bukkit.banIP("192.0.2.1");
+        assertTrue(Bukkit.getIPBans().contains("192.0.2.1"));
+        assertTrue(Bukkit.getBanList(org.bukkit.BanList.Type.IP).isBanned("192.0.2.1"));
+        Bukkit.unbanIP("192.0.2.1");
+        assertFalse(Bukkit.getBanList(org.bukkit.BanList.Type.IP).isBanned("192.0.2.1"));
+        assertNotNull(Bukkit.getMessenger());
+        assertNotNull(Bukkit.getCommandMap());
+        var scoreboard = Bukkit.getScoreboardManager().getMainScoreboard();
+        var team = scoreboard.registerNewTeam("example");
+        team.addEntry("player");
+        assertSame(team, scoreboard.getEntryTeam("player"));
+        assertTrue(scoreboard.getEntries().contains("player"));
+        team.unregister();
+        assertNull(scoreboard.getTeam("example"));
+        assertNull(org.bukkit.Registry.MENU.get(org.bukkit.NamespacedKey.minecraft("not_a_menu")));
+        assertNotNull(org.bukkit.Registry.ATTRIBUTE.get(org.bukkit.NamespacedKey.minecraft("armor")));
+        assertNotNull(org.bukkit.Registry.SOUNDS.get(org.bukkit.NamespacedKey.minecraft("entity.player.levelup")));
+        assertNotNull(org.bukkit.Registry.BIOME.get(org.bukkit.NamespacedKey.minecraft("plains")));
+        assertNotNull(org.bukkit.Registry.ENTITY_TYPE.get(org.bukkit.NamespacedKey.minecraft("zombie")));
+        var sharpness = org.bukkit.Registry.ENCHANTMENT.get(org.bukkit.NamespacedKey.minecraft("sharpness"));
+        assertNotNull(sharpness);
+        assertSame(sharpness, io.papermc.paper.registry.RegistryAccess.registryAccess().getRegistry(io.papermc.paper.registry.RegistryKey.ENCHANTMENT).get(org.bukkit.NamespacedKey.minecraft("sharpness")));
+        assertNotNull(org.bukkit.Registry.MOB_EFFECT.get(org.bukkit.NamespacedKey.minecraft("speed")));
+        assertNull(org.bukkit.Registry.ATTRIBUTE.get(org.bukkit.NamespacedKey.minecraft("not_an_attribute")));
+        assertTrue(org.bukkit.Material.STONE.isBlock());
+        assertFalse(org.bukkit.Material.STONE.isAir());
+        assertTrue(org.bukkit.Material.AIR.isAir());
+        var inventory = Bukkit.createInventory(null, 9, "test");
+        assertEquals(9, inventory.getSize());
+        var item = new org.bukkit.inventory.ItemStack(org.bukkit.Material.STONE, 4);
+        var meta = item.getItemMeta();
+        meta.setDisplayName("Example");
+        meta.setLore(java.util.List.of("first"));
+        meta.setCustomModelData(12);
+        var key = new org.bukkit.NamespacedKey("ferrite", "example");
+        meta.getPersistentDataContainer().set(key, org.bukkit.persistence.PersistentDataType.STRING, "value");
+        assertTrue(item.setItemMeta(meta));
+        assertEquals("Example", item.getItemMeta().getDisplayName());
+        assertEquals(java.util.List.of("first"), item.getItemMeta().getLore());
+        assertEquals(12, item.getItemMeta().getCustomModelData());
+        assertEquals("value", item.getItemMeta().getPersistentDataContainer().get(key, org.bukkit.persistence.PersistentDataType.STRING));
+        inventory.setItem(0, item);
+        assertEquals(4, inventory.getItem(0).getAmount());
+        assertEquals(1, inventory.firstEmpty());
+        inventory.clear();
+        assertNull(inventory.getItem(0));
+        assertSame(Bukkit.getPluginCommand("ft"), Bukkit.getCommandMap().getCommand("ft"));
+        var dispatched = new java.util.concurrent.atomic.AtomicBoolean();
+        Bukkit.getCommandMap().register("probe", new org.bukkit.command.Command("plain") {
+            public boolean execute(org.bukkit.command.CommandSender sender, String label, String[] args) { dispatched.set(true); return true; }
+        });
+        assertTrue(Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "plain"));
+        assertTrue(dispatched.get());
         assertTrue(Bukkit.isPrimaryThread());
         assertTrue(Bukkit.getPluginManager().isPluginEnabled("FerriteTest"));
-        assertTrue(((FerritePluginManager) Bukkit.getPluginManager()).isLegacy(Bukkit.getPluginManager().getPlugin("FerriteLegacyTest")));
+        assertTrue(((FerriteServer) Bukkit.getServer()).plugins.isLegacy(Bukkit.getPluginManager().getPlugin("FerriteLegacyTest")));
         assertThrows(ClassNotFoundException.class, () -> Bukkit.getPluginManager().getPlugin("FerriteLegacyTest").getClass().getClassLoader().loadClass("dev.ferrite.dependency.Helper"));
         assertSame(Bukkit.getPluginManager().getPlugin("FerriteDependency"), Bukkit.getPluginManager().getPlugin("FerriteAlias"));
         var order = new ArrayList<String>();
@@ -103,6 +167,32 @@ class BootstrapTest {
         Bukkit.getAsyncScheduler().runNow(Bukkit.getPluginManager().getPlugin("FerriteTest"), task -> asyncRan.countDown());
         try { assertTrue(asyncRan.await(5, java.util.concurrent.TimeUnit.SECONDS)); } catch (InterruptedException e) { throw new AssertionError(e); }
         assertTrue(log.contains("FerriteTest event"));
+        UUID snapshotId = UUID.randomUUID();
+        Bootstrap.registerPlayer(snapshotId.toString(), "snapshot", true);
+        var snapshotPlayer = Bukkit.getPlayer(snapshotId);
+        assertInstanceOf(org.bukkit.craftbukkit.entity.CraftHumanEntity.class, snapshotPlayer);
+        assertEquals("snapshot", snapshotPlayer.getName());
+        assertTrue(snapshotPlayer.isOnline());
+        assertTrue(snapshotPlayer.isOp());
+        assertTrue(snapshotPlayer.hasPermission("ferrite.test"));
+        var shim = (org.bukkit.craftbukkit.entity.CraftHumanEntity) snapshotPlayer;
+        var oldPermissible = shim.perm;
+        try {
+            org.bukkit.craftbukkit.entity.CraftHumanEntity.class.getDeclaredField("perm").set(snapshotPlayer, new org.bukkit.permissions.PermissibleBase(snapshotPlayer) {
+                @Override public boolean hasPermission(String name) { return name.equals("injected.permission"); }
+            });
+        } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
+        assertTrue(snapshotPlayer.hasPermission("injected.permission"));
+        assertFalse(snapshotPlayer.hasPermission("ferrite.test"));
+        shim.perm = oldPermissible;
+        snapshotPlayer.setHealth(12.0);
+        assertEquals(12.0, snapshotPlayer.getHealth());
+        snapshotPlayer.setFoodLevel(8);
+        assertEquals(8, snapshotPlayer.getFoodLevel());
+        snapshotPlayer.setGameMode(org.bukkit.GameMode.CREATIVE);
+        assertEquals(org.bukkit.GameMode.CREATIVE, snapshotPlayer.getGameMode());
+        snapshotPlayer.getPersistentDataContainer().set(key, org.bukkit.persistence.PersistentDataType.STRING, "player-value");
+        assertEquals("player-value", snapshotPlayer.getPersistentDataContainer().get(key, org.bukkit.persistence.PersistentDataType.STRING));
         UUID playerId = UUID.randomUUID();
         org.bukkit.entity.Player player = (org.bukkit.entity.Player) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.entity.Player.class}, (proxy, method, args) -> {
             if (method.getName().equals("getUniqueId")) return playerId;
@@ -112,6 +202,34 @@ class BootstrapTest {
             throw new UnsupportedOperationException(method.getName());
         });
         ((FerriteServer) Bukkit.getServer()).registerPlayer(player);
+        var ferrite = (FerriteServer) Bukkit.getServer();
+        UUID worldId = UUID.randomUUID();
+        var world = (org.bukkit.World) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.World.class}, (proxy, method, args) -> {
+            if (method.getName().equals("getUID")) return worldId;
+            if (method.getName().equals("getName")) return "world";
+            throw new UnsupportedOperationException(method.getName());
+        });
+        ferrite.registerWorld(world);
+        assertSame(world, Bukkit.getWorld(worldId));
+        assertSame(world, Bukkit.getWorld("world"));
+        assertEquals(1, Bukkit.getWorlds().size());
+        assertSame(player, Bukkit.getOfflinePlayer(playerId));
+        UUID knownId = UUID.fromString("00000000-0000-0000-0000-00000000002c");
+        Bootstrap.registerOfflinePlayer(knownId.toString(), "KnownOffline", true);
+        var known = Bukkit.getOfflinePlayer("knownOFFLINE");
+        assertEquals(knownId, known.getUniqueId());
+        assertEquals("KnownOffline", known.getName());
+        assertTrue(known.isOp());
+        assertEquals(knownId, Bukkit.getOfflinePlayer(knownId).getUniqueId());
+        assertTrue(Bukkit.getOperators().contains(known));
+        var offline = Bukkit.getOfflinePlayer("Absent");
+        assertEquals("Absent", offline.getName());
+        assertFalse(offline.isOnline());
+        offline.setOp(true);
+        assertTrue(Bukkit.getOperators().contains(offline));
+        assertSame(player, Bukkit.getPlayerExact("PLAYER"));
+        assertSame(player, Bukkit.getPlayer("pla"));
+        assertNull(Bukkit.getPlayerExact("pla"));
         assertFalse(Bootstrap.dispatchCommand("unknown", "ferrite-test hello"));
         assertFalse(Native.dispatchCommand((org.bukkit.command.CommandSender) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.command.ConsoleCommandSender.class}, (proxy, method, args) -> null), "bridge-command"));
         Bootstrap.dispatchCommand(playerId.toString(), "ferrite-test hello");

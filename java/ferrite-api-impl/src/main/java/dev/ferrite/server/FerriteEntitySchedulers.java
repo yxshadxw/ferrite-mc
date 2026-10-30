@@ -54,6 +54,6 @@ final class FerriteEntitySchedulers {
             public ScheduledTask runAtFixedRate(Plugin p, Consumer<ScheduledTask> action, Runnable retired, long delay, long period) { if (period < 1) throw new IllegalArgumentException("period"); return schedule(p, action, retired, delay, period); }
         };
     }
-    void execute(long id) { Task task = tasks.get(id); if (task != null) { String previous = currentEntity.get(); currentEntity.set(task.entity); try { if (((FerritePluginManager) org.bukkit.Bukkit.getPluginManager()).isLegacy(task.plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { task.run(); } } else task.run(); } finally { if (previous == null) currentEntity.remove(); else currentEntity.set(previous); } } }
+    void execute(long id) { Task task = tasks.get(id); if (task != null) { String previous = currentEntity.get(); currentEntity.set(task.entity); try { if (((FerriteServer) org.bukkit.Bukkit.getServer()).plugins.isLegacy(task.plugin)) { synchronized (Bootstrap.LEGACY_LOCK) { task.run(); } } else task.run(); } finally { if (previous == null) currentEntity.remove(); else currentEntity.set(previous); } } }
     void cancelTasks(Plugin plugin) { tasks.values().stream().filter(t -> t.plugin == plugin).forEach(Task::cancel); }
 }
