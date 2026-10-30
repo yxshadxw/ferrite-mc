@@ -1,9 +1,8 @@
 //! Scheduled fluid simulation, based on `FlowingFluid.java#tick`, `#spread`,
-//! `#getSpread` and `#getSlopeDistance`. Partial collision faces use the
-//! approximation documented by `can_pass_through`.
+//! `#getSpread` and `#getSlopeDistance`.
 use crate::{
-    FluidKind, FluidState, FluidWorld, block_for, can_hold_fluid, can_pass_through, fluid_state,
-    get_new_liquid, tick_delay,
+    Direction, FluidKind, FluidState, FluidWorld, block_for, can_hold_fluid, can_pass_at,
+    fluid_state, get_new_liquid, tick_delay,
 };
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -24,6 +23,21 @@ fn offset(p: Position, d: Position) -> Option<Position> {
         p.1.checked_add(d.1)?,
         p.2.checked_add(d.2)?,
     ))
+}
+fn direction(from: Position, to: Position) -> Direction {
+    if to.0 < from.0 {
+        Direction::West
+    } else if to.0 > from.0 {
+        Direction::East
+    } else if to.1 < from.1 {
+        Direction::Down
+    } else if to.1 > from.1 {
+        Direction::Up
+    } else if to.2 < from.2 {
+        Direction::North
+    } else {
+        Direction::South
+    }
 }
 fn block(w: &impl FluidWorld, p: Position) -> u32 {
     w.block(p.0, p.1, p.2)
@@ -65,7 +79,12 @@ impl FluidTicks {
         }
         self.now = tick;
     }
-    fn changed(&mut self, world: &impl FluidWorld, pos: Position, kind: FluidKind) {
+    /// Notify the scheduler after a block placement, removal or neighbor change.
+    pub fn on_block_change(&mut self, world: &mut impl FluidWorld, pos: Position) {
+        let kind = fluid_state(block(world, pos)).kind;
+        self.changed(world, pos, kind);
+    }
+    fn changed(&mut self, world: &mut impl FluidWorld, pos: Position, kind: FluidKind) {
         let delay = u64::from(tick_delay(kind, world.ultrawarm()));
         if delay > 0 {
             self.schedule(pos, delay);
@@ -78,28 +97,28 @@ impl FluidTicks {
                 }
             }
         }
+        for n in std::iter::once(Some(pos))
+            .chain(NEIGHBORS.into_iter().map(|d| offset(pos, d)))
+            .flatten()
+        {
+            let f = fluid_state(block(world, n));
+            if f.kind == FluidKind::Lava {
+                self.lava_reaction(world, n, f);
+            }
+        }
     }
     fn put(&mut self, world: &mut impl FluidWorld, pos: Position, state: FluidState) {
         let old = block(world, pos);
-        // Preserve waterloggable blocks instead of replacing them with water.
+        // `SimpleWaterloggedBlock.placeLiquid` accepts source water only.
         let new = if state.kind == FluidKind::Water && fluid_state(old).kind == FluidKind::Empty {
-            u16::try_from(old)
-                .ok()
-                .and_then(ferrite_data::blocks::state)
-                .and_then(|(name, properties)| {
-                    if !properties
-                        .iter()
-                        .any(|&(k, v)| k == "waterlogged" && v == "false")
-                    {
-                        return None;
-                    }
-                    let properties: Vec<_> = properties
-                        .iter()
-                        .map(|&(k, v)| (k, if k == "waterlogged" { "true" } else { v }))
-                        .collect();
-                    ferrite_data::blocks::state_id(name, &properties).map(u32::from)
-                })
-                .unwrap_or_else(|| block_for(state))
+            if let Some(wet) = crate::waterlogged_variant(old, true) {
+                if !state.source {
+                    return;
+                }
+                wet
+            } else {
+                block_for(state)
+            }
         } else {
             block_for(state)
         };
@@ -113,8 +132,19 @@ impl FluidTicks {
         if current.kind == FluidKind::Empty {
             return;
         }
+        // `LiquidBlock.java#shouldSpreadLiquid` reacts on the lava block.
+        if current.kind == FluidKind::Lava && self.lava_reaction(world, pos, current) {
+            return;
+        }
         if !current.source {
-            let next = get_new_liquid(world, pos.0, pos.1, pos.2, current.kind, false);
+            let next = get_new_liquid(
+                world,
+                pos.0,
+                pos.1,
+                pos.2,
+                current.kind,
+                world.lava_conversion(),
+            );
             if next != current {
                 self.put(world, pos, next);
                 current = next;
@@ -126,9 +156,38 @@ impl FluidTicks {
         let Some(down) = offset(pos, (0, -1, 0)) else {
             return;
         };
+        // `LavaFluid.java#spreadTo` creates stone when flowing downward into
+        // a standalone water block (waterlogged containers are not replaced).
+        if current.kind == FluidKind::Lava
+            && fluid_state(block(world, down)).kind == FluidKind::Water
+            && can_pass_at(world, pos, down, Direction::Down)
+        {
+            let target = block(world, down);
+            let standalone = u16::try_from(target)
+                .ok()
+                .and_then(ferrite_data::blocks::state)
+                .is_some_and(|(name, _)| name == "minecraft:water" || name == "water");
+            if standalone {
+                world.set_block(
+                    down.0,
+                    down.1,
+                    down.2,
+                    u32::from(ferrite_data::blocks::default_state("stone").unwrap()),
+                );
+                self.changed(world, down, FluidKind::Empty);
+            }
+            return;
+        }
         let mut spread_down = false;
         if self.can_enter(world, pos, down, current.kind) {
-            let next = get_new_liquid(world, down.0, down.1, down.2, current.kind, false);
+            let next = get_new_liquid(
+                world,
+                down.0,
+                down.1,
+                down.2,
+                current.kind,
+                world.lava_conversion(),
+            );
             if next.kind != FluidKind::Empty {
                 self.put(world, down, next);
                 spread_down = true;
@@ -183,11 +242,49 @@ impl FluidTicks {
             }
         }
         for n in choices {
-            let next = get_new_liquid(world, n.0, n.1, n.2, current.kind, false);
+            let next = get_new_liquid(world, n.0, n.1, n.2, current.kind, world.lava_conversion());
             if next.kind != FluidKind::Empty {
                 self.put(world, n, next);
             }
         }
+    }
+    fn lava_reaction(
+        &mut self,
+        w: &mut impl FluidWorld,
+        pos: Position,
+        current: FluidState,
+    ) -> bool {
+        let soul = offset(pos, (0, -1, 0)).is_some_and(|p| {
+            block(w, p) == u32::from(ferrite_data::blocks::default_state("soul_soil").unwrap())
+        });
+        for d in [(0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)] {
+            let Some(n) = offset(pos, d) else { continue };
+            let neighbor = block(w, n);
+            let result = if fluid_state(neighbor).kind == FluidKind::Water {
+                Some(if current.source {
+                    "obsidian"
+                } else {
+                    "cobblestone"
+                })
+            } else if soul
+                && neighbor == u32::from(ferrite_data::blocks::default_state("blue_ice").unwrap())
+            {
+                Some("basalt")
+            } else {
+                None
+            };
+            if let Some(result) = result {
+                w.set_block(
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    u32::from(ferrite_data::blocks::default_state(result).unwrap()),
+                );
+                self.changed(w, pos, FluidKind::Empty);
+                return true;
+            }
+        }
+        false
     }
     fn can_enter(
         &self,
@@ -199,7 +296,7 @@ impl FluidTicks {
         let target = block(w, to);
         fluid_state(target).kind == FluidKind::Empty
             && can_hold_fluid(target, kind)
-            && can_pass_through(block(w, from), target)
+            && can_pass_at(w, from, to, direction(from, to))
     }
     fn can_explore(
         &self,
@@ -212,14 +309,14 @@ impl FluidTicks {
         let fluid = fluid_state(target);
         (fluid.kind == FluidKind::Empty || (fluid.kind == kind && !fluid.source))
             && can_hold_fluid(target, kind)
-            && can_pass_through(block(w, from), target)
+            && can_pass_at(w, from, to, direction(from, to))
     }
     fn hole(&self, w: &impl FluidWorld, pos: Position, kind: FluidKind) -> bool {
         let Some(below) = offset(pos, (0, -1, 0)) else {
             return false;
         };
         let target = block(w, below);
-        can_pass_through(block(w, pos), target)
+        can_pass_at(w, pos, below, Direction::Down)
             && (fluid_state(target).kind == kind || can_hold_fluid(target, kind))
     }
     fn slope(
