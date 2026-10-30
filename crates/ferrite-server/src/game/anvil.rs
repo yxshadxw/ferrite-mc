@@ -174,6 +174,40 @@ impl AnvilChunkSource {
         })?;
         Some(f(&column.chunk))
     }
+    pub(super) fn brightness(&self, x: i32, y: i32, z: i32) -> Option<u8> {
+        let cache = self.cache.lock().unwrap();
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        let light = if let Some(d) = cache.dirty.get(&key) {
+            &d.light
+        } else {
+            &cache
+                .entries
+                .iter()
+                .find_map(|(&(cx, cz, _), entry)| {
+                    if (cx, cz) == key
+                        && let Entry::Ready(Ok(column), _) = entry
+                    {
+                        return Some(column);
+                    }
+                    None
+                })?
+                .light
+        };
+        let section = usize::try_from(y.div_euclid(16) + 5).ok()?;
+        let index = (y.rem_euclid(16) as usize * 256)
+            + (z.rem_euclid(16) as usize * 16)
+            + x.rem_euclid(16) as usize;
+        let read = |sections: &[LightSection]| match sections.get(section) {
+            Some(LightSection::Data(data)) => Some((data[index / 2] >> ((index % 2) * 4)) & 15),
+            Some(LightSection::Empty) => Some(0),
+            _ => None,
+        };
+        Some(
+            read(&light.sky)
+                .unwrap_or(0)
+                .max(read(&light.block).unwrap_or(0)),
+        )
+    }
     pub fn block(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         let key = (x.div_euclid(16), z.div_euclid(16));
         let cache = self.cache.lock().unwrap();
