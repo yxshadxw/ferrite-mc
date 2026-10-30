@@ -77,6 +77,7 @@ pub struct World {
     task: tokio::task::JoinHandle<()>,
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
+    source: Arc<anvil::AnvilChunkSource>,
 }
 impl World {
     pub fn start() -> Self {
@@ -87,6 +88,10 @@ impl World {
     pub fn profiler(&self) -> Arc<profile::Profiler> {
         Arc::clone(&self.profiler)
     }
+    /// Chunk packet cache counters (encodes, hit rate) for this world.
+    pub fn cache_stats(&self) -> anvil::CacheStats {
+        self.source.cache_stats()
+    }
     pub fn start_with(source: Option<Arc<anvil::AnvilChunkSource>>, spawn: [i32; 3]) -> Self {
         Self::start_configured(source, spawn, WorldSettings::default())
     }
@@ -96,7 +101,7 @@ impl World {
         settings: WorldSettings,
     ) -> Self {
         let flat = source.is_none();
-        let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
+        let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
         let (sender, rx) = mpsc::unbounded_channel();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
@@ -107,7 +112,7 @@ impl World {
         let task = tokio::spawn(run(
             rx,
             sender.clone(),
-            source,
+            Some(Arc::clone(&source)),
             flat,
             spawn,
             metrics,
@@ -118,6 +123,7 @@ impl World {
             task,
             tick_samples,
             profiler,
+            source,
         }
     }
     pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {

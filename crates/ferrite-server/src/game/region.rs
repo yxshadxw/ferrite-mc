@@ -187,7 +187,7 @@ impl Player {
         // and spawns background loads for the rest. Without this, chunks became ready one per tick.
         if let Some(source) = &self.source {
             for &(x, z) in self.queue.iter().take(PREFETCH_CHUNKS) {
-                let _ = source.get(x, z, self.biome);
+                source.prefetch(x, z, self.biome);
             }
         }
         let mut tracking = self.tracking.lock().unwrap();
@@ -200,7 +200,9 @@ impl Player {
             let packet = if let Some(source) = &self.source {
                 match source.get(x, z, self.biome) {
                     None => break,
-                    Some(Ok(packet)) => packet,
+                    // The cache shares one encoded body; the connection layer
+                    // needs an owned buffer, so this is the only copy per send.
+                    Some(Ok(packet)) => packet.to_vec(),
                     Some(Err(error)) => {
                         tracing::error!(x, z, %error, "failed to load chunk");
                         let _ = self
