@@ -33,6 +33,7 @@ mod biome;
 mod biome_source;
 mod density;
 mod dimension;
+mod evaluator;
 mod id;
 mod loader;
 mod material;
@@ -56,6 +57,7 @@ pub use dimension::{
     BiomeSource, Dimension, DimensionType, FlatLayer, FlatSettings, IntProvider, WorldGenerator,
     WorldPreset,
 };
+pub use evaluator::FunctionContext;
 pub use id::{InvalidResourceId, ResourceId};
 pub use loader::LoadError;
 pub use material::{
