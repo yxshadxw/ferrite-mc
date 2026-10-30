@@ -10,6 +10,10 @@ pub trait FluidWorld {
     fn block(&self, x: i32, y: i32, z: i32) -> u32;
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32);
     fn ultrawarm(&self) -> bool;
+    /// Whether the lava source conversion game rule is enabled.
+    fn lava_conversion(&self) -> bool {
+        false
+    }
     /// Collision boxes in block-local coordinates; override for dynamic shapes.
     fn collision_shape(&self, x: i32, y: i32, z: i32) -> Vec<[f64; 6]> {
         u16::try_from(self.block(x, y, z))
@@ -336,3 +340,64 @@ pub fn get_new_liquid(
 
 mod tick;
 pub use tick::{FluidTicks, Position};
+
+/// Emulates `SimpleWaterloggedBlock.placeLiquid` and a water bucket for
+/// standalone replaceable blocks. Returns whether a block was changed.
+pub fn place_water(world: &mut impl FluidWorld, pos: Position) -> bool {
+    let old = world.block(pos.0, pos.1, pos.2);
+    if fluid_state(old).kind != FluidKind::Empty {
+        return false;
+    }
+    if let Some(new) = waterlogged_variant(old, true) {
+        world.set_block(pos.0, pos.1, pos.2, new);
+        return true;
+    }
+    if props(old).is_some_and(|p| p.replaceable) {
+        world.set_block(
+            pos.0,
+            pos.1,
+            pos.2,
+            u32::from(blocks::default_state("water").unwrap()),
+        );
+        return true;
+    }
+    false
+}
+/// Emulates source water `BucketPickup` for liquid blocks and waterlogged blocks.
+pub fn pickup_water(world: &mut impl FluidWorld, pos: Position) -> bool {
+    let old = world.block(pos.0, pos.1, pos.2);
+    let fluid = fluid_state(old);
+    if fluid.kind != FluidKind::Water || !fluid.source {
+        return false;
+    }
+    let new = waterlogged_variant(old, false).or_else(|| {
+        u16::try_from(old)
+            .ok()
+            .and_then(blocks::state)
+            .and_then(|(name, _)| {
+                (name == "minecraft:water" || name == "water")
+                    .then(|| u32::from(blocks::default_state("air").unwrap()))
+            })
+    });
+    if let Some(new) = new {
+        world.set_block(pos.0, pos.1, pos.2, new);
+        true
+    } else {
+        false
+    }
+}
+fn waterlogged_variant(state: u32, wet: bool) -> Option<u32> {
+    let (name, properties) = u16::try_from(state).ok().and_then(blocks::state)?;
+    let desired = if wet { "true" } else { "false" };
+    if !properties
+        .iter()
+        .any(|&(k, v)| k == "waterlogged" && v != desired)
+    {
+        return None;
+    }
+    let properties: Vec<_> = properties
+        .iter()
+        .map(|&(k, v)| (k, if k == "waterlogged" { desired } else { v }))
+        .collect();
+    blocks::state_id(name, &properties).map(u32::from)
+}
