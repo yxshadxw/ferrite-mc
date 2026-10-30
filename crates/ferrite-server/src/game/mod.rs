@@ -367,17 +367,22 @@ async fn run(
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
-          GameMessage::Joined{session,uuid,name,properties,dimension_type,biome,view_distance,online_mode,secure_chat,chat_type,chat_visibility,max_players,outbound}=>{
+          GameMessage::Joined{session,uuid,name,properties,address,dimension_type,biome,view_distance,online_mode,secure_chat,chat_type,chat_visibility,max_players,outbound}=>{
            if let Some((_, mailbox, old)) = mailboxes.get(&uuid) {
              let _ = old.send(Outbound::Disconnect("You logged in from another location".into()));
              mailbox.lock().unwrap().push_back(Command::Leave);
-             if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, dimension_type, biome, view_distance, online_mode, secure_chat, chat_type, chat_visibility, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
+             if let Some(GameMessage::Joined { outbound: displaced, .. }) = pending.insert(uuid, GameMessage::Joined { session, uuid, name, properties, address, dimension_type, biome, view_distance, online_mode, secure_chat, chat_type, chat_visibility, max_players, outbound }) { let _ = displaced.send(Outbound::Disconnect("You logged in from another location".into())); }
              continue;
            }
            // Vanilla checks bans before the whitelist (`PlayerList.canPlayerLogin`).
            if let Some(ban) = admin.as_ref().and_then(|lists| lists.bans.player_ban(uuid)) {
              // `multiplayer.disconnect.banned.reason`.
              let _ = outbound.send(Outbound::Disconnect(format!("You are banned from this server!\nReason: {}", ban.reason)));
+             continue;
+           }
+           if let Some(ip) = address && let Some(ban) = admin.as_ref().and_then(|lists| lists.bans.ip_ban(&ip.to_string())) {
+             // `multiplayer.disconnect.banned_ip.reason`.
+             let _ = outbound.send(Outbound::Disconnect(format!("Your IP address is banned from this server!\nReason: {}", ban.reason)));
              continue;
            }
            if whitelist_enabled && let Some(lists) = &admin && !lists.whitelist.contains(uuid) {

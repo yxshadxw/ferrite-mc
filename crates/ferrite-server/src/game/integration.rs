@@ -1009,6 +1009,50 @@ async fn banned_player_is_disconnected_before_play() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ip_banned_player_is_disconnected_before_play() {
+    use ferrite_admin::AdminLists;
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-ban-ip-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    lists.bans.ban_ip("127.0.0.1", "proxies", "Server", None);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::begin_join(addr, "Bob").await;
+    let body = bot.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        disconnect.reason.0,
+        "Your IP address is banned from this server!\nReason: proxies"
+    );
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bot_break_is_saved_on_shutdown() {
     use ferrite_protocol::{
         packets::play::{MoveRotation, PlayerAction},
