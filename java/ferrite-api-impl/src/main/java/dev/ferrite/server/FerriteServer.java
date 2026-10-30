@@ -37,11 +37,19 @@ public class FerriteServer extends ServerStubs {
     @Override public org.bukkit.plugin.messaging.Messenger getMessenger() { return messenger; }
     @Override public java.util.Set<String> getListeningPluginChannels() { return messenger.getIncomingChannels(); }
     private final java.util.concurrent.ConcurrentMap<java.util.UUID, org.bukkit.OfflinePlayer> offlinePlayers = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<java.util.UUID, String> offlineNames = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<String, java.util.UUID> offlineIds = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Set<java.util.UUID> operators = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Remember a player seen while offline so plugins can resolve its name and id. */
+    public void registerOfflinePlayer(java.util.UUID id, String name, boolean operator) {
+        java.util.Objects.requireNonNull(id, "id");
+        if (name != null) { offlineNames.put(id, name); offlineIds.put(name.toLowerCase(java.util.Locale.ROOT), id); }
+        if (operator) operators.add(id); else operators.remove(id);
+    }
     private org.bukkit.OfflinePlayer offline(java.util.UUID id, String name) {
         return offlinePlayers.computeIfAbsent(id, key -> (org.bukkit.OfflinePlayer) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.OfflinePlayer.class}, (proxy, method, args) -> switch (method.getName()) {
             case "getUniqueId" -> key;
-            case "getName" -> name;
+            case "getName" -> offlineNames.getOrDefault(key, name);
             case "getPlayer" -> players.get(key);
             case "isOnline" -> players.containsKey(key);
             case "isOp" -> operators.contains(key);
@@ -52,11 +60,13 @@ public class FerriteServer extends ServerStubs {
             default -> throw new UnsupportedOperationException("Ferrite: not implemented: OfflinePlayer#" + method.getName());
         }));
     }
-    @Override public org.bukkit.OfflinePlayer getOfflinePlayer(java.util.UUID id) { var player = players.get(id); return player != null ? player : offline(id, null); }
+    @Override public org.bukkit.OfflinePlayer getOfflinePlayer(java.util.UUID id) { var player = players.get(id); return player != null ? player : offline(id, offlineNames.get(id)); }
     @Override public org.bukkit.OfflinePlayer getOfflinePlayer(String name) {
         java.util.Objects.requireNonNull(name, "name");
         var player = getPlayerExact(name);
         if (player != null) return player;
+        var known = offlineIds.get(name.toLowerCase(java.util.Locale.ROOT));
+        if (known != null) return offline(known, name);
         return offline(java.util.UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(java.nio.charset.StandardCharsets.UTF_8)), name);
     }
     @Override public java.util.Set<org.bukkit.OfflinePlayer> getOperators() {

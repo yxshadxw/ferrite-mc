@@ -214,6 +214,14 @@ class BootstrapTest {
         assertSame(world, Bukkit.getWorld("world"));
         assertEquals(1, Bukkit.getWorlds().size());
         assertSame(player, Bukkit.getOfflinePlayer(playerId));
+        UUID knownId = UUID.fromString("00000000-0000-0000-0000-00000000002c");
+        Bootstrap.registerOfflinePlayer(knownId.toString(), "KnownOffline", true);
+        var known = Bukkit.getOfflinePlayer("knownOFFLINE");
+        assertEquals(knownId, known.getUniqueId());
+        assertEquals("KnownOffline", known.getName());
+        assertTrue(known.isOp());
+        assertEquals(knownId, Bukkit.getOfflinePlayer(knownId).getUniqueId());
+        assertTrue(Bukkit.getOperators().contains(known));
         var offline = Bukkit.getOfflinePlayer("Absent");
         assertEquals("Absent", offline.getName());
         assertFalse(offline.isOnline());

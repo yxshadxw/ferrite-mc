@@ -145,6 +145,12 @@ fn plugin_lifecycle() {
         operator: true,
     })
     .unwrap();
+    host.register_offline_player(&OfflinePlayerSnapshot {
+        id: uuid::Uuid::from_u128(45),
+        name: None,
+        operator: false,
+    })
+    .unwrap();
     let player_id = uuid::Uuid::new_v4();
     host.register_player(&PlayerSnapshot {
         id: player_id,
@@ -175,6 +181,11 @@ fn plugin_lifecycle() {
         host.logs()
             .iter()
             .any(|line| line.contains("player snapshot 16.0 14 CREATIVE"))
+    );
+    assert!(
+        host.logs()
+            .iter()
+            .any(|line| line.contains("offline snapshot true"))
     );
     assert!(
         host.logs()

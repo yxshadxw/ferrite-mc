@@ -94,6 +94,13 @@ pub struct PlayerSnapshot {
     pub location: PlayerLocation,
     pub inventory: Vec<Option<ItemSnapshot>>,
 }
+/// A player the server knows but that is not connected.
+#[derive(Clone, Debug)]
+pub struct OfflinePlayerSnapshot {
+    pub id: uuid::Uuid,
+    pub name: Option<String>,
+    pub operator: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageContent {
     Plain(String),
@@ -245,6 +252,8 @@ pub enum Error {
     MissingRegionContext,
     #[error("invalid player snapshot")]
     InvalidPlayerSnapshot,
+    #[error("invalid offline player snapshot")]
+    InvalidOfflinePlayerSnapshot,
 }
 pub enum CommandSender {
     Console,
@@ -1083,6 +1092,31 @@ impl PluginHost {
                     )?;
                 }
             }
+            Ok(())
+        })?;
+        Ok(())
+    }
+    /// Publish a known offline player for name and operator lookups.
+    pub fn register_offline_player(&self, player: &OfflinePlayerSnapshot) -> Result<(), Error> {
+        if player.name.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::InvalidOfflinePlayerSnapshot);
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(player.id.to_string())?;
+            let name = match &player.name {
+                Some(name) => env.new_string(name)?,
+                None => JString::from(JObject::null()),
+            };
+            env.call_static_method(
+                BOOTSTRAP,
+                "registerOfflinePlayer",
+                "(Ljava/lang/String;Ljava/lang/String;Z)V",
+                &[
+                    JValue::Object(id.as_ref()),
+                    JValue::Object(name.as_ref()),
+                    JValue::Bool(u8::from(player.operator)),
+                ],
+            )?;
             Ok(())
         })?;
         Ok(())

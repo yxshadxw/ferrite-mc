@@ -27,6 +27,7 @@ public final class Bootstrap {
     public static void registerPlayer(String id, String name, boolean operator) { registerPlayer(id, name, operator, 20.0, 20, 0, null, 0, 0, 0, 0, 0); }
     public static void registerPlayer(String id, String name, boolean operator, double health, int food, int mode, String world, double x, double y, double z, float yaw, float pitch) { var location = world == null ? null : new org.bukkit.Location(java.util.Objects.requireNonNull(server.getWorld(java.util.UUID.fromString(world))), x, y, z, yaw, pitch); server.registerPlayer(FerritePlayer.create(server, java.util.UUID.fromString(id), name, operator, health, food, mode, location)); }
     public static void setInventorySnapshot(String player, int slot, String material, int amount) { ((FerritePlayer) java.util.Objects.requireNonNull(server.getPlayer(java.util.UUID.fromString(player)))).inventorySnapshot(slot, material, amount); }
+    public static void registerOfflinePlayer(String id, String name, boolean operator) { server.registerOfflinePlayer(java.util.UUID.fromString(id), name, operator); }
     public static boolean isPluginEnabled(String name) { return server.getPluginManager().isPluginEnabled(name); }
     public static boolean dispatchCommand(String sender, String line) {
         org.bukkit.command.CommandSender resolved;

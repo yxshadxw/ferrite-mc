@@ -73,6 +73,13 @@ fn compat_probe() {
 fn compatibility_report() {
     let root = root();
     let fixtures = root.join("plugins-test");
+    // Keep the checked-in report when no fixture is available to probe.
+    if !["Vault", "LuckPerms", "EssentialsX", "PlaceholderAPI"]
+        .iter()
+        .any(|name| fixtures.join(format!("{name}.jar")).exists())
+    {
+        return;
+    }
     let mut report = String::from(
         "# Plugin compatibility report\n\nEach plugin is tested alone in an isolated process with a basic console command; optional integrations are not exercised.\n\n",
     );
