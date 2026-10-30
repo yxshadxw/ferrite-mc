@@ -116,6 +116,7 @@ def capture(port, seconds, name):
     records = []  # (phase, full frame incl. id)
     phase = "login"
     deadline = None
+    sent_chat = False
     names = {s: {v["protocol_id"]: k for k, v in PACKETS[s]["clientbound"].items()} for s in PACKETS if "clientbound" in PACKETS[s]}
     while True:
         if deadline and time.time() > deadline:
@@ -160,6 +161,16 @@ def capture(port, seconds, name):
                 yaw, pitch = struct.unpack(">ff", rest[48:56])
                 c.send(pid("play", "serverbound", "minecraft:accept_teleportation"),
                        varint(tid) + struct.pack(">dddff", x, y, z, yaw, pitch))
+                if not sent_chat:
+                    # Unsigned chat (offline path): no signature, empty last-seen update.
+                    sent_chat = True
+                    c.send(pid("play", "serverbound", "minecraft:chat"),
+                           string("wirecheck chat")
+                           + struct.pack(">qq", int(time.time() * 1000), 0)
+                           + b"\x00"              # no signature
+                           + b"\x00"              # last-seen offset 0
+                           + b"\x00\x00\x00"      # 20 acknowledged bits
+                           + b"\x00")             # checksum
     return records, names
 
 

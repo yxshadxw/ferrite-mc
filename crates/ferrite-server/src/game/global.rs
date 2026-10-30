@@ -1,3 +1,4 @@
+use super::chat::PlayerChatState;
 use ferrite_net::game::{Outbound, packet};
 use ferrite_protocol::{
     VarInt,
@@ -19,14 +20,23 @@ pub struct GlobalPlayer {
     pub yaw: f32,
     pub pitch: f32,
     pub ground: bool,
+    /// Client `chat_mode`: 0 shown, 1 commands only, 2 hidden.
+    pub chat_visibility: u8,
+    /// Registry id of `minecraft:chat` used to decorate broadcast messages.
+    pub chat_type: i32,
+    pub chat: PlayerChatState,
 }
 impl GlobalPlayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         uuid: Uuid,
         entity: i32,
         name: String,
         properties: Vec<Property>,
         outbound: UnboundedSender<Outbound>,
+        secure_chat: bool,
+        chat_type: i32,
+        chat_visibility: u8,
     ) -> Self {
         Self {
             uuid,
@@ -39,6 +49,9 @@ impl GlobalPlayer {
             yaw: 0.0,
             pitch: 0.0,
             ground: true,
+            chat_visibility,
+            chat_type,
+            chat: PlayerChatState::new(secure_chat),
         }
     }
     fn info(&self) -> PlayerInfo {
@@ -46,9 +59,33 @@ impl GlobalPlayer {
             uuid: self.uuid,
             name: self.name.clone(),
             properties: self.properties.clone(),
+            chat_session: self.chat.session_data().cloned(),
             game_mode: VarInt(self.game_mode),
         }
     }
+}
+fn tell(player: &GlobalPlayer, text: &str) {
+    send(
+        player,
+        &SystemChat {
+            content: PlainText(text.into()),
+            overlay: false,
+        },
+    );
+}
+fn kick(player: &GlobalPlayer, reason: &str) {
+    let _ = player.outbound.send(Outbound::Disconnect(reason.into()));
+}
+/// Vanilla `StringUtil.isAllowedChatCharacter`: control characters and `§` are illegal.
+fn is_illegal_chat(message: &str) -> bool {
+    message
+        .chars()
+        .any(|c| c == '\u{a7}' || (c as u32) < 0x20 || c as u32 == 0x7f)
+}
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 #[derive(Default)]
 pub struct GlobalRegion {
@@ -94,9 +131,111 @@ impl GlobalRegion {
     pub fn say(&self, message: &str) {
         self.broadcast(message);
     }
-    pub fn chat(&mut self, id: Uuid, msg: &str) {
-        if let Some(p) = self.players.get(&id) {
-            self.broadcast(&format!("<{}> {}", p.name, msg));
+    /// Registers or replaces a player's chat session and tells every client about it, so they
+    /// can verify that player's message signatures (`INITIALIZE_CHAT`).
+    pub fn chat_session(&mut self, id: Uuid, data: RemoteChatSessionData) {
+        let Some(player) = self.players.get_mut(&id) else {
+            return;
+        };
+        match player.chat.update_session(id, data.clone()) {
+            Ok(true) => {
+                let update = PlayerInfoChatSession {
+                    uuid: id,
+                    chat_session: Some(data),
+                };
+                for other in self.players.values() {
+                    send(other, &update);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => kick(player, error.disconnect_reason()),
+        }
+    }
+    /// Applies a client's acknowledgement offset (`chat_ack`).
+    pub fn chat_ack(&mut self, id: Uuid, offset: i32) {
+        let Some(player) = self.players.get_mut(&id) else {
+            return;
+        };
+        if let Err(error) = player.chat.apply_ack(offset) {
+            tracing::error!(%id, %error, "invalid chat acknowledgement offset");
+            kick(player, "Chat message validation failed");
+        }
+    }
+    /// Applies the last-seen update carried by a signed chat command. The command's own signed
+    /// arguments are not verified yet, but the acknowledgement state must stay in sync.
+    pub fn apply_chat_update(&mut self, id: Uuid, update: &LastSeenUpdate) {
+        let Some(player) = self.players.get_mut(&id) else {
+            return;
+        };
+        if let Err(error) = player.chat.unpack_last_seen(update) {
+            tracing::error!(%id, %error, "invalid chat last-seen update");
+            kick(player, "Chat message validation failed");
+        }
+    }
+    /// Validates a `serverbound_chat` message and broadcasts it as `player_chat`.
+    pub fn chat(&mut self, id: Uuid, packet: &ServerboundChat) {
+        let Some(player) = self.players.get_mut(&id) else {
+            return;
+        };
+        // Vanilla `tryHandleChat`: hidden chat is rejected before the signature is even checked.
+        if player.chat_visibility == 2 {
+            tell(player, "Chat is disabled in your client settings");
+            return;
+        }
+        if is_illegal_chat(&packet.message) {
+            kick(player, "Illegal characters in chat");
+            return;
+        }
+        let last_seen = match player.chat.unpack_last_seen(&packet.last_seen) {
+            Ok(last_seen) => last_seen,
+            Err(error) => {
+                tracing::error!(%id, %error, "invalid chat last-seen update");
+                kick(player, "Chat message validation failed");
+                return;
+            }
+        };
+        let message = match player.chat.decode(packet, last_seen, now_millis()) {
+            Ok(message) => message,
+            Err(error) => {
+                tell(player, error.message());
+                return;
+            }
+        };
+        let name = player.name.clone();
+        let chat_type = player.chat_type;
+        let bound = ChatTypeBound {
+            chat_type: VarInt(chat_type),
+            name: PlainText(name),
+            target_name: None,
+        };
+        for recipient in self.players.values_mut() {
+            // Vanilla `ServerPlayer.acceptsChatMessages`: only clients with chat "Shown" receive
+            // player chat, and a skipped client must not advance the acknowledgement index.
+            if recipient.chat_visibility != 0 {
+                continue;
+            }
+            let global_index = recipient.chat.next_global_index();
+            send(
+                recipient,
+                &ClientboundPlayerChat {
+                    global_index: VarInt(global_index),
+                    sender: id,
+                    index: VarInt(message.index),
+                    signature: message.signature,
+                    body: SignedMessageBody {
+                        content: message.content.clone(),
+                        timestamp: message.timestamp,
+                        salt: message.salt,
+                        last_seen: message.last_seen.clone(),
+                    },
+                    unsigned_content: None,
+                    filter_mask: VarInt(0),
+                    chat_type: bound.clone(),
+                },
+            );
+            if let Some(signature) = message.signature {
+                recipient.chat.add_pending(signature);
+            }
         }
     }
     fn broadcast(&self, text: &str) {
@@ -268,8 +407,26 @@ mod tests {
         let mut g = GlobalRegion::default();
         let (a, mut ar) = tokio::sync::mpsc::unbounded_channel();
         let (b, mut br) = tokio::sync::mpsc::unbounded_channel();
-        let pa = GlobalPlayer::new(uuid::Uuid::from_u128(1), 1, "A".into(), vec![], a);
-        let pb = GlobalPlayer::new(uuid::Uuid::from_u128(2), 2, "B".into(), vec![], b);
+        let pa = GlobalPlayer::new(
+            uuid::Uuid::from_u128(1),
+            1,
+            "A".into(),
+            vec![],
+            a,
+            false,
+            1,
+            0,
+        );
+        let pb = GlobalPlayer::new(
+            uuid::Uuid::from_u128(2),
+            2,
+            "B".into(),
+            vec![],
+            b,
+            false,
+            1,
+            0,
+        );
         g.join(pa);
         g.join(pb);
         g.tick();
@@ -277,10 +434,19 @@ mod tests {
             std::iter::from_fn(|| br.try_recv().ok())
                 .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==1))
         );
-        g.chat(uuid::Uuid::from_u128(1), "hello");
+        g.chat(
+            uuid::Uuid::from_u128(1),
+            &ServerboundChat {
+                message: "hello".into(),
+                timestamp: 0,
+                salt: 0,
+                signature: None,
+                last_seen: LastSeenUpdate::new(0, &[], 0),
+            },
+        );
         assert!(
             std::iter::from_fn(|| br.try_recv().ok())
-                .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==124))
+                .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==66))
         );
         g.leave(uuid::Uuid::from_u128(1));
         assert!(

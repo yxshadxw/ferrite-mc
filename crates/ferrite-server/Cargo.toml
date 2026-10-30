@@ -19,7 +19,12 @@ ferrite-region.workspace = true
 uuid.workspace = true
 ferrite-world.workspace = true
 ferrite-nbt.workspace = true
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
 
 ferrite-command = { path = "../ferrite-command" }
 ferrite-data.workspace = true
 ferrite-math = { path = "../ferrite-math" }
+
+[dev-dependencies]
+rand = "0.8"
