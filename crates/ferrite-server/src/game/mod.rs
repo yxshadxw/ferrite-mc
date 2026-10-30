@@ -9,6 +9,7 @@ pub fn new_anvil_source(
 }
 mod chunk;
 mod commands;
+mod drops;
 pub mod interaction;
 mod profile;
 #[cfg(test)]
@@ -36,7 +37,7 @@ mod region;
 
 use self::{
     global::{GlobalPlayer, GlobalRegion},
-    region::{Command, Mailbox, Player, Region, Signal},
+    region::{Command, Mailbox, Player, Region, Signal, TickContext},
 };
 use ferrite_net::game::{self, GameMessage, Outbound, ServerboundPlay};
 use ferrite_protocol::{Encode, VarInt, packets::play::*};
@@ -75,6 +76,9 @@ impl Default for WorldSettings {
 }
 pub struct World {
     pub sender: mpsc::UnboundedSender<GameMessage>,
+    /// The world loop's region signal channel (tests inject entities through it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    signals: mpsc::UnboundedSender<Signal>,
     task: tokio::task::JoinHandle<()>,
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
@@ -99,6 +103,8 @@ impl World {
         let flat = source.is_none();
         let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
         let (sender, rx) = mpsc::unbounded_channel();
+        let (signals, signal_rx) = mpsc::unbounded_channel();
+        drops::preload();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
         let metrics = LoopMetrics {
@@ -106,8 +112,12 @@ impl World {
             profiler: Arc::clone(&profiler),
         };
         let task = tokio::spawn(run(
-            rx,
-            sender.clone(),
+            Channels {
+                events: rx,
+                event_tx: sender.clone(),
+                signal_tx: signals.clone(),
+                signals: signal_rx,
+            },
             source,
             flat,
             spawn,
@@ -116,6 +126,7 @@ impl World {
         ));
         Self {
             sender,
+            signals,
             task,
             tick_samples,
             profiler,
@@ -160,21 +171,38 @@ struct LoopMetrics {
     tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
 }
-async fn run(
-    mut events: mpsc::UnboundedReceiver<GameMessage>,
+/// Both ends of the world loop's event and region signal channels.
+struct Channels {
+    events: mpsc::UnboundedReceiver<GameMessage>,
     event_tx: mpsc::UnboundedSender<GameMessage>,
+    signal_tx: mpsc::UnboundedSender<Signal>,
+    signals: mpsc::UnboundedReceiver<Signal>,
+}
+async fn run(
+    channels: Channels,
     source: Option<Arc<anvil::AnvilChunkSource>>,
     flat: bool,
     spawn: [i32; 3],
     metrics: LoopMetrics,
     settings: WorldSettings,
 ) {
+    let Channels {
+        mut events,
+        event_tx,
+        signal_tx,
+        mut signals,
+    } = channels;
+    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
+    let ctx = TickContext {
+        signals: signal_tx.clone(),
+        tracking: tracking.clone(),
+        source: source.clone(),
+    };
     let LoopMetrics {
         tick_samples,
         profiler,
     } = metrics;
     let region_profiler = Arc::clone(&profiler);
-    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let fluid_tracking = tracking.clone();
     let fluid_source = source.clone();
     let scheduler = Scheduler::with_default_threads(
@@ -186,7 +214,7 @@ async fn run(
             region
                 .timings
                 .get_or_insert_with(|| Arc::clone(region_profiler.timings()));
-            Region::tick(region);
+            region.tick(&ctx);
             if let Some(source) = &fluid_source {
                 region.tick_fluids(source, &fluid_tracking);
             }
@@ -209,7 +237,6 @@ async fn run(
             }
         },
     );
-    let (signal_tx, mut signals) = mpsc::unbounded_channel();
     let mut mailboxes: HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)> =
         HashMap::new();
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
@@ -220,7 +247,6 @@ async fn run(
     let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let positions = Arc::new(Mutex::new(HashMap::new()));
-    let mut next_entity = 1i32;
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
         spawn[1] as f64,
@@ -245,7 +271,7 @@ async fn run(
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
            permissions.insert(uuid, permission);
-           let entity=next_entity;next_entity+=1;
+           let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
            let (actions, _) = mpsc::unbounded_channel();
            if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
@@ -257,7 +283,7 @@ async fn run(
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
+           let mut player=Player{uuid,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
@@ -318,6 +344,7 @@ async fn run(
           },
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
+          Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
           Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }}
         }
@@ -333,6 +360,17 @@ fn defer_release(
     scheduler.schedule_at_chunk(chunk, move |region| {
         region.release_chunk(chunk);
         let _ = signals.send(Signal::FinishRelease { chunk, flush });
+    });
+}
+/// Hands an entity to the region owning `to`. A chunk nobody holds parks the entity in the
+/// scheduler until a region takes that chunk.
+fn hand_off(
+    scheduler: &Scheduler<Region, GlobalRegion>,
+    to: ChunkPos,
+    entity: Box<ferrite_entity::EntityRecord>,
+) {
+    scheduler.schedule_at_chunk(to, move |r| {
+        r.entities.insert(*entity);
     });
 }
 fn release_hold(

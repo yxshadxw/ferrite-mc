@@ -981,3 +981,368 @@ async fn water_bucket_spread_reaches_tracking_bot_on_fixture_world() {
     assert_eq!(resolved.parent(), Some(temp_root.as_path()));
     std::fs::remove_dir_all(resolved).unwrap();
 }
+
+/// Runs `f` inside the region owning `chunk` and returns its result, handing off entities that
+/// regions report as crossing (the world loop's job) while waiting.
+fn in_region<T: Send + 'static>(
+    scheduler: &ferrite_region::Scheduler<super::Region, super::GlobalRegion>,
+    signals: &mut tokio::sync::mpsc::UnboundedReceiver<super::Signal>,
+    chunk: ferrite_region::ChunkPos,
+    f: impl FnOnce(&mut super::Region) -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    scheduler.schedule_at_chunk(chunk, move |r| {
+        let _ = tx.send(f(r));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        while let Ok(signal) = signals.try_recv() {
+            if let super::Signal::EntityTransfer { to, entity } = signal {
+                super::hand_off(scheduler, to, entity);
+            }
+        }
+        if let Ok(value) = rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "region task timed out"
+        );
+    }
+}
+
+#[test]
+fn entities_follow_region_merges_splits_and_hand_offs() {
+    use ferrite_entity::{EntityData, EntityRecord, Flags, allocate_id, random_uuid};
+    use ferrite_math::Vec3;
+    use ferrite_region::{ChunkPos, Regionizer, Scheduler};
+    let (tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = super::TickContext {
+        signals: tx,
+        tracking: Default::default(),
+        source: None,
+    };
+    let scheduler = Scheduler::new(
+        Regionizer::<super::Region>::default(),
+        super::GlobalRegion::default(),
+        2,
+        move |r| r.tick(&ctx),
+        super::GlobalRegion::tick,
+    );
+    let west = ChunkPos(0, 0);
+    let east = ChunkPos(200, 0);
+    scheduler.add_chunk(west);
+    scheduler.add_chunk(east);
+    assert_eq!(scheduler.region_count(), 2);
+    let spawn = |x: f64| EntityRecord {
+        pos: Vec3::new(x, 64.0, 8.0),
+        vel: Vec3::ZERO,
+        flags: Flags::default(),
+        data: EntityData::new(allocate_id(), random_uuid(), 71, 0.25, 0.25),
+    };
+    let (walker, stayer, resident) = (spawn(8.0), spawn(9.0), spawn(3208.0));
+    let ids = [walker.data.id, stayer.data.id, resident.data.id];
+    in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.insert(walker);
+        r.entities.insert(stayer);
+    });
+    in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.insert(resident);
+    });
+    // The walker crosses into the east region; the west region hands it off.
+    in_region(&scheduler, &mut signals, west, move |r| {
+        let key = r.entities.key_of(ids[0]).unwrap();
+        r.entities.set_pos(key, Vec3::new(3210.0, 64.0, 8.0));
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.key_of(ids[0]).is_some()
+    }) {
+        assert!(std::time::Instant::now() < deadline, "walker never arrived");
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.key_of(ids[0]).is_none() && r.entities.key_of(ids[1]).is_some()
+    }));
+    // Bridge the gap: both regions merge and so do their entities.
+    let bridge: Vec<_> = (1..7).map(|i| ChunkPos(i * 30, 0)).collect();
+    for chunk in &bridge {
+        scheduler.add_chunk(*chunk);
+    }
+    while scheduler.region_count() != 1 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.check_invariants().unwrap();
+        ids.iter().all(|id| r.entities.key_of(*id).is_some())
+    }));
+    // Remove the bridge: the region splits and entities follow their sections.
+    for chunk in &bridge {
+        scheduler.remove_chunk(*chunk);
+    }
+    while scheduler.region_count() != 2 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(in_region(&scheduler, &mut signals, west, move |r| {
+        r.entities.len() == 1 && r.entities.key_of(ids[1]).is_some()
+    }));
+    assert!(in_region(&scheduler, &mut signals, east, move |r| {
+        r.entities.len() == 2 && r.entities.key_of(ids[0]).is_some()
+    }));
+    let stopped = scheduler.shutdown();
+    let total: usize = stopped.regions.iter().map(|r| r.entities.len()).sum();
+    assert_eq!(total, 3);
+}
+
+/// The next packet `packet` about entity `id` (any entity when `id` is negative).
+async fn entity_packet(bot: &mut Bot, packet: i32, id: i32) -> Vec<u8> {
+    let fut = async {
+        loop {
+            let body = bot.until(packet).await;
+            if id < 0 || VarInt::decode(&mut body.as_slice()).unwrap().0 == id {
+                return body;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        .await
+        .expect("entity packet")
+}
+
+/// An item entity record with the given stack, as block drops create them.
+fn item_record(pos: [f64; 3], item_id: i32) -> ferrite_entity::EntityRecord {
+    use ferrite_entity::{EntityData, EntityRecord, Flags, metadata};
+    use ferrite_protocol::packets::play::{ItemStack, MetaValue};
+    let kind = ferrite_data::entity_props::by_name("item").unwrap().id;
+    let mut data = EntityData::new(
+        ferrite_entity::allocate_id(),
+        ferrite_entity::random_uuid(),
+        kind,
+        0.25,
+        0.25,
+    );
+    data.metadata.define(
+        metadata::item::ITEM,
+        MetaValue::ItemStack(ItemStack::default()),
+    );
+    data.metadata.set(
+        metadata::item::ITEM,
+        MetaValue::ItemStack(ItemStack { count: 1, item_id }),
+    );
+    EntityRecord {
+        pos: ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+        vel: ferrite_math::Vec3::ZERO,
+        flags: Flags::default(),
+        data,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_spawns_and_removes_entities_by_range() {
+    use ferrite_protocol::packets::play::{AddEntity, MetaValue, RemoveEntities, SetEntityData};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Watcher").await;
+    bot.until(46).await;
+    let record = item_record([8.5, 65.0, 8.5], 1);
+    let id = record.data.id;
+    // Arrive through the region hand-off path, as an entity walking in would.
+    world
+        .signals
+        .send(super::Signal::EntityTransfer {
+            to: ferrite_region::ChunkPos(0, 0),
+            entity: Box::new(record),
+        })
+        .unwrap();
+    let add = entity_packet(&mut bot, AddEntity::ID, id).await;
+    let add = AddEntity::decode(&mut add.as_slice()).unwrap();
+    assert_eq!(
+        add.entity_type.0,
+        i32::from(ferrite_data::entity_props::by_name("item").unwrap().id)
+    );
+    assert_eq!([add.x, add.y, add.z], [8.5, 65.0, 8.5]);
+    let data = entity_packet(&mut bot, SetEntityData::ID, id).await;
+    let data = SetEntityData::decode(&mut data.as_slice()).unwrap();
+    assert!(
+        data.values
+            .iter()
+            .any(|v| v.index == 8 && matches!(v.value, MetaValue::ItemStack(s) if s.item_id == 1))
+    );
+    // Out of range (view distance 2 caps it at 32 blocks): removed.
+    bot.send(&MovePosition {
+        x: 60.5,
+        y: 65.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    loop {
+        let body = entity_packet(&mut bot, RemoveEntities::ID, -1).await;
+        let removed = RemoveEntities::decode(&mut body.as_slice()).unwrap();
+        if removed.ids.contains(&VarInt(id)) {
+            break;
+        }
+    }
+    // Back in range: spawned again.
+    bot.send(&MovePosition {
+        x: 2.5,
+        y: 65.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    entity_packet(&mut bot, AddEntity::ID, id).await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
+    use ferrite_protocol::{
+        packets::play::{
+            AddEntity, ContainerSlot, EntityTeleport, ItemStack, MoveRotation, PlayerAction,
+            RemoveEntities, TakeItemEntity,
+        },
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let world = World::start_configured(
+        Some(source.clone()),
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![],
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut miner = Bot::join(addr, "Miner").await;
+    let mut walker = Bot::join(addr, "Walker").await;
+    miner.until(46).await;
+    walker.until(46).await;
+    // The walker waits off to the side; the miner hovers above the block it breaks, out of
+    // pickup reach of the drop.
+    walker
+        .send(&MovePosition {
+            x: 3.5,
+            y: 65.0,
+            z: 0.5,
+            flags: 1,
+        })
+        .await;
+    miner
+        .send(&MovePosition {
+            x: 0.5,
+            y: 66.0,
+            z: 0.5,
+            flags: 0,
+        })
+        .await;
+    miner
+        .send(&MoveRotation {
+            yaw: 0.0,
+            pitch: 90.0,
+            flags: 0,
+        })
+        .await;
+    let location = BlockPos::new(0, 64, 0).pack();
+    miner
+        .send(&PlayerAction {
+            status: VarInt(0),
+            location,
+            face: 1,
+            sequence: VarInt(1),
+        })
+        .await;
+    miner.until(4).await;
+    // Grass takes 18 ticks by hand.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    miner
+        .send(&PlayerAction {
+            status: VarInt(2),
+            location,
+            face: 1,
+            sequence: VarInt(2),
+        })
+        .await;
+    miner.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    // The walker sees the dropped dirt appear inside the broken block.
+    let item_type = i32::from(ferrite_data::entity_props::by_name("item").unwrap().id);
+    let add = loop {
+        let body = entity_packet(&mut walker, AddEntity::ID, -1).await;
+        let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+        if add.entity_type.0 == item_type {
+            break add;
+        }
+    };
+    assert!((0.0..1.0).contains(&add.x) && (0.0..1.0).contains(&add.z));
+    assert!(add.y > 64.0 && add.y < 65.0, "spawned at {}", add.y);
+    // It falls into the hole and lands on the block below.
+    loop {
+        let body = entity_packet(&mut walker, EntityTeleport::ID, add.id.0).await;
+        let sync = EntityTeleport::decode(&mut body.as_slice()).unwrap();
+        if sync.on_ground {
+            assert!((sync.y - 64.0).abs() < 1e-9, "landed at {}", sync.y);
+            break;
+        }
+    }
+    // Walking over it picks it up into the first hotbar slot.
+    walker
+        .send(&MovePosition {
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            flags: 1,
+        })
+        .await;
+    let body = entity_packet(&mut walker, TakeItemEntity::ID, add.id.0).await;
+    let take = TakeItemEntity::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(take.amount.0, 1);
+    let dirt = ferrite_data::registries::id("minecraft:item", "minecraft:dirt").unwrap();
+    let slot = loop {
+        let body = entity_packet(&mut walker, ContainerSlot::ID, -1).await;
+        let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
+        if slot.slot == 36 {
+            break slot;
+        }
+    };
+    assert_eq!(
+        slot.item,
+        ItemStack {
+            count: 1,
+            item_id: dirt
+        }
+    );
+    // The picked-up item is gone for everyone.
+    loop {
+        let body = entity_packet(&mut miner, RemoveEntities::ID, -1).await;
+        let removed = RemoveEntities::decode(&mut body.as_slice()).unwrap();
+        if removed.ids.contains(&add.id) {
+            break;
+        }
+    }
+    drop(miner);
+    drop(walker);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

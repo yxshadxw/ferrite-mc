@@ -8,6 +8,8 @@ import java.nio.file.Path;
 import java.util.HexFormat;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.component.DataComponentMap;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.ProtocolInfo;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.protocol.Packet;
@@ -22,7 +24,14 @@ public class PacketCheck {
         PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), true);
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
-        ProtocolInfo<?> play = GameProtocols.CLIENTBOUND_TEMPLATE.bind(RegistryFriendlyByteBuf.decorator(RegistryAccess.EMPTY));
+        // Built-in registries (entity types, items, ...) so registry-backed fields decode; data-driven
+        // registries synced during configuration are still absent.
+        RegistryAccess registries = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY);
+        // Item default components are bound by datapack loading, which never runs here. Stacks only
+        // need a bound map to decode, so give unbound items an empty one.
+        BuiltInRegistries.ITEM.listElements().filter(item -> !item.areComponentsBound())
+            .forEach(item -> item.bindComponents(DataComponentMap.EMPTY));
+        ProtocolInfo<?> play = GameProtocols.CLIENTBOUND_TEMPLATE.bind(RegistryFriendlyByteBuf.decorator(registries));
         ProtocolInfo<?> config = ConfigurationProtocols.CLIENTBOUND;
         int ok = 0, bad = 0;
         for (String line : Files.readAllLines(Path.of(args[0]))) {

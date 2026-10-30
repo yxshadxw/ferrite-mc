@@ -4,6 +4,9 @@ configuration and play phases, then decode each one with the REAL vanilla 26.3 c
 would reject (exception, or bytes left over) — the same failures players see as "Network Protocol Error".
 
 Usage:  python tools/wirecheck/run.py [--port 25565] [--seconds 3] [--name WireCheck]
+        python tools/wirecheck/run.py --frames FILE
+          checks pre-recorded "<phase> <name> <hex frame>" lines without a server, e.g. the entity
+          packets from `cargo run -q -p ferrite-entity --example wiredump > target/wirecheck/entity.txt`
 Needs Java 25 (FERRITE_JAVA25 or the Temurin path below) and `python tools/fetch_vanilla.py` done once.
 Nothing Mojang-owned is committed: the checker only runs against the locally extracted jar.
 """
@@ -123,7 +126,8 @@ def capture(port, seconds, name):
         try:
             frame = c.recv()
         except (EOFError, socket.timeout) as e:
-            records.append((phase, b"", f"[connection ended: {e}]"))
+            # No spaces: PacketCheck splits each line on them.
+            records.append((phase, b"", f"[connection-ended:{type(e).__name__}]"))
             break
         i, body = split_id(frame)
         n = names[phase].get(i, f"unknown_{i}")
@@ -179,15 +183,19 @@ def main():
     ap.add_argument("--port", type=int, default=25565)
     ap.add_argument("--seconds", type=float, default=8)
     ap.add_argument("--name", default="WireCheck")
+    ap.add_argument("--frames", type=pathlib.Path, help="check this recorded frame file instead of joining a server")
     a = ap.parse_args()
-    records, _ = capture(a.port, a.seconds, a.name)
     out = ROOT / "target" / "wirecheck"
     out.mkdir(parents=True, exist_ok=True)
-    dump = out / "packets.txt"
-    with dump.open("w", encoding="utf-8") as f:
-        for phase, frame, n in records:
-            f.write(f"{phase} {n} {frame.hex() or '-'}\n")
-    print(f"captured {len(records)} packets -> {dump}")
+    if a.frames:
+        dump = a.frames.resolve()
+    else:
+        records, _ = capture(a.port, a.seconds, a.name)
+        dump = out / "packets.txt"
+        with dump.open("w", encoding="utf-8") as f:
+            for phase, frame, n in records:
+                f.write(f"{phase} {n} {frame.hex() or '-'}\n")
+        print(f"captured {len(records)} packets -> {dump}")
     java = pathlib.Path(JAVA_HOME) / "bin"
     lib = ROOT / f"vanilla/{VERSION}/lib"
     cp = os.pathsep.join([str(lib / f"server-{VERSION}.jar")] + [str(p) for p in (lib / "libraries").rglob("*.jar")])

@@ -67,9 +67,123 @@ impl Decode for Ident {
     }
 }
 
+/// Low-precision vector (vanilla `LpVec3`, `Vec3.LP_STREAM_CODEC`) used for entity velocities.
+///
+/// One zero byte encodes a vector shorter than [`LpVec3::ABS_MIN`]. Otherwise the vector is
+/// scaled by the ceiling of its largest component; each component is quantized to 15 bits and
+/// packed with a 2-bit scale and a continuation flag into 6 bytes, and scales above 3 continue
+/// in a trailing VarInt.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LpVec3(pub [f64; 3]);
+
+impl LpVec3 {
+    pub const ZERO: Self = Self([0.0; 3]);
+    pub const ABS_MAX: f64 = 1.7179869183E10;
+    pub const ABS_MIN: f64 = 3.051944088384301E-5;
+
+    fn sanitize(v: f64) -> f64 {
+        if v.is_nan() {
+            0.0
+        } else {
+            v.clamp(-Self::ABS_MAX, Self::ABS_MAX)
+        }
+    }
+
+    fn pack(v: f64) -> i64 {
+        // Java's Math.round: round half up.
+        ((v * 0.5 + 0.5) * 32766.0 + 0.5).floor() as i64
+    }
+
+    fn unpack(v: i64) -> f64 {
+        ((v & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0
+    }
+}
+
+impl Encode for LpVec3 {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let [x, y, z] = self.0.map(Self::sanitize);
+        let chessboard = x.abs().max(y.abs()).max(z.abs());
+        if chessboard < Self::ABS_MIN {
+            out.push(0);
+            return;
+        }
+        let scale = chessboard.ceil() as i64;
+        let partial = scale & 3 != scale;
+        let markers = if partial { scale & 3 | 4 } else { scale };
+        let buffer = markers
+            | Self::pack(x / scale as f64) << 3
+            | Self::pack(y / scale as f64) << 18
+            | Self::pack(z / scale as f64) << 33;
+        out.push(buffer as u8);
+        out.push((buffer >> 8) as u8);
+        ((buffer >> 16) as i32).encode(out);
+        if partial {
+            crate::VarInt((scale >> 2) as i32).encode(out);
+        }
+    }
+}
+
+impl Decode for LpVec3 {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let lowest = i64::from(u8::decode(buf)?);
+        if lowest == 0 {
+            return Ok(Self::ZERO);
+        }
+        let middle = i64::from(u8::decode(buf)?);
+        let highest = i64::from(u32::decode(buf)?);
+        let buffer = highest << 16 | middle << 8 | lowest;
+        let mut scale = lowest & 3;
+        if lowest & 4 != 0 {
+            scale |= (i64::from(crate::VarInt::decode(buf)?.0) & 0xFFFF_FFFF) << 2;
+        }
+        let scale = scale as f64;
+        Ok(Self([
+            Self::unpack(buffer >> 3) * scale,
+            Self::unpack(buffer >> 18) * scale,
+            Self::unpack(buffer >> 33) * scale,
+        ]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lp_vec3_matches_vanilla_quantization() {
+        let mut out = Vec::new();
+        LpVec3([1e-6, 0.0, -1e-6]).encode(&mut out);
+        assert_eq!(out, [0]);
+        for v in [
+            [0.0, 0.2, 0.0],
+            [0.05, -0.04, -0.1],
+            [3.0, -2.5, 1.0],
+            [7.9, 0.0, -12.3],
+            [1000.0, 1.0, -0.5],
+        ] {
+            let mut out = Vec::new();
+            LpVec3(v).encode(&mut out);
+            let back = LpVec3::decode(&mut out.as_slice()).unwrap().0;
+            let scale = v.iter().fold(0.0f64, |m, c| m.max(c.abs())).ceil();
+            for (a, b) in v.iter().zip(back) {
+                assert!(
+                    (a - b).abs() <= scale / 32766.0 + 1e-12,
+                    "{v:?} -> {back:?}"
+                );
+            }
+        }
+        // Scale 1: lowest byte carries markers 01 and no continuation.
+        let mut out = Vec::new();
+        LpVec3([0.0, 0.2, 0.0]).encode(&mut out);
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0] & 7, 1);
+        // Scale 13 needs the VarInt continuation.
+        let mut out = Vec::new();
+        LpVec3([0.0, 0.0, -12.3]).encode(&mut out);
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[0] & 7, 4 | (13 & 3));
+        assert_eq!(out[6], 13 >> 2);
+    }
 
     #[test]
     #[allow(clippy::unusual_byte_groupings)] // grouped as x / z / y fields

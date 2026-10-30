@@ -27,6 +27,10 @@ ferrite-plugin = { path = "../ferrite-plugin" }
 ferrite-profiler = { path = "../ferrite-profiler" }
 ferrite-fluid = { path = "../ferrite-fluid" }
 
+ferrite-entity = { path = "../ferrite-entity" }
+ferrite-item = { path = "../ferrite-item" }
+ferrite-loot = { path = "../ferrite-loot" }
+
 [dev-dependencies]
 ferrite-jvm = { path = "../ferrite-jvm" }
 tempfile = "3"

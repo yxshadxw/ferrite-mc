@@ -2,6 +2,10 @@ use super::{
     chunk::{ChunkSource, FlatGenerator},
     valid_move,
 };
+use ferrite_entity::{
+    BlockGetter, EntityRecord, EntityStore, Rng, item,
+    tracker::{self, Viewer, ViewerKey},
+};
 use ferrite_net::game::{Outbound, ServerboundPlay, packet};
 use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
@@ -51,12 +55,48 @@ pub enum Signal {
         chunk: ChunkPos,
         held: Vec<ChunkPos>,
     },
+    /// An entity walked into another region section; the main loop hands it to the region
+    /// owning `to` through that region's task queue (Folia: only the owner touches it).
+    EntityTransfer {
+        to: ChunkPos,
+        entity: Box<EntityRecord>,
+    },
+}
+/// What a region tick needs from the world loop.
+#[derive(Clone)]
+pub struct TickContext {
+    pub signals: UnboundedSender<Signal>,
+    /// Every online player's sent chunks and connection; reaches players that left the region.
+    pub tracking: Tracking,
+    /// World blocks, for entity physics.
+    pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+}
+/// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
+struct TickBlocks<'a> {
+    source: Option<&'a super::anvil::AnvilChunkSource>,
+    seen: std::cell::RefCell<HashMap<(i32, i32, i32), Option<u16>>>,
+}
+impl BlockGetter for TickBlocks<'_> {
+    fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        let source = self.source?;
+        *self
+            .seen
+            .borrow_mut()
+            .entry((x, y, z))
+            .or_insert_with(|| source.block(x, y, z).and_then(|s| u16::try_from(s).ok()))
+    }
 }
 /// How many queued chunks to request ahead of the batch being sent.
 const PREFETCH_CHUNKS: usize = 96;
 
 pub struct Player {
     pub uuid: Uuid,
+    /// Login session; a reconnect gets a new one, so trackers treat it as a new viewer.
+    pub session: u64,
+    /// Network entity id.
+    pub entity: i32,
+    /// Blocks this player broke in survival this tick, with their previous state.
+    pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -84,6 +124,7 @@ pub struct Player {
 #[derive(Default)]
 pub struct Region {
     pub players: HashMap<Uuid, Player>,
+    pub entities: EntityStore,
     generator: FlatGenerator,
     fluid_ticks: ferrite_fluid::FluidTicks,
     held_chunks: HashMap<ChunkPos, usize>,
@@ -91,6 +132,7 @@ pub struct Region {
     pub profile_slot: Option<u32>,
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
+    rng: Rng,
 }
 impl RegionData for Region {
     fn merge(&mut self, mut other: Self) {
@@ -101,6 +143,7 @@ impl RegionData for Region {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
         self.players.extend(other.players);
+        self.entities.merge(other.entities);
         self.generator.merge(other.generator);
     }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
@@ -112,6 +155,10 @@ impl RegionData for Region {
             .collect();
         let mut result = Self {
             players: HashMap::new(),
+            rng: Rng::default(),
+            entities: self
+                .entities
+                .split(|(x, z)| sections.contains(&SectionPos(x >> 4, z >> 4))),
             generator: self.generator.split(sections),
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
             held_chunks: HashMap::new(),
@@ -575,7 +622,19 @@ impl Player {
                                 if self.gamemode == 1 {
                                     self.change_block(p.location, state, 0);
                                 } else if self.gamemode == 0 {
-                                    self.breaking = Some((p.location, state, 0));
+                                    // Zero hardness breaks on the first hit (vanilla: destroy
+                                    // progress >= 1 on START), so no finish action follows.
+                                    let instant = u16::try_from(state).is_ok_and(|s| {
+                                        usize::from(s) < ferrite_data::blocks::STATE_COUNT
+                                            && ferrite_data::block_props::get(s).hardness == 0.0
+                                    });
+                                    if instant {
+                                        if self.change_block(p.location, state, 0) {
+                                            self.broken.push((pos, state));
+                                        }
+                                    } else {
+                                        self.breaking = Some((p.location, state, 0));
+                                    }
                                 }
                             }
                         }
@@ -588,8 +647,9 @@ impl Player {
                                     .ok()
                                     .and_then(super::interaction::break_ticks)
                                     .is_some_and(|ticks| elapsed >= ticks)
+                                && self.change_block(location, state, 0)
                             {
-                                self.change_block(location, state, 0);
+                                self.broken.push((pos, state));
                             }
                         }
                         _ => {}
@@ -710,6 +770,27 @@ impl Player {
         true
     }
 }
+/// Sends a tracker packet to a player: through its connection while it is in this region,
+/// otherwise through the world-wide table (it left the region since it started tracking).
+fn deliver(
+    players: &HashMap<Uuid, Player>,
+    ctx: &TickContext,
+    (uuid, session): ViewerKey,
+    bytes: &[u8],
+) {
+    let packet = Outbound::Packet(bytes.to_vec());
+    match players.get(&uuid) {
+        Some(p) if p.session == session => {
+            let _ = p.outbound.send(packet);
+        }
+        Some(_) => {}
+        None => {
+            if let Some((_, outbound)) = ctx.tracking.lock().unwrap().get(&uuid) {
+                let _ = outbound.send(packet);
+            }
+        }
+    }
+}
 impl Region {
     pub fn hold_chunk(&mut self, chunk: ChunkPos) {
         *self.held_chunks.entry(chunk).or_default() += 1;
@@ -732,7 +813,79 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
-    pub fn tick(&mut self) {
+    /// Spawns the loot of the blocks a player broke in survival as item entities.
+    fn drop_broken_blocks(&mut self, p: &mut Player) {
+        let tool = p.inventory[36 + usize::from(p.held_slot.min(8))];
+        for (pos, state) in p.broken.drain(..) {
+            let Ok(state) = u16::try_from(state) else {
+                continue;
+            };
+            for stack in super::drops::block_drops(state, tool, &mut self.rng) {
+                let record = item::pop_resource([pos.x, pos.y, pos.z], stack, &mut self.rng);
+                self.entities.insert(record);
+            }
+        }
+    }
+    /// Lets every non-spectator player pick up the items it touches.
+    fn pick_up_items(&mut self, ctx: &TickContext) {
+        let mut sent = Vec::new();
+        let mut slots = Vec::new();
+        for p in self.players.values_mut() {
+            if p.gamemode == 3 {
+                continue;
+            }
+            let mut picker = item::Picker {
+                uuid: p.uuid,
+                entity_id: p.entity,
+                pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                inventory: &mut p.inventory,
+                selected: usize::from(p.held_slot),
+                infinite: p.gamemode == 1,
+            };
+            let changed = item::pick_up(&mut self.entities, &mut picker, &mut |viewer, bytes| {
+                sent.push((viewer, bytes.to_vec()))
+            });
+            if !changed.is_empty() {
+                slots.push((p.uuid, changed));
+            }
+        }
+        // Like vanilla: the take animation first, the inventory sync at the end of the tick.
+        for (viewer, bytes) in sent {
+            deliver(&self.players, ctx, viewer, &bytes);
+        }
+        for (uuid, changed) in slots {
+            let p = &self.players[&uuid];
+            for slot in changed {
+                send(
+                    p,
+                    &ContainerSlot {
+                        window: VarInt(0),
+                        state: VarInt(0),
+                        slot: slot as i16,
+                        item: p.inventory[slot],
+                    },
+                );
+            }
+        }
+    }
+    /// Runs the entity tracker against this region's players.
+    fn track_entities(&mut self, ctx: &TickContext) {
+        let viewers: Vec<_> = self
+            .players
+            .values()
+            .map(|p| Viewer {
+                key: (p.uuid, p.session),
+                pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                view_distance: p.view,
+                chunks: &p.loaded,
+            })
+            .collect();
+        let players = &self.players;
+        tracker::track(&mut self.entities, &viewers, &mut |viewer, bytes| {
+            deliver(players, ctx, viewer, bytes)
+        });
+    }
+    pub fn tick(&mut self, ctx: &TickContext) {
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
         let ids: Vec<_> = self.players.keys().copied().collect();
@@ -777,7 +930,23 @@ impl Region {
                 }
                 None => p.chunks_tick(&mut self.generator),
             }
+            self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
+        }
+        let blocks = TickBlocks {
+            source: ctx.source.as_deref(),
+            seen: Default::default(),
+        };
+        item::tick_items(&mut self.entities, &blocks, &mut self.rng);
+        self.pick_up_items(ctx);
+        self.track_entities(ctx);
+        self.entities.sweep_removed();
+        for entity in self.entities.take_crossing() {
+            let (x, z) = entity.chunk();
+            let _ = ctx.signals.send(Signal::EntityTransfer {
+                to: ChunkPos(x, z),
+                entity: Box::new(entity),
+            });
         }
     }
 }
@@ -790,7 +959,12 @@ mod tests {
         let timings = Arc::new(Timings::new());
         region.timings = Some(timings.clone());
 
-        region.tick();
+        let (signals, _rx) = tokio::sync::mpsc::unbounded_channel();
+        region.tick(&TickContext {
+            signals,
+            tracking: Default::default(),
+            source: None,
+        });
 
         let report = timings.report_all(50.0);
         assert!(
