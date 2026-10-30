@@ -17,6 +17,8 @@
 
 use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
+use crate::metadata::Metadata;
+use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -70,6 +72,10 @@ pub struct EntityData {
     pub head_yaw: f32,
     /// Ticks lived, vanilla's `tickCount`.
     pub tick_count: u32,
+    /// Synched data values.
+    pub metadata: Metadata,
+    /// Tracker state; travels with the entity between regions.
+    pub tracker: TrackerState,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -89,6 +95,8 @@ impl EntityData {
             pitch: 0.0,
             head_yaw: 0.0,
             tick_count: 0,
+            metadata: Metadata::default(),
+            tracker: TrackerState::default(),
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }

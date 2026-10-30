@@ -73,6 +73,9 @@ impl Default for WorldSettings {
 }
 pub struct World {
     pub sender: mpsc::UnboundedSender<GameMessage>,
+    /// The world loop's region signal channel (tests inject entities through it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    signals: mpsc::UnboundedSender<Signal>,
     task: tokio::task::JoinHandle<()>,
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
 }
@@ -91,10 +94,15 @@ impl World {
         let flat = source.is_none();
         let source = Some(source.unwrap_or_else(anvil::AnvilChunkSource::new_memory));
         let (sender, rx) = mpsc::unbounded_channel();
+        let (signals, signal_rx) = mpsc::unbounded_channel();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let task = tokio::spawn(run(
-            rx,
-            sender.clone(),
+            Channels {
+                events: rx,
+                event_tx: sender.clone(),
+                signal_tx: signals.clone(),
+                signals: signal_rx,
+            },
             source,
             flat,
             spawn,
@@ -103,6 +111,7 @@ impl World {
         ));
         Self {
             sender,
+            signals,
             task,
             tick_samples,
         }
@@ -131,18 +140,31 @@ impl World {
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
     let _ = tx.send(game::packet(p));
 }
-async fn run(
-    mut events: mpsc::UnboundedReceiver<GameMessage>,
+/// Both ends of the world loop's event and region signal channels.
+struct Channels {
+    events: mpsc::UnboundedReceiver<GameMessage>,
     event_tx: mpsc::UnboundedSender<GameMessage>,
+    signal_tx: mpsc::UnboundedSender<Signal>,
+    signals: mpsc::UnboundedReceiver<Signal>,
+}
+async fn run(
+    channels: Channels,
     source: Option<Arc<anvil::AnvilChunkSource>>,
     flat: bool,
     spawn: [i32; 3],
     tick_samples: Arc<Mutex<Vec<f64>>>,
     settings: WorldSettings,
 ) {
-    let (signal_tx, mut signals) = mpsc::unbounded_channel();
+    let Channels {
+        mut events,
+        event_tx,
+        signal_tx,
+        mut signals,
+    } = channels;
+    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let ctx = TickContext {
         signals: signal_tx.clone(),
+        tracking: tracking.clone(),
     };
     let scheduler = Scheduler::with_default_threads(
         Regionizer::<Region>::default(),
@@ -166,7 +188,6 @@ async fn run(
         .join("../../vanilla/26.3/generated/reports");
     let parser_registry = ferrite_command::ParserRegistry::load(registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
-    let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(HashMap::new()));
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
@@ -204,7 +225,7 @@ async fn run(
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
+           let mut player=Player{uuid,session,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.players.insert(uuid,player);});
            let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },

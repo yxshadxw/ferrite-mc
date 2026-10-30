@@ -2,7 +2,10 @@ use super::{
     chunk::{ChunkSource, FlatGenerator},
     valid_move,
 };
-use ferrite_entity::{EntityRecord, EntityStore};
+use ferrite_entity::{
+    EntityRecord, EntityStore,
+    tracker::{self, Viewer},
+};
 use ferrite_net::game::{Outbound, ServerboundPlay, packet};
 use ferrite_protocol::{VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, RegionData, SectionPos};
@@ -53,12 +56,16 @@ pub enum Signal {
 #[derive(Clone)]
 pub struct TickContext {
     pub signals: UnboundedSender<Signal>,
+    /// Every online player's sent chunks and connection; reaches players that left the region.
+    pub tracking: Tracking,
 }
 /// How many queued chunks to request ahead of the batch being sent.
 const PREFETCH_CHUNKS: usize = 96;
 
 pub struct Player {
     pub uuid: Uuid,
+    /// Login session; a reconnect gets a new one, so trackers treat it as a new viewer.
+    pub session: u64,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -660,6 +667,39 @@ impl Player {
     }
 }
 impl Region {
+    /// Runs the entity tracker against this region's players.
+    fn track_entities(&mut self, ctx: &TickContext) {
+        let viewers: Vec<_> = self
+            .players
+            .values()
+            .map(|p| Viewer {
+                key: (p.uuid, p.session),
+                pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                view_distance: p.view,
+                chunks: &p.loaded,
+            })
+            .collect();
+        let players = &self.players;
+        tracker::track(
+            &mut self.entities,
+            &viewers,
+            &mut |(uuid, session), bytes| {
+                let packet = Outbound::Packet(bytes.to_vec());
+                match players.get(&uuid) {
+                    Some(p) if p.session == session => {
+                        let _ = p.outbound.send(packet);
+                    }
+                    Some(_) => {}
+                    // Left the region: reach it through the world-wide table.
+                    None => {
+                        if let Some((_, outbound)) = ctx.tracking.lock().unwrap().get(&uuid) {
+                            let _ = outbound.send(packet);
+                        }
+                    }
+                }
+            },
+        );
+    }
     pub fn tick(&mut self, ctx: &TickContext) {
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in ids {
@@ -692,6 +732,8 @@ impl Region {
             p.chunks_tick(&mut self.generator);
             self.players.insert(id, p);
         }
+        self.track_entities(ctx);
+        self.entities.sweep_removed();
         for entity in self.entities.take_crossing() {
             let (x, z) = entity.chunk();
             let _ = ctx.signals.send(Signal::EntityTransfer {

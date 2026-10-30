@@ -160,6 +160,7 @@ impl GlobalRegion {
                                 x: target.pos[0],
                                 y: target.pos[1],
                                 z: target.pos[2],
+                                velocity: ferrite_protocol::types::LpVec3::ZERO,
                                 pitch: angle(target.pitch),
                                 yaw: angle(target.yaw),
                                 head_yaw: angle(target.yaw),

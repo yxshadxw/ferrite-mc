@@ -269,6 +269,7 @@ mod multiplayer_tests {
             x: 0.5,
             y: 65.0,
             z: 0.5,
+            velocity: crate::types::LpVec3::ZERO,
             pitch: 0,
             yaw: 0,
             head_yaw: 0,

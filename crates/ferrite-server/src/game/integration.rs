@@ -816,7 +816,10 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
     use ferrite_math::Vec3;
     use ferrite_region::{ChunkPos, Regionizer, Scheduler};
     let (tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
-    let ctx = super::TickContext { signals: tx };
+    let ctx = super::TickContext {
+        signals: tx,
+        tracking: Default::default(),
+    };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),
         super::GlobalRegion::default(),
@@ -886,4 +889,117 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
     let stopped = scheduler.shutdown();
     let total: usize = stopped.regions.iter().map(|r| r.entities.len()).sum();
     assert_eq!(total, 3);
+}
+
+/// The next packet `packet` about entity `id` (any entity when `id` is negative).
+async fn entity_packet(bot: &mut Bot, packet: i32, id: i32) -> Vec<u8> {
+    let fut = async {
+        loop {
+            let body = bot.until(packet).await;
+            if id < 0 || VarInt::decode(&mut body.as_slice()).unwrap().0 == id {
+                return body;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        .await
+        .expect("entity packet")
+}
+
+/// An item entity record with the given stack, as block drops create them.
+fn item_record(pos: [f64; 3], item_id: i32) -> ferrite_entity::EntityRecord {
+    use ferrite_entity::{EntityData, EntityRecord, Flags, metadata};
+    use ferrite_protocol::packets::play::{ItemStack, MetaValue};
+    let kind = ferrite_data::entity_props::by_name("item").unwrap().id;
+    let mut data = EntityData::new(
+        ferrite_entity::allocate_id(),
+        ferrite_entity::random_uuid(),
+        kind,
+        0.25,
+        0.25,
+    );
+    data.metadata.define(
+        metadata::item::ITEM,
+        MetaValue::ItemStack(ItemStack::default()),
+    );
+    data.metadata.set(
+        metadata::item::ITEM,
+        MetaValue::ItemStack(ItemStack { count: 1, item_id }),
+    );
+    EntityRecord {
+        pos: ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+        vel: ferrite_math::Vec3::ZERO,
+        flags: Flags::default(),
+        data,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_spawns_and_removes_entities_by_range() {
+    use ferrite_protocol::packets::play::{AddEntity, MetaValue, RemoveEntities, SetEntityData};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Watcher").await;
+    bot.until(46).await;
+    let record = item_record([8.5, 65.0, 8.5], 1);
+    let id = record.data.id;
+    // Arrive through the region hand-off path, as an entity walking in would.
+    world
+        .signals
+        .send(super::Signal::EntityTransfer {
+            to: ferrite_region::ChunkPos(0, 0),
+            entity: Box::new(record),
+        })
+        .unwrap();
+    let add = entity_packet(&mut bot, AddEntity::ID, id).await;
+    let add = AddEntity::decode(&mut add.as_slice()).unwrap();
+    assert_eq!(
+        add.entity_type.0,
+        i32::from(ferrite_data::entity_props::by_name("item").unwrap().id)
+    );
+    assert_eq!([add.x, add.y, add.z], [8.5, 65.0, 8.5]);
+    let data = entity_packet(&mut bot, SetEntityData::ID, id).await;
+    let data = SetEntityData::decode(&mut data.as_slice()).unwrap();
+    assert!(
+        data.values
+            .iter()
+            .any(|v| v.index == 8 && matches!(v.value, MetaValue::ItemStack(s) if s.item_id == 1))
+    );
+    // Out of range (view distance 2 caps it at 32 blocks): removed.
+    bot.send(&MovePosition {
+        x: 60.5,
+        y: 65.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    loop {
+        let body = entity_packet(&mut bot, RemoveEntities::ID, -1).await;
+        let removed = RemoveEntities::decode(&mut body.as_slice()).unwrap();
+        if removed.ids.contains(&VarInt(id)) {
+            break;
+        }
+    }
+    // Back in range: spawned again.
+    bot.send(&MovePosition {
+        x: 2.5,
+        y: 65.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    entity_packet(&mut bot, AddEntity::ID, id).await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
 }

@@ -4,6 +4,8 @@
 //!   columns for the hot fields (position, velocity, bounding box, flags) plus a dense column
 //!   of everything else, and a chunk-section index ([`SectionIndex`]) for range and collision
 //!   queries.
+//! - [`tracker`]: the vanilla entity tracker, run per region against the region's players.
+//! - [`Metadata`]: synched entity data with dirty tracking.
 //! - [`allocate_id`] / [`random_uuid`]: the process-wide network id counter (shared with
 //!   players) and entity UUIDs.
 //!
@@ -14,8 +16,11 @@
 
 mod id;
 mod index;
+pub mod metadata;
 mod store;
+pub mod tracker;
 
 pub use id::{EntityKey, allocate_id, random_uuid};
 pub use index::{Cell, QUERY_MARGIN, SectionIndex};
+pub use metadata::Metadata;
 pub use store::{DEFAULT_REGION_SHIFT, EntityData, EntityRecord, EntityStore, Flags, chunk_of};

@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 ferrite-math = { path = "../ferrite-math" }
 uuid.workspace = true
+ferrite-data.workspace = true
+ferrite-protocol.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
