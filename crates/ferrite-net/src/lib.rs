@@ -1,3 +1,4 @@
+pub mod cfb8;
 mod wire;
 use anyhow::{Context, Result, bail};
 use ferrite_protocol::{
