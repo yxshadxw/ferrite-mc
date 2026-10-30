@@ -124,3 +124,148 @@ fn arithmetic_and_markers_evaluate_their_children() {
         assert_eq!(function.compute(&ctx), expected);
     }
 }
+
+#[test]
+fn cubic_spline_interpolates_extrapolates_and_evaluates_nested_points() {
+    use ferrite_worldgen::{Spline, SplinePoint, SplineValue};
+    let coordinate = || {
+        node(DensityNode::Gradient {
+            axis: ferrite_worldgen::Axis::X,
+            from_coordinate: 0.0,
+            to_coordinate: 10.0,
+            from_value: 0.0,
+            to_value: 10.0,
+        })
+    };
+    let nested = Spline {
+        coordinate: DensityFunction::Constant(0.0),
+        points: vec![SplinePoint {
+            location: 0.0,
+            derivative: 0.0,
+            value: SplineValue::Constant(2.0),
+        }],
+    };
+    let spline = node(DensityNode::Spline {
+        spline: Box::new(Spline {
+            coordinate: coordinate(),
+            points: vec![
+                SplinePoint {
+                    location: 0.0,
+                    derivative: 0.0,
+                    value: SplineValue::Constant(0.0),
+                },
+                SplinePoint {
+                    location: 10.0,
+                    derivative: 0.0,
+                    value: SplineValue::Spline(Box::new(nested)),
+                },
+            ],
+        }),
+    });
+    assert_eq!(spline.compute(&Pos(0, 0, 0)), 0.0);
+    assert_eq!(spline.compute(&Pos(5, 0, 0)), 1.0);
+    assert_eq!(spline.compute(&Pos(10, 0, 0)), 2.0);
+}
+
+#[test]
+fn seeded_noise_matches_noise_primitive_with_vanilla_positional_seed() {
+    use ferrite_noise::{Noise, NormalNoise, RandomSource, XoroshiroRandomSource};
+    use ferrite_worldgen::{NoiseParameters, ResourceId, SeededNoise, WorldgenData};
+    let id = ResourceId::parse("minecraft:test_noise").unwrap();
+    let mut data = WorldgenData::default();
+    data.noises.insert(
+        id.clone(),
+        NoiseParameters {
+            base_octave: -8,
+            octave_count: Some(5),
+            base_amplitude: 1.0,
+            amplitude_modifiers: Some(vec![1.0, 0.5, 1.0, 0.0, 1.0]),
+        },
+    );
+    let seeded = SeededNoise::new(&data, 3456);
+    let mut random = XoroshiroRandomSource::new(3456);
+    let factory = random.fork_positional();
+    let mut instance = factory.from_hash_of("minecraft:test_noise");
+    let normal = NormalNoise::builder()
+        .set_base_octave(-8)
+        .set_octave_count(5)
+        .set_amplitude_modifier(1, 0.5)
+        .set_amplitude_modifier(3, 0.0)
+        .build()
+        .create(&mut *instance);
+    let f = node(DensityNode::Noise {
+        noise: id,
+        xz_scale: 1.0,
+        y_scale: 1.0,
+        shift_x: None,
+        shift_z: None,
+    });
+    assert_eq!(
+        f.compute(&seeded.at(12, -34, 56)),
+        f64::from(normal.get(12.0, -34.0, 56.0))
+    );
+}
+
+#[test]
+fn noise_node_matches_vanilla_reference_vector() {
+    use ferrite_noise::{Noise, NoiseStack, NormalNoise, XoroshiroRandomSource};
+    use ferrite_worldgen::ResourceId;
+    struct KnownNoise(NoiseStack);
+    impl FunctionContext for KnownNoise {
+        fn block_x(&self) -> i32 {
+            0
+        }
+        fn block_y(&self) -> i32 {
+            -103
+        }
+        fn block_z(&self) -> i32 {
+            0
+        }
+        fn sample_noise(&self, _: &ResourceId, x: f64, y: f64, z: f64) -> f32 {
+            self.0.get(x, y, z)
+        }
+    }
+    let mut rng = XoroshiroRandomSource::new(3456);
+    let normal = NormalNoise::builder()
+        .set_base_octave(-8)
+        .set_octave_count(5)
+        .set_amplitude_modifier(1, 0.5)
+        .set_amplitude_modifier(3, 0.0)
+        .build()
+        .create(&mut rng);
+    let function = node(DensityNode::Noise {
+        noise: ResourceId::parse("test").unwrap(),
+        xz_scale: 1.0,
+        y_scale: 0.25,
+        shift_x: Some(c(-639.6875)),
+        shift_z: Some(c(-12.0)),
+    });
+    assert_eq!(
+        function.compute(&KnownNoise(normal)).to_bits(),
+        0x3fc3460920000000
+    );
+}
+
+#[test]
+fn shift_node_scales_all_three_coordinates() {
+    use ferrite_worldgen::ResourceId;
+    struct CoordinateNoise;
+    impl FunctionContext for CoordinateNoise {
+        fn block_x(&self) -> i32 {
+            4
+        }
+        fn block_y(&self) -> i32 {
+            8
+        }
+        fn block_z(&self) -> i32 {
+            12
+        }
+        fn sample_noise(&self, _: &ResourceId, x: f64, y: f64, z: f64) -> f32 {
+            (x + 10.0 * y + 100.0 * z) as f32
+        }
+    }
+    let function = node(DensityNode::Shift {
+        noise: ResourceId::parse("test").unwrap(),
+    });
+    assert_eq!(function.compute(&CoordinateNoise), 1284.0);
+}

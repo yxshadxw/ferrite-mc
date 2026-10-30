@@ -113,6 +113,8 @@ pub enum DensityNode {
     ShiftA { noise: ResourceId },
     #[serde(rename = "minecraft:shift_b")]
     ShiftB { noise: ResourceId },
+    #[serde(rename = "minecraft:shift")]
+    Shift { noise: ResourceId },
     #[serde(rename = "minecraft:blend_alpha")]
     BlendAlpha,
     #[serde(rename = "minecraft:blend_offset")]
@@ -262,7 +264,7 @@ impl DensityNode {
             | Self::Cache { input }
             | Self::BlendDensity { input }
             | Self::Slice { input, .. } => input.accumulate(nodes, references),
-            Self::ShiftA { .. } | Self::ShiftB { .. } => {}
+            Self::ShiftA { .. } | Self::ShiftB { .. } | Self::Shift { .. } => {}
             Self::Gradient { .. }
             | Self::OldBlendedNoise { .. }
             | Self::BlendAlpha
@@ -428,6 +430,7 @@ impl DensityNode {
             },
             Self::ShiftA { noise } => Self::ShiftA { noise },
             Self::ShiftB { noise } => Self::ShiftB { noise },
+            Self::Shift { noise } => Self::Shift { noise },
             Self::BlendAlpha => Self::BlendAlpha,
             Self::BlendOffset => Self::BlendOffset,
             Self::BlendDensity { input } => Self::BlendDensity {

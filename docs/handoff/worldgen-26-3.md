@@ -8,3 +8,4 @@ The 26.3 server jar and generated data use updated names and structures:
 - `DensitySampler.sampleValue` returns a Java `float`; a faithful evaluator needs to preserve vanilla's intermediate float arithmetic.
 
 These observations were verified against `vanilla/26.3/lib/server-26.3.jar` with `javap` and the generated overworld JSON. They do not establish that terrain generation has been implemented or verified.
+- The retired `weird_scaled_sampler` and its rarity mappers are absent from the 26.3 density-function classes and generated overworld data; 26.3 uses its current density nodes instead.

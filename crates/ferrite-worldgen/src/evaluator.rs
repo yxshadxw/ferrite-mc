@@ -1,12 +1,15 @@
 //! Evaluation of density functions that do not depend on seeded noise.
 
-use crate::{Axis, DensityFunction, DensityNode};
+use crate::{Axis, DensityFunction, DensityNode, ResourceId, Spline, SplineValue};
 
 /// Block coordinates used when evaluating a density function.
 pub trait FunctionContext {
     fn block_x(&self) -> i32;
     fn block_y(&self) -> i32;
     fn block_z(&self) -> i32;
+    fn sample_noise(&self, id: &ResourceId, _x: f64, _y: f64, _z: f64) -> f32 {
+        panic!("noise sampler not available for {id}")
+    }
 }
 
 impl DensityFunction {
@@ -101,9 +104,75 @@ impl DensityFunction {
                         let x = eval(first);
                         x + a * (eval(second) - x)
                     }
+                    DensityNode::Noise {
+                        noise,
+                        xz_scale,
+                        y_scale,
+                        shift_x,
+                        shift_z,
+                    } => {
+                        let x = f64::from(ctx.block_x()) * xz_scale
+                            + shift_x.as_ref().map_or(0.0, |f| f64::from(eval(f)));
+                        let y = f64::from(ctx.block_y()) * y_scale;
+                        let z = f64::from(ctx.block_z()) * xz_scale
+                            + shift_z.as_ref().map_or(0.0, |f| f64::from(eval(f)));
+                        ctx.sample_noise(noise, x, y, z)
+                    }
+                    DensityNode::ShiftA { noise } => {
+                        ctx.sample_noise(
+                            noise,
+                            f64::from(ctx.block_x()) * 0.25,
+                            0.0,
+                            f64::from(ctx.block_z()) * 0.25,
+                        ) * 4.0
+                    }
+                    DensityNode::ShiftB { noise } => {
+                        ctx.sample_noise(
+                            noise,
+                            f64::from(ctx.block_z()) * 0.25,
+                            f64::from(ctx.block_x()) * 0.25,
+                            0.0,
+                        ) * 4.0
+                    }
+                    DensityNode::Shift { noise } => {
+                        ctx.sample_noise(
+                            noise,
+                            f64::from(ctx.block_x()) * 0.25,
+                            f64::from(ctx.block_y()) * 0.25,
+                            f64::from(ctx.block_z()) * 0.25,
+                        ) * 4.0
+                    }
+                    DensityNode::Spline { spline } => spline.compute_float(ctx),
                     _ => panic!("density node requires a sampler: {node:?}"),
                 }
             }
         }
+    }
+}
+
+impl Spline {
+    fn compute_float(&self, ctx: &impl FunctionContext) -> f32 {
+        let x = self.coordinate.compute_float(ctx);
+        let index = self
+            .points
+            .partition_point(|point| (point.location as f32) <= x);
+        let value = |value: &SplineValue| match value {
+            SplineValue::Constant(value) => *value as f32,
+            SplineValue::Spline(spline) => spline.compute_float(ctx),
+        };
+        if index == 0 || index == self.points.len() {
+            let point = &self.points[if index == 0 { 0 } else { index - 1 }];
+            return value(&point.value) + point.derivative as f32 * (x - point.location as f32);
+        }
+        let left = &self.points[index - 1];
+        let right = &self.points[index];
+        let length = right.location as f32 - left.location as f32;
+        let t = (x - left.location as f32) / length;
+        let a = value(&left.value);
+        let b = value(&right.value);
+        let delta = b - a;
+        let m = left.derivative as f32 * length - delta;
+        let n = -right.derivative as f32 * length + delta;
+        (a + t * (b - a)) + t * (1.0 - t) * (m + t * (n - m))
     }
 }

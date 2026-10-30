@@ -41,6 +41,7 @@ mod multi_noise;
 mod noise;
 mod noise_settings;
 mod resolve;
+mod seeded_noise;
 mod strict;
 
 use std::collections::BTreeMap;
@@ -73,6 +74,7 @@ pub use noise_settings::{
     AquiferSettings, DebugFunction, NoiseRouter, NoiseSamplingSettings, NoiseSettings,
 };
 pub use resolve::ResolveError;
+pub use seeded_noise::{SeededContext, SeededNoise};
 
 /// All world generation data loaded from one generated data set.
 ///
