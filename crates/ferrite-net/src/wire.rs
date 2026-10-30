@@ -1,43 +1,19 @@
-use aes::{
-    Aes128,
-    cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
-};
+use crate::cfb8::Cfb8;
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-#[derive(Clone)]
-struct Cfb8 {
-    cipher: Aes128,
-    shift: [u8; 16],
-}
-impl Cfb8 {
-    fn new(key: &[u8; 16]) -> Self {
-        Self::with_iv(key, key)
-    }
-    fn with_iv(key: &[u8; 16], iv: &[u8; 16]) -> Self {
-        Self {
-            cipher: Aes128::new(GenericArray::from_slice(key)),
-            shift: *iv,
-        }
-    }
-    fn apply(&mut self, data: &mut [u8], decrypt: bool) {
-        for byte in data {
-            let input = *byte;
-            let mut block = GenericArray::clone_from_slice(&self.shift);
-            self.cipher.encrypt_block(&mut block);
-            *byte ^= block[0];
-            self.shift.copy_within(1.., 0);
-            self.shift[15] = if decrypt { input } else { *byte };
-        }
-    }
-}
+
 pub struct Wire {
     stream: TcpStream,
     read: Option<Cfb8>,
     write: Option<Cfb8>,
+    /// Ciphertext for the packet currently being written. `poll_write` only
+    /// hands us an immutable slice, so the buffer is encrypted in place here
+    /// and handed to the socket in one call. Reused between writes.
+    scratch: Vec<u8>,
 }
 impl Wire {
     pub fn new(stream: TcpStream) -> Self {
@@ -45,6 +21,7 @@ impl Wire {
             stream,
             read: None,
             write: None,
+            scratch: Vec::new(),
         }
     }
     pub fn enable_encryption(&mut self, key: &[u8; 16]) {
@@ -62,7 +39,7 @@ impl AsyncRead for Wire {
         match Pin::new(&mut self.stream).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
                 if let Some(cipher) = &mut self.read {
-                    cipher.apply(&mut buf.filled_mut()[before..], true);
+                    cipher.decrypt(&mut buf.filled_mut()[before..]);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -76,20 +53,46 @@ impl AsyncWrite for Wire {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if let Some(cipher) = &self.write {
-            let mut next = cipher.clone();
-            let mut encrypted = data.to_vec();
-            next.apply(&mut encrypted, false);
-            match Pin::new(&mut self.stream).poll_write(cx, &encrypted) {
-                Poll::Ready(Ok(n)) => {
-                    let mut consumed = data[..n].to_vec();
-                    self.write.as_mut().unwrap().apply(&mut consumed, false);
-                    Poll::Ready(Ok(n))
-                }
-                v => v,
+        let this = self.as_mut().get_mut();
+        if this.write.is_none() {
+            return Pin::new(&mut this.stream).poll_write(cx, data);
+        }
+        let cipher = this.write.as_mut().unwrap();
+        // CFB8 has no rewind, so keep the state around until we know how many
+        // bytes the socket took: a short write has to be replayed from here.
+        let saved = cipher.state();
+        let mut scratch = std::mem::take(&mut this.scratch);
+        scratch.clear();
+        scratch.extend_from_slice(data);
+        cipher.encrypt(&mut scratch);
+        let result = Pin::new(&mut this.stream).poll_write(cx, &scratch);
+        match result {
+            // Common case: the whole packet went out after a single pass over
+            // the data (the old path encrypted it twice).
+            Poll::Ready(Ok(written)) if written == data.len() => {
+                this.scratch = scratch;
+                Poll::Ready(Ok(written))
             }
-        } else {
-            Pin::new(&mut self.stream).poll_write(cx, data)
+            Poll::Ready(Ok(written)) => {
+                // Short write: rewind and advance by exactly the bytes the
+                // socket accepted, so the caller retries with `data[written..]`.
+                cipher.restore(saved);
+                let mut accepted = data[..written].to_vec();
+                cipher.encrypt(&mut accepted);
+                this.scratch = scratch;
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(error)) => {
+                cipher.restore(saved);
+                this.scratch = scratch;
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                // Nothing was written, so nothing may be consumed.
+                cipher.restore(saved);
+                this.scratch = scratch;
+                Poll::Pending
+            }
         }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -102,16 +105,46 @@ impl AsyncWrite for Wire {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn nist_cfb8_vector() {
-        let key = [
-            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
-            0x4f, 0x3c,
-        ];
-        let iv = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let mut cipher = Cfb8::with_iv(&key, &iv);
-        let mut data = [0x6b, 0xc1, 0xbe, 0xe2];
-        cipher.apply(&mut data, false);
-        assert_eq!(data, [0x3b, 0x79, 0x42, 0x4c]);
+    use crate::cfb8::Cfb8;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const KEY: [u8; 16] = *b"ferrite-test-key";
+
+    /// A 3 MiB payload forces the socket buffers full, so the writer goes
+    /// through `Pending` and short writes instead of the happy path only.
+    #[tokio::test]
+    async fn encrypted_stream_roundtrips_under_backpressure() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let plaintext: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i * 7 + 3) as u8).collect();
+            let expected = plaintext.clone();
+
+            let writer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire = Wire::new(stream);
+                wire.enable_encryption(&KEY);
+                for chunk in plaintext.chunks(65_521) {
+                    wire.write_all(chunk).await.unwrap();
+                }
+                wire.flush().await.unwrap();
+            });
+
+            let mut reader = tokio::net::TcpStream::connect(address).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let mut cipher = Cfb8::new(&KEY);
+            let mut received = Vec::with_capacity(expected.len());
+            let mut buffer = vec![0u8; 8192];
+            while received.len() < expected.len() {
+                let read = reader.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "connection closed early");
+                cipher.decrypt(&mut buffer[..read]);
+                received.extend_from_slice(&buffer[..read]);
+            }
+            writer.await.unwrap();
+            assert_eq!(received, expected);
+        })
+        .await
+        .expect("encrypted transfer timed out");
     }
 }
