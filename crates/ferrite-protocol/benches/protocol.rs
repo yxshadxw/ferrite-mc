@@ -113,6 +113,70 @@ fn frame_benches(c: &mut Criterion) {
     }
 }
 
+/// Compression backend comparison on a chunk-sized payload: the frame API
+/// (libdeflate) against flate2 driven the way the old frame code drove it.
+#[cfg(feature = "libdeflate")]
+fn compression_benches(c: &mut Criterion) {
+    use flate2::Compression;
+    use flate2::read::ZlibDecoder;
+    use flate2::write::ZlibEncoder;
+    use std::io::{Read, Write};
+
+    let payload = body(256 * 1024);
+    let mut enc = FrameEncoder::default();
+    enc.set_compression(Some(0), 6);
+    let mut wire = Vec::new();
+    enc.encode(&payload, &mut wire);
+
+    let mut group = c.benchmark_group("compression_256KiB");
+    group.throughput(Throughput::Bytes(payload.len() as u64));
+
+    group.bench_function("libdeflater_compress", |b| {
+        let mut out = Vec::with_capacity(wire.len());
+        b.iter(|| {
+            out.clear();
+            enc.encode(black_box(payload.as_slice()), &mut out);
+            black_box(out.len())
+        });
+    });
+
+    group.bench_function("flate2_compress", |b| {
+        b.iter(|| {
+            let mut z =
+                ZlibEncoder::new(Vec::with_capacity(payload.len() / 2), Compression::new(6));
+            z.write_all(black_box(payload.as_slice())).unwrap();
+            black_box(z.finish().unwrap().len())
+        });
+    });
+
+    group.bench_function("libdeflater_decompress", |b| {
+        let mut dec = FrameDecoder::default();
+        dec.set_compression(Some(0));
+        b.iter(|| {
+            dec.feed(&wire);
+            black_box(dec.next_frame().unwrap().unwrap())
+        });
+    });
+
+    let compressed = {
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::new(6));
+        z.write_all(&payload).unwrap();
+        z.finish().unwrap()
+    };
+    group.bench_function("flate2_decompress", |b| {
+        let mut out = Vec::with_capacity(payload.len());
+        b.iter(|| {
+            out.clear();
+            ZlibDecoder::new(black_box(compressed.as_slice()))
+                .read_to_end(&mut out)
+                .unwrap();
+            black_box(out.len())
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -121,4 +185,18 @@ criterion_group! {
         .measurement_time(Duration::from_secs(2));
     targets = varint_benches, frame_benches
 }
+
+#[cfg(feature = "libdeflate")]
+criterion_group! {
+    name = compression;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(10));
+    targets = compression_benches
+}
+
+#[cfg(feature = "libdeflate")]
+criterion_main!(benches, compression);
+#[cfg(not(feature = "libdeflate"))]
 criterion_main!(benches);
