@@ -646,6 +646,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-inventory"
+version = "0.1.0"
+dependencies = [
+ "ferrite-item",
+ "ferrite-nbt",
+]
+
+[[package]]
 name = "ferrite-item"
 version = "0.1.0"
 dependencies = [
