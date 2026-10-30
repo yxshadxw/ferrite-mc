@@ -32,6 +32,7 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
 }
 mod fluid;
 mod global;
+mod random_tick;
 mod region;
 
 use self::{
@@ -43,7 +44,10 @@ use ferrite_protocol::{Encode, VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, Regionizer, Scheduler};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -78,6 +82,7 @@ pub struct World {
     task: tokio::task::JoinHandle<()>,
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
+    random_tick_speed: Arc<AtomicU32>,
 }
 impl World {
     pub fn start() -> Self {
@@ -101,7 +106,9 @@ impl World {
         let (sender, rx) = mpsc::unbounded_channel();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
+        let random_tick_speed = Arc::new(AtomicU32::new(3));
         let metrics = LoopMetrics {
+            random_tick_speed: Arc::clone(&random_tick_speed),
             tick_samples: tick_samples.clone(),
             profiler: Arc::clone(&profiler),
         };
@@ -119,7 +126,11 @@ impl World {
             task,
             tick_samples,
             profiler,
+            random_tick_speed,
         }
+    }
+    pub fn set_random_tick_speed(&self, speed: u32) {
+        self.random_tick_speed.store(speed, Ordering::Relaxed);
     }
     pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {
         let (complete, done) = oneshot::channel();
@@ -156,6 +167,7 @@ fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
 }
 /// Per-tick measurements owned by the game loop's instrumentation.
 struct LoopMetrics {
+    random_tick_speed: Arc<AtomicU32>,
     /// Raw region tick durations consumed by the load-test example.
     tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
@@ -170,6 +182,7 @@ async fn run(
     settings: WorldSettings,
 ) {
     let LoopMetrics {
+        random_tick_speed,
         tick_samples,
         profiler,
     } = metrics;
@@ -189,6 +202,11 @@ async fn run(
             Region::tick(region);
             if let Some(source) = &fluid_source {
                 region.tick_fluids(source, &fluid_tracking);
+                region.tick_random(
+                    source,
+                    &fluid_tracking,
+                    random_tick_speed.load(Ordering::Relaxed),
+                );
             }
             let elapsed = now.elapsed();
             region_profiler.record_region(slot, elapsed);

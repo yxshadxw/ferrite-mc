@@ -86,6 +86,7 @@ pub struct Region {
     pub players: HashMap<Uuid, Player>,
     generator: FlatGenerator,
     fluid_ticks: ferrite_fluid::FluidTicks,
+    random_ticks: super::random_tick::RandomTicks,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -114,6 +115,7 @@ impl RegionData for Region {
             players: HashMap::new(),
             generator: self.generator.split(sections),
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
+            random_ticks: super::random_tick::RandomTicks::default(),
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -727,6 +729,15 @@ impl Region {
         if self.held_chunks.contains_key(&chunk) {
             self.fluid_ticks.schedule(pos, 0);
         }
+    }
+    pub fn tick_random(
+        &mut self,
+        source: &super::anvil::AnvilChunkSource,
+        tracking: &Tracking,
+        speed: u32,
+    ) {
+        self.random_ticks
+            .tick(source, &self.held_chunks, tracking, speed);
     }
     pub fn tick_fluids(&mut self, source: &super::anvil::AnvilChunkSource, tracking: &Tracking) {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);

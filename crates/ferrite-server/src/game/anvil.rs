@@ -154,6 +154,26 @@ impl AnvilChunkSource {
             .get(&(x, z))
             .map(|dirty| dirty.packet.clone())
     }
+    pub(super) fn with_loaded_chunk<R>(
+        &self,
+        x: i32,
+        z: i32,
+        f: impl FnOnce(&Chunk) -> R,
+    ) -> Option<R> {
+        let cache = self.cache.lock().unwrap();
+        if let Some(dirty) = cache.dirty.get(&(x, z)) {
+            return Some(f(&dirty.chunk));
+        }
+        let column = cache.entries.iter().find_map(|(&(cx, cz, _), entry)| {
+            if (cx, cz) == (x, z)
+                && let Entry::Ready(Ok(column), _) = entry
+            {
+                return Some(column);
+            }
+            None
+        })?;
+        Some(f(&column.chunk))
+    }
     pub fn block(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         let key = (x.div_euclid(16), z.div_euclid(16));
         let cache = self.cache.lock().unwrap();
