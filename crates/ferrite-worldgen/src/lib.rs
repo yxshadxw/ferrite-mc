@@ -1,8 +1,8 @@
 //! Vanilla world generation data (Minecraft Java 26.3).
 //!
 //! This crate is the phase-6 foundation: it parses the data generator output under
-//! `vanilla/26.3/generated/` into typed Rust structures. It does not evaluate any density
-//! function yet.
+//! `vanilla/26.3/generated/` into typed Rust structures and evaluates overworld density
+//! functions using seeded noise.
 //!
 //! The 26.3 data format differs from the older schemas that most documentation describes:
 //!

@@ -1,4 +1,4 @@
-//! Evaluation of density functions that do not depend on seeded noise.
+//! Evaluation of 26.3 density functions.
 
 use crate::{Axis, DensityFunction, DensityNode, ResourceId, Spline, SplineValue};
 
@@ -10,10 +10,38 @@ pub trait FunctionContext {
     fn sample_noise(&self, id: &ResourceId, _x: f64, _y: f64, _z: f64) -> f32 {
         panic!("noise sampler not available for {id}")
     }
+    fn sample_blended(&self, _settings: [f64; 5], _x: i32, _y: i32, _z: i32) -> f32 {
+        panic!("blended noise sampler not available")
+    }
+}
+
+struct Positioned<'a> {
+    parent: &'a dyn FunctionContext,
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl FunctionContext for Positioned<'_> {
+    fn block_x(&self) -> i32 {
+        self.x
+    }
+    fn block_y(&self) -> i32 {
+        self.y
+    }
+    fn block_z(&self) -> i32 {
+        self.z
+    }
+    fn sample_noise(&self, id: &ResourceId, x: f64, y: f64, z: f64) -> f32 {
+        self.parent.sample_noise(id, x, y, z)
+    }
+    fn sample_blended(&self, settings: [f64; 5], x: i32, y: i32, z: i32) -> f32 {
+        self.parent.sample_blended(settings, x, y, z)
+    }
 }
 
 impl DensityFunction {
-    /// Evaluates a resolved, noise-free function with 26.3 float arithmetic.
+    /// Evaluates a resolved density function with 26.3 float arithmetic.
     ///
     /// # Panics
     /// Panics for unresolved references and nodes requiring a seeded sampler.
@@ -21,7 +49,7 @@ impl DensityFunction {
         f64::from(self.compute_float(ctx))
     }
 
-    fn compute_float(&self, ctx: &impl FunctionContext) -> f32 {
+    fn compute_float(&self, ctx: &dyn FunctionContext) -> f32 {
         match self {
             Self::Constant(value) => *value as f32,
             Self::Reference(id) => panic!("unresolved density function: {id}"),
@@ -71,14 +99,53 @@ impl DensityFunction {
                             Axis::Y => ctx.block_y(),
                             Axis::Z => ctx.block_z(),
                         } as f32;
-                        let t = ((coordinate - *from_coordinate as f32)
-                            / (*to_coordinate as f32 - *from_coordinate as f32))
-                            .clamp(0.0, 1.0);
-                        *from_value as f32 + t * (*to_value as f32 - *from_value as f32)
+                        let start = *from_coordinate as i32;
+                        let end = *to_coordinate as i32;
+                        let offset =
+                            (coordinate as i32).clamp(start.min(end), start.max(end)) - start;
+                        let slope = (*to_value as f32 - *from_value as f32) / (end - start) as f32;
+                        *from_value as f32 + offset as f32 * slope
                     }
-                    DensityNode::Interpolated { input, .. }
-                    | DensityNode::Cache { input }
-                    | DensityNode::BlendDensity { input } => eval(input),
+                    DensityNode::Interpolated {
+                        input,
+                        cell_size_xz,
+                        cell_size_y,
+                    } => {
+                        let sx = *cell_size_xz as i32;
+                        let sy = *cell_size_y as i32;
+                        let rx = ctx.block_x().rem_euclid(sx);
+                        let ry = ctx.block_y().rem_euclid(sy);
+                        let rz = ctx.block_z().rem_euclid(sx);
+                        if rx == 0 && ry == 0 && rz == 0 {
+                            return eval(input);
+                        }
+                        let x = ctx.block_x() - rx;
+                        let y = ctx.block_y() - ry;
+                        let z = ctx.block_z() - rz;
+                        let sample = |dx, dy, dz| {
+                            input.compute_float(&Positioned {
+                                parent: ctx,
+                                x: x + dx,
+                                y: y + dy,
+                                z: z + dz,
+                            })
+                        };
+                        let lerp = |t: f32, a: f32, b: f32| a + t * (b - a);
+                        let tx = rx as f32 / sx as f32;
+                        let ty = ry as f32 / sy as f32;
+                        let tz = rz as f32 / sx as f32;
+                        let plane = |dz| {
+                            lerp(
+                                ty,
+                                lerp(tx, sample(0, 0, dz), sample(sx, 0, dz)),
+                                lerp(tx, sample(0, sy, dz), sample(sx, sy, dz)),
+                            )
+                        };
+                        lerp(tz, plane(0), plane(sx))
+                    }
+                    DensityNode::Cache { input } | DensityNode::BlendDensity { input } => {
+                        eval(input)
+                    }
                     DensityNode::BlendAlpha => 1.0,
                     DensityNode::BlendOffset | DensityNode::Beardifier => 0.0,
                     DensityNode::RangeChoice {
@@ -95,12 +162,52 @@ impl DensityFunction {
                             eval(when_out_of_range)
                         }
                     }
+                    DensityNode::IntervalSelect {
+                        input,
+                        thresholds,
+                        functions,
+                    } => {
+                        let value = eval(input);
+                        let index = thresholds
+                            .iter()
+                            .position(|threshold| value < *threshold as f32)
+                            .unwrap_or(functions.len() - 1);
+                        eval(&functions[index])
+                    }
+                    DensityNode::FindTopSurface {
+                        density,
+                        upper_bound,
+                        lower_bound,
+                        cell_height,
+                    } => {
+                        let height = *cell_height as i32;
+                        let mut y = (eval(upper_bound) / height as f32).floor() as i32 * height;
+                        while y > *lower_bound {
+                            let pos = Positioned {
+                                parent: ctx,
+                                x: ctx.block_x(),
+                                y,
+                                z: ctx.block_z(),
+                            };
+                            if density.compute_float(&pos) > 0.0 {
+                                return y as f32;
+                            }
+                            y -= height;
+                        }
+                        *lower_bound as f32
+                    }
                     DensityNode::Lerp {
                         alpha,
                         first,
                         second,
                     } => {
                         let a = eval(alpha);
+                        if a == 0.0 {
+                            return eval(first);
+                        }
+                        if a == 1.0 {
+                            return eval(second);
+                        }
                         let x = eval(first);
                         x + a * (eval(second) - x)
                     }
@@ -142,6 +249,24 @@ impl DensityFunction {
                             f64::from(ctx.block_z()) * 0.25,
                         ) * 4.0
                     }
+                    DensityNode::OldBlendedNoise {
+                        xz_scale,
+                        y_scale,
+                        xz_factor,
+                        y_factor,
+                        smear_scale_multiplier,
+                    } => ctx.sample_blended(
+                        [
+                            *xz_scale,
+                            *y_scale,
+                            *xz_factor,
+                            *y_factor,
+                            *smear_scale_multiplier,
+                        ],
+                        ctx.block_x(),
+                        ctx.block_y(),
+                        ctx.block_z(),
+                    ),
                     DensityNode::Spline { spline } => spline.compute_float(ctx),
                     _ => panic!("density node requires a sampler: {node:?}"),
                 }
@@ -151,7 +276,7 @@ impl DensityFunction {
 }
 
 impl Spline {
-    fn compute_float(&self, ctx: &impl FunctionContext) -> f32 {
+    fn compute_float(&self, ctx: &dyn FunctionContext) -> f32 {
         let x = self.coordinate.compute_float(ctx);
         let index = self
             .points
