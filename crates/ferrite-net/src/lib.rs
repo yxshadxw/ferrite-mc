@@ -9,11 +9,102 @@ use ferrite_protocol::{
         status::{PingRequest, PongResponse, StatusRequest, StatusResponse},
     },
 };
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
 use wire::Wire;
+
+/// Vanilla caps the server-list player sample at 12 entries (`MinecraftServer.getPlayerSample`).
+pub const STATUS_SAMPLE_LIMIT: usize = 12;
+/// Vanilla's Netty `ReadTimeoutHandler` drops a client that sends nothing for 30 seconds.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One entry of the server-list player sample (`ServerStatus.Players.SamplePlayer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplePlayer {
+    pub name: String,
+    pub id: uuid::Uuid,
+}
+
+/// The live player list behind the server-list ping.
+///
+/// Connections join when they enter play and leave when they disconnect, so the ping reports the
+/// actual online count instead of a hardcoded zero. Entries are keyed by connection session: a
+/// duplicate login replaces the old entry for that UUID, and the displaced connection's later
+/// leave cannot remove the new one.
+#[derive(Debug, Default)]
+pub struct StatusState {
+    players: std::sync::Mutex<Vec<(u64, SamplePlayer)>>,
+}
+impl StatusState {
+    pub fn join(&self, session: u64, name: impl Into<String>, id: uuid::Uuid) {
+        let mut players = self
+            .players
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        players.retain(|(_, player)| player.id != id);
+        players.push((
+            session,
+            SamplePlayer {
+                name: name.into(),
+                id,
+            },
+        ));
+    }
+    pub fn leave(&self, session: u64) {
+        let mut players = self
+            .players
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        players.retain(|(tracked, _)| *tracked != session);
+    }
+    pub fn online(&self) -> usize {
+        self.players
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+    pub fn players(&self) -> Vec<SamplePlayer> {
+        self.players
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(_, player)| player.clone())
+            .collect()
+    }
+}
+
+/// The vanilla `status_response` JSON.
+fn status_json(config: &ServerConfig) -> String {
+    let players = config.status.players();
+    let sample: Vec<serde_json::Value> = players
+        .iter()
+        .take(STATUS_SAMPLE_LIMIT)
+        .map(|player| serde_json::json!({ "name": player.name, "id": player.id.to_string() }))
+        .collect();
+    let mut response = serde_json::json!({
+        "version": {
+            "name": ferrite_protocol::GAME_VERSION,
+            "protocol": ferrite_protocol::PROTOCOL_VERSION
+        },
+        "players": {
+            "max": config.max_players,
+            "online": players.len(),
+            "sample": sample
+        },
+        "description": { "text": config.motd },
+        // Mirrors the `secure_chat` flag advertised at login: offline mode accepts unsigned chat,
+        // so it must not claim to enforce secure profiles.
+        "enforcesSecureChat": config.enforce_secure_profile && config.online_mode
+    });
+    if let Some(favicon) = &config.favicon {
+        response["favicon"] = serde_json::Value::String(favicon.clone());
+    }
+    response.to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -27,6 +118,13 @@ pub struct ServerConfig {
     pub compression_threshold: usize,
     pub view_distance: u8,
     pub forwarding: forwarding::Forwarding,
+    /// `data:image/png;base64,...` shown in the server list, when a valid icon was loaded.
+    pub favicon: Option<String>,
+    /// Live players reported by the server-list ping.
+    pub status: Arc<StatusState>,
+    /// Handshake/status/login clients that send nothing for this long are dropped, like vanilla's
+    /// Netty `ReadTimeoutHandler`.
+    pub read_timeout: Duration,
     pub game: Option<tokio::sync::mpsc::UnboundedSender<game::GameMessage>>,
 }
 impl Default for ServerConfig {
@@ -40,6 +138,9 @@ impl Default for ServerConfig {
             compression_threshold: 256,
             view_distance: 10,
             forwarding: forwarding::Forwarding::None,
+            favicon: None,
+            status: Arc::new(StatusState::default()),
+            read_timeout: DEFAULT_READ_TIMEOUT,
             game: None,
         }
     }
@@ -89,6 +190,17 @@ async fn read_packet<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// Read one framed packet, disconnecting a client that stalls past `timeout`.
+async fn read_packet_timeout<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    decoder: &mut FrameDecoder,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout(timeout, read_packet(stream, decoder))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {timeout:?} waiting for a packet"))?
+}
+
 async fn send_packet<P: Packet, W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
     packet: &P,
@@ -107,7 +219,7 @@ async fn handle_connection(
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::default();
-    let packet = read_packet(&mut stream, &mut decoder).await?;
+    let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != Intention::ID {
         bail!("expected handshake");
@@ -128,21 +240,17 @@ async fn handle_connection(
         };
         return offline_login(stream, decoder, config, key, legacy).await;
     }
-    let packet = read_packet(&mut stream, &mut decoder).await?;
+    let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != StatusRequest::ID {
         bail!("expected status request");
     }
     StatusRequest::decode(&mut body)?;
-    let json = serde_json::json!({
-        "version": { "name": ferrite_protocol::GAME_VERSION, "protocol": ferrite_protocol::PROTOCOL_VERSION },
-        "players": { "max": config.max_players, "online": 0 },
-        "description": { "text": config.motd }
-    }).to_string();
+    let json = status_json(&config);
     send_packet(&mut stream, &StatusResponse { json })
         .await
         .context("send status")?;
-    let packet = read_packet(&mut stream, &mut decoder).await?;
+    let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != PingRequest::ID {
         bail!("expected ping");
@@ -166,7 +274,7 @@ async fn offline_login(
 ) -> Result<()> {
     use ferrite_protocol::packets::login::{LoginStart, LoginSuccess, SetCompression};
 
-    let packet = read_packet(&mut stream, &mut decoder).await?;
+    let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != LoginStart::ID {
         bail!("expected login start");
@@ -185,6 +293,7 @@ async fn offline_login(
                     &key,
                     &start.name,
                     config.online_mode,
+                    config.read_timeout,
                 )
                 .await?
             } else {
@@ -199,7 +308,8 @@ async fn offline_login(
             }
         }
         forwarding::Forwarding::Velocity { secret } => {
-            let forwarded = query_velocity(&mut stream, &mut decoder, secret).await?;
+            let forwarded =
+                query_velocity(&mut stream, &mut decoder, secret, config.read_timeout).await?;
             Profile {
                 uuid: forwarded.uuid,
                 name: forwarded.name,
@@ -258,6 +368,7 @@ async fn query_velocity(
     stream: &mut Wire,
     decoder: &mut FrameDecoder,
     secret: &str,
+    timeout: Duration,
 ) -> Result<forwarding::VelocityProfile> {
     use ferrite_protocol::packets::login::CustomQueryAnswer;
 
@@ -273,7 +384,7 @@ async fn query_velocity(
     send_packet(stream, &query)
         .await
         .context("send Velocity forwarding query")?;
-    let packet = read_packet(stream, decoder).await?;
+    let packet = read_packet_timeout(stream, decoder, timeout).await?;
     let mut body = packet.as_slice();
     ensure!(
         VarInt::decode(&mut body)?.0 == CustomQueryAnswer::ID,
@@ -327,7 +438,7 @@ async fn configure(
             login::LoginAcknowledged,
         },
     };
-    let packet = read_packet(&mut stream, &mut decoder).await?;
+    let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != LoginAcknowledged::ID {
         bail!("expected login acknowledgement");
@@ -514,6 +625,8 @@ async fn play(
     static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uuid = profile.uuid;
+    let status = config.status.clone();
+    let status_name = profile.name.clone();
     let (outbound, mut queue) = tokio::sync::mpsc::unbounded_channel();
     game.send(GameMessage::Joined {
         session,
@@ -532,6 +645,7 @@ async fn play(
         outbound,
     })
     .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+    status.join(session, status_name, uuid);
     let result=async {
         let mut tick=tokio::time::interval(std::time::Duration::from_millis(50));
         let mut keepalive=tokio::time::interval_at(tokio::time::Instant::now()+std::time::Duration::from_secs(10),std::time::Duration::from_secs(10));
@@ -543,6 +657,7 @@ async fn play(
         }}
     }.await;
     let _ = game.send(GameMessage::Left { session, uuid });
+    status.leave(session);
     result
 }
 fn minecraft_digest(digest: &[u8]) -> String {
@@ -554,6 +669,7 @@ async fn authenticate(
     key: &rsa::RsaPrivateKey,
     name: &str,
     online: bool,
+    timeout: Duration,
 ) -> Result<(
     uuid::Uuid,
     String,
@@ -580,17 +696,21 @@ async fn authenticate(
     )
     .await?;
     // Do not read ahead across the encryption boundary.
-    let response = loop {
-        if let Some(frame) = decoder.next_frame()? {
-            break frame;
+    let response = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(frame) = decoder.next_frame()? {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+            let mut byte = [0u8; 1];
+            let n = stream.read(&mut byte).await?;
+            if n == 0 {
+                bail!("connection closed during encryption");
+            }
+            decoder.feed(&byte);
         }
-        let mut byte = [0u8; 1];
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            bail!("connection closed during encryption");
-        }
-        decoder.feed(&byte);
-    };
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for the encryption response"))??;
     let mut body = response.as_slice();
     if VarInt::decode(&mut body)?.0 != EncryptionResponse::ID {
         bail!("expected encryption response");
@@ -659,7 +779,7 @@ fn offline_uuid(name: &str) -> uuid::Uuid {
 mod tests {
     use super::*;
     use ferrite_protocol::{
-        Decode, FrameDecoder, FrameEncoder, Packet, VarInt, encode_packet,
+        Decode, Encode, FrameDecoder, FrameEncoder, Packet, VarInt, encode_packet,
         packets::{
             handshake::{Intent, Intention},
             status::{PingRequest, PongResponse, StatusRequest, StatusResponse},
@@ -722,9 +842,123 @@ mod tests {
             serde_json::from_str(&StatusResponse::decode(&mut body).unwrap().json).unwrap();
         assert_eq!(response["version"]["protocol"], 777);
         assert_eq!(response["version"]["name"], "26.3");
+        assert_eq!(response["players"]["max"], 20);
+        assert_eq!(response["players"]["online"], 0);
+        assert_eq!(response["players"]["sample"], serde_json::json!([]));
+        assert_eq!(response["description"]["text"], "A Ferrite server");
+        assert_eq!(response["enforcesSecureChat"], true);
+        assert!(response.get("favicon").is_none());
         let mut body = frames[1].as_slice();
         assert_eq!(VarInt::decode(&mut body).unwrap().0, PongResponse::ID);
         assert_eq!(PongResponse::decode(&mut body).unwrap().payload, 42);
+        server.abort();
+    }
+
+    #[test]
+    fn status_json_reports_sample_favicon_and_secure_chat() {
+        let mut config = ServerConfig {
+            motd: "Hello".into(),
+            max_players: 100,
+            favicon: Some("data:image/png;base64,AA==".into()),
+            ..Default::default()
+        };
+        for index in 0..13u128 {
+            config.status.join(
+                index as u64 + 1,
+                format!("Player{index}"),
+                uuid::Uuid::from_u128(index + 1),
+            );
+        }
+        let status: serde_json::Value = serde_json::from_str(&status_json(&config)).unwrap();
+        assert_eq!(status["version"]["name"], ferrite_protocol::GAME_VERSION);
+        assert_eq!(
+            status["version"]["protocol"],
+            ferrite_protocol::PROTOCOL_VERSION
+        );
+        assert_eq!(status["players"]["max"], 100);
+        assert_eq!(status["players"]["online"], 13);
+        let sample = status["players"]["sample"].as_array().unwrap();
+        assert_eq!(sample.len(), STATUS_SAMPLE_LIMIT);
+        assert_eq!(sample[0]["name"], "Player0");
+        assert_eq!(sample[0]["id"], uuid::Uuid::from_u128(1).to_string());
+        assert_eq!(sample[11]["name"], "Player11");
+        assert_eq!(status["description"]["text"], "Hello");
+        assert_eq!(status["favicon"], "data:image/png;base64,AA==");
+        assert_eq!(status["enforcesSecureChat"], true);
+
+        // Offline mode must not advertise secure-chat enforcement.
+        config.online_mode = false;
+        let offline: serde_json::Value = serde_json::from_str(&status_json(&config)).unwrap();
+        assert_eq!(offline["enforcesSecureChat"], false);
+    }
+
+    #[test]
+    fn status_state_scopes_leave_to_the_session() {
+        let status = StatusState::default();
+        let alice = uuid::Uuid::from_u128(1);
+        let bob = uuid::Uuid::from_u128(2);
+        status.join(1, "Alice", alice);
+        status.join(2, "Bob", bob);
+        assert_eq!(status.online(), 2);
+        // A duplicate login replaces the entry, keeping one row per UUID.
+        status.join(3, "Alice", alice);
+        assert_eq!(status.online(), 2);
+        // The displaced connection's leave must not remove the new session.
+        status.leave(1);
+        assert_eq!(status.online(), 2);
+        status.leave(3);
+        assert_eq!(
+            status.players(),
+            vec![SamplePlayer {
+                name: "Bob".into(),
+                id: bob
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_client_is_disconnected_by_the_read_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                read_timeout: Duration::from_millis(150),
+                ..Default::default()
+            },
+        ));
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte))
+            .await
+            .expect("server did not close the idle connection")
+            .unwrap();
+        assert_eq!(read, 0, "expected EOF after the read timeout");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_handshake_frame_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                ..Default::default()
+            },
+        ));
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut header = Vec::new();
+        VarInt(ferrite_protocol::frame::MAX_FRAME_LEN as i32 + 1).encode(&mut header);
+        socket.write_all(&header).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte))
+            .await
+            .expect("server did not reject the oversized frame")
+            .unwrap();
+        assert_eq!(read, 0, "expected EOF after rejecting the frame");
         server.abort();
     }
 }
