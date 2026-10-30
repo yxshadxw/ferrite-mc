@@ -74,6 +74,10 @@ impl PalettedContainer {
     pub fn packed_data(&self) -> &[u64] {
         &self.data
     }
+    /// Frequencies already accumulated when the container was decoded or changed.
+    pub(crate) fn value_counts(&self) -> impl Iterator<Item = (u32, usize)> + '_ {
+        self.counts.iter().map(|(&value, &count)| (value, count))
+    }
     pub fn palette(&self) -> &[u32] {
         &self.palette
     }
@@ -263,3 +267,36 @@ impl PalettedContainer {
 }
 mod chunk_nbt;
 pub use chunk_nbt::{ChunkNbtError, DATA_VERSION, chunk_from_nbt, chunk_to_nbt};
+
+#[cfg(test)]
+mod frequency_tests {
+    use super::*;
+    #[test]
+    fn frequencies_track_single_indirect_and_direct_palettes() {
+        let mut p = PalettedContainer::new(PaletteKind::Blocks, 0, 16).unwrap();
+        assert_eq!(p.value_counts().collect::<Vec<_>>(), vec![(0, 4096)]);
+        for i in 0..20 {
+            p.set(i, i as u32 + 1).unwrap();
+        }
+        assert_ne!(p.bits_per_entry(), 16);
+        assert_eq!(p.value_counts().map(|(_, n)| n).sum::<usize>(), 4096);
+        assert_eq!(
+            p.value_counts().find(|(value, _)| *value == 0),
+            Some((0, 4076))
+        );
+        for i in 20..300 {
+            p.set(i, i as u32 + 1).unwrap();
+        }
+        assert_eq!(p.bits_per_entry(), 16);
+        let counts: BTreeMap<_, _> = p.value_counts().collect();
+        let mut expected = BTreeMap::new();
+        for i in 0..4096 {
+            *expected.entry(p.get(i).unwrap()).or_insert(0) += 1;
+        }
+        assert_eq!(counts, expected);
+        for i in 0..300 {
+            p.set(i, 0).unwrap();
+        }
+        assert_eq!(p.value_counts().collect::<Vec<_>>(), vec![(0, 4096)]);
+    }
+}
