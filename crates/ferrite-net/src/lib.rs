@@ -648,7 +648,8 @@ fn valid_username(name: &str) -> bool {
         && name.len() <= 16
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
-fn offline_uuid(name: &str) -> uuid::Uuid {
+/// The UUID an offline-mode server gives a player name (`OfflinePlayer:<name>`, MD5, version 3).
+pub fn offline_uuid(name: &str) -> uuid::Uuid {
     let digest = md5::compute(format!("OfflinePlayer:{name}"));
     let mut bytes = digest.0;
     bytes[6] = (bytes[6] & 0x0f) | 0x30;

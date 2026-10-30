@@ -1097,6 +1097,14 @@ impl Menu {
         }
     }
 
+    /// Vanilla `setRemoteSlot`: records that the client already shows `stack` in a slot (it
+    /// predicted the change itself), so no update is sent for it.
+    pub fn set_remote_slot(&mut self, slot: usize, stack: &ItemStack) {
+        if let Some(remote) = self.remote.get_mut(slot) {
+            *remote = Remote::Known(stack.clone());
+        }
+    }
+
     /// Vanilla `transferState`: adopts what the client was last sent for the inventory slots
     /// `other` shares with this menu, so returning to this menu only sends real changes.
     pub fn transfer_state(&mut self, other: &Menu) {

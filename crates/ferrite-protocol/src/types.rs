@@ -204,6 +204,43 @@ mod tests {
     }
 }
 
+/// A translatable text component, `{translate: key}` as network NBT (the title of vanilla
+/// containers such as `container.crafting`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Translatable(pub String);
+impl Encode for Translatable {
+    fn encode(&self, out: &mut Vec<u8>) {
+        10u8.encode(out);
+        let mut key = Vec::new();
+        PlainText("translate".into()).encode(&mut key);
+        // A named compound entry: the tag type, the name, then the string payload.
+        out.extend_from_slice(&key);
+        let mut value = Vec::new();
+        PlainText(self.0.clone()).encode(&mut value);
+        out.extend_from_slice(&value[1..]);
+        0u8.encode(out);
+    }
+}
+impl Decode for Translatable {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        if u8::decode(buf)? != 10 {
+            return Err(DecodeError::Invalid("expected a text compound"));
+        }
+        if PlainText::decode(buf)?.0 != "translate" {
+            return Err(DecodeError::Invalid("expected a translate key"));
+        }
+        // The value is a bare string payload: restore its tag byte for PlainText.
+        let len = u16::decode(&mut &buf[..])? as usize;
+        let mut tagged = vec![8u8];
+        tagged.extend_from_slice(crate::codec::take(buf, 2 + len)?);
+        let key = PlainText::decode(&mut tagged.as_slice())?.0;
+        if u8::decode(buf)? != 0 {
+            return Err(DecodeError::Invalid("unexpected extra text fields"));
+        }
+        Ok(Self(key))
+    }
+}
+
 /// A plain-text network NBT component encoded as a nameless TAG_String.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainText(pub String);

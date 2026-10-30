@@ -483,40 +483,31 @@ async fn operator_teleport_command_moves_player() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn creative_slot_updates_player_inventory() {
-    use ferrite_protocol::packets::play::{ContainerSlot, CreativeSlot, ItemStack};
-    let world = World::start();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve(
-        listener,
-        ServerConfig {
-            online_mode: false,
-            view_distance: 2,
-            game: Some(world.sender.clone()),
-            ..Default::default()
-        },
-    ));
-    let mut bot = Bot::join(addr, "Alice").await;
+    use ferrite_protocol::packets::play::{CreativeSlot, ItemStack};
+    let (world, addr, server) = op_world(None, 1, &[]).await;
+    let mut bot = join_with_inventory(addr, "Creator").await;
+    let stack = ItemStack {
+        count: 3,
+        item_id: 1,
+    };
     bot.send(&CreativeSlot {
         slot: 36,
-        item: ItemStack {
-            count: 3,
-            item_id: 1,
-        },
+        item: stack,
     })
     .await;
-    let body = tokio::time::timeout(std::time::Duration::from_secs(3), bot.until(20))
-        .await
-        .unwrap();
-    let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
-    assert_eq!(slot.slot, 36);
-    assert_eq!(
-        slot.item,
-        ItemStack {
-            count: 3,
-            item_id: 1
-        }
-    );
+    // The client already shows the stack, so (like vanilla) nothing is echoed; the server's
+    // full view has it.
+    assert_eq!(inventory_of(&mut bot).await[36], stack);
+    // Out-of-range slots and oversized stacks are ignored.
+    for (slot, count) in [(0, 1), (46, 1), (37, 65)] {
+        bot.send(&CreativeSlot {
+            slot,
+            item: ItemStack { count, item_id: 1 },
+        })
+        .await;
+    }
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots.iter().filter(|s| s.count > 0).count(), 1);
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
@@ -1377,8 +1368,8 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     assert_eq!(take.amount.0, 1);
     let dirt = ferrite_data::registries::id("minecraft:item", "minecraft:dirt").unwrap();
     let slot = loop {
-        let body = entity_packet(&mut walker, ContainerSlot::ID, -1).await;
-        let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
+        let body = entity_packet(&mut walker, ContainerSlot::<ItemStack>::ID, -1).await;
+        let slot = ContainerSlot::<ItemStack>::decode(&mut body.as_slice()).unwrap();
         if slot.slot == 36 {
             break slot;
         }
@@ -1475,4 +1466,258 @@ async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
         Some(std::env::temp_dir().canonicalize().unwrap().as_path())
     );
     std::fs::remove_dir_all(resolved).unwrap();
+}
+
+/// A world in `gamemode` whose named players are operators (for `/gamemode`), served on a
+/// local port.
+async fn op_world(
+    source: Option<std::sync::Arc<super::anvil::AnvilChunkSource>>,
+    gamemode: i32,
+    names: &[&str],
+) -> (
+    World,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let world = World::start_configured(
+        source,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode,
+            ops: names
+                .iter()
+                .map(|name| super::Operator {
+                    uuid: ferrite_net::offline_uuid(name),
+                    level: 4,
+                })
+                .collect(),
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    (world, addr, server)
+}
+
+/// Joins and consumes the initial inventory contents.
+async fn join_with_inventory(addr: std::net::SocketAddr, name: &str) -> Bot {
+    let mut bot = Bot::join(addr, name).await;
+    bot.until(18).await;
+    bot
+}
+
+/// Sends a `container_click` with a stale state id, so the server answers with its whole view
+/// of the menu (vanilla `broadcastFullState`), and returns that view.
+async fn click_in(
+    bot: &mut Bot,
+    window: i32,
+    slot: i16,
+    button: i8,
+    input: ferrite_inventory::ClickInput,
+) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    use ferrite_protocol::packets::play::{ContainerClick, ContainerContent, ItemStack};
+    bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+        window: VarInt(window),
+        state: VarInt(-1),
+        slot,
+        button,
+        input: VarInt(input.id()),
+        changed: vec![],
+        carried: None,
+    })
+    .await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), bot.until(18))
+        .await
+        .expect("container contents");
+    let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(content.window.0, window);
+    content.slots
+}
+
+/// [`click_in`] on the inventory menu.
+async fn click(
+    bot: &mut Bot,
+    slot: i16,
+    button: i8,
+    input: ferrite_inventory::ClickInput,
+) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    click_in(bot, 0, slot, button, input).await
+}
+
+/// The server view of the inventory menu, without changing anything.
+async fn inventory_of(bot: &mut Bot) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    click(bot, -1, 0, ferrite_inventory::ClickInput::Pickup).await
+}
+
+fn plain(name: &str, count: i32) -> ferrite_protocol::packets::play::ItemStack {
+    ferrite_protocol::packets::play::ItemStack {
+        count,
+        item_id: ferrite_data::registries::id("minecraft:item", &format!("minecraft:{name}"))
+            .unwrap(),
+    }
+}
+
+/// Switches a bot to another game mode with `/gamemode` and waits for the change.
+async fn set_mode(bot: &mut Bot, mode: &str, id: u8) {
+    use ferrite_protocol::packets::play::GameEvent;
+    bot.raw(7, &format!("gamemode {mode}")).await;
+    loop {
+        let body = bot.until(GameEvent::ID).await;
+        let event = GameEvent::decode(&mut body.as_slice()).unwrap();
+        if event.event == 3 && event.value == f32::from(id) {
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_inventory_clicks_drops_and_hotbar_swaps() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::packets::play::{
+        AddEntity, CreativeSlot, ItemStack, PlayerAction, SetHeldItem,
+    };
+    let (world, addr, server) = op_world(None, 1, &["Sorter"]).await;
+    let mut bot = join_with_inventory(addr, "Sorter").await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("stone", 40),
+    })
+    .await;
+    bot.send(&CreativeSlot {
+        slot: 9,
+        item: plain("dirt", 10),
+    })
+    .await;
+    set_mode(&mut bot, "survival", 0).await;
+    let empty = ItemStack::default();
+    // Move a stack: pick it up, put it down elsewhere.
+    let slots = click(&mut bot, 36, 0, Pickup).await;
+    assert_eq!(slots[36], empty);
+    let slots = click(&mut bot, 20, 0, Pickup).await;
+    assert_eq!((slots[20], slots[36]), (plain("stone", 40), empty));
+    // Shift-click from the main inventory goes to the hotbar.
+    let slots = click(&mut bot, 20, 0, QuickMove).await;
+    assert_eq!((slots[20], slots[36]), (empty, plain("stone", 40)));
+    // Number key 3 swaps the hovered slot with hotbar slot 2.
+    let slots = click(&mut bot, 9, 2, Swap).await;
+    assert_eq!((slots[9], slots[38]), (empty, plain("dirt", 10)));
+    // Right-click takes half; a left click puts it down elsewhere.
+    click(&mut bot, 36, 1, Pickup).await;
+    let slots = click(&mut bot, 10, 0, Pickup).await;
+    assert_eq!(
+        (slots[36], slots[10]),
+        (plain("stone", 20), plain("stone", 20))
+    );
+    // Q drops one from the selected slot, Ctrl+Q the rest; both become item entities.
+    bot.send(&SetHeldItem { slot: 0 }).await;
+    for status in [4, 3] {
+        bot.send(&PlayerAction {
+            status: VarInt(status),
+            location: 0,
+            face: 0,
+            sequence: VarInt(0),
+        })
+        .await;
+    }
+    let item_type = i32::from(ferrite_data::entity_props::by_name("item").unwrap().id);
+    let mut spawned = 0;
+    while spawned < 2 {
+        let body = entity_packet(&mut bot, AddEntity::ID, -1).await;
+        if AddEntity::decode(&mut body.as_slice())
+            .unwrap()
+            .entity_type
+            .0
+            == item_type
+        {
+            spawned += 1;
+        }
+    }
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots[36], empty);
+    // Q over a slot of the inventory screen drops one item.
+    let slots = click(&mut bot, 10, 0, Throw).await;
+    assert_eq!(slots[10], plain("stone", 19));
+    // F swaps the main hand with the offhand.
+    bot.send(&SetHeldItem { slot: 2 }).await;
+    bot.send(&PlayerAction {
+        status: VarInt(6),
+        location: 0,
+        face: 0,
+        sequence: VarInt(0),
+    })
+    .await;
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!((slots[38], slots[45]), (empty, plain("dirt", 10)));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_placement_uses_items_in_survival_only() {
+    use ferrite_protocol::{
+        packets::play::{CreativeSlot, MoveRotation, PlayerAction, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &["Mason"]).await;
+    let mut bot = join_with_inventory(addr, "Mason").await;
+    bot.until(46).await;
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("stone", 2),
+    })
+    .await;
+    let stone = u32::from(ferrite_data::blocks::default_state("minecraft:stone").unwrap());
+    let break_block = |sequence: i32| PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(sequence),
+    };
+    let place = |sequence: i32| UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(sequence),
+    };
+    // Creative placement keeps the stack.
+    bot.send(&break_block(1)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    bot.send(&place(2)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(stone));
+    assert_eq!(inventory_of(&mut bot).await[36], plain("stone", 2));
+    // Break it again in creative, then place it in survival: one stone is used up.
+    bot.send(&break_block(3)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    set_mode(&mut bot, "survival", 0).await;
+    bot.send(&place(4)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(stone));
+    assert_eq!(inventory_of(&mut bot).await[36], plain("stone", 1));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
 }
