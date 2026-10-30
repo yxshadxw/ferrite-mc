@@ -1491,6 +1491,7 @@ async fn op_world(
                     level: 4,
                 })
                 .collect(),
+            plugins: None,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1717,6 +1718,143 @@ async fn block_placement_uses_items_in_survival_only() {
     bot.until(4).await;
     assert_eq!(source.block(0, 64, 0), Some(stone));
     assert_eq!(inventory_of(&mut bot).await[36], plain("stone", 1));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crafting_planks_and_sticks_in_the_grid_and_on_a_table() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::{
+        packets::play::{
+            ClientboundContainerClose, ContainerContent, CreativeSlot, ItemStack, MoveRotation,
+            OpenScreen, ServerboundContainerClose, UseItemOn,
+        },
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &["Joiner"]).await;
+    let mut bot = join_with_inventory(addr, "Joiner").await;
+    bot.until(46).await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("oak_log", 3),
+    })
+    .await;
+    set_mode(&mut bot, "survival", 0).await;
+    let empty = ItemStack::default();
+
+    // 2x2 grid: one log shows four planks, a click takes one craft.
+    click(&mut bot, 36, 0, Pickup).await;
+    let slots = click(&mut bot, 1, 1, Pickup).await;
+    assert_eq!(
+        (slots[1], slots[0]),
+        (plain("oak_log", 1), plain("oak_planks", 4))
+    );
+    click(&mut bot, 36, 0, Pickup).await;
+    click(&mut bot, 0, 0, Pickup).await;
+    let slots = click(&mut bot, 9, 0, Pickup).await;
+    assert_eq!((slots[0], slots[1]), (empty, empty));
+    assert_eq!(
+        (slots[9], slots[36]),
+        (plain("oak_planks", 4), plain("oak_log", 2))
+    );
+    // Two planks stacked vertically make sticks; shift-click crafts into the hotbar end.
+    click(&mut bot, 9, 0, Pickup).await;
+    click(&mut bot, 1, 1, Pickup).await;
+    let slots = click(&mut bot, 3, 1, Pickup).await;
+    assert_eq!(slots[0], plain("stick", 4));
+    click(&mut bot, 9, 0, Pickup).await;
+    let slots = click(&mut bot, 0, 0, QuickMove).await;
+    assert_eq!((slots[44], slots[0]), (plain("stick", 4), empty));
+    assert_eq!(
+        (slots[1], slots[3], slots[9]),
+        (empty, empty, plain("oak_planks", 2))
+    );
+
+    // Crafting table: using it opens the 3x3 menu instead of placing the held logs.
+    let table = u32::from(ferrite_data::blocks::default_state("crafting_table").unwrap());
+    source.set_block(0, 64, 0, table).unwrap();
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    let use_table = UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    };
+    bot.send(&use_table).await;
+    let body = bot.until(OpenScreen::ID).await;
+    let screen = OpenScreen::decode(&mut body.as_slice()).unwrap();
+    let crafting = ferrite_data::registries::id("minecraft:menu", "minecraft:crafting").unwrap();
+    assert_eq!((screen.window.0, screen.menu.0), (1, crafting));
+    assert_eq!(screen.title.0, "container.crafting");
+    let body = bot.until(18).await;
+    let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(content.window.0, 1);
+    assert_eq!(content.slots.len(), 46);
+    assert_eq!(content.slots[37], plain("oak_log", 2));
+    assert_eq!(source.block(0, 65, 0), Some(0));
+    // Log in the centre, shift-click the result: the planks join the stack in the inventory.
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 5, 1, Pickup).await;
+    assert_eq!(slots[0], plain("oak_planks", 4));
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 0, 0, QuickMove).await;
+    assert_eq!(
+        (slots[0], slots[5], slots[10]),
+        (empty, empty, plain("oak_planks", 6))
+    );
+    // Sticks in the 3x3 grid, taken with a plain click.
+    click_in(&mut bot, 1, 10, 0, Pickup).await;
+    click_in(&mut bot, 1, 2, 1, Pickup).await;
+    let slots = click_in(&mut bot, 1, 5, 1, Pickup).await;
+    assert_eq!(slots[0], plain("stick", 4));
+    click_in(&mut bot, 1, 10, 0, Pickup).await;
+    click_in(&mut bot, 1, 0, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 11, 0, Pickup).await;
+    assert_eq!(
+        (slots[11], slots[2], slots[5]),
+        (plain("stick", 4), empty, empty)
+    );
+    // Closing gives back what is left in the grid.
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    click_in(&mut bot, 1, 1, 0, Pickup).await;
+    bot.send(&ServerboundContainerClose { window: VarInt(1) })
+        .await;
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots[36], plain("oak_log", 1));
+    assert_eq!(
+        (slots[9], slots[10]),
+        (plain("oak_planks", 4), plain("stick", 4))
+    );
+    assert_eq!(slots[44], plain("stick", 4));
+    // Walking away from an open table closes it (vanilla `stillValid`).
+    bot.send(&use_table).await;
+    let body = bot.until(OpenScreen::ID).await;
+    assert_eq!(
+        OpenScreen::decode(&mut body.as_slice()).unwrap().window.0,
+        2
+    );
+    bot.raw(7, "tp 30 65 0").await;
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        bot.until(ClientboundContainerClose::ID),
+    )
+    .await
+    .expect("container close");
+    let closed = ClientboundContainerClose::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(closed.window.0, 2);
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();

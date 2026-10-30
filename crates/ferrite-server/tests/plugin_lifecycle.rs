@@ -18,7 +18,10 @@ use ferrite_protocol::{
         },
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
-        play::{ChunkBatchReceived, ConfirmTeleport, PositionSync, SystemChat},
+        play::{
+            ChunkBatchReceived, ConfirmTeleport, LastSeenUpdate, PositionSync, ServerboundChat,
+            SystemChat,
+        },
     },
 };
 
@@ -242,6 +245,17 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
+    /// An unsigned chat message (offline mode accepts it).
+    fn chat(&mut self, text: &str) {
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp: 1_700_000_000_000,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
+        });
+    }
+
     fn raw(&mut self, id: i32, text: &str) {
         let mut body = Vec::new();
         VarInt(id).encode(&mut body);
@@ -422,12 +436,12 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
-    bot.raw(9, "hello plugins");
+    bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
     let broadcast = wait_for_chat(&mut bot, "<Bot> hello plugins", &stdout, &stderr, &events);
     assert!(broadcast.contains("hello plugins"), "{broadcast}");
-    bot.raw(9, "cancel this");
+    bot.chat("cancel this");
     wait_for_line(&events, "chat cancel this", &stdout, &stderr);
     let after_cancel = bot.collect_chats(Duration::from_millis(1500));
     assert!(

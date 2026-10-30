@@ -121,6 +121,7 @@ impl World {
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
         drops::preload();
+        crafting::preload();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
         let random_tick_speed = Arc::new(AtomicU32::new(3));

@@ -23,6 +23,8 @@ pub struct Containers {
     counter: i32,
     /// Stacks the player dropped, spawned as item entities by the region this tick.
     pub thrown: Vec<ItemStack>,
+    /// The block the open menu belongs to (a crafting table), for vanilla `stillValid`.
+    pub open_at: Option<[i32; 3]>,
 }
 
 impl Default for Containers {
@@ -32,6 +34,7 @@ impl Default for Containers {
             open: None,
             counter: 0,
             thrown: Vec::new(),
+            open_at: None,
         }
     }
 }
@@ -43,7 +46,6 @@ impl Containers {
     }
 
     /// Vanilla `nextContainerCounter`.
-    #[allow(dead_code)]
     fn next_id(&mut self) -> i32 {
         self.counter = self.counter % 100 + 1;
         self.counter
@@ -103,10 +105,52 @@ impl Player {
         emit(self, vec![full]);
     }
 
-    /// Vanilla `containerMenu.broadcastChanges()`, once per tick.
-    pub fn broadcast_inventory_changes(&mut self) {
+    /// Once per tick, like `ServerPlayer.tick`: `containerMenu.broadcastChanges()`, then the
+    /// open menu closes if it is no longer valid.
+    pub fn tick_containers(&mut self) {
         let out = self.menus.current().broadcast_changes(&self.inventory);
         emit(self, out);
+        if !self.container_still_valid() {
+            self.close_open_container();
+        }
+    }
+
+    /// Vanilla `AbstractContainerMenu.stillValid` for a block menu: the block is still there
+    /// and within the player's block interaction range plus 4 (`canInteractWithBlock(pos, 4)`).
+    fn container_still_valid(&self) -> bool {
+        let Some([x, y, z]) = self.menus.open_at else {
+            return true;
+        };
+        let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
+        let present = self.source.as_ref().and_then(|s| s.block(x, y, z));
+        if present.is_none() || present != table {
+            return false;
+        }
+        let eye = [self.pos[0], self.pos[1] + 1.62, self.pos[2]];
+        let distance_sq: f64 = [x, y, z]
+            .iter()
+            .zip(eye)
+            .map(|(&min, e)| {
+                let min = f64::from(min);
+                let d = (min - e).max(e - (min + 1.0)).max(0.0);
+                d * d
+            })
+            .sum();
+        let range = if self.gamemode == 1 { 5.0 } else { 4.5 } + 4.0;
+        distance_sq < range * range
+    }
+
+    /// Vanilla `closeContainer`: tells the client, then closes on the server.
+    fn close_open_container(&mut self) {
+        if let Some(window) = self.menus.open.as_ref().map(Menu::container_id) {
+            send(
+                self,
+                &ClientboundContainerClose {
+                    window: VarInt(window),
+                },
+            );
+            self.close_container();
+        }
     }
 
     /// Vanilla `handleContainerClick`.
@@ -128,6 +172,14 @@ impl Player {
         let Some(input) = ClickInput::from_id(p.input.0) else {
             return;
         };
+        if !self.container_still_valid() {
+            return;
+        }
+        let menu = self
+            .menus
+            .open
+            .as_mut()
+            .unwrap_or(&mut self.menus.inventory);
         let mut clicker = Clicker::new(&mut self.inventory, infinite, crafter());
         let out = menu.handle_click(
             &mut clicker,
@@ -148,6 +200,7 @@ impl Player {
     pub fn close_container(&mut self) {
         let infinite = self.infinite_materials();
         let mut clicker = Clicker::new(&mut self.inventory, infinite, crafter());
+        self.menus.open_at = None;
         match self.menus.open.take() {
             Some(mut open) => {
                 open.close(&mut clicker);
@@ -160,19 +213,10 @@ impl Player {
     }
 
     /// Opens a container screen (vanilla `ServerPlayer.openMenu`): any open menu closes first,
-    /// then the client gets `open_screen` and the menu's full contents.
-    #[allow(dead_code)] // Opened by crafting tables (I3).
-    pub fn open_menu(&mut self, make: impl FnOnce(i32) -> Menu, title: &str) {
-        // Vanilla `closeContainer`: tell the client, then close on the server.
-        if let Some(window) = self.menus.open.as_ref().map(Menu::container_id) {
-            send(
-                self,
-                &ClientboundContainerClose {
-                    window: VarInt(window),
-                },
-            );
-            self.close_container();
-        }
+    /// then the client gets `open_screen` and the menu's full contents. `at` is the block the
+    /// menu belongs to.
+    pub fn open_menu(&mut self, make: impl FnOnce(i32) -> Menu, title: &str, at: Option<[i32; 3]>) {
+        self.close_open_container();
         let id = self.menus.next_id();
         let mut menu = make(id);
         let Some(kind) = menu.kind().menu_type() else {
@@ -192,7 +236,28 @@ impl Player {
         );
         let full = menu.broadcast_full_state(&self.inventory);
         self.menus.open = Some(menu);
+        self.menus.open_at = at;
         emit(self, vec![full]);
+    }
+
+    /// Vanilla `CraftingTableBlock.useWithoutItem`: using a crafting table opens its menu
+    /// instead of placing the held item. Returns whether the block was used.
+    pub fn use_crafting_table(&mut self, location: i64) -> bool {
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
+        let state = self
+            .source
+            .as_ref()
+            .and_then(|s| s.block(pos.x, pos.y, pos.z));
+        if state.is_none() || state != table {
+            return false;
+        }
+        self.open_menu(
+            Menu::crafting,
+            "container.crafting",
+            Some([pos.x, pos.y, pos.z]),
+        );
+        true
     }
 
     /// Vanilla `handleSetCreativeModeSlot`: slots 1..=45 of the inventory menu, or a drop for a

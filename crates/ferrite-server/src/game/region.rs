@@ -659,7 +659,13 @@ impl Player {
                     );
                 }
                 ServerboundPlay::UseItemOn(p) => {
-                    self.place(&p);
+                    let clicked = ferrite_protocol::types::BlockPos::unpack(p.location);
+                    let used = (0..=1).contains(&p.hand.0)
+                        && self.hit(clicked).is_some()
+                        && self.use_crafting_table(p.location);
+                    if !used {
+                        self.place(&p);
+                    }
                     self.send_block_snapshot(p.location);
                     if let Some(face) = usize::try_from(p.face.0)
                         .ok()
@@ -933,7 +939,7 @@ impl Region {
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
         for p in self.players.values_mut() {
-            p.broadcast_inventory_changes();
+            p.tick_containers();
         }
         self.track_entities(ctx);
         self.entities.sweep_removed();
