@@ -1,11 +1,25 @@
-//! End-to-end M3: the server starts the embedded JVM, enables plugins, and disables them on stop.
+//! End-to-end M3: the server starts the embedded JVM, enables plugins, fires their events,
+//! and disables them on stop.
 use std::{
     fs,
     io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
+};
+
+use ferrite_protocol::{
+    Decode, Encode, FrameDecoder, FrameEncoder, Packet, VarInt, encode_packet,
+    packets::{
+        configuration::{
+            AcknowledgeFinishConfiguration, ClientboundKnownPacks, ServerboundKnownPacks,
+        },
+        handshake::{Intent, Intention},
+        login::{LoginAcknowledged, LoginStart},
+        play::{ChunkBatchReceived, ConfirmTeleport, PositionSync, SystemChat},
+    },
 };
 
 fn repo_root() -> PathBuf {
@@ -65,6 +79,14 @@ fn toml_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("binding a probe port")
+        .local_addr()
+        .expect("probe address")
+        .port()
+}
+
 /// Kills the server if a test assertion panics before it exits.
 struct Process(Child);
 impl Drop for Process {
@@ -96,6 +118,246 @@ fn capture(
     (log, handle)
 }
 
+fn wait_for_line(
+    path: &Path,
+    needle: &str,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(content) = fs::read_to_string(path)
+            && content.lines().any(|line| line == needle)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin never wrote {needle:?} to {}:\n{}\n{}\n{}",
+            path.display(),
+            fs::read_to_string(path).unwrap_or_default(),
+            stdout.lock().unwrap(),
+            stderr.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A minimal protocol bot: enough to log in, chat, run a command and disconnect.
+struct Bot {
+    stream: TcpStream,
+    encoder: FrameEncoder,
+    decoder: FrameDecoder,
+}
+
+impl Bot {
+    fn join(
+        addr: SocketAddr,
+        name: &str,
+        stdout: &Arc<Mutex<String>>,
+        stderr: &Arc<Mutex<String>>,
+    ) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stream = loop {
+            match TcpStream::connect(addr) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => panic!("connecting to {addr}: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut bot = Self {
+            stream,
+            encoder: FrameEncoder::default(),
+            decoder: FrameDecoder::default(),
+        };
+        bot.send(&Intention {
+            protocol_version: 777,
+            server_address: "localhost".into(),
+            server_port: addr.port(),
+            intent: Intent::Login,
+        });
+        bot.send(&LoginStart {
+            name: name.into(),
+            uuid: uuid::Uuid::nil(),
+        });
+        let first = match bot.read_frame() {
+            Some(frame) => frame,
+            None => panic!(
+                "no set compression packet:\n{}\n{}",
+                stdout.lock().unwrap(),
+                stderr.lock().unwrap()
+            ),
+        };
+        assert_eq!(VarInt::decode(&mut first.as_slice()).unwrap().0, 3);
+        bot.encoder.set_compression(Some(256), 6);
+        bot.decoder.set_compression(Some(256));
+        let login = match bot.read_frame() {
+            Some(frame) => frame,
+            None => panic!(
+                "no login success packet:\n{}\n{}",
+                stdout.lock().unwrap(),
+                stderr.lock().unwrap()
+            ),
+        };
+        assert_eq!(VarInt::decode(&mut login.as_slice()).unwrap().0, 2);
+        bot.send(&LoginAcknowledged);
+        loop {
+            let frame = match bot.read_frame() {
+                Some(frame) => frame,
+                None => panic!(
+                    "no finish configuration packet:\n{}\n{}",
+                    stdout.lock().unwrap(),
+                    stderr.lock().unwrap()
+                ),
+            };
+            let mut body = frame.as_slice();
+            let id = VarInt::decode(&mut body).unwrap().0;
+            if id == ClientboundKnownPacks::ID {
+                let packs = ClientboundKnownPacks::decode(&mut body).unwrap();
+                bot.send(&ServerboundKnownPacks { packs: packs.packs });
+            }
+            if id == 3 {
+                break;
+            }
+        }
+        bot.send(&AcknowledgeFinishConfiguration);
+        bot.until(73);
+        bot.stream
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        bot
+    }
+
+    fn send<P: Packet>(&mut self, packet: &P) {
+        let mut body = Vec::new();
+        encode_packet(packet, &mut body);
+        let mut wire = Vec::new();
+        self.encoder.encode(&body, &mut wire);
+        self.stream.write_all(&wire).unwrap();
+    }
+
+    fn raw(&mut self, id: i32, text: &str) {
+        let mut body = Vec::new();
+        VarInt(id).encode(&mut body);
+        text.encode(&mut body);
+        let mut wire = Vec::new();
+        self.encoder.encode(&body, &mut wire);
+        self.stream.write_all(&wire).unwrap();
+    }
+
+    fn read_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(frame) = self.decoder.next_frame().unwrap() {
+                return Some(frame);
+            }
+            let mut bytes = [0_u8; 8192];
+            match self.stream.read(&mut bytes) {
+                Ok(0) => return None,
+                Ok(read) => self.decoder.feed(&bytes[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
+                Err(error) => panic!("reading from the server: {error}"),
+            }
+        }
+    }
+
+    fn next_play(&mut self) -> Option<(i32, Vec<u8>)> {
+        let bytes = self.read_frame()?;
+        let mut body = bytes.as_slice();
+        let id = VarInt::decode(&mut body).unwrap().0;
+        let rest = body.to_vec();
+        match id {
+            73 => {
+                let mut body = rest.as_slice();
+                let position = PositionSync::decode(&mut body).unwrap();
+                self.send(&ConfirmTeleport {
+                    id: position.teleport_id,
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                    yaw: position.yaw,
+                    pitch: position.pitch,
+                });
+            }
+            11 => self.send(&ChunkBatchReceived {
+                chunks_per_tick: 64.0,
+            }),
+            _ => {}
+        }
+        Some((id, rest))
+    }
+
+    fn until(&mut self, wanted: i32) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for packet {wanted}"
+            );
+            if let Some((id, body)) = self.next_play()
+                && id == wanted
+            {
+                return body;
+            }
+        }
+    }
+
+    fn collect_chats(&mut self, duration: Duration) -> Vec<String> {
+        let deadline = Instant::now() + duration;
+        let mut messages = Vec::new();
+        while Instant::now() < deadline {
+            if let Some((id, body)) = self.next_play()
+                && id == 124
+            {
+                messages.push(SystemChat::decode(&mut body.as_slice()).unwrap().content.0);
+            }
+        }
+        messages
+    }
+}
+
+fn wait_for_chat(
+    bot: &mut Bot,
+    needle: &str,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+    events: &Path,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            panic!(
+                "no system chat containing {needle:?}; saw {seen:?}\nevents:\n{}\n{}\n{}",
+                fs::read_to_string(events).unwrap_or_default(),
+                stdout.lock().unwrap(),
+                stderr.lock().unwrap()
+            );
+        }
+        if let Some((id, body)) = bot.next_play()
+            && id == 124
+        {
+            let message = SystemChat::decode(&mut body.as_slice()).unwrap().content.0;
+            if message.contains(needle) {
+                return message;
+            }
+            seen.push(message);
+        }
+    }
+}
+
 #[test]
 fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let java_home = match ferrite_jvm::find_java_home(None) {
@@ -112,10 +374,11 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     fs::create_dir(&plugins).unwrap();
     fs::copy(plugin_jar, plugins.join("test-plugin.jar")).unwrap();
     fs::copy(dependency_jar, plugins.join("test-dependency.jar")).unwrap();
+    let port = free_port();
     fs::write(
         dir.path().join("ferrite.toml"),
         format!(
-            "bind-address = \"127.0.0.1:0\"\nonline-mode = false\nmotd = \"Plugin lifecycle\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
+            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\nmotd = \"Plugin lifecycle\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
             toml_path(&bridge_jar)
         ),
     )
@@ -155,6 +418,30 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let events = plugins.join("TestPlugin/events.txt");
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
+    wait_for_line(&events, "join Bot", &stdout, &stderr);
+    bot.raw(9, "hello plugins");
+    wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
+    wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
+    let broadcast = wait_for_chat(&mut bot, "<Bot> hello plugins", &stdout, &stderr, &events);
+    assert!(broadcast.contains("hello plugins"), "{broadcast}");
+    bot.raw(9, "cancel this");
+    wait_for_line(&events, "chat cancel this", &stdout, &stderr);
+    let after_cancel = bot.collect_chats(Duration::from_millis(1500));
+    assert!(
+        !after_cancel
+            .iter()
+            .any(|message| message.contains("<Bot> cancel this")),
+        "a cancelled chat event was still broadcast: {after_cancel:?}"
+    );
+    bot.raw(7, "testping");
+    let pong = wait_for_chat(&mut bot, "pong", &stdout, &stderr, &events);
+    assert_eq!(pong, "pong");
+    drop(bot);
+    wait_for_line(&events, "quit Bot", &stdout, &stderr);
+
     let mut stdin = process.0.stdin.take().unwrap();
     stdin.write_all(b"stop\n").unwrap();
     drop(stdin);

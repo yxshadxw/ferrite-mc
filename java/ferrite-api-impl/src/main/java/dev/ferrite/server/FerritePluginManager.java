@@ -34,6 +34,10 @@ final class FerritePluginManager extends PluginManagerStubs {
     @Override public synchronized Set<org.bukkit.permissions.Permissible> getDefaultPermSubscriptions(boolean op) { var map = server.facade.defSubs.get(op); return map == null ? Set.of() : Set.copyOf(map.keySet()); }
     private record Handler(Class<?> type, org.bukkit.event.EventPriority priority, boolean ignoreCancelled, Plugin owner, java.lang.invoke.MethodHandle method) {}
     private final List<Handler> handlers = new ArrayList<>();
+    private final java.util.Set<Class<?>> listened = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private void noteListener(Class<?> type) { if (listened.add(type)) Native.eventRegistered(type.getName()); }
+    /** Whether any plugin registered a listener for the exact event class. */
+    boolean hasListeners(Class<? extends org.bukkit.event.Event> type) { return listened.contains(type); }
     public synchronized void registerEvents(org.bukkit.event.Listener listener, Plugin owner) {
         Set<String> seen = new HashSet<>();
         for (Class<?> type = listener.getClass(); type != null; type = type.getSuperclass()) for (java.lang.reflect.Method method : type.getDeclaredMethods()) {
@@ -44,6 +48,7 @@ final class FerritePluginManager extends PluginManagerStubs {
             try {
                 method.setAccessible(true);
                 handlers.add(new Handler(method.getParameterTypes()[0], annotation.priority(), annotation.ignoreCancelled(), owner, java.lang.invoke.MethodHandles.lookup().unreflect(method).bindTo(listener)));
+                noteListener(method.getParameterTypes()[0]);
             } catch (IllegalAccessException e) { throw new IllegalArgumentException(e); }
         }
         handlers.sort(Comparator.comparing(Handler::priority));
@@ -54,6 +59,7 @@ final class FerritePluginManager extends PluginManagerStubs {
             var method = java.lang.invoke.MethodHandles.lookup().findVirtual(EventExecutor.class, "execute", java.lang.invoke.MethodType.methodType(void.class, org.bukkit.event.Listener.class, org.bukkit.event.Event.class)).bindTo(executor).bindTo(listener);
             handlers.add(new Handler(type, priority, ignoreCancelled, plugin, method));
             handlers.sort(Comparator.comparing(Handler::priority));
+            noteListener(type);
         } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
     }
     public void callEvent(org.bukkit.event.Event event) {
@@ -131,6 +137,8 @@ final class FerritePluginManager extends PluginManagerStubs {
             finally { server.scheduler.cancelTasks(plugin); server.regionScheduler.cancelTasks(plugin); server.asyncScheduler.cancelTasks(plugin); server.entitySchedulers.cancelTasks(plugin); }
         }
         synchronized (this) { handlers.clear(); }
+        listened.clear();
+        Native.eventsCleared();
         for (FerriteClassLoader loader : new HashSet<>(loaders.values())) {
             try { loader.close(); } catch (IOException e) { server.getLogger().warning("Could not close plugin classloader: " + e); }
         }

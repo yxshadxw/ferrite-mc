@@ -1,8 +1,9 @@
 //! Loading plugins into the embedded JVM at server startup.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
-use ferrite_plugin::{PluginConfig, PluginHost, ServerSnapshot};
+use ferrite_plugin::{PluginConfig, PluginHost, ServerHooks, ServerSnapshot};
 
 /// Everything the plugin bridge needs from the server's startup configuration.
 pub struct Settings {
@@ -18,7 +19,7 @@ pub struct Settings {
 
 /// A running embedded JVM with the server's plugins enabled.
 pub struct PluginBridge {
-    host: PluginHost,
+    host: Arc<PluginHost>,
 }
 
 impl PluginBridge {
@@ -30,26 +31,34 @@ impl PluginBridge {
         if !has_plugin_jars(&settings.directory) {
             return Ok(None);
         }
-        let host = PluginHost::start(
-            &settings.directory,
-            PluginConfig {
-                bridge_jar: settings.bridge_jar,
-                server_snapshot: ServerSnapshot {
-                    motd: settings.motd,
-                    max_players: settings.max_players,
-                    port: settings.port,
-                    view_distance: settings.view_distance,
-                    whitelist: settings.whitelist,
-                    online_mode: settings.online_mode,
-                    banned_ips: Vec::new(),
+        let host = Arc::new(
+            PluginHost::start(
+                &settings.directory,
+                PluginConfig {
+                    bridge_jar: settings.bridge_jar,
+                    server_snapshot: ServerSnapshot {
+                        motd: settings.motd,
+                        max_players: settings.max_players,
+                        port: settings.port,
+                        view_distance: settings.view_distance,
+                        whitelist: settings.whitelist,
+                        online_mode: settings.online_mode,
+                        banned_ips: Vec::new(),
+                    },
+                    ..Default::default()
                 },
-                ..Default::default()
-            },
-        )
-        .with_context(|| format!("loading plugins from {}", settings.directory.display()))?;
+            )
+            .with_context(|| format!("loading plugins from {}", settings.directory.display()))?,
+        );
         let bridge = Self { host };
         bridge.flush_logs();
         Ok(Some(bridge))
+    }
+
+    /// Server-side hooks that deliver lifecycle events to plugin listeners.
+    pub fn hooks(&self) -> Arc<dyn ServerHooks> {
+        let hooks: Arc<dyn ServerHooks> = self.host.clone();
+        hooks
     }
 
     /// Disable every plugin, which runs their `onDisable` handlers.

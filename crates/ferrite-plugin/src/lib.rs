@@ -5,7 +5,7 @@ use ferrite_jvm::jni::{
 };
 use ferrite_jvm::{Jvm, JvmConfig, NativeMethod};
 pub use scheduling::{EntityTask, RegionTask};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -20,7 +20,15 @@ static WORLD_HANDLER: OnceLock<Option<WorldHandler>> = OnceLock::new();
 static PLAYER_HANDLER: OnceLock<Option<PlayerHandler>> = OnceLock::new();
 static COMMAND_HANDLER: OnceLock<Option<CommandHandler>> = OnceLock::new();
 thread_local! { static REGION: std::cell::RefCell<Option<(String, i32, i32)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static CAPTURED_MESSAGES: std::cell::RefCell<Option<Vec<PluginMessage>>> = const { std::cell::RefCell::new(None) }; }
 const BOOTSTRAP: &str = "dev/ferrite/server/Bootstrap";
+/// Bukkit event classes the server forwards; keep in sync with the Java bridge.
+pub const PLAYER_JOIN_EVENT: &str = "org.bukkit.event.player.PlayerJoinEvent";
+pub const PLAYER_QUIT_EVENT: &str = "org.bukkit.event.player.PlayerQuitEvent";
+pub const ASYNC_CHAT_EVENT: &str = "io.papermc.paper.event.player.AsyncChatEvent";
+pub const ASYNC_PLAYER_CHAT_EVENT: &str = "org.bukkit.event.player.AsyncPlayerChatEvent";
+/// Event classes with at least one registered listener, reported by the JVM.
+static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct PluginConfig {
@@ -244,8 +252,6 @@ pub enum Error {
     Jvm(#[from] ferrite_jvm::JvmError),
     #[error("plugin metadata rejected: {0}")]
     Metadata(String),
-    #[error("event bridge is not implemented")]
-    EventUnsupported,
     #[error("task was not issued or has already been consumed")]
     InvalidTask,
     #[error("region context is not configured")]
@@ -255,9 +261,50 @@ pub enum Error {
     #[error("invalid offline player snapshot")]
     InvalidOfflinePlayerSnapshot,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandSender {
     Console,
     Player(uuid::Uuid),
+}
+/// A command declared by a plugin's `plugin.yml` or `paper-plugin.yml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginCommand {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub permission: Option<String>,
+    pub usage: Option<String>,
+}
+/// A message a plugin sent to one player during a callback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginMessage {
+    pub player: uuid::Uuid,
+    pub content: MessageContent,
+}
+/// Result of dispatching a line to a plugin `CommandExecutor`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PluginCommandResult {
+    pub handled: bool,
+    /// Messages captured from `CommandSender.sendMessage` during the call.
+    pub messages: Vec<PluginMessage>,
+}
+/// Server hooks the game loop forwards to plugins.
+pub trait ServerHooks: Send + Sync {
+    /// Fires Bukkit's `PlayerJoinEvent` for a player that just joined.
+    fn player_joined(&self, id: uuid::Uuid, name: &str) -> Result<(), Error>;
+    /// Fires Bukkit's `PlayerQuitEvent` before the player is removed.
+    fn player_left(&self, id: uuid::Uuid, name: &str) -> Result<(), Error>;
+    /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
+    ///
+    /// Returns the message after listeners ran, or `None` when one cancelled chat.
+    fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error>;
+    /// Commands declared by enabled plugins.
+    fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
+    /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
+    fn run_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error>;
 }
 pub struct PluginHost {
     jvm: Jvm,
@@ -272,6 +319,26 @@ extern "system" fn log(mut env: JNIEnv, _: JClass, message: JString) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(s.into());
     }
+}
+fn listened_events() -> &'static Mutex<HashSet<String>> {
+    LISTENED_EVENTS.get_or_init(Default::default)
+}
+/// Records that a plugin registered a listener for one Bukkit event class.
+extern "system" fn event_registered(mut env: JNIEnv, _: JClass, event: JString) {
+    if let Ok(event) = env.get_string(&event) {
+        let event: String = event.into();
+        listened_events()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(event);
+    }
+}
+/// Forgets every listener after the JVM disabled all plugins.
+extern "system" fn events_cleared(_: JNIEnv, _: JClass) {
+    listened_events()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 extern "system" fn server_whitelist(_: JNIEnv, _: JClass, enabled: u8) -> u8 {
     let Some(handler) = SERVER_HANDLER.get().and_then(Option::as_ref) else {
@@ -390,6 +457,20 @@ extern "system" fn player_message(
     } else {
         MessageContent::AdventureJson(message)
     };
+    let captured = CAPTURED_MESSAGES.with(|captured| {
+        let mut captured = captured.borrow_mut();
+        let Some(messages) = captured.as_mut() else {
+            return false;
+        };
+        messages.push(PluginMessage {
+            player,
+            content: content.clone(),
+        });
+        true
+    });
+    if captured {
+        return;
+    }
     if let Some(handler) = PLAYER_HANDLER.get().and_then(Option::as_ref) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handler(PlayerCommand::Message { player, content })
@@ -849,6 +930,12 @@ impl PluginHost {
             &[
                 NativeMethod::new("log", "(Ljava/lang/String;)V", log as *mut _),
                 NativeMethod::new(
+                    "eventRegistered",
+                    "(Ljava/lang/String;)V",
+                    event_registered as *mut _,
+                ),
+                NativeMethod::new("eventsCleared", "()V", events_cleared as *mut _),
+                NativeMethod::new(
                     "serverBan",
                     "(Ljava/lang/String;Ljava/lang/String;JLjava/lang/String;Z)Z",
                     server_ban as *mut _,
@@ -1248,9 +1335,180 @@ impl PluginHost {
         REGION.with(|region| *region.borrow_mut() = previous);
         Ok(result?)
     }
-    /// Placeholder until server events have a Java representation.
-    pub fn call_event(&self, _event: &str) -> Result<(), Error> {
-        Err(Error::EventUnsupported)
+    /// Commands declared by enabled plugins in their descriptor.
+    pub fn declared_commands(&self) -> Result<Vec<PluginCommand>, Error> {
+        let encoded: String = self.jvm.with_env(|env| {
+            let value = env
+                .call_static_method(BOOTSTRAP, "pluginCommands", "()Ljava/lang/String;", &[])?
+                .l()?;
+            if value.is_null() {
+                return Ok(String::new());
+            }
+            let value = JString::from(value);
+            let value: String = env.get_string(&value)?.into();
+            Ok(value)
+        })?;
+        Ok(encoded
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                let name = fields.next().filter(|name| !name.is_empty())?;
+                let aliases = fields
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|alias| !alias.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let permission = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let usage = fields
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                Some(PluginCommand {
+                    name: name.to_owned(),
+                    aliases,
+                    permission,
+                    usage,
+                })
+            })
+            .collect())
+    }
+
+    /// Executes a plugin command through its Bukkit `CommandExecutor`.
+    ///
+    /// Messages the plugin sends with `CommandSender.sendMessage` on this thread are captured
+    /// and returned so the game loop can deliver them to the player.
+    pub fn execute_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error> {
+        let line = line.trim().trim_start_matches('/');
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            return Ok(PluginCommandResult::default());
+        };
+        let label = label.to_owned();
+        let args: Vec<String> = parts.map(str::to_owned).collect();
+        let sender = match sender {
+            CommandSender::Console => "console".to_owned(),
+            CommandSender::Player(id) => id.to_string(),
+        };
+        let previous = CAPTURED_MESSAGES.with(|captured| captured.replace(Some(Vec::new())));
+        let result = self.jvm.with_env(|env| {
+            let sender = env.new_string(sender)?;
+            let label = env.new_string(&label)?;
+            let array =
+                env.new_object_array(args.len() as i32, "java/lang/String", JObject::null())?;
+            for (index, arg) in args.iter().enumerate() {
+                let arg = env.new_string(arg)?;
+                env.set_object_array_element(&array, index as i32, arg)?;
+            }
+            let status = env.call_static_method(
+                BOOTSTRAP,
+                "runPluginCommand",
+                "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)I",
+                &[
+                    JValue::Object(sender.as_ref()),
+                    JValue::Object(label.as_ref()),
+                    JValue::Object(array.as_ref()),
+                ],
+            )?;
+            status.i()
+        });
+        let messages = CAPTURED_MESSAGES
+            .with(|captured| captured.replace(previous))
+            .unwrap_or_default();
+        Ok(PluginCommandResult {
+            handled: result? == 1,
+            messages,
+        })
+    }
+
+    /// Whether at least one plugin listener is registered for `event_class`.
+    pub fn listens_for(&self, event_class: &str) -> bool {
+        listened_events()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(event_class)
+    }
+
+    /// Fires Bukkit's `PlayerJoinEvent`; no JNI call without a registered listener.
+    pub fn fire_player_join(&self, id: uuid::Uuid, name: &str) -> Result<(), Error> {
+        if !self.listens_for(PLAYER_JOIN_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "firePlayerJoin",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(id.as_ref()), JValue::Object(name.as_ref())],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `PlayerQuitEvent`; no JNI call without a registered listener.
+    pub fn fire_player_quit(&self, id: uuid::Uuid) -> Result<(), Error> {
+        if !self.listens_for(PLAYER_QUIT_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "firePlayerQuit",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(id.as_ref())],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
+    ///
+    /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
+    pub fn fire_chat(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        message: &str,
+    ) -> Result<Option<String>, Error> {
+        if !self.listens_for(ASYNC_CHAT_EVENT) && !self.listens_for(ASYNC_PLAYER_CHAT_EVENT) {
+            return Ok(Some(message.to_owned()));
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let message = env.new_string(message)?;
+            let result = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireChat",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Object(message.as_ref()),
+                    ],
+                )?
+                .l()?;
+            if result.is_null() {
+                return Ok(None);
+            }
+            let result = JString::from(result);
+            let result: String = env.get_string(&result)?.into();
+            Ok(Some(result))
+        })?)
     }
     pub fn shutdown(&self) -> Result<(), Error> {
         self.issued_regions
@@ -1262,6 +1520,27 @@ impl PluginHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         Ok(self.jvm.call_static(BOOTSTRAP, "shutdown", "()V", &[])?)
+    }
+}
+impl ServerHooks for PluginHost {
+    fn player_joined(&self, id: uuid::Uuid, name: &str) -> Result<(), Error> {
+        self.fire_player_join(id, name)
+    }
+    fn player_left(&self, id: uuid::Uuid, _name: &str) -> Result<(), Error> {
+        self.fire_player_quit(id)
+    }
+    fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error> {
+        self.fire_chat(id, name, message)
+    }
+    fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
+        self.declared_commands()
+    }
+    fn run_plugin_command(
+        &self,
+        sender: CommandSender,
+        line: &str,
+    ) -> Result<PluginCommandResult, Error> {
+        self.execute_plugin_command(sender, line)
     }
 }
 fn consume_task<T: PartialEq>(issued: &Mutex<Vec<T>>, task: &T) -> Result<(), Error> {
