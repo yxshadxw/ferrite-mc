@@ -8,4 +8,5 @@ description = "Brigadier-style command dispatcher, vanilla argument parsers and 
 [dependencies]
 ferrite-protocol.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 thiserror.workspace = true

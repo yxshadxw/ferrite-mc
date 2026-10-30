@@ -1419,3 +1419,78 @@ async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
     );
     std::fs::remove_dir_all(resolved).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gamerule_zero_stops_grass_spread_for_bot() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.path().to_path_buf(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let y = (64..318)
+        .find(|y| source.brightness(8, y + 1, 8).unwrap_or(0) >= 9)
+        .unwrap();
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    for x in 7..=9 {
+        for z in 7..=9 {
+            source
+                .set_block(
+                    x,
+                    y,
+                    z,
+                    block(if (x, z) == (8, 8) {
+                        "dirt"
+                    } else {
+                        "grass_block"
+                    }),
+                )
+                .unwrap();
+            source.set_block(x, y + 1, z, block("air")).unwrap();
+        }
+    }
+    let world = World::start_configured(
+        Some(source.clone()),
+        [8, y + 1, 8],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+        },
+    );
+    world.set_random_tick_speed(0);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.until(46).await;
+    bot.raw(7, "gamerule randomTickSpeed 0").await;
+    bot.chat_containing("randomTickSpeed = 0").await;
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(source.block(8, y, 8), Some(block("dirt")));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

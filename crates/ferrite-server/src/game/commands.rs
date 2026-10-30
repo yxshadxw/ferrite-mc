@@ -4,6 +4,7 @@ use tokio::sync::mpsc::UnboundedSender;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     GameMode(i32),
+    GameRule(String, Option<String>),
     Teleport([f64; 3]),
     Say(String),
     Tps,
@@ -27,6 +28,34 @@ fn send(source: &Source, action: Action) -> Result<i32, CommandError> {
 }
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
+    tree.register(
+        literal::<Source>("gamerule")
+            .requires(|s| s.permission >= 2)
+            .then(
+                argument("rule", ArgumentType::word())
+                    .executes(|ctx| {
+                        let rule = ctx.string("rule").unwrap_or_default();
+                        if ferrite_command::gamerule::GameRules::default()
+                            .get(rule)
+                            .is_none()
+                        {
+                            return Err(CommandError::failed("Unknown game rule"));
+                        }
+                        send(ctx.source(), Action::GameRule(rule.to_owned(), None))
+                    })
+                    .then(argument("value", ArgumentType::word()).executes(|ctx| {
+                        let rule = ctx.string("rule").unwrap_or_default();
+                        let value = ctx.string("value").unwrap_or_default();
+                        ferrite_command::gamerule::GameRules::default()
+                            .set(rule, value)
+                            .map_err(CommandError::failed)?;
+                        send(
+                            ctx.source(),
+                            Action::GameRule(rule.to_owned(), Some(value.to_owned())),
+                        )
+                    })),
+            ),
+    );
     tree.register(
         literal::<Source>("gamemode")
             .requires(|s| s.permission >= 2)
@@ -124,4 +153,35 @@ mod tests {
         tree.execute("profile stop", operator).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), Action::ProfileStop));
     }
+}
+#[test]
+fn gamerule_commands_validate_types_and_query() {
+    let tree = dispatcher();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let op = Source {
+        permission: 2,
+        console: false,
+        actions: tx,
+    };
+    tree.execute("gamerule randomTickSpeed 0", op.clone())
+        .unwrap();
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Action::GameRule("randomTickSpeed".into(), Some("0".into()))
+    );
+    tree.execute("gamerule doDaylightCycle", op.clone())
+        .unwrap();
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Action::GameRule("doDaylightCycle".into(), None)
+    );
+    assert!(
+        tree.execute("gamerule randomTickSpeed -1", op.clone())
+            .is_err()
+    );
+    assert!(
+        tree.execute("gamerule doMobSpawning 42", op.clone())
+            .is_err()
+    );
+    assert!(tree.execute("gamerule doesNotExist", op).is_err());
 }

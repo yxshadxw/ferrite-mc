@@ -87,6 +87,8 @@ pub struct World {
     pub tick_samples: Arc<Mutex<Vec<f64>>>,
     profiler: Arc<profile::Profiler>,
     random_tick_speed: Arc<AtomicU32>,
+    game_rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
+    game_rules_path: Option<std::path::PathBuf>,
 }
 impl World {
     pub fn start() -> Self {
@@ -112,8 +114,23 @@ impl World {
         drops::preload();
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
-        let random_tick_speed = Arc::new(AtomicU32::new(3));
+        let game_rules_path = source.as_ref().and_then(|source| source.game_rules_path());
+        let rules = game_rules_path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| {
+                serde_json::from_slice::<ferrite_command::gamerule::GameRules>(&bytes).ok()
+            })
+            .unwrap_or_default();
+        let speed = match rules.get("random_tick_speed") {
+            Some(ferrite_command::gamerule::RuleValue::Integer(value)) => value as u32,
+            _ => 3,
+        };
+        let game_rules = Arc::new(Mutex::new(rules));
+        let random_tick_speed = Arc::new(AtomicU32::new(speed));
         let metrics = LoopMetrics {
+            game_rules: Arc::clone(&game_rules),
+            game_rules_path: game_rules_path.clone(),
             random_tick_speed: Arc::clone(&random_tick_speed),
             tick_samples: tick_samples.clone(),
             profiler: Arc::clone(&profiler),
@@ -138,10 +155,20 @@ impl World {
             tick_samples,
             profiler,
             random_tick_speed,
+            game_rules,
+            game_rules_path,
         }
     }
     pub fn set_random_tick_speed(&self, speed: u32) {
-        self.random_tick_speed.store(speed, Ordering::Relaxed);
+        if let Err(error) = apply_game_rule(
+            &self.game_rules,
+            self.game_rules_path.as_deref(),
+            &self.random_tick_speed,
+            "random_tick_speed",
+            Some(&speed.to_string()),
+        ) {
+            tracing::warn!(%error, "setting random tick speed failed");
+        }
     }
     pub async fn console_command(&self, command: String) -> anyhow::Result<bool> {
         let (complete, done) = oneshot::channel();
@@ -164,6 +191,50 @@ impl World {
         result.map_err(anyhow::Error::msg)
     }
 }
+fn apply_game_rule(
+    rules: &Mutex<ferrite_command::gamerule::GameRules>,
+    path: Option<&std::path::Path>,
+    speed: &AtomicU32,
+    name: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
+    use ferrite_command::gamerule::RuleValue;
+    let mut rules = rules.lock().map_err(|error| error.to_string())?;
+    let result = if let Some(value) = value {
+        let mut updated = rules.clone();
+        let result = updated.set(name, value)?;
+        if let Some(path) = path {
+            let bytes = serde_json::to_vec_pretty(&updated).map_err(|error| error.to_string())?;
+            let temp = path.with_extension("json.tmp");
+            std::fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+            // Windows rename cannot replace an existing file; write through the same world path.
+            std::fs::write(
+                path,
+                std::fs::read(&temp).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = std::fs::remove_file(temp);
+        }
+        *rules = updated;
+        if matches!(
+            name,
+            "randomTickSpeed" | "random_tick_speed" | "minecraft:random_tick_speed"
+        ) && let RuleValue::Integer(n) = result
+        {
+            speed.store(n as u32, Ordering::Relaxed);
+        }
+        result
+    } else {
+        rules
+            .get(name)
+            .ok_or_else(|| format!("Unknown game rule: {name}"))?
+    };
+    let text = match result {
+        RuleValue::Boolean(value) => value.to_string(),
+        RuleValue::Integer(value) => value.to_string(),
+    };
+    Ok(format!("{name} = {text}"))
+}
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
     let _ = tx.send(game::packet(p));
 }
@@ -178,6 +249,8 @@ fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
 }
 /// Per-tick measurements owned by the game loop's instrumentation.
 struct LoopMetrics {
+    game_rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
+    game_rules_path: Option<std::path::PathBuf>,
     random_tick_speed: Arc<AtomicU32>,
     /// Raw region tick durations consumed by the load-test example.
     tick_samples: Arc<Mutex<Vec<f64>>>,
@@ -211,10 +284,13 @@ async fn run(
         source: source.clone(),
     };
     let LoopMetrics {
+        game_rules,
+        game_rules_path,
         random_tick_speed,
         tick_samples,
         profiler,
     } = metrics;
+    let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
     let fluid_tracking = tracking.clone();
     let fluid_source = source.clone();
@@ -311,6 +387,7 @@ async fn run(
               let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               while let Ok(action) = received.try_recv() { match action {
+                  commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules,game_rules_path.as_deref(),&command_speed,&name,value.as_deref()) { Ok(message) => chat(outbound,&message), Err(error) => chat(outbound,&error) },
                   commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
                   commands::Action::Teleport(pos) => mailbox.lock().unwrap().push_back(Command::Teleport(pos)),
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
@@ -336,6 +413,7 @@ async fn run(
               let mut stop = false;
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules,game_rules_path.as_deref(),&command_speed,&name,value.as_deref()) { Ok(message) => tracing::info!("{message}"), Err(error) => tracing::warn!("{error}") },
                   commands::Action::Stop => stop = true,
                   commands::Action::Tps => for line in profiler.tps_lines_plain() { tracing::info!("{line}"); },
                   commands::Action::Mspt => for line in profiler.mspt_lines_plain() { tracing::info!("{line}"); },
@@ -516,4 +594,32 @@ async fn memory_chunk_block_mutation_is_visible() {
     assert_ne!(before, 0);
     source.set_block(0, 64, 0, 0).unwrap();
     assert_eq!(source.block(0, 64, 0), Some(0));
+}
+
+#[tokio::test]
+async fn gamerules_persist_across_world_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3/generated");
+    let source = anvil::AnvilChunkSource::new(
+        dir.path().to_path_buf(),
+        ferrite_world::RuntimeRegistry::load(root).unwrap(),
+    );
+    let world = World::start_with(Some(source.clone()), [0, 65, 0]);
+    world
+        .console_command("gamerule randomTickSpeed 0".into())
+        .await
+        .unwrap();
+    world
+        .console_command("gamerule doMobSpawning false".into())
+        .await
+        .unwrap();
+    world.shutdown().await.unwrap();
+    let reloaded = World::start_with(Some(source), [0, 65, 0]);
+    assert_eq!(reloaded.random_tick_speed.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        reloaded.game_rules.lock().unwrap().get("doMobSpawning"),
+        Some(ferrite_command::gamerule::RuleValue::Boolean(false))
+    );
+    reloaded.shutdown().await.unwrap();
 }

@@ -146,6 +146,9 @@ impl AnvilChunkSource {
             flat: Mutex::new(HashMap::new()),
         })
     }
+    pub(super) fn game_rules_path(&self) -> Option<PathBuf> {
+        self.path.as_ref().map(|path| path.join("gamerules.json"))
+    }
     pub fn modified_packet(&self, x: i32, z: i32) -> Option<Vec<u8>> {
         self.cache
             .lock()
