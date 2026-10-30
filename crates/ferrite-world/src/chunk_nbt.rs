@@ -184,18 +184,24 @@ pub fn chunk_from_nbt(
             PaletteKind::Biomes,
             registry,
         )?;
-        let count = (0..4096)
-            .filter(|&i| !registry.flags(blocks.get(i).unwrap()).air)
-            .count() as u16;
-        let fluid_count = (0..4096)
-            .filter(|&i| registry.flags(blocks.get(i).unwrap()).fluid)
-            .count() as u16;
-        let random_blocks = (0..4096)
-            .filter(|&i| registry.randomly_ticking(blocks.get(i).unwrap()))
-            .count() as u16;
-        let random_fluids = (0..4096)
-            .filter(|&i| registry.fluid_randomly_ticking(blocks.get(i).unwrap()))
-            .count() as u16;
+        let (mut count, mut fluid_count, mut random_blocks, mut random_fluids) =
+            (0u16, 0u16, 0u16, 0u16);
+        for (state, occurrences) in blocks.value_counts() {
+            let occurrences = occurrences as u16;
+            let flags = registry.flags(state);
+            if !flags.air {
+                count += occurrences;
+            }
+            if flags.fluid {
+                fluid_count += occurrences;
+            }
+            if registry.randomly_ticking(state) {
+                random_blocks += occurrences;
+            }
+            if registry.fluid_randomly_ticking(state) {
+                random_fluids += occurrences;
+            }
+        }
         chunk.sections[idx as usize] = ChunkSection {
             blocks,
             biomes,

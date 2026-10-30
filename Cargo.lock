@@ -771,6 +771,7 @@ dependencies = [
 name = "ferrite-world"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ferrite-data",
  "ferrite-nbt",
  "flate2",
