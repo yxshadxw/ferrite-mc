@@ -32,6 +32,7 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
 }
 mod fluid;
 mod global;
+mod random_tick;
 mod region;
 
 use self::{
