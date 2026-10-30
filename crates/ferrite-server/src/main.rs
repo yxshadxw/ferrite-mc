@@ -18,6 +18,8 @@ struct Config {
     world: Option<std::path::PathBuf>,
     gamemode: GameMode,
     ops: Vec<OpConfig>,
+    plugins_dir: Option<std::path::PathBuf>,
+    plugin_bridge: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +71,8 @@ impl Default for Config {
             world: None,
             gamemode: GameMode::Creative,
             ops: Vec::new(),
+            plugins_dir: Some("plugins".into()),
+            plugin_bridge: None,
         }
     }
 }
@@ -119,6 +123,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         game::World::start_configured(None, [0, 65, 0], settings)
     };
+    let plugin_bridge =
+        ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
+            directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
+            bridge_jar: config.plugin_bridge.unwrap_or_else(|| {
+                "java/ferrite-api-impl/build/libs/ferrite-api-impl-all.jar".into()
+            }),
+            motd: config.motd.clone(),
+            max_players: u16::try_from(config.max_players).unwrap_or(u16::MAX),
+            port: listener.local_addr()?.port(),
+            view_distance: config.view_distance,
+            online_mode: config.online_mode,
+            whitelist: false,
+        })
+        .context("starting plugins")?;
     let mut server = tokio::spawn(ferrite_net::serve(
         listener,
         ferrite_net::ServerConfig {
@@ -156,7 +174,13 @@ async fn main() -> anyhow::Result<()> {
             },
         }
     };
-    world.shutdown().await?;
+    let world_result = world.shutdown().await;
+    if let Some(bridge) = plugin_bridge
+        && let Err(error) = bridge.shutdown()
+    {
+        tracing::error!(%error, "plugin shutdown failed");
+    }
+    world_result?;
     if let Some(result) = result {
         result??;
     } else {
@@ -174,6 +198,11 @@ mod tests {
         assert_eq!(defaults.max_players, 20);
         assert_eq!(defaults.compression_threshold, 256);
         assert_eq!(defaults.world, None);
+        assert_eq!(
+            defaults.plugins_dir.as_deref(),
+            Some(std::path::Path::new("plugins"))
+        );
+        assert_eq!(defaults.plugin_bridge, None);
         assert!(parse_ops(vec![OpConfig::Uuid("Alice".into())]).is_err());
         let parsed = parse_ops(vec![OpConfig::Detailed {
             uuid: "00000000-0000-0000-0000-00000000000a".into(),

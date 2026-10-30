@@ -2,8 +2,16 @@ package dev.ferrite.test;
 import org.bukkit.event.*;
 import org.bukkit.plugin.java.JavaPlugin;
 public final class TestPlugin extends JavaPlugin implements Listener {
+    private void writeMarker(String name) {
+        try {
+            var folder = new java.io.File(getDataFolder().getParentFile(), "TestPlugin");
+            java.nio.file.Files.createDirectories(folder.toPath());
+            java.nio.file.Files.writeString(new java.io.File(folder, name).toPath(), "ok");
+        } catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+    }
     @Override public void onEnable() {
         getLogger().info("FerriteTest enabled");
+        getLogger().info("server name " + getServer().getName());
         getLogger().info("initial ip ban " + getServer().getIPBans().contains("192.0.2.7"));
         getLogger().info("FerriteTest settings " + getServer().getMotd() + " " + getServer().getMaxPlayers() + " " + getServer().getPort() + " " + getServer().getViewDistance() + " " + getServer().hasWhitelist());
         if (!getName().equals("FerriteLegacyTest")) getLogger().info(dev.ferrite.dependency.Helper.greeting());
@@ -19,7 +27,8 @@ public final class TestPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().callEvent(new TestEvent());
         getServer().getGlobalRegionScheduler().runAtFixedRate(this, task -> getLogger().info("FerriteTest global"), 1, 1);
         getServer().getScheduler().runTaskTimer(this, () -> getLogger().info("FerriteTest tick"), 1, 1);
+        writeMarker("enabled.txt");
     }
     @EventHandler public void onTest(TestEvent event) { getLogger().info("FerriteTest event"); }
-    @Override public void onDisable() { getLogger().info("FerriteTest disabled"); }
+    @Override public void onDisable() { getLogger().info("FerriteTest disabled"); writeMarker("disabled.txt"); }
 }
