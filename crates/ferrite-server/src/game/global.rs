@@ -91,7 +91,7 @@ impl GlobalRegion {
             send(player, &update);
         }
     }
-    pub fn say(&self, message: &str) {
+    pub fn broadcast_text(&self, message: &str) {
         self.broadcast(message);
     }
     pub fn chat(&mut self, id: Uuid, msg: &str) {

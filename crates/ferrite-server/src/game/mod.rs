@@ -165,6 +165,13 @@ async fn run(
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(HashMap::new()));
+    let command_state = Arc::new(Mutex::new(commands::GameState::new(
+        settings.gamemode,
+        0,
+        20,
+    )));
+    let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_entity = 1i32;
     let spawn_pos = [
         spawn[0] as f64 + 0.5,
@@ -186,14 +193,16 @@ async fn run(
            let saved = playerdata::load(&uuid);
            let start_pos = saved.as_ref().map_or(spawn_pos, |s| s.pos);
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
-           let start_mode = saved.as_ref().map_or(settings.gamemode, |s| s.gamemode);
+           let start_mode = saved.as_ref().map_or_else(|| command_state.lock().unwrap().default_gamemode, |s| s.gamemode);
+           command_state.lock().unwrap().join(uuid, name.clone(), start_mode, max_players as i32);
+           let seed = command_state.lock().unwrap().seed;
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
            permissions.insert(uuid, permission);
            let entity=next_entity;next_entity+=1;
-           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
+           emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat:false});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, console: false, uuid: Some(uuid), name: Some(name.clone()), state: command_state.clone(), actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
            }
            emit(&outbound, &ContainerContent { window:VarInt(0), state:VarInt(0), slots:start_inventory.to_vec(), carried:ItemStack::default() });
@@ -209,12 +218,20 @@ async fn run(
           GameMessage::Input{session,uuid,packet:ServerboundPlay::Chat(text)}=>{if mailboxes.get(&uuid).is_some_and(|m| m.0 == session) && text.chars().count()<=256 {scheduler.schedule_global(move |g|g.chat(uuid,&text));}},
           GameMessage::Input{session,uuid,packet:ServerboundPlay::Command(command)}=>{if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let (actions, mut received) = mpsc::unbounded_channel();
-              let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, actions };
+              let name = command_state.lock().unwrap().players.iter().find(|p| p.uuid == uuid).map(|p| p.name.clone());
+              let source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), console: false, uuid: Some(uuid), name, state: command_state.clone(), actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               while let Ok(action) = received.try_recv() { match action {
-                  commands::Action::GameMode(mode) => { mailbox.lock().unwrap().push_back(Command::SetMode(mode)); scheduler.schedule_global(move |g| g.set_mode(uuid, mode)); },
+                  commands::Action::GameMode { mode, targets } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { target_mailbox.lock().unwrap().push_back(Command::SetMode(mode)); } scheduler.schedule_global(move |g| g.set_mode(target, mode)); } },
+                  commands::Action::DefaultGameMode(mode) => tracing::info!(mode, "default game mode changed"),
+                  commands::Action::Difficulty(value) => tracing::info!(value, "difficulty changed"),
+                  commands::Action::TimeSet(ticks) => tracing::info!(ticks, "time set"),
+                  commands::Action::TimeAdd(ticks) => tracing::info!(ticks, "time added"),
+                  commands::Action::Weather { kind, duration } => tracing::info!(?kind, ?duration, "weather changed"),
+                  commands::Action::Feedback(feedback) => emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(feedback.text), overlay:false }),
+                  commands::Action::PlayerFeedback { uuid: target, feedback } => { if let Some((_, _, target_outbound)) = mailboxes.get(&target) { emit(target_outbound, &SystemChat { content:ferrite_protocol::types::PlainText(feedback.text), overlay:false }); } },
+                  commands::Action::Broadcast(feedback) => { let text = feedback.text; scheduler.schedule_global(move |g| g.broadcast_text(&text)); },
                   commands::Action::Teleport(pos) => mailbox.lock().unwrap().push_back(Command::Teleport(pos)),
-                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
                   commands::Action::Tps => emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText("TPS unavailable".into()), overlay:false }),
                   commands::Action::Stop => {},
               }}
@@ -224,13 +241,19 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let result = command_tree.execute(command.trim().trim_start_matches('/'), commands::Source { permission: 4, console: true, actions }).map_err(|e| e.to_string());
+              let result = command_tree.execute(command.trim().trim_start_matches('/'), commands::Source { permission: 4, console: true, uuid: None, name: None, state: command_state.clone(), actions }).map_err(|e| e.to_string());
               let mut stop = false;
               while let Ok(action) = received.try_recv() { match action {
-                  commands::Action::Say(text) => scheduler.schedule_global(move |g| g.say(&text)),
+                  commands::Action::DefaultGameMode(mode) => tracing::info!(mode, "default game mode changed"),
+                  commands::Action::Difficulty(value) => tracing::info!(value, "difficulty changed"),
+                  commands::Action::TimeSet(ticks) => tracing::info!(ticks, "time set"),
+                  commands::Action::TimeAdd(ticks) => tracing::info!(ticks, "time added"),
+                  commands::Action::Weather { kind, duration } => tracing::info!(?kind, ?duration, "weather changed"),
+                  commands::Action::Feedback(feedback) => tracing::info!("{}", feedback.text),
+                  commands::Action::Broadcast(feedback) => { let text = feedback.text; scheduler.schedule_global(move |g| g.broadcast_text(&text)); },
                   commands::Action::Stop => stop = true,
                   commands::Action::Tps => tracing::info!("TPS unavailable"),
-                  _ => tracing::warn!("command requires a player"),
+                  commands::Action::GameMode { .. } | commands::Action::PlayerFeedback { .. } | commands::Action::Teleport(_) => tracing::warn!("command requires a player"),
               }}
               let _ = complete.send(result.map(|_| stop));
           },
@@ -240,8 +263,9 @@ async fn run(
           Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);}else{release_hold(&scheduler, &mut holds, &source, chunk);},
           Signal::Update{uuid,pos,yaw,pitch,ground}=>scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground)),
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.players.insert(id,*player);});scheduler.remove_chunk(from);},
-          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
-         }}
+          Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);command_state.lock().unwrap().leave(uuid);permissions.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &source, pos);}scheduler.remove_chunk(chunk);scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
+         }},
+         _tick = clock.tick() => { command_state.lock().unwrap().tick(); }
         }
     }
 }

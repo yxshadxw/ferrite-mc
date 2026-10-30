@@ -768,14 +768,28 @@ async fn commands_packet_decodes_and_filters_permissions() {
     let bot = Bot::join(addr, "Guest").await;
     let bytes = bot.commands.as_ref().expect("commands packet");
     let mut input = bytes.as_slice();
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 2);
+    // Guest-visible nodes, breadth-first: root, list, me, tps, list uuids, me action.
+    assert_eq!(VarInt::decode(&mut input).unwrap().0, 6);
     assert_eq!(u8::decode(&mut input).unwrap(), 0);
-    assert_eq!(Vec::<VarInt>::decode(&mut input).unwrap(), vec![VarInt(1)]);
+    assert_eq!(
+        Vec::<VarInt>::decode(&mut input).unwrap(),
+        vec![VarInt(1), VarInt(2), VarInt(3)]
+    );
+    assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
+    assert_eq!(Vec::<VarInt>::decode(&mut input).unwrap(), vec![VarInt(4)]);
+    assert_eq!(String::decode(&mut input).unwrap(), "list");
+    assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
+    assert_eq!(Vec::<VarInt>::decode(&mut input).unwrap(), vec![VarInt(5)]);
+    assert_eq!(String::decode(&mut input).unwrap(), "me");
     assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
     assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
     assert_eq!(String::decode(&mut input).unwrap(), "tps");
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 0);
-    assert!(input.is_empty());
+    assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
+    assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
+    assert_eq!(String::decode(&mut input).unwrap(), "uuids");
+    assert_eq!(u8::decode(&mut input).unwrap() & 3, 2);
+    assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
+    assert_eq!(String::decode(&mut input).unwrap(), "action");
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
