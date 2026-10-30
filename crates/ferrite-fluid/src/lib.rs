@@ -216,3 +216,6 @@ pub fn get_new_liquid(
         }
     }
 }
+
+mod tick;
+pub use tick::{FluidTicks, Position};
