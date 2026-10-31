@@ -1,0 +1,255 @@
+//! Vanilla player combat maths: weapon attack damage and speed from the item's
+//! `minecraft:attribute_modifiers` component, the attack-strength scale, critical hits,
+//! sweeping and entity reach. Nothing here touches the world; the region applies these to the
+//! lid of an entity.
+//!
+//! The constants mirror `Player`: base attack damage 1.0, base attack speed 4.0, the entity
+//! interaction range of 3 blocks (5 in creative), `Player.attack`'s critical multiplier 1.5 and
+//! `Player.ATTACK_STRENGTH_DECAY`-free scale `0.2 + strength^2 * 0.8`.
+
+use ferrite_item::{AttributeOperation, Component, component_ids};
+use ferrite_math::{AABB, Vec3};
+
+/// Vanilla `Player` base attack damage attribute (`ATTACK_DAMAGE`, base value 1.0).
+pub const BASE_ATTACK_DAMAGE: f64 = 1.0;
+/// Vanilla `Player` base attack speed attribute (`ATTACK_SPEED`, base value 4.0).
+pub const BASE_ATTACK_SPEED: f64 = 4.0;
+/// Vanilla `Player.entityInteractionRange()` in survival.
+pub const ENTITY_RANGE: f64 = 3.0;
+/// Vanilla creative-mode entity reach (`ServerPlayer` uses 5 blocks).
+pub const CREATIVE_ENTITY_RANGE: f64 = 5.0;
+/// `Player.attack`: a critical hit multiplies by 1.5 (`ATTACK_DAMAGE` is already scaled).
+pub const CRITICAL_MULTIPLIER: f64 = 1.5;
+/// `Player.attack`: sweep damage is `1.0 + sweeping ratio * damage`, without enchantments 1.
+pub const SWEEP_DAMAGE: f32 = 1.0;
+/// Vanilla `AbstractArrow` base damage before the velocity scale.
+pub const ARROW_BASE_DAMAGE: f32 = 2.0;
+
+/// The attack damage and speed a held stack grants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeaponStats {
+    /// Total attack damage, including the player's base 1.0.
+    pub attack_damage: f64,
+    /// Attack speed in attacks per second (vanilla's `ATTACK_SPEED`).
+    pub attack_speed: f64,
+}
+
+/// Applies one attribute modifier to a base value, like `AttributeInstance`.
+fn apply(base: f64, value: &mut f64, operation: AttributeOperation, amount: f64) {
+    match operation {
+        AttributeOperation::AddValue => *value += amount,
+        AttributeOperation::AddMultipliedBase => *value += base * amount,
+        AttributeOperation::AddMultipliedTotal => *value *= 1.0 + amount,
+    }
+}
+
+/// Attack statistics of a held stack: the item's attribute modifiers over the player's base
+/// attributes. Items only modify the main hand; an off-hand or armor modifier is ignored.
+pub fn weapon_stats(stack: &ferrite_item::ItemStack) -> WeaponStats {
+    let mut attack_damage = BASE_ATTACK_DAMAGE;
+    let mut attack_speed = BASE_ATTACK_SPEED;
+    if let Some(Component::AttributeModifiers(modifiers)) =
+        stack.effective_component(component_ids::ATTRIBUTE_MODIFIERS)
+    {
+        for modifier in modifiers {
+            if !matches!(modifier.slot.name(), "mainhand" | "hand" | "any") {
+                continue;
+            }
+            let attribute = modifier
+                .attribute
+                .strip_prefix("minecraft:")
+                .unwrap_or(&modifier.attribute);
+            match attribute {
+                "attack_damage" => apply(
+                    BASE_ATTACK_DAMAGE,
+                    &mut attack_damage,
+                    modifier.operation,
+                    modifier.amount,
+                ),
+                "attack_speed" => apply(
+                    BASE_ATTACK_SPEED,
+                    &mut attack_speed,
+                    modifier.operation,
+                    modifier.amount,
+                ),
+                _ => {}
+            }
+        }
+    }
+    WeaponStats {
+        attack_damage,
+        attack_speed: attack_speed.max(0.1),
+    }
+}
+
+/// Vanilla `Player.getAttackStrengthScale(0.5)`: `(ticks + 0.5) / (20 / attackSpeed)`, clamped.
+pub fn attack_strength(ticks_since_attack: i32, attack_speed: f64) -> f64 {
+    let delay = 20.0 / attack_speed.max(0.1);
+    ((f64::from(ticks_since_attack) + 0.5) / delay).clamp(0.0, 1.0)
+}
+
+/// Vanilla's damage scale from the attack strength: `0.2 + strength^2 * 0.8`.
+pub fn damage_scale(strength: f64) -> f64 {
+    0.2 + strength.clamp(0.0, 1.0).powi(2) * 0.8
+}
+
+/// Vanilla `Player.attack` critical condition: falling, not on the ground, not sprinting.
+/// Climbing, water and blindness are not modelled.
+pub fn can_critical(on_ground: bool, fall_distance: f64, sprinting: bool) -> bool {
+    !on_ground && fall_distance > 0.0 && !sprinting
+}
+
+/// Vanilla sweep condition: a sword, a nearly full attack strength, on the ground and not
+/// sprinting.
+pub fn can_sweep(sword: bool, strength: f64, on_ground: bool, sprinting: bool) -> bool {
+    sword && strength > 0.9 && on_ground && !sprinting
+}
+
+/// Whether an item is one of the sword items, which are the only ones that sweep.
+pub fn is_sword(stack: &ferrite_item::ItemStack) -> bool {
+    stack.name().is_some_and(|name| name.ends_with("_sword"))
+}
+
+/// Vanilla `Entity.getViewVector`: the unit look direction from yaw and pitch in degrees.
+pub fn look_vector(yaw: f32, pitch: f32) -> Vec3 {
+    let (sy, cy) = f64::from(yaw).to_radians().sin_cos();
+    let (sp, cp) = f64::from(pitch).to_radians().sin_cos();
+    Vec3::new(-sy * cp, -sp, cy * cp)
+}
+
+/// The eye position of a player standing at `feet`.
+pub fn eye_position(feet: Vec3) -> Vec3 {
+    Vec3::new(feet.x, feet.y + 1.62, feet.z)
+}
+
+/// Vanilla `Player.canHitEntity`: the target's box within reach of the eye point.
+pub fn within_reach(eye: Vec3, target: AABB, range: f64) -> bool {
+    let closest = Vec3::new(
+        eye.x.clamp(target.min.x, target.max.x),
+        eye.y.clamp(target.min.y, target.max.y),
+        eye.z.clamp(target.min.z, target.max.z),
+    );
+    (closest - eye).length_sqr() <= range * range
+}
+
+/// Whether a target is in front of the look vector, so a swing behind the player misses.
+pub fn facing(eye: Vec3, look: Vec3, target: Vec3) -> bool {
+    let to = target - eye;
+    let horizontal = Vec3::new(to.x, 0.0, to.z);
+    let facing = Vec3::new(look.x, 0.0, look.z);
+    if horizontal.length_sqr() < 1.0e-6 || facing.length_sqr() < 1.0e-6 {
+        return true;
+    }
+    facing.normalize().dot(horizontal.normalize()) > -0.1
+}
+
+/// Vanilla `LivingEntity.isDamageSourceBlocked`: a raised shield stops a hit coming from the
+/// half-space in front of the player's body yaw.
+pub fn shield_blocks(yaw: f32, player: Vec3, source: Vec3) -> bool {
+    let look = look_vector(yaw, 0.0);
+    let to = source - player;
+    let horizontal = Vec3::new(to.x, 0.0, to.z);
+    if horizontal.length_sqr() < 1.0e-6 {
+        return true;
+    }
+    look.normalize().dot(horizontal.normalize()) > 0.0
+}
+
+/// Vanilla `AbstractArrow` damage: base damage scaled by the draw (speed / 3), critical arrows
+/// hit for 1.5x. A full-draw arrow does 6 damage.
+pub fn arrow_damage(draw: f32, critical: bool) -> f32 {
+    let base = ARROW_BASE_DAMAGE * (1.0 + 2.0 * draw.clamp(0.0, 1.0));
+    if critical { base * 1.5 } else { base }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack(name: &str) -> ferrite_item::ItemStack {
+        ferrite_item::ItemStack::from_name(name).expect("a vanilla item")
+    }
+
+    #[test]
+    fn swords_beat_fists_and_faster_weapons_charge_faster() {
+        let sword = weapon_stats(&stack("minecraft:diamond_sword"));
+        assert!(sword.attack_damage > BASE_ATTACK_DAMAGE, "{sword:?}");
+        assert!(sword.attack_damage > weapon_stats(&stack("minecraft:wooden_sword")).attack_damage);
+        assert_eq!(sword.attack_damage, 7.0);
+        assert!((sword.attack_speed - 1.6).abs() < 1e-6, "{sword:?}");
+        let axe = weapon_stats(&stack("minecraft:diamond_axe"));
+        assert!(axe.attack_speed < sword.attack_speed, "{axe:?}");
+        assert!(axe.attack_damage > sword.attack_damage, "{axe:?}");
+        // An empty hand has the player's base attributes.
+        assert_eq!(
+            weapon_stats(&ferrite_item::ItemStack::default()),
+            WeaponStats {
+                attack_damage: BASE_ATTACK_DAMAGE,
+                attack_speed: BASE_ATTACK_SPEED
+            }
+        );
+    }
+
+    #[test]
+    fn attack_strength_scales_damage_from_a_fifth_to_full() {
+        assert!((attack_strength(0, 4.0) - 0.1).abs() < 1e-9);
+        assert!((attack_strength(4, 4.0) - 0.9).abs() < 1e-9);
+        assert_eq!(attack_strength(100, 4.0), 1.0);
+        assert!((damage_scale(0.0) - 0.2).abs() < 1e-9);
+        assert!((damage_scale(1.0) - 1.0).abs() < 1e-9);
+        assert!(damage_scale(0.5) < damage_scale(1.0));
+        // A slower weapon needs more ticks for the same strength.
+        assert!(attack_strength(10, 1.6) < attack_strength(10, 4.0));
+    }
+
+    #[test]
+    fn criticals_and_sweeps_follow_the_vanilla_conditions() {
+        assert!(can_critical(false, 1.5, false));
+        assert!(!can_critical(true, 1.5, false));
+        assert!(!can_critical(false, 0.0, false));
+        assert!(!can_critical(false, 1.5, true));
+        assert!(can_sweep(true, 0.95, true, false));
+        assert!(!can_sweep(false, 0.95, true, false));
+        assert!(!can_sweep(true, 0.5, true, false));
+        assert!(!can_sweep(true, 0.95, false, false));
+        assert!(!can_sweep(true, 0.95, true, true));
+        assert!(is_sword(&stack("minecraft:iron_sword")));
+        assert!(!is_sword(&stack("minecraft:iron_axe")));
+    }
+
+    #[test]
+    fn reach_facing_and_look_vectors_match_the_client_conventions() {
+        let eye = Vec3::new(0.5, 1.62, 0.5);
+        let target = AABB::new(2.0, 0.0, 0.0, 3.0, 1.8, 1.0);
+        assert!(within_reach(eye, target, ENTITY_RANGE));
+        assert!(!within_reach(eye, target, 1.0));
+        // Yaw zero looks south (+z) and yaw -90 looks east (+x).
+        let south = look_vector(0.0, 0.0);
+        assert!((south.z - 1.0).abs() < 1e-9);
+        let east = look_vector(-90.0, 0.0);
+        assert!((east.x - 1.0).abs() < 1e-9);
+        assert!(facing(eye, east, Vec3::new(3.0, 0.0, 0.5)));
+        assert!(!facing(eye, east, Vec3::new(-3.0, 0.0, 0.5)));
+        // Looking down pitches negative.
+        assert!(look_vector(0.0, 60.0).y < 0.0);
+    }
+
+    #[test]
+    fn a_raised_shield_faces_the_attacker() {
+        let player = Vec3::new(0.0, 64.0, 0.0);
+        // Yaw zero looks south; an attacker in front is blocked, one behind is not.
+        assert!(shield_blocks(0.0, player, Vec3::new(0.0, 64.0, 3.0)));
+        assert!(!shield_blocks(0.0, player, Vec3::new(0.0, 64.0, -3.0)));
+        assert!(!shield_blocks(0.0, player, Vec3::new(0.0, 64.0, -0.2)));
+        // A player facing east blocks an attacker to the east.
+        assert!(shield_blocks(-90.0, player, Vec3::new(3.0, 64.0, 0.0)));
+    }
+
+    #[test]
+    fn arrows_scale_with_draw_and_criticals() {
+        assert_eq!(arrow_damage(0.0, false), ARROW_BASE_DAMAGE);
+        assert_eq!(arrow_damage(1.0, false), 6.0);
+        assert!(arrow_damage(1.0, true) > arrow_damage(1.0, false));
+        assert_eq!(arrow_damage(2.0, false), arrow_damage(1.0, false));
+    }
+}

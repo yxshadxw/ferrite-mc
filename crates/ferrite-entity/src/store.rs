@@ -15,6 +15,7 @@
 //! follow the regionizer, and [`EntityStore::take_crossing`] removes entities that walked into
 //! another region section so the caller can hand them to the owner of their new chunk.
 
+use crate::arrow::ArrowState;
 use crate::effect::ActiveEffects;
 use crate::experience::OrbState;
 use crate::id::EntityKey;
@@ -82,6 +83,8 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Arrow state, for `minecraft:arrow`.
+    pub arrow: Option<ArrowState>,
     /// Living state, for the modelled mobs.
     pub mob: Option<MobState>,
     /// Experience-orb state, for `minecraft:experience_orb`.
@@ -114,6 +117,7 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            arrow: None,
             mob: None,
             orb: None,
             effects: ActiveEffects::default(),
