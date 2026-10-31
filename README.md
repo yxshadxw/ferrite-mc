@@ -9,7 +9,8 @@
 > hunger, death, XP), redstone, falling blocks and explosions, passive and hostile mobs
 > (zombie, skeleton, spider, creeper, enderman) with pathfinding, melee combat and arrows,
 > random ticks, fluids,
-> ~70 vanilla commands (including execute and data), plugin events, multi-version client
+> ~80 vanilla commands (including execute, data, locate, datapack, schedule and trigger),
+> plugin events, multi-version client
 > translation, a Folia-style regionizer and Starlight-style lighting (0 mismatches vs vanilla).
 > World generation (density functions, noise chunks, aquifers, surface rules, carvers) matches
 > the vanilla Java reference on the fixture world; terrain features and structures are still in
@@ -63,12 +64,16 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   블록 격자 길찾기, 몬스터 자연 스폰(밝기·몹 캡·디스폰), `/summon`
 - **전투** — 공격 패킷과 무기 공격 속도·공격력, 치명타(1.5배)와 휩쓸기, 넉백, 방패 방어,
   화살 피해
-- **명령(약 70개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
+- **명령(약 80개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
   `give`, `clear`, `xp`, `effect`, `enchant`, `title`, `scoreboard`, `bossbar`, `team`,
   `worldborder`, `setblock`, `fill`, `clone`, `execute`(as/at/if/unless/store/run 등),
   `data`(get/merge/modify/remove), `function`(월드 데이터팩의 `.mcfunction`, `load`/`tick`
-  태그, 매크로, `return`), `op`, `ban`, `whitelist`, `stop` 등.
-  선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능합니다.
+  태그, 매크로, `return`), `locate`(생물군계·관심 지점, 구조물은 문서화된 스텁),
+  `datapack`(list/enable/disable), `help`, `schedule`, `trigger`, `reload`, `op`, `ban`,
+  `whitelist`, `stop` 등.
+  선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능하며, `@e`는 리전 엔티티 저장소에서
+  type(부정·태그 포함)/distance/dx·dy·dz/scores/tag/team/level/gamemode/x_rotation/
+  y_rotation/nbt/limit/sort 옵션으로 해석됩니다.
 - **플러그인** — `plugin.yml`/`paper-plugin.yml` 로딩, 내장 JVM(Java 25) 위에서 플러그인
   `onEnable` 실행, 플레이어 이동·상호작용·블록 파괴/설치·명령 이벤트(취소 가능),
   오류 정책 `plugins.on-event-error = allow | deny`. Bukkit `Server`/`Player`/`World`/
