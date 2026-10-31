@@ -1760,6 +1760,288 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     server.abort();
 }
 
+/// A placed sand block finds no support and becomes a `FallingBlockEntity`; the tracking bot
+/// sees the block removal, the entity and the block placed where it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placed_sand_falls_and_lands_for_tracking_bot() {
+    use ferrite_protocol::{
+        packets::play::{AddEntity, BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    // A stone block to click, a floor three blocks below the free spot, air in between.
+    source.set_block(0, 64, 0, block("stone")).unwrap();
+    for y in 61..=64 {
+        source.set_block(1, y, 0, block("air")).unwrap();
+    }
+    source.set_block(1, 60, 0, block("stone")).unwrap();
+    let world = World::start_with(Some(source.clone()), [3, 65, 0]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "SandTester").await;
+    bot.until(46).await;
+    let sand_item = ferrite_data::registries::id("minecraft:item", "minecraft:sand").unwrap();
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: sand_item,
+        },
+    })
+    .await;
+    // Look west and down at the east face of the stone block at (0, 64, 0).
+    bot.send(&MoveRotation {
+        yaw: 90.0,
+        pitch: 35.3,
+        flags: 1,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(5),
+        cursor_x: 0.5,
+        cursor_y: 0.5,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+    let sand = block("sand");
+    let falling_type = i32::from(ferrite_entity::falling::falling_type());
+    let mut saw_falling = false;
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            match id {
+                AddEntity::ID => {
+                    let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+                    if add.entity_type.0 == falling_type {
+                        saw_falling = true;
+                    }
+                }
+                BlockUpdate::ID => {
+                    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                    if BlockPos::unpack(update.location) == BlockPos::new(1, 61, 0)
+                        && update.block_state.0 == sand as i32
+                    {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(landed.is_ok(), "sand never landed for the tracking bot");
+    assert_eq!(source.block(1, 61, 0), Some(sand));
+    assert!(saw_falling, "the bot never saw the falling block entity");
+}
+
+/// TNT: flint and steel primes the block (`PrimedTnt`), the fuse ends in a vanilla `Explosion`,
+/// and the tracking bot sees the entity, the destroyed block and the loot drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tnt_explodes_and_drops_blocks_for_tracking_bot() {
+    use ferrite_protocol::{
+        packets::play::{AddEntity, BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    for x in 0..=1 {
+        for z in 0..=1 {
+            source.set_block(x, 63, z, block("dirt")).unwrap();
+            source.set_block(x, 64, z, block("air")).unwrap();
+            source.set_block(x, 65, z, block("air")).unwrap();
+        }
+    }
+    source.set_block(0, 64, 0, block("tnt")).unwrap();
+    let world = World::start_with(Some(source.clone()), [0, 65, 3]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "TntTester").await;
+    bot.until(46).await;
+    let flint =
+        ferrite_data::registries::id("minecraft:item", "minecraft:flint_and_steel").unwrap();
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: flint,
+        },
+    })
+    .await;
+    bot.send(&MoveRotation {
+        yaw: 180.0,
+        pitch: 35.3,
+        flags: 1,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(3),
+        cursor_x: 0.5,
+        cursor_y: 0.5,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+    let tnt_type = i32::from(ferrite_data::entity_props::by_name("tnt").unwrap().id);
+    let item_type = i32::from(ferrite_data::entity_props::by_name("item").unwrap().id);
+    let mut saw_tnt = false;
+    let mut saw_item = false;
+    let mut saw_blast = false;
+    let blast = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if saw_blast && saw_item {
+                break;
+            }
+            let (id, body) = bot.next_play().await;
+            match id {
+                AddEntity::ID => {
+                    let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+                    saw_tnt |= add.entity_type.0 == tnt_type;
+                    saw_item |= add.entity_type.0 == item_type;
+                }
+                BlockUpdate::ID => {
+                    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                    if BlockPos::unpack(update.location) == BlockPos::new(0, 63, 0)
+                        && update.block_state.0 == 0
+                    {
+                        saw_blast = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(
+        blast.is_ok(),
+        "the TNT never destroyed the floor for the bot"
+    );
+    assert_eq!(source.block(0, 63, 0), Some(0));
+    assert!(saw_tnt, "the bot never saw the primed TNT entity");
+    assert!(saw_blast, "the bot never saw the destroyed floor");
+    assert!(saw_item, "the bot never saw the dirt drop");
+}
+
+/// Vanilla `Level.markAndNotifyBlock` at work: breaking the block under a torch breaks the
+/// torch in the same region tick, and the tracking bot sees both block updates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn breaking_support_drops_torch_for_tracking_bot() {
+    use ferrite_protocol::{
+        packets::play::{BlockUpdate, PlayerAction},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    // A wall torch facing east hangs on the block at its west, which is what the bot breaks.
+    let wall_torch =
+        u32::from(ferrite_data::blocks::state_id("wall_torch", &[("facing", "east")]).unwrap());
+    source.set_block(0, 64, 0, block("stone")).unwrap();
+    source.set_block(1, 64, 0, wall_torch).unwrap();
+    source.set_block(0, 65, 0, block("air")).unwrap();
+    let world = World::start_with(Some(source.clone()), [0, 65, 0]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "TorchTester").await;
+    bot.until(46).await;
+    // Looking straight down at the block the torch is attached to.
+    bot.send(&ferrite_protocol::packets::play::MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 0,
+    })
+    .await;
+    bot.send(&PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(1),
+    })
+    .await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let body = bot.until(8).await;
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            if BlockPos::unpack(update.location) == BlockPos::new(1, 64, 0) {
+                break update;
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    let got = got.expect("tracking bot did not receive the torch removal");
+    assert_eq!(got.block_state.0, 0);
+    assert_eq!(source.block(1, 64, 0), Some(0));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
     use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
