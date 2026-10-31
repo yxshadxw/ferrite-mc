@@ -1,5 +1,7 @@
 mod anvil;
 pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
+mod terrain;
+pub use terrain::{Generated, TerrainKind, VanillaTerrain};
 pub mod playerdata;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
@@ -7,18 +9,33 @@ pub fn new_anvil_source(
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
 }
+pub fn new_anvil_source_with(
+    path: std::path::PathBuf,
+    registry: ferrite_world::RuntimeRegistry,
+    terrain: Option<Arc<VanillaTerrain>>,
+) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_with_terrain(path, registry, terrain)
+}
+pub fn new_memory_source(terrain: Option<Arc<VanillaTerrain>>) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_memory_with_terrain(terrain)
+}
 mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod commands_data;
+mod commands_exec;
 mod commands_extras;
 mod commands_meta;
 mod commands_world;
 mod container;
 mod crafting;
 mod drops;
+pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
+mod explosion;
 mod feedback;
 pub mod interaction;
+mod nbt_path;
 mod profile;
 #[cfg(test)]
 mod tests {
@@ -41,8 +58,11 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
 }
 mod fluid;
 mod global;
+mod gravity;
+mod neighbors;
 mod random_tick;
 mod region;
+mod survival;
 
 use self::{
     global::{GlobalPlayer, GlobalRegion},
@@ -144,7 +164,7 @@ impl World {
         spawn: [i32; 3],
         settings: WorldSettings,
     ) -> Self {
-        let flat = source.is_none();
+        let flat = source.as_ref().is_none_or(|source| source.is_flat());
         let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
@@ -351,11 +371,6 @@ async fn run(
         mut signals,
     } = channels;
     let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
-    let ctx = TickContext {
-        signals: signal_tx.clone(),
-        tracking: tracking.clone(),
-        source: source.clone(),
-    };
     let LoopMetrics {
         game_rules,
         random_tick_speed,
@@ -363,6 +378,18 @@ async fn run(
         profiler,
         stop: stop_tx,
     } = metrics;
+    let spawn_pos = [
+        spawn[0] as f64 + 0.5,
+        spawn[1] as f64,
+        spawn[2] as f64 + 0.5,
+    ];
+    let ctx = TickContext {
+        signals: signal_tx.clone(),
+        tracking: tracking.clone(),
+        source: source.clone(),
+        rules: Arc::clone(&game_rules),
+        spawn: spawn_pos,
+    };
     let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
     let fluid_tracking = tracking.clone();
@@ -437,11 +464,6 @@ async fn run(
     )));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let spawn_pos = [
-        spawn[0] as f64 + 0.5,
-        spawn[1] as f64,
-        spawn[2] as f64 + 0.5,
-    ];
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
@@ -480,6 +502,7 @@ async fn run(
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
            let start_mode = saved.as_ref().map_or_else(|| command_state.lock().unwrap().default_gamemode, |s| s.gamemode);
            command_state.lock().unwrap().join(uuid, name.clone(), start_mode, max_players as i32);
+           command_state.lock().unwrap().set_position(uuid, start_pos, start_yaw, start_pitch);
            let seed = command_state.lock().unwrap().seed;
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = container::restore(saved.as_ref());
@@ -487,17 +510,20 @@ async fn run(
            let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), state: command_state.clone(), actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet.into()));
            }
            emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
+           // Vanilla sends the health bar and experience right after the join position.
+           emit(&outbound, &SetHealth { health: 20.0, food: VarInt(20), saturation: 5.0 });
+           emit(&outbound, &SetExperience { progress: 0.0, level: VarInt(0), total: VarInt(0) });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -538,7 +564,7 @@ async fn run(
               let (actions, mut received) = mpsc::unbounded_channel();
               let (origin, yaw, pitch) = online.get(&uuid).map_or(([0.0; 3], 0.0, 0.0), |player| (player.pos, player.yaw, player.pitch));
               let name = command_state.lock().unwrap().players.iter().find(|p| p.uuid == uuid).map(|p| p.name.clone());
-              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), command_source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               let source_name = online.get(&uuid).map_or_else(|| "Server".to_owned(), |player| player.name.clone());
               let mut runtime = CommandRuntime {
@@ -593,7 +619,7 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
               let result = command_tree.execute(command.trim().trim_start_matches('/'), command_source).map_err(|e| e.to_string());
               let mut stop = false;
               let mut runtime = CommandRuntime {
@@ -665,7 +691,7 @@ async fn run(
               if scheduler.owner(chunk).is_some(){scheduler.schedule_at_chunk(chunk,move |r|r.schedule_fluid((x,y,z)));}
             }
           },
-          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
+          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}command_state.lock().unwrap().set_position(uuid,pos,yaw,pitch);scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
           Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
           Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);command_state.lock().unwrap().leave(uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
@@ -868,6 +894,13 @@ impl CommandRuntime<'_> {
             | Action::GameRule(..)
             | Action::World(_)
             | Action::Enchant { .. } => false,
+            Action::Data(command) => {
+                match commands_data::apply_block(self.source.as_deref(), &command) {
+                    Ok(feedback) => self.reply.text(&feedback.text),
+                    Err(message) => self.reply.text(&message),
+                }
+                false
+            }
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
@@ -1027,10 +1060,9 @@ impl CommandRuntime<'_> {
                     }
                 };
                 for target in &targets {
-                    if let Some(player) = self.online.get(&target.uuid) {
-                        let _ = player
-                            .outbound
-                            .send(Outbound::Disconnect("You died!".into()));
+                    // `/kill` deals `genericKill` damage on the region that owns the player.
+                    if let Some((_, mailbox, _)) = self.mailboxes.get(&target.uuid) {
+                        mailbox.lock().unwrap().push_back(Command::Kill);
                     }
                 }
                 if targets.len() == 1 {

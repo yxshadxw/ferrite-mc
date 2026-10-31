@@ -661,6 +661,8 @@ mod tests {
                 super::super::commands::GameState::default(),
             )),
             actions,
+            anchor: ferrite_command::EntityAnchor::Feet,
+            world: None,
         }
     }
 

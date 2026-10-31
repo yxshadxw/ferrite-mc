@@ -97,6 +97,7 @@ impl<S> CommandDispatcher<S> {
             modifier,
             forks,
             suggester,
+            store,
         } = builder;
         let id = if let Some(existing) = self.node(parent).child(&name) {
             if command.is_some() {
@@ -112,6 +113,7 @@ impl<S> CommandDispatcher<S> {
             node.modifier = modifier;
             node.forks = forks;
             node.suggester = suggester;
+            node.store = store;
             self.insert_node(parent, node)
         };
         for child in children {
@@ -546,47 +548,56 @@ impl<S: Clone> CommandDispatcher<S> {
             }
             .into());
         }
-        let mut result = 0i32;
-        let mut successful_forks = 0i32;
-        let mut forked = false;
-        let mut found_command = false;
-        let mut contexts = vec![parse.context.clone()];
-        while !contexts.is_empty() {
-            let mut next = Vec::new();
-            for context in &contexts {
-                if let Some(child) = context.child.as_deref() {
-                    forked |= context.forks;
-                    if child.has_nodes() {
-                        found_command = true;
-                        match &context.modifier {
-                            None => next.push(child.copy_for(context.source.clone())),
-                            Some(modifier) => match modifier(context) {
-                                Ok(sources) => {
-                                    next.extend(sources.into_iter().map(|s| child.copy_for(s)))
-                                }
-                                Err(e) if !forked => return Err(e),
-                                Err(_) => {}
-                            },
-                        }
-                    }
-                } else if let Some(command) = &context.command {
-                    found_command = true;
-                    match command(context) {
-                        Ok(value) => {
-                            result = result.wrapping_add(value);
-                            successful_forks += 1;
-                        }
-                        Err(e) if !forked => return Err(e),
-                        Err(_) => {}
-                    }
-                }
-            }
-            contexts = next;
-        }
+        let (result, found_command) = self.run_context(&parse.context)?;
         if !found_command {
             return Err(builtin::unknown_command(&parse.reader).into());
         }
-        Ok(if forked { successful_forks } else { result })
+        Ok(result)
+    }
+
+    /// Runs one parse level and everything redirected from it. A fork skips failing
+    /// branches; every other failure ends the command.
+    fn run_context(
+        &self,
+        context: &crate::context::CommandContext<S>,
+    ) -> Result<(i32, bool), CommandError> {
+        let mut result = 0i32;
+        let mut successful = 0i32;
+        let mut found_command = false;
+        let mut forked = false;
+        if let Some(child) = context.child.as_deref() {
+            if child.has_nodes() {
+                found_command = true;
+                forked = context.forks;
+                let sources = match &context.modifier {
+                    None => vec![context.source.clone()],
+                    Some(modifier) => match modifier(context) {
+                        Ok(sources) => sources,
+                        Err(_) if forked => Vec::new(),
+                        Err(e) => return Err(e),
+                    },
+                };
+                for source in sources {
+                    match self.run_context(&child.copy_for(source)) {
+                        Ok((value, _)) => {
+                            result = result.wrapping_add(value);
+                            successful += 1;
+                        }
+                        Err(_) if forked => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        } else if let Some(command) = &context.command {
+            found_command = true;
+            result = command(context)?;
+        }
+        if let Some(parsed) = context.nodes.last()
+            && let Some(store) = &self.node(parsed.node).store
+        {
+            store(context, result)?;
+        }
+        Ok((if forked { successful } else { result }, found_command))
     }
 
     /// Completions for the input of `parse` at byte `cursor`
