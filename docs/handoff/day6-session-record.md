@@ -128,3 +128,25 @@ pointed at it); `worker-start --agent opencode2` takes no `--model` flag; openco
 credentials in its own database, not in `auth.json` or the environment. `wip/day6-oc3` was merged
 (`1f82fb9`) and is on `main` at `275bcc8` (984 tests passed, clippy and fmt clean).
 
+## 8. Outcome of the NVIDIA experiment and the plan for midnight
+
+All five opencode sessions (OC4-OC8) hit **HTTP 429 Too Many Requests** from NVIDIA's free endpoint
+within about two hours (five sessions sharing one key) and stopped; a direct request also returned
+429 with no retry hint. They are idle, nothing was lost, and the work they had is saved as
+snapshot branches (may not compile):
+
+| Branch | Content |
+|---|---|
+| `wip/day6b-oc4` | plugin bridge takeover: current main merged in, snapshot of the in-progress changes |
+| `wip/day6b-oc5` | hostile mobs: main merged in, pathfinding and combat changes in progress |
+| `wip/day6b-oc6` | worldgen throughput: main merged in, first changes |
+| `wip/day6b-oc7`, `wip/day6b-oc8` | nothing beyond a main merge (containers and commands not started) |
+
+`wip/day6-oc3` was merged (`1f82fb9`); `main` is `ac12e89` or newer.
+
+**Plan: at midnight resume with Freebuff** (the free NVIDIA model needed 22-90 s per turn and rate
+limited quickly, so Freebuff is faster and more reliable). Order: finish `wip/day6b-oc4` and
+`wip/day6b-oc5` (they already contain the latest main), start `day6-tasks/oc6.md` (chunk
+generation throughput, highest priority), then `oc8.md` and `oc7.md`. One Freebuff session per task.
+If opencode is used again, run at most two sessions per NVIDIA key.
+
