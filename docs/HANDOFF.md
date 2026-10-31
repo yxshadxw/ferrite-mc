@@ -322,12 +322,14 @@ left half-done when the opencode session hit its quota.
   through `Native.playerInventory`.
 
 ## Checks
-- `cargo test -p ferrite-server --test plugin_lifecycle`: 2/2 (129 s).
-- `cargo test --workspace`: 906 passed, 0 failed, 2 ignored across 70 binaries. The
-  `ferrite-worldgen` binary then exited abnormally while
-  `carver::tests::mask_matches_26_3_java_harness` was waiting on the Java harness under the shared
-  machine load; rerun alone it passes (1/1, 134.6 s), and no test assertion failed.
+Final run on the merged tree (`origin/main` at `b8ef576`, merge `c015421`):
+- `cargo test --workspace`: **990 passed, 0 failed, 2 ignored** across 105 test binaries.
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`: clean.
+- `cargo test -p ferrite-server --test plugin_lifecycle`: 2/2 (129 s), also covered by the merge
+  run above.
+- One earlier full run aborted the `ferrite-worldgen` Java harness
+  (`carver::tests::mask_matches_26_3_java_harness`) under shared machine load; it passes alone
+  (1/1, 134.6 s) and in the final run.
 
 ## Startup note
 On this machine a debug server spends about 80 s loading the vanilla registry and 60 s preloading
