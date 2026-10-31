@@ -70,6 +70,11 @@ fn constant_density_fills_stone_or_water_and_air() {
     assert_eq!(solid.block(0, 15, 0), Some(stone));
 }
 
+/// Compares the generated solid mask with the fixture world below y=40.
+///
+/// Structures (mineshafts, trial chambers, ...) modify saved terrain after the noise/aquifer
+/// stage, so the 99% assertion applies only to chunks whose `structures.References` is empty.
+/// The all-chunk rate is reported for comparison but deliberately not asserted.
 #[test]
 fn fixture_solid_mask_matches_vanilla_below_y_40() {
     let (data, registry) = setup();
@@ -142,8 +147,8 @@ fn fixture_solid_mask_matches_vanilla_below_y_40() {
         "noise fill solid mask: {matches}/{total} = {:.5}%",
         rate * 100.0
     );
-    eprintln!(
-        "no structure references: {clear_matches}/{clear_total} = {:.5}%",
+    println!(
+        "noise fill solid mask without structure references: {clear_matches}/{clear_total} = {:.5}%",
         clear_matches as f64 * 100.0 / clear_total as f64
     );
     eprintln!("mismatch states: {names:?}");
