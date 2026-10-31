@@ -1,3 +1,6 @@
+> **Newest:** the Day 6 end state (what is on main, snapshot branches, unstarted tasks, how to resume) is in
+> [`docs/handoff/day6-session-record.md`](handoff/day6-session-record.md).
+
 # Handoff — end of 2026-10-28 session
 
 Branch `phase1-foundation` (HEAD `c8989a7`): workspace green — 131 tests, clippy -D warnings, fmt.

@@ -284,6 +284,10 @@ fn template(key: &str) -> Option<&'static str> {
         }
         "commands.team.option.suffix.success" => "Team suffix set to %s",
         "commands.team.remove.success" => "Removed team %s",
+        "commands.function.unknown" => "Unknown function %s",
+        "commands.function.return.not_in_function" => {
+            "This command can only be run from inside a function"
+        }
         _ => return None,
     })
 }

@@ -229,7 +229,6 @@ pub fn impulse(
 mod tests {
     use super::super::anvil::AnvilChunkSource;
     use super::*;
-    use ferrite_protocol::packets::play::ItemStack;
     use ferrite_world::RuntimeRegistry;
     use std::collections::HashMap;
 
@@ -375,7 +374,7 @@ mod tests {
         let dirt_id = ferrite_data::registries::id("minecraft:item", "minecraft:dirt").unwrap();
         let drops = super::super::drops::block_drops(
             u16::try_from(dirt).unwrap(),
-            ItemStack::default(),
+            &ferrite_item::ItemStack::empty(),
             &mut Rng::new(1),
         );
         assert!(

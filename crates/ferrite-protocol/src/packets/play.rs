@@ -1692,6 +1692,72 @@ impl Packet for PlayerTeam {
     const BOUND: Bound = Bound::Clientbound;
 }
 
+/// Vanilla `ServerboundSignUpdatePacket`: the four lines of one side of a sign.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignUpdate {
+    pub location: i64,
+    pub is_front_text: bool,
+    pub lines: [String; 4],
+}
+impl Encode for SignUpdate {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.location.encode(out);
+        self.is_front_text.encode(out);
+        for line in &self.lines {
+            line.encode(out);
+        }
+    }
+}
+impl Decode for SignUpdate {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            location: i64::decode(buf)?,
+            is_front_text: bool::decode(buf)?,
+            lines: [
+                String::decode(buf)?,
+                String::decode(buf)?,
+                String::decode(buf)?,
+                String::decode(buf)?,
+            ],
+        })
+    }
+}
+impl Packet for SignUpdate {
+    const ID: i32 = 62;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
+
+// Vanilla `ClientboundOpenSignEditorPacket`.
+packet!(OpenSignEditor,61,Clientbound,{location:i64,is_front_text:bool});
+
+#[cfg(test)]
+mod sign_packet_tests {
+    use super::*;
+    use crate::types::BlockPos;
+
+    fn rt<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
+        let mut bytes = Vec::new();
+        value.encode(&mut bytes);
+        let mut input = bytes.as_slice();
+        assert_eq!(T::decode(&mut input).unwrap(), value);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn player_command_sign_update_and_editor_roundtrip() {
+        rt(SignUpdate {
+            location: i64::from(BlockPos::new(1, 2, 3).pack() as i32),
+            is_front_text: true,
+            lines: ["one".into(), "two".into(), "".into(), "four".into()],
+        });
+        rt(OpenSignEditor {
+            location: i64::from(BlockPos::new(1, 2, 3).pack() as i32),
+            is_front_text: false,
+        });
+    }
+}
+
 #[cfg(test)]
 mod command_feedback_tests {
     use super::*;
