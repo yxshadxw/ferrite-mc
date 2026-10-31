@@ -128,6 +128,8 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    /// Blocks this player placed or broke this tick, for neighbor updates.
+    pub changed_blocks: Vec<[i32; 3]>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -167,6 +169,7 @@ pub struct Region {
     generator: FlatGenerator,
     fluid_ticks: ferrite_fluid::FluidTicks,
     random_ticks: super::random_tick::RandomTicks,
+    updates: super::neighbors::Updates,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -202,6 +205,7 @@ impl RegionData for Region {
             generator: self.generator.split(sections),
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
             random_ticks: super::random_tick::RandomTicks::default(),
+            updates: super::neighbors::Updates::default(),
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -542,9 +546,10 @@ impl Player {
         if !self.change_block(location, Some(state), 0) {
             return false;
         }
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        let pos = [pos.x, pos.y, pos.z];
+        self.changed_blocks.push(pos);
         if let Some(source) = &self.source {
-            let pos = ferrite_protocol::types::BlockPos::unpack(location);
-            let pos = [pos.x, pos.y, pos.z];
             for stack in super::block_container::take_contents(source, pos, state) {
                 self.menus.spilled.push((pos, stack));
             }
@@ -610,6 +615,11 @@ impl Player {
             };
             state
         };
+        // Vanilla `BlockItem.place` -> `BlockPlaceContext.canPlace` -> `canSurvive`.
+        if !super::neighbors::can_survive(state, [target.x, target.y, target.z], source.as_ref()) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         if !self.plugin_allows(|plugins| {
             plugins.block_placed(
                 self.uuid,
@@ -651,6 +661,9 @@ impl Player {
         }
         let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
+        if placed {
+            self.changed_blocks.push([target.x, target.y, target.z]);
+        }
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
@@ -1269,6 +1282,48 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
+    /// Runs the neighbor updates of this tick's block changes (vanilla
+    /// `Level.markAndNotifyBlock` -> `Block.updateNeighbourShapes`). Unsupported blocks break
+    /// here; their loot drops as item entities through the normal loot tables.
+    fn tick_block_updates(&mut self, ctx: &TickContext) -> Vec<[i32; 3]> {
+        let mut changed = Vec::new();
+        for p in self.players.values_mut() {
+            changed.append(&mut p.changed_blocks);
+        }
+        let Some(source) = ctx.source.as_deref() else {
+            return changed;
+        };
+        for pos in &changed {
+            self.updates.block_changed(*pos);
+        }
+        let mut removed = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut removed);
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+            changed.push(pos);
+        }
+        changed
+    }
+
+    /// Runs the queued shape updates against the region's blocks.
+    fn apply_neighbor_updates(
+        &mut self,
+        source: &super::anvil::AnvilChunkSource,
+        ctx: &TickContext,
+        removed: &mut Vec<([i32; 3], u16)>,
+    ) {
+        let mut world =
+            super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        self.updates.apply(&mut world, removed);
+    }
+
+    /// Drops the loot table of a block broken by a neighbor or gravity update.
+    fn spawn_block_drops(&mut self, pos: [i32; 3], state: u16) {
+        for stack in super::drops::block_drops(state, ItemStack::default(), &mut self.rng) {
+            let record = item::pop_resource(pos, stack, &mut self.rng);
+            self.entities.insert(record);
+        }
+    }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
@@ -1398,6 +1453,7 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
+        self.tick_block_updates(ctx);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),
