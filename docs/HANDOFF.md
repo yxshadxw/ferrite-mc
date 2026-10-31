@@ -255,3 +255,39 @@ stubs, plugin API breadth, multi-version, persistence, perf, release).
 2. Re-run `cargo test --workspace` after any packet or test-harness change, and the two drop tests
    ten times in a row (`cargo test -p ferrite-server --lib`) if touching `playerdata`/tracking.
 3. Next feature work in priority order is in `docs/BACKLOG.md`; start with worldgen W2 and mobs.
+
+---
+
+# Day 6 (2026-10-31) — plugin compatibility: real plugin surfaces
+
+`main` at the time of writing: **`5d76bb9`** (FB1 widened the Paper Server API to 120/206 methods;
+the compat report on the WIP branches lists what real plugins still need). Worktree `fb4`.
+
+## On top of 5d76bb9 (green, not pushed)
+- `dabcc1c` Plugin API: class-based BLOCK/ITEM registries for `Material.asBlockType()`, a versioned
+  `UnsafeValues` (data version 5023, protocol 777), `BlockData` over material ids, Server
+  tick/stop/entity/folder getters, `Block#getBlockData` and `World#getEntities`.
+- `2210482` CraftBukkit shims (`CraftWorld`, `CraftPlayer`, `CraftOfflinePlayer`, `CraftBlock`,
+  `CraftBlockData`, `CraftItemStack`, `CraftInventory`, `CraftInventoryPlayer`,
+  `CraftNamespacedKey`) plus `java/test-plugin-typical` and its end-to-end test.
+- `179cc43` Host wiring: `PluginHost::tick` runs from the 50 ms game clock (Bukkit scheduler tasks
+  finally execute), the main world is published before plugins load, and joining players are
+  registered with location/mode/op so `getLocation`/`getSpawnLocation` work in listeners.
+- `3bbab31` `plugin.yml` permissions are registered and removed with the plugin manager, so
+  `default: true` reaches players and command permission gates pass.
+
+## Verified
+- `cargo test -p ferrite-server --test plugin_lifecycle`: 2/2 (25 s). The typical plugin reads
+  config.yml, completes tabs, receives join events, runs `/typical ping|where|info`, and its
+  repeating task reaches tick 5 and cancels itself.
+- Gradle bridge tests pass; `cargo clippy -p ferrite-plugin -p ferrite-server --all-targets` and
+  `cargo fmt --all --check` are green.
+
+## Remaining
+- `Native.playerInventory` needs a `PlayerHandler` in the server (route `PlayerCommand` into the
+  owning region); until then `PlayerInventory#setItem` reports "No player command handler" and the
+  fixture asserts that branch.
+- Block snapshots are still opt-in (`setBlockSnapshot`), so arbitrary `Block#getType` throws.
+- The rest of the `Server` stubs and NMS-typed CraftBukkit methods (`CraftItemStack.asNMSCopy`,
+  `CraftWorld#getHandle`, `CraftMagicNumbers`) remain; client-facing tab completion still goes
+  through the Rust dispatcher, not plugin `TabCompleter`s.
