@@ -235,6 +235,10 @@ impl<D: RegionData> Regionizer<D> {
     pub fn region_count(&self) -> usize {
         self.regions.len()
     }
+    pub fn holder_count(&self, chunk: ChunkPos) -> usize {
+        self.chunks.get(&chunk).copied().unwrap_or(0)
+    }
+
     pub fn owner(&self, chunk: ChunkPos) -> Option<RegionId> {
         self.sections.get(&self.section_of(chunk)).map(|s| s.1)
     }
