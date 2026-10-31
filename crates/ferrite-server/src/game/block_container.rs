@@ -48,6 +48,7 @@ pub fn inventory_slots(name: &str) -> Option<usize> {
     Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
         "chest" | "trapped_chest" | "barrel" => SIZE,
         "hopper" => super::hopper::SIZE,
+        "dropper" | "dispenser" => super::dispenser::SIZE,
         "furnace" | "blast_furnace" | "smoker" => super::furnace::SLOTS,
         _ => return None,
     })
@@ -255,13 +256,6 @@ fn save_items(items: &[ItemStack]) -> Tag {
         })
         .collect();
     Tag::List(List::Compound(list))
-}
-
-/// The `Items` of one block entity, sized to `size` and truncated to it.
-pub fn entity_items(entity: &BlockEntity, size: usize) -> Vec<ItemStack> {
-    let mut items = load_items(Some(entity));
-    items.truncate(size);
-    items
 }
 
 /// The items of every part, top half first.

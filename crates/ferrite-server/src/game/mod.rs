@@ -34,6 +34,7 @@ mod commands_server;
 mod commands_world;
 mod container;
 mod crafting;
+mod dispenser;
 mod drops;
 mod entity_index;
 pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};

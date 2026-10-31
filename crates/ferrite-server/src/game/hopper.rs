@@ -136,19 +136,6 @@ pub fn store(source: &AnvilChunkSource, [x, y, z]: [i32; 3], data: &HopperData) 
     }
 }
 
-/// Removes a broken hopper's block entity and returns its items.
-pub fn take_contents(source: &AnvilChunkSource, [x, y, z]: [i32; 3]) -> Vec<ItemStack> {
-    source
-        .update_block_entity(x, y, z, |entity| match entity.take() {
-            Some(removed) => (true, block_container::entity_items(&removed, SIZE)),
-            None => (false, Vec::new()),
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|stack| !stack.is_empty())
-        .collect()
-}
-
 /// The slots a hopper may pull from, given the face of the container it reaches.
 fn extract_slots(name: &str, size: usize) -> Vec<usize> {
     match name.strip_prefix("minecraft:").unwrap_or(name) {

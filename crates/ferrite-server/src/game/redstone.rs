@@ -534,6 +534,12 @@ impl Redstone {
         std::mem::take(&mut self.primed)
     }
 
+    /// The redstone power arriving at a block (`Level.getSignal`), including comparator
+    /// outputs this region computed. Dispensers use it for their rising edge.
+    pub fn power_at(&self, world: &impl RedstoneWorld, pos: [i32; 3]) -> u8 {
+        input_power(world, pos, &self.analog)
+    }
+
     pub fn tick(&mut self, world: &mut impl RedstoneWorld, players: &[[f64; 3]]) {
         self.clock = self.clock.wrapping_add(1);
         // `BasePressurePlateBlock.entityInside`: plates loaded from disk are found from the

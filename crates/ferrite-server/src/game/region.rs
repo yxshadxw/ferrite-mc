@@ -301,6 +301,7 @@ pub struct Region {
     gravity: super::gravity::Gravity,
     fire: super::fire::FireTicks,
     buttons: super::blocks::ButtonTicks,
+    dispensers: super::dispenser::Dispensers,
     hoppers: super::hopper::Hoppers,
     redstone: super::redstone::Redstone,
     held_chunks: HashMap<ChunkPos, usize>,
@@ -323,6 +324,7 @@ impl RegionData for Region {
         self.gravity.merge(other.gravity);
         self.fire.merge(other.fire);
         self.buttons.merge(other.buttons);
+        self.dispensers.merge(other.dispensers);
         self.hoppers.merge(other.hoppers);
         self.redstone.merge(other.redstone);
         self.players.extend(other.players);
@@ -354,6 +356,9 @@ impl RegionData for Region {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             buttons: self.buttons.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            dispensers: self.dispensers.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             hoppers: self.hoppers.split(|x, z| {
@@ -740,11 +745,6 @@ impl Player {
                 .map(|(name, _)| name);
             if name.and_then(super::furnace::kind).is_some() {
                 for stack in super::furnace::take_contents(source, pos) {
-                    self.menus.spilled.push((pos, stack));
-                }
-            }
-            if name == Some("minecraft:hopper") {
-                for stack in super::hopper::take_contents(source, pos) {
                     self.menus.spilled.push((pos, stack));
                 }
             }
@@ -2870,6 +2870,106 @@ impl Region {
             self.spawn_tnt(pos, fuse);
         }
     }
+    /// Fires droppers and dispensers whose redstone input rose this tick (vanilla
+    /// `DispenserBlock.neighborChanged`).
+    fn tick_dispensers(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let actions = {
+            let Self {
+                held_chunks,
+                dispensers,
+                redstone,
+                ..
+            } = self;
+            let world = super::fluid::RegionFluidWorld::new(source, held_chunks, &ctx.tracking);
+            dispensers.tick(source, redstone, &world)
+        };
+        for (_, action) in actions {
+            match action {
+                super::dispenser::Action::Arrow { pos, velocity } => {
+                    let record = ferrite_entity::arrow::new_arrow(
+                        ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+                        ferrite_math::Vec3::new(velocity[0], velocity[1], velocity[2]),
+                        2.0,
+                        None,
+                        &mut self.rng,
+                    );
+                    self.entities.insert(record);
+                }
+                super::dispenser::Action::Throw { .. } | super::dispenser::Action::Drop { .. } => {
+                    if let Some(record) = super::dispenser::item_entity(&action, &mut self.rng) {
+                        self.entities.insert(record);
+                    }
+                }
+                super::dispenser::Action::Splash { pos, stack } => {
+                    self.splash_potion(pos, &stack);
+                }
+                super::dispenser::Action::Fire { pos } => self.ignite_block(pos, ctx),
+                super::dispenser::Action::Nothing => {}
+            }
+        }
+    }
+
+    /// Vanilla `ThrownPotion.applySplash`: every player within four blocks gains the potion's
+    /// effects, with the duration falling off with distance.
+    fn splash_potion(&mut self, center: [f64; 3], stack: &ferrite_item::ItemStack) {
+        let effects = match stack.effective_component(ferrite_item::component_ids::POTION_CONTENTS)
+        {
+            Some(ferrite_item::Component::PotionContents(contents)) => {
+                ferrite_entity::potion::effects_from_component(&contents)
+            }
+            Some(ferrite_item::Component::Opaque(tag)) => PotionContents::from_tag(&tag)
+                .map(|contents| contents.all_effects())
+                .unwrap_or_default(),
+            _ => return,
+        };
+        if effects.is_empty() {
+            return;
+        }
+        for p in self.players.values_mut() {
+            let distance = ((p.pos[0] - center[0]).powi(2)
+                + (p.pos[1] - center[1]).powi(2)
+                + (p.pos[2] - center[2]).powi(2))
+            .sqrt();
+            if distance > 4.0 {
+                continue;
+            }
+            let scale = (1.0 - distance / 4.0).max(0.25);
+            for instance in &effects {
+                let mut instance = *instance;
+                if instance.duration > 0 {
+                    instance.duration = (f64::from(instance.duration) * scale) as i32;
+                }
+                p.apply_effect(instance);
+            }
+        }
+    }
+
+    /// A fire charge: light the facing block when fire may be placed there.
+    fn ignite_block(&mut self, pos: [i32; 3], ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let placed = {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            super::fire::placement_state(&world, pos).map(|state| {
+                ferrite_fluid::FluidWorld::set_block(
+                    &mut world,
+                    pos[0],
+                    pos[1],
+                    pos[2],
+                    u32::from(state),
+                );
+            })
+        };
+        if placed.is_some() {
+            self.updates.block_changed(pos);
+        }
+    }
+
     /// Ticks primed TNT and runs its `Explosion` where a fuse ends.
     fn tick_tnt(&mut self, ctx: &TickContext) {
         let Some(source) = ctx.source.as_deref() else {
@@ -3227,6 +3327,7 @@ impl Region {
         // hoppers it has seen and ticks them every game tick (their own cooldown gates moves).
         if let Some(source) = ctx.source.as_deref() {
             self.hoppers.blocks_changed(source, &changed);
+            self.dispensers.blocks_changed(source, &changed);
             let Self {
                 hoppers,
                 entities,
@@ -3267,6 +3368,7 @@ impl Region {
         }
         self.tick_gravity(ctx);
         self.tick_redstone(ctx, &changed);
+        self.tick_dispensers(ctx);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),
