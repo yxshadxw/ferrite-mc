@@ -1,3 +1,5 @@
+> **Coordinator:** how to run the orchestration (start workers, merge, push) is in
+> [`docs/handoff/coordinator-guide.md`](handoff/coordinator-guide.md).
 > **Newest:** the Day 6 end state (what is on main, snapshot branches, unstarted tasks, how to resume) is in
 > [`docs/handoff/day6-session-record.md`](handoff/day6-session-record.md).
 
