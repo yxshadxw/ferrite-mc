@@ -11,7 +11,12 @@ public final class Bootstrap {
     public static void configureIpBan(String ip) { initialIpBans.add(ip); }
     private Bootstrap() {}
     public static void start(String[] paths) { start(paths, null); }
-    public static void start(String[] paths, boolean[] regionAware) {
+    public static void start(String[] paths, boolean[] regionAware) { startServer(); enablePlugins(paths, regionAware); }
+    /**
+     * Creates the Bukkit server without enabling plugins, so the host can publish worlds and
+     * players before {@code onEnable} runs. Pair it with {@link #enablePlugins}.
+     */
+    public static void startServer() {
         Native.link();
         if (!"false".equals(System.getProperty("ferrite.native"))) java.util.logging.Logger.getLogger("").addHandler(new java.util.logging.Handler() {
             public void publish(java.util.logging.LogRecord record) { Native.log(record.getMessage()); }
@@ -20,13 +25,27 @@ public final class Bootstrap {
         server = new org.bukkit.craftbukkit.CraftServer(settings);
         initialIpBans.forEach(server::seedIpBan);
         org.bukkit.Bukkit.setServer(server);
+    }
+    public static void enablePlugins(String[] paths, boolean[] regionAware) {
         synchronized (LEGACY_LOCK) { server.plugins.loadOrdered(paths, regionAware); }
     }
     public static void registerWorld(String id, String name, long time, int x, int y, int z) { server.registerWorld(FerriteWorld.create(server, java.util.UUID.fromString(id), name, time, x, y, z)); }
     public static void setHeightSnapshot(String world, int x, int z, int y) { FerriteWorld.setHeight(server.getWorld(java.util.UUID.fromString(world)), x, z, y); }
     public static void setBlockSnapshot(String world, int x, int y, int z, String material) { FerriteWorld.setSnapshot(server.getWorld(java.util.UUID.fromString(world)), x, y, z, material); }
     public static void registerPlayer(String id, String name, boolean operator) { registerPlayer(id, name, operator, 20.0, 20, 0, null, 0, 0, 0, 0, 0); }
-    public static void registerPlayer(String id, String name, boolean operator, double health, int food, int mode, String world, double x, double y, double z, float yaw, float pitch) { var location = world == null ? null : new org.bukkit.Location(java.util.Objects.requireNonNull(server.getWorld(java.util.UUID.fromString(world))), x, y, z, yaw, pitch); server.registerPlayer(FerritePlayer.create(server, java.util.UUID.fromString(id), name, operator, health, food, mode, location)); }
+    public static void registerPlayer(String id, String name, boolean operator, double health, int food, int mode, String world, double x, double y, double z, float yaw, float pitch) {
+        var uuid = java.util.UUID.fromString(id);
+        var location = world == null ? null : new org.bukkit.Location(java.util.Objects.requireNonNull(server.getWorld(java.util.UUID.fromString(world))), x, y, z, yaw, pitch);
+        // Keep the object identity: plugins hold Player references across refreshes.
+        if (server.getPlayer(uuid) instanceof FerritePlayer current) { current.updateSnapshot(health, food, mode, location, operator); return; }
+        server.registerPlayer(FerritePlayer.create(server, uuid, name, operator, health, food, mode, location));
+    }
+    /** Moves the host-side snapshot with the player; called on every accepted movement packet. */
+    public static void updatePlayerLocation(String id, String world, double x, double y, double z, float yaw, float pitch) {
+        if (!(server.getPlayer(java.util.UUID.fromString(id)) instanceof FerritePlayer player)) return;
+        var resolved = server.getWorld(java.util.UUID.fromString(world));
+        if (resolved != null) player.updateLocation(new org.bukkit.Location(resolved, x, y, z, yaw, pitch));
+    }
     public static void setInventorySnapshot(String player, int slot, String material, int amount) { ((FerritePlayer) java.util.Objects.requireNonNull(server.getPlayer(java.util.UUID.fromString(player)))).inventorySnapshot(slot, material, amount); }
     public static void registerOfflinePlayer(String id, String name, boolean operator) { server.registerOfflinePlayer(java.util.UUID.fromString(id), name, operator); }
     public static boolean isPluginEnabled(String name) { return server.getPluginManager().isPluginEnabled(name); }

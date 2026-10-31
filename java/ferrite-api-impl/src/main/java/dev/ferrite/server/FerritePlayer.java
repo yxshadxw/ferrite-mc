@@ -19,6 +19,12 @@ final class FerritePlayer extends org.bukkit.craftbukkit.entity.CraftHumanEntity
     }
     static org.bukkit.entity.Player create(FerriteServer server, java.util.UUID id, String name, boolean operator, double health, int food, int mode, org.bukkit.Location location) { return new FerritePlayer(server, id, name, operator, health, food, mode, location); }
     void inventorySnapshot(int slot, String material, int amount) { inventory.setSnapshot(slot, material, amount); }
+    /** Refreshes the host-owned state without replacing the player object plugins already hold. */
+    void updateSnapshot(double health, int food, int mode, org.bukkit.Location location, boolean operator) {
+        this.health = health; this.food = food; this.mode = java.util.Objects.requireNonNull(org.bukkit.GameMode.getByValue(mode));
+        this.location = location; this.operator = operator; this.perm.recalculatePermissions();
+    }
+    void updateLocation(org.bukkit.Location value) { this.location = value; }
     @Override public org.bukkit.inventory.PlayerInventory getInventory() { return inventory.proxy; }
     @Override public java.util.UUID getUniqueId() { return id; }
     @Override public String getName() { return name; }
