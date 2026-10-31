@@ -195,7 +195,13 @@ pub struct Regionizer<D: RegionData> {
 }
 impl<D: RegionData> Default for Regionizer<D> {
     fn default() -> Self {
-        Self::new(4, 2)
+        Self::with_config(RegionizerConfig {
+            section_shift: 4,
+            merge_radius: 2,
+            empty_section_radius: 2,
+            min_section_recalc_count: 2,
+            max_dead_section_percent: 0.3,
+        })
     }
 }
 impl<D: RegionData> Regionizer<D> {
