@@ -217,6 +217,21 @@ pub enum TeleportDestination {
     Entity(EntityTarget),
 }
 
+/// An `/xp` (vanilla `/experience`) operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpOperation {
+    Add,
+    Set,
+    Query,
+}
+
+/// Whether an `/xp` amount counts experience points or levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpUnit {
+    Points,
+    Levels,
+}
+
 /// A command's effect, applied by the game loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -296,6 +311,26 @@ pub enum Action {
     },
     /// Chat visible to every player (`say`, `me`).
     Broadcast(Feedback),
+    /// `/clear`: remove matching items from the targets' inventories.
+    Clear {
+        targets: Vec<Uuid>,
+        item: Option<u16>,
+        max_count: Option<i32>,
+    },
+    /// `/give`: place items in each target's inventory.
+    Give {
+        targets: Vec<Uuid>,
+        item: u16,
+        count: i32,
+        item_name: String,
+    },
+    /// `/xp` (vanilla `/experience`): add, set or query points or levels.
+    Experience {
+        operation: XpOperation,
+        targets: Vec<Uuid>,
+        amount: i32,
+        unit: XpUnit,
+    },
     Tps,
     Mspt,
     ProfileStart,
@@ -1233,6 +1268,98 @@ fn camel_case(name: &str) -> String {
     out
 }
 
+/// Resolves an item argument (`stone`, `minecraft:stone`) to its protocol id.
+/// Component patches are not supported yet; the bare id is what `/give` uses.
+pub fn parse_item(raw: &str) -> Result<u16, CommandError> {
+    let base = raw.split(['[', '{']).next().unwrap_or(raw).trim();
+    ferrite_item::item_id(base)
+        .ok_or_else(|| CommandError::failed(format!("Unknown item '{base}'")))
+}
+
+/// Vanilla's item display name for a stack, e.g. `diamond_sword` -> "Diamond Sword".
+pub fn item_display(id: u16) -> String {
+    let name = ferrite_item::item_name(id).unwrap_or("minecraft:air");
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    path.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Resolves a player target against the online players in the command state.
+fn resolved_targets(ctx: &CommandContext<Source>, name: &str) -> Result<Vec<Uuid>, CommandError> {
+    let target = entity(ctx, name)?;
+    let state = ctx.source().state.lock().unwrap();
+    resolve_players(&state.players, &target, ctx.source().uuid)
+}
+
+fn clear_action(
+    ctx: &CommandContext<Source>,
+    item: Option<&str>,
+    max_count: Option<i32>,
+) -> Result<i32, CommandError> {
+    let targets = if ctx.argument("targets").is_some() {
+        resolved_targets(ctx, "targets")?
+    } else {
+        vec![ctx.source().uuid.ok_or_else(player_only)?]
+    };
+    let item = item.map(parse_item).transpose()?;
+    send(
+        ctx.source(),
+        Action::Clear {
+            targets,
+            item,
+            max_count,
+        },
+    )
+}
+
+fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let raw = ctx
+        .string("item")
+        .ok_or_else(|| CommandError::failed("Missing item"))?;
+    let item = parse_item(raw)?;
+    let count = ctx.integer("count").unwrap_or(1);
+    let max = ferrite_item::item_defaults(item).map_or(64, |defaults| defaults.max_stack_size);
+    if count > max {
+        return Err(CommandError::failed(format!(
+            "Can't give more than {max} of {}",
+            item_display(item)
+        )));
+    }
+    send(
+        ctx.source(),
+        Action::Give {
+            targets: resolved_targets(ctx, "targets")?,
+            item,
+            count,
+            item_name: item_display(item),
+        },
+    )
+}
+
+fn experience_action(
+    ctx: &CommandContext<Source>,
+    operation: XpOperation,
+    unit: XpUnit,
+) -> Result<i32, CommandError> {
+    send(
+        ctx.source(),
+        Action::Experience {
+            operation,
+            targets: resolved_targets(ctx, "target")?,
+            amount: ctx.integer("amount").unwrap_or(0),
+            unit,
+        },
+    )
+}
+
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
     tree.set_selector_requirement(|source: &Source| source.permission >= SELECTOR_PERMISSION);
@@ -1307,6 +1434,98 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
         }
     }
     tree.register(gamerule);
+
+    // ---- inventory and experience ----
+    tree.register(
+        literal::<Source>("clear")
+            .requires(|source| source.permission >= 2)
+            .executes(|ctx| clear_action(ctx, None, None))
+            .then(
+                argument("targets", ArgumentType::players())
+                    .executes(|ctx| clear_action(ctx, None, None))
+                    .then(
+                        argument("item", ArgumentType::opaque("minecraft:item_predicate"))
+                            .executes(|ctx| clear_action(ctx, ctx.string("item"), None))
+                            .then(
+                                argument("maxCount", ArgumentType::integer_range(0, i32::MAX))
+                                    .executes(|ctx| {
+                                        clear_action(
+                                            ctx,
+                                            ctx.string("item"),
+                                            ctx.integer("maxCount"),
+                                        )
+                                    }),
+                            ),
+                    ),
+            ),
+    );
+    tree.register(
+        literal::<Source>("give")
+            .requires(|source| source.permission >= 2)
+            .then(
+                argument("targets", ArgumentType::players()).then(
+                    argument("item", ArgumentType::opaque("minecraft:item_stack"))
+                        .executes(give_action)
+                        .then(
+                            argument("count", ArgumentType::integer_range(1, i32::MAX))
+                                .executes(give_action),
+                        ),
+                ),
+            ),
+    );
+    let experience = tree.register(
+        literal::<Source>("experience")
+            .requires(|source| source.permission >= 2)
+            .then(
+                literal("add").then(
+                    argument("target", ArgumentType::players()).then(
+                        argument("amount", ArgumentType::integer())
+                            .executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Points)
+                            })
+                            .then(literal("points").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Points)
+                            }))
+                            .then(literal("levels").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Levels)
+                            })),
+                    ),
+                ),
+            )
+            .then(
+                literal("set").then(
+                    argument("target", ArgumentType::players()).then(
+                        argument("amount", ArgumentType::integer_range(0, i32::MAX))
+                            .executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Points)
+                            })
+                            .then(literal("points").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Points)
+                            }))
+                            .then(literal("levels").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Levels)
+                            })),
+                    ),
+                ),
+            )
+            .then(
+                literal("query").then(
+                    argument("target", ArgumentType::player())
+                        .then(literal("points").executes(|ctx| {
+                            experience_action(ctx, XpOperation::Query, XpUnit::Points)
+                        }))
+                        .then(literal("levels").executes(|ctx| {
+                            experience_action(ctx, XpOperation::Query, XpUnit::Levels)
+                        })),
+                ),
+            ),
+    );
+    // Vanilla registers the tree as `experience` and aliases it as `xp`.
+    tree.register(
+        literal::<Source>("xp")
+            .requires(|source| source.permission >= 2)
+            .redirect(experience),
+    );
 
     // ---- gamemode (owned by the gamemode worker) ----
     tree.register(
@@ -2629,6 +2848,136 @@ mod tests {
         assert!(run("gamerule random_tick_speed -1", 2).0.is_err());
         assert!(run("gamerule keep_inventory 42", 2).0.is_err());
         assert!(run("gamerule does_not_exist", 2).0.is_err());
+    }
+
+    fn inventory_source(permission: u8) -> (Source, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+        let alice = Uuid::from_u128(1);
+        let mut state = GameState::default();
+        state.join(alice, "Alice".into(), 1, 20);
+        state.join(Uuid::from_u128(2), "Bob".into(), 1, 20);
+        let (actions, received) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Source {
+                permission,
+                origin: [0.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                uuid: Some(alice),
+                name: Some("Alice".into()),
+                state: Arc::new(Mutex::new(state)),
+                actions,
+            },
+            received,
+        )
+    }
+
+    #[test]
+    fn clear_and_give_resolve_targets_items_and_counts() {
+        let tree = dispatcher();
+        let (source, mut rx) = inventory_source(2);
+        let stone = ferrite_item::item_id("minecraft:stone").unwrap();
+        tree.execute("clear", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Clear {
+                targets: vec![Uuid::from_u128(1)],
+                item: None,
+                max_count: None
+            }
+        );
+        tree.execute("clear Bob minecraft:stone 5", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Clear {
+                targets: vec![Uuid::from_u128(2)],
+                item: Some(stone),
+                max_count: Some(5)
+            }
+        );
+        tree.execute("give @s stone 3", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Give {
+                targets: vec![Uuid::from_u128(1)],
+                item: stone,
+                count: 3,
+                item_name: "Stone".into()
+            }
+        );
+        tree.execute("give @p apple", source.clone()).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Action::Give { targets, count: 1, .. } if targets == vec![Uuid::from_u128(1)]
+        ));
+        assert!(
+            tree.execute("give @s diamond_sword 2", source.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Can't give more than 1 of Diamond Sword")
+        );
+        assert!(tree.execute("give @s stone 65", source.clone()).is_err());
+        assert_eq!(
+            tree.execute("give @s not_an_item", source.clone())
+                .unwrap_err()
+                .to_string(),
+            "Unknown item 'not_an_item'"
+        );
+        let (guest, mut guest_rx) = inventory_source(1);
+        assert!(tree.execute("clear", guest.clone()).is_err());
+        assert!(tree.execute("give @s stone", guest).is_err());
+        assert!(guest_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn xp_resolves_operations_units_and_permissions() {
+        let tree = dispatcher();
+        let (source, mut rx) = inventory_source(2);
+        tree.execute("xp add @s 5", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Add,
+                targets: vec![Uuid::from_u128(1)],
+                amount: 5,
+                unit: XpUnit::Points
+            }
+        );
+        tree.execute("experience add Bob -3 levels", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Add,
+                targets: vec![Uuid::from_u128(2)],
+                amount: -3,
+                unit: XpUnit::Levels
+            }
+        );
+        tree.execute("xp set @p 7 levels", source.clone()).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Set,
+                amount: 7,
+                unit: XpUnit::Levels,
+                ..
+            }
+        ));
+        tree.execute("xp query Alice points", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Query,
+                targets: vec![Uuid::from_u128(1)],
+                amount: 0,
+                unit: XpUnit::Points
+            }
+        );
+        assert!(tree.execute("xp set @s -1", source.clone()).is_err());
+        let (guest, _) = inventory_source(1);
+        assert!(tree.execute("xp add @s 1", guest).is_err());
     }
 
     #[test]
