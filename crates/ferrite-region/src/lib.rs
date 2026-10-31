@@ -191,10 +191,22 @@ fn weighted_deadline(a: (Instant, usize), b: (Instant, usize)) -> Instant {
     early.0 + Duration::from_nanos(offset as u64)
 }
 
+/// Folia ThreadedRegionizer section and recalculation parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionizerConfig {
+    pub section_shift: u32,
+    pub merge_radius: i32,
+    pub empty_section_radius: i32,
+    pub min_section_recalc_count: usize,
+    pub max_dead_section_percent: f64,
+}
 /// Single-threaded topology; transfer it to a `Scheduler` to start ticking.
 pub struct Regionizer<D: RegionData> {
     shift: u32,
     radius: i32,
+    empty_radius: i32,
+    min_recalc: usize,
+    max_dead_percent: f64,
     chunks: HashMap<ChunkPos, usize>,
     sections: HashMap<SectionPos, (usize, RegionId)>,
     regions: HashMap<RegionId, Region<D>>,
@@ -208,10 +220,27 @@ impl<D: RegionData> Default for Regionizer<D> {
 }
 impl<D: RegionData> Regionizer<D> {
     pub fn new(shift: u32, radius: i32) -> Self {
-        assert!(shift < 31 && radius >= 1);
+        Self::with_config(RegionizerConfig {
+            section_shift: shift,
+            merge_radius: radius,
+            empty_section_radius: 0,
+            min_section_recalc_count: 2,
+            max_dead_section_percent: 0.0,
+        })
+    }
+    pub fn with_config(config: RegionizerConfig) -> Self {
+        assert!(
+            config.section_shift < 31
+                && config.merge_radius >= 1
+                && config.empty_section_radius >= 0
+                && (0.0..=1.0).contains(&config.max_dead_section_percent)
+        );
         Self {
-            shift,
-            radius,
+            shift: config.section_shift,
+            radius: config.merge_radius,
+            empty_radius: config.empty_section_radius,
+            min_recalc: config.min_section_recalc_count.max(2),
+            max_dead_percent: config.max_dead_section_percent,
             chunks: HashMap::new(),
             sections: HashMap::new(),
             regions: HashMap::new(),
@@ -247,6 +276,29 @@ impl<D: RegionData> Regionizer<D> {
             .into_iter()
             .filter_map(|s| self.sections.get(&s).map(|entry| entry.1))
             .collect()
+    }
+    fn affected_mutation(&self, mutation: Mutation) -> HashSet<RegionId> {
+        let chunk = mutation.chunk();
+        let section = self.section_of(chunk);
+        let mut regions = self.affected(chunk);
+        if matches!(mutation, Mutation::Add(_))
+            && self.sections.get(&section).is_none_or(|entry| entry.0 == 0)
+        {
+            for dx in -self.empty_radius..=self.empty_radius {
+                for dz in -self.empty_radius..=self.empty_radius {
+                    if let (Some(x), Some(z)) =
+                        (section.0.checked_add(dx), section.1.checked_add(dz))
+                    {
+                        regions.extend(
+                            self.neighborhood(SectionPos(x, z))
+                                .into_iter()
+                                .filter_map(|p| self.sections.get(&p).map(|entry| entry.1)),
+                        );
+                    }
+                }
+            }
+        }
+        regions
     }
     /// Verifies the structural invariants: holder counts match the section
     /// table, every held section is owned by exactly one non-empty region,
@@ -356,11 +408,37 @@ impl<D: RegionData> Regionizer<D> {
     pub fn add_chunk(&mut self, chunk: ChunkPos) {
         *self.chunks.entry(chunk).or_default() += 1;
         let section = self.section_of(chunk);
+        let was_empty = self.sections.get(&section).is_none_or(|entry| entry.0 == 0);
         if let Some(entry) = self.sections.get_mut(&section) {
             entry.0 += 1;
-            return;
+        } else {
+            self.insert_section(section, 1);
         }
-        let mut neighbors: Vec<_> = self.affected(chunk).into_iter().collect();
+        if was_empty && self.empty_radius > 0 {
+            let radius = self.empty_radius;
+            for dx in -radius..=radius {
+                for dz in -radius..=radius {
+                    if let (Some(x), Some(z)) =
+                        (section.0.checked_add(dx), section.1.checked_add(dz))
+                    {
+                        let neighbor = SectionPos(x, z);
+                        if !self.sections.contains_key(&neighbor) {
+                            self.insert_section(neighbor, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Creates a ThreadedRegionSection and merges adjacent idle regions.
+    fn insert_section(&mut self, section: SectionPos, holders: usize) {
+        let mut neighbors: Vec<_> = self
+            .neighborhood(section)
+            .into_iter()
+            .filter_map(|s| self.sections.get(&s).map(|e| e.1))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         neighbors.sort_unstable();
         let id = if let Some(&id) = neighbors.first() {
             id
@@ -388,8 +466,56 @@ impl<D: RegionData> Regionizer<D> {
                 tick_offset(old.tick_count, region.tick_count),
             );
         }
-        self.sections.insert(section, (1, id));
+        self.sections.insert(section, (holders, id));
         self.regions.get_mut(&id).unwrap().sections.insert(section);
+    }
+    fn is_dead_section(&self, section: SectionPos) -> bool {
+        if self.sections.get(&section).is_none_or(|entry| entry.0 != 0) {
+            return false;
+        }
+        for dx in -self.empty_radius..=self.empty_radius {
+            for dz in -self.empty_radius..=self.empty_radius {
+                if let (Some(x), Some(z)) = (section.0.checked_add(dx), section.1.checked_add(dz))
+                    && self
+                        .sections
+                        .get(&SectionPos(x, z))
+                        .is_some_and(|entry| entry.0 != 0)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    /// Recalculates dead ThreadedRegionSection entries and splits disconnected regions.
+    pub fn recalculate(&mut self) {
+        let ids: Vec<_> = self.regions.keys().copied().collect();
+        for id in ids {
+            self.recalculate_region(id);
+        }
+    }
+    fn recalculate_region(&mut self, id: RegionId) {
+        let Some(region) = self.regions.get(&id) else {
+            return;
+        };
+        let dead: Vec<_> = region
+            .sections
+            .iter()
+            .copied()
+            .filter(|&section| self.is_dead_section(section))
+            .collect();
+        let radius = self.empty_radius;
+        self.empty_radius = 0;
+        for section in dead {
+            if !self.sections.contains_key(&section) {
+                continue;
+            }
+            let ghost = ChunkPos(section.0 << self.shift, section.1 << self.shift);
+            self.chunks.insert(ghost, 1);
+            self.sections.get_mut(&section).unwrap().0 = 1;
+            self.remove_chunk(ghost);
+        }
+        self.empty_radius = radius;
     }
     pub fn remove_chunk(&mut self, chunk: ChunkPos) -> bool {
         let Some(count) = self.chunks.get_mut(&chunk) else {
@@ -406,6 +532,11 @@ impl<D: RegionData> Regionizer<D> {
             return true;
         }
         let id = entry.1;
+        if self.empty_radius > 0 {
+            // Folia ThreadedRegionizer.removeChunk only marks section state;
+            // markNotTicking performs threshold-based cleanup.
+            return true;
+        }
         self.sections.remove(&section);
         self.regions.get_mut(&id).unwrap().sections.remove(&section);
         if self.regions[&id].sections.is_empty() {
@@ -770,7 +901,44 @@ fn nearby<D: RegionData, G>(s: &State<D, G>, section: SectionPos) -> Vec<u64> {
 fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
     let chunk = mutation.chunk();
     let section = s.topology.section_of(chunk);
-    let affected = s.topology.affected(chunk);
+    let mut create = vec![section];
+    let mut affected = s.topology.affected(chunk);
+    if matches!(mutation, Mutation::Add(_))
+        && s.topology
+            .sections
+            .get(&section)
+            .is_none_or(|entry| entry.0 == 0)
+        && s.topology.empty_radius > 0
+    {
+        create.clear();
+        for dx in -s.topology.empty_radius..=s.topology.empty_radius {
+            for dz in -s.topology.empty_radius..=s.topology.empty_radius {
+                if let (Some(x), Some(z)) = (section.0.checked_add(dx), section.1.checked_add(dz)) {
+                    let pos = SectionPos(x, z);
+                    create.push(pos);
+                    affected.extend(
+                        s.topology
+                            .neighborhood(pos)
+                            .into_iter()
+                            .filter_map(|p| s.topology.sections.get(&p).map(|entry| entry.1)),
+                    );
+                }
+            }
+        }
+    }
+    // Reviving a reserved empty section needs no new region if its full halo
+    // already exists, including when the owner is ticking.
+    if matches!(mutation, Mutation::Add(_))
+        && s.topology.sections.contains_key(&section)
+        && create
+            .iter()
+            .all(|pos| s.topology.sections.contains_key(pos))
+        && nearby(s, section).is_empty()
+    {
+        *s.topology.chunks.entry(chunk).or_default() += 1;
+        s.topology.sections.get_mut(&section).unwrap().0 += 1;
+        return;
+    }
     // ThreadedRegionizer.removeChunk changes holder metadata immediately even
     // when the owner is ticking; dead-section cleanup waits for markNotTicking.
     if matches!(mutation, Mutation::Remove(_))
@@ -795,9 +963,12 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
         }
         return;
     }
-    // Adding a holder to an already-owned section never expands its region.
+    // Existing nonempty sections do not expand ownership.
     if matches!(mutation, Mutation::Add(_))
-        && s.topology.sections.contains_key(&section)
+        && s.topology
+            .sections
+            .get(&section)
+            .is_some_and(|entry| entry.0 > 0)
         && nearby(s, section).is_empty()
     {
         *s.topology.chunks.entry(chunk).or_default() += 1;
@@ -807,7 +978,6 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
     // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: attach new
     // sections to a non-ticking region and defer merges into ticking regions.
     if matches!(mutation, Mutation::Add(_))
-        && !s.topology.sections.contains_key(&section)
         && nearby(s, section).is_empty()
         && !affected.is_empty()
         && affected
@@ -883,12 +1053,22 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
             region.state = RegionState::Transient;
             region.generation += 1;
         }
-        region.sections.insert(section);
-        s.topology.sections.insert(section, (1, id));
-        *s.topology.chunks.entry(chunk).or_default() += 1;
-        if let Some(tasks) = s.parked.remove(&section) {
-            s.topology.regions.get_mut(&id).unwrap().tasks.extend(tasks);
+        for pos in create {
+            if !s.topology.sections.contains_key(&pos) {
+                s.topology
+                    .regions
+                    .get_mut(&id)
+                    .unwrap()
+                    .sections
+                    .insert(pos);
+                s.topology.sections.insert(pos, (0, id));
+                if let Some(tasks) = s.parked.remove(&pos) {
+                    s.topology.regions.get_mut(&id).unwrap().tasks.extend(tasks);
+                }
+            }
         }
+        s.topology.sections.get_mut(&section).unwrap().0 += 1;
+        *s.topology.chunks.entry(chunk).or_default() += 1;
         return;
     }
     if nearby(s, section).is_empty() && affected.iter().all(|&id| is_free(s, id)) {
@@ -925,8 +1105,7 @@ fn pump<D: RegionData, G>(s: &mut State<D, G>, mut work: BTreeSet<u64>) {
 /// Re-derives the involved regions of a pending mutation from the current
 /// topology, reserving new ones and releasing ones no longer involved.
 fn refresh<D: RegionData, G>(s: &mut State<D, G>, id: u64, work: &mut BTreeSet<u64>) {
-    let chunk = s.pending[&id].mutation.chunk();
-    let wanted = s.topology.affected(chunk);
+    let wanted = s.topology.affected_mutation(s.pending[&id].mutation);
     let old = std::mem::take(&mut s.pending.get_mut(&id).unwrap().regions);
     for &r in old.difference(&wanted) {
         release(s, r, id, work);
@@ -1003,8 +1182,33 @@ fn apply_topology<D: RegionData, G>(
             s.topology.remove_chunk(c);
         }
     }
-    if let Some(mut parked) = s.parked.remove(&section) {
-        tasks.append(&mut parked);
+    if matches!(mutation, Mutation::Remove(_))
+        && s.topology.empty_radius > 0
+        && let Some(&(0, id)) = s.topology.sections.get(&section)
+    {
+        s.topology
+            .regions
+            .get_mut(&id)
+            .unwrap()
+            .dead_sections
+            .insert(section);
+    }
+    let radius = if matches!(mutation, Mutation::Add(_)) {
+        s.topology.empty_radius
+    } else {
+        0
+    };
+    for dx in -radius..=radius {
+        for dz in -radius..=radius {
+            if let (Some(x), Some(z)) = (section.0.checked_add(dx), section.1.checked_add(dz)) {
+                let pos = SectionPos(x, z);
+                if s.topology.sections.contains_key(&pos)
+                    && let Some(mut parked) = s.parked.remove(&pos)
+                {
+                    tasks.append(&mut parked);
+                }
+            }
+        }
     }
     for (chunk, task) in tasks {
         route(s, chunk, task);
@@ -1137,29 +1341,52 @@ fn worker<D: RegionData, G: Send + 'static>(
                 } else {
                     HashSet::new()
                 };
-                for section in dead {
-                    let Some(&(count, owner)) = s.topology.sections.get(&section) else {
-                        continue;
-                    };
-                    if count != 0 {
-                        continue;
+                if s.topology.empty_radius > 0 && !dead.is_empty() {
+                    let region = &s.topology.regions[&id];
+                    let count = region
+                        .sections
+                        .iter()
+                        .filter(|&&section| s.topology.is_dead_section(section))
+                        .count();
+                    if region.sections.len() >= s.topology.min_recalc
+                        && count as f64
+                            >= region.sections.len() as f64 * s.topology.max_dead_percent
+                    {
+                        let mut tasks =
+                            std::mem::take(&mut s.topology.regions.get_mut(&id).unwrap().tasks);
+                        let first_new = s.topology.next_id;
+                        s.topology.recalculate_region(id);
+                        for (chunk, task) in tasks.drain(..) {
+                            route(&mut s, chunk, task);
+                        }
+                        for new_id in first_new..s.topology.next_id {
+                            enqueue(&mut s, new_id);
+                        }
                     }
-                    if s.topology.regions[&owner].state != RegionState::Ready {
-                        s.topology
-                            .regions
-                            .get_mut(&owner)
-                            .unwrap()
-                            .dead_sections
-                            .insert(section);
-                        continue;
+                } else {
+                    for section in dead {
+                        let Some(&(count, owner)) = s.topology.sections.get(&section) else {
+                            continue;
+                        };
+                        if count != 0 {
+                            continue;
+                        }
+                        if s.topology.regions[&owner].state != RegionState::Ready {
+                            s.topology
+                                .regions
+                                .get_mut(&owner)
+                                .unwrap()
+                                .dead_sections
+                                .insert(section);
+                            continue;
+                        }
+                        let ghost =
+                            ChunkPos(section.0 << s.topology.shift, section.1 << s.topology.shift);
+                        s.topology.chunks.insert(ghost, 1);
+                        s.topology.sections.get_mut(&section).unwrap().0 = 1;
+                        let affected = s.topology.affected(ghost);
+                        apply_topology(&mut s, Mutation::Remove(ghost), &affected);
                     }
-                    // Reuse the normal split path for an empty section at the safe point.
-                    let ghost =
-                        ChunkPos(section.0 << s.topology.shift, section.1 << s.topology.shift);
-                    s.topology.chunks.insert(ghost, 1);
-                    s.topology.sections.get_mut(&section).unwrap().0 = 1;
-                    let affected = s.topology.affected(ghost);
-                    apply_topology(&mut s, Mutation::Remove(ghost), &affected);
                 }
                 let Some(r) = s.topology.regions.get_mut(&id) else {
                     shared.wake.notify_all();

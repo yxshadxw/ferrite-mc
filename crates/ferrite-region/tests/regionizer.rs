@@ -299,3 +299,69 @@ fn bridge_task_queued_during_tick_survives_deferred_merge() {
     assert!(rx.try_recv().is_err());
     assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
+#[test]
+fn configured_empty_sections_reserve_the_merge_radius() {
+    use ferrite_region::RegionizerConfig;
+    let mut r = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 2,
+        max_dead_section_percent: 0.5,
+    });
+    r.add_chunk(ChunkPos(0, 0));
+    let owner = r.owner(ChunkPos(0, 0)).unwrap();
+    for x in -1..=1 {
+        for z in -1..=1 {
+            assert_eq!(r.owner(ChunkPos(x, z)), Some(owner));
+        }
+    }
+    r.check_invariants().unwrap();
+    assert!(r.remove_chunk(ChunkPos(0, 0)));
+    r.recalculate();
+    assert_eq!(r.region_count(), 0);
+}
+#[test]
+fn recalculation_retains_empty_sections_near_remaining_chunks() {
+    use ferrite_region::RegionizerConfig;
+    let mut r = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 1000,
+        max_dead_section_percent: 1.0,
+    });
+    r.add_chunk(ChunkPos(0, 0));
+    r.add_chunk(ChunkPos(2, 0));
+    r.remove_chunk(ChunkPos(0, 0));
+    assert!(
+        r.owner(ChunkPos(-1, 0)).is_some(),
+        "dead sections stay until recalculation"
+    );
+    r.recalculate();
+    assert_eq!(r.owner(ChunkPos(-1, 0)), None);
+    assert!(
+        r.owner(ChunkPos(1, 0)).is_some(),
+        "empty section beside live chunk stays"
+    );
+    r.check_invariants().unwrap();
+}
+#[test]
+fn tasks_parked_in_new_empty_sections_follow_owner() {
+    use ferrite_region::{RegionizerConfig, Scheduler};
+    use std::{sync::mpsc, time::Duration};
+    let mut topology = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 2,
+        max_dead_section_percent: 0.5,
+    });
+    topology.add_chunk(ChunkPos(0, 0));
+    let scheduler = Scheduler::new(topology, (), 2, |_| {}, |_| {});
+    let (tx, rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(3, 0), move |_| tx.send(()).unwrap());
+    scheduler.add_chunk(ChunkPos(2, 0));
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
