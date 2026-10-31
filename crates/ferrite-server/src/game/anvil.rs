@@ -220,6 +220,10 @@ impl AnvilChunkSource {
     pub fn is_flat(&self) -> bool {
         self.terrain.is_none()
     }
+    /// The world directory this source reads and writes, when it is backed by disk.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
     /// The first free block above the generated surface, when vanilla generation is enabled.
     pub fn spawn_height(&self, x: i32, z: i32) -> Option<i32> {
         self.terrain.as_ref()?.spawn_height(x, z).ok()

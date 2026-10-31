@@ -732,6 +732,8 @@ mod tests {
                 name: Some("Alice".into()),
                 anchor: ferrite_command::EntityAnchor::Feet,
                 world: None,
+                tree: None,
+                function_depth: 0,
                 state,
                 actions: tx,
             },
