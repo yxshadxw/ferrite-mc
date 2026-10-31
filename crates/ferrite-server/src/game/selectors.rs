@@ -426,14 +426,20 @@ fn apply_options(
             }
             "type" => {
                 let (negated, kind) = split_negated(raw);
-                if kind.starts_with('#') {
-                    return Err(error(
-                        "argument.entity.options.type.invalid",
-                        "Entity type tags are not supported by this selector yet",
-                    ));
+                if let Some(tag_name) = kind.strip_prefix('#') {
+                    // Vanilla resolves `type=#tag` through the built-in entity_type tags, e.g.
+                    // `@e[type=#minecraft:zombies]` and its negated form.
+                    let Some(tag) = ferrite_data::tags::get("entity_type", tag_name) else {
+                        return Err(option_error("argument.entity.options.type.invalid", raw));
+                    };
+                    chosen.retain(|candidate| tag.contains(candidate.type_name()) != negated);
+                } else {
+                    let kind = normalized_type(kind);
+                    if ferrite_data::entity_props::by_name(&kind).is_none() {
+                        return Err(option_error("argument.entity.options.type.invalid", raw));
+                    }
+                    chosen.retain(|candidate| (candidate.type_name() == kind) != negated);
                 }
-                let kind = normalized_type(kind);
-                chosen.retain(|candidate| (candidate.type_name() == kind) != negated);
             }
             "tag" => {
                 let (negated, tag) = split_negated(raw);
@@ -687,5 +693,44 @@ mod tests {
         }
         // Selector permission is enforced by the dispatcher, not here.
         assert!(resolve_selection(&state, &target("@s"), None, [0.0; 3]).is_err());
+    }
+
+    #[test]
+    fn entity_type_tags_match_and_negate() {
+        let (state, alice, zombie) = state();
+        let selected = resolve_selection(
+            &state,
+            &target("@e[type=#minecraft:zombies]"),
+            None,
+            [0.0; 3],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].uuid, zombie);
+
+        let selected = resolve_selection(
+            &state,
+            &target("@e[type=!#minecraft:zombies]"),
+            None,
+            [0.0; 3],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].uuid, alice);
+
+        // Unknown tags and unknown entity types are argument errors, not empty selections.
+        for raw in [
+            "@e[type=#minecraft:not_a_tag]",
+            "@e[type=not_a_real_entity]",
+        ] {
+            let error = resolve_selection(&state, &target(raw), None, [0.0; 3]).unwrap_err();
+            let CommandError::Syntax(error) = error else {
+                panic!("{raw} should be a syntax error");
+            };
+            assert_eq!(
+                error.translation_key(),
+                "argument.entity.options.type.invalid"
+            );
+        }
     }
 }
