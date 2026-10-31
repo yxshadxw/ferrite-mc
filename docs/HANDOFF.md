@@ -144,3 +144,114 @@ Main also has FB2's M3 (plugins/*.jar loaded at startup, onEnable/onDisable, end
 - Orca run `run_57911c7b3e38`; session table and terminal handles are in `docs/sessions.md` (handles die with the Orca runtime).
 - Routing used: hard tasks to Claude workers and Terra (as commit-sized milestones), small ones to Freebuff/opencode2. Terra gives up fast on big specs ("incomplete" within a minute) but reliably finishes one-commit steps.
 - Sending a long task to Codex/Freebuff lands as a pasted chip; press Enter and verify `Working (` / `working...`.
+
+
+---
+# Day 5 (2026-10-31) — release prep, docs, and the drop-test flake
+
+`main` at the time of writing: **`3a43753`** (`Merge yxshadxw/fb2: plugin event error policy`), which
+already contains every Day-4 merge. Sessions: `docs/sessions.md` (1 Claude worker + 5 Freebuff;
+Terra/Terra-2 are out of quota until 2026-10-31 00:00; OC1/OC2 closed).
+
+## On main now (all merged, all building)
+- **Net**: per-connection writer task — ticks only push encoded bytes into a byte-budgeted queue
+  (`send_queue_bytes`, 2 MiB default); the writer batches, compresses, encrypts, keepalives and
+  drops a client that stops reading (`ferrite-net/src/game.rs`, `write_loop` in `lib.rs`).
+- **Commands**: `/gamemode`, `/defaultgamemode`, `/difficulty`, `/time`, `/weather`, `/seed`,
+  `/list`, `/say`, `/me` (OC2); `/tp`/`/teleport`, `/msg`+aliases, `/kill`, `/op`/`/deop`,
+  `/whitelist`, `/ban`/`/pardon`/`/kick`, `/stop`, `/save-*` (FB3); `/clear`, `/give`, `/xp` (FB5);
+  the whole `/gamerule` family with names from `commands.json` and values persisted in
+  `data/minecraft/game_rules.dat`.
+- **Inventory**: `ferrite-inventory` extraction, hashed-slot clicks, crafting (1,763 recipes),
+  chest menus shared between players with block-entity save/spill (Claude worker).
+- **Entities**: region-local store, vanilla tracker (spawn/move/rotate/teleport/remove, metadata,
+  tracker ranges), item entities (physics, merging, pickup, loot-table drops) (Claude worker).
+- **Chat**: 26.3 signed chat (signature chain, last-seen/ack, profile keys) and the status ping with
+  MOTD/favicon (FB4).
+- **Plugins**: embedded JVM at startup, Paper-only `plugin.yml` loading, `onEnable`/`onDisable`,
+  player/chat/block events, plugin commands, `plugins.on-event-error = allow|deny` (FB2).
+- **Selector permission** is enforced in **one place**: the dispatcher's `set_selector_requirement`
+  (`ferrite-command/src/dispatcher.rs`), wired once in `commands::dispatcher()` (FB3). Day 5 removed
+  the duplicate helper check that OC2 had added in `game/commands.rs`.
+- Also from Day 4: Velocity/Bungee forwarding (OC1), random ticks (Terra), fluids (Terra), worldgen
+  density functions + bit-exact noise (Terra-2), `/tps` `/mspt` `/profile` (FB3), chunk packet cache
+  (FB5).
+
+## Fixed on Day 5 (FB4)
+
+### The intermittent `survival_break_drops_an_item_that_falls_and_is_picked_up` failure
+**Symptom**: `entity packet: Elapsed(...)` after 20 s in full-suite runs, green when the test ran
+alone; also seen as 20 s waits in `chest_contents_are_shared_saved_and_spilled_when_broken`.
+
+**Root cause: integration tests shared one process-wide player-data directory.**
+`playerdata::dir()` returned a single `ferrite-test-playerdata-<pid>` directory for the whole test
+process, and `World::start_configured` restored `saved.gamemode`, `saved.pos` and the saved
+inventory at join. Test worlds reuse bot names (`Miner`, `Walker`, `Alice`, ...), so whichever test
+left first wrote that name's save and every later world in the same process joined as **that**
+player:
+- `/creative_break_broadcasts_to_tracking_player` saved `Miner` in **creative mode**, so the survival
+drop test's miner joined in creative, broke the dirt without a drop, and the walker waited for an
+`AddEntity` that could never come — the reported 20 s timeout.
+- `/crossing_region_boundary_keeps_chat_and_movement_routed` saved `Walker` at **x = 300.5**, so the
+drop test's walker joined there; its `MovePosition` to the drop (3.5, 65) is rejected as a 297-block
+move, and the item stays out of tracking range.
+- Leftover `Keeper.json` files with 40 stone in slot 0 (PID reuse across runs) explain the chest
+test's 20 s "picked up N stone" waits.
+It is intermittent because the save only happens if the region processes `Command::Leave` before
+`World::shutdown()` stops the scheduler — the join/leave race made it roughly 3 in 5 full runs.
+Stale files proving the mechanism are still under `%TEMP%\ferrite-test-playerdata-*`.
+
+**Fix**: player data is now owned by the world, not the process. `WorldSettings::playerdata:
+Option<PathBuf>` (default `None`) is the only save directory; `Player::update` writes with
+`playerdata::save_to` only when it is `Some`, and the global `OnceLock`/`init`/`load`/`save` are
+gone. Production passes the configured `<world>/playerdata` in `main.rs` (behaviour unchanged);
+test worlds pass `None`, so they neither restore nor write anything. New regression test:
+`player_data_is_scoped_to_one_world` (same directory resumes the saved position, another starts at
+world spawn). That is also the first test that covers player-data resume end to end.
+
+**Checked and ruled out** (as asked): the writer task's 2 MiB byte budget is far above what these
+connections queue (view distance 2, one item entity); an overflow disconnects with "Timed out" and
+the bot then reads EOF and panics, it does not sit in `Elapsed`. Item tracking is correct in
+isolation (spawn/teleport/pickup all arrive when the bot is in range). Tick scheduling keeps
+50 ms region deadlines; the 20 s gap was always "this world never had an item to track".
+
+### Fixture-less CI and test hygiene
+- Tests that read `vanilla/26.3/fixture-world` now **skip** when it is absent (`ferrite-server`
+  `fixture_version_root`, `ferrite-world/tests/chunk_nbt_roundtrip.rs`); CI has no fixture, so these
+  used to panic there. The light differential already skipped.
+- CI (`.github/workflows/ci.yml`) keeps the Linux toolchain override (`RUSTUP_TOOLCHAIN=stable`
+  beats the MSVC pin in `rust-toolchain.toml`) and now fails if any `vanilla/` file is tracked.
+- `git ls-files | grep -E '^vanilla/'` is empty. (The bare `grep -i vanilla` also matches nine
+  first-party source/test files named `vanilla*.rs`, which are code, not Mojang data.)
+- README: current feature list, honest caveats, build instructions, CI and legal note.
+
+## Checks on Day 5
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` are green: **782 passed, 0 failed, 2 ignored** across 97 test binaries
+(includes the 181 s light differential on the regenerated fixture and the 125-test
+`ferrite-server` lib suite). The two drop tests passed ten consecutive full-suite runs
+(`cargo test -p ferrite-server --lib`, 125/125 each, both tests `ok` every run).
+
+The CI condition (no fixture world) was verified locally: with `vanilla/26.3/fixture-world` moved
+away the workspace is still green (782 passed, 0 failed) and the five fixture tests print
+`SKIP fixture-world test`; the light differential skips the same way. The workflow YAML parses and
+`RUSTUP_TOOLCHAIN=stable` overrides the MSVC pin in `rust-toolchain.toml`. **Caveat**: there is no
+Linux or Docker runtime on this machine, so the GitHub Linux job itself was not executed here.
+
+## Real backlog
+See **`docs/BACKLOG.md`** — remaining work by family (worldgen W2/W3, mobs/AI, redstone, command
+stubs, plugin API breadth, multi-version, persistence, perf, release).
+
+## Known issues
+- `ferrite-light` differential needs the regenerated fixture: `python tools/make_fixture_world.py`
+  (stable double flush). The fixture used on 2026-10-30 had only 196/256 comparable chunks and made
+  the test fail; the 2026-10-31 fixture compares 256 and passes (181 s). The fixture is gitignored.
+- Terra/Terra-2 out of quota until 2026-10-31 00:00; Freebuff sessions need an hourly resume.
+- `tools/wirecheck/run.py` must be run after any packet change (it needs a real 26.3 client).
+- `cargo test --workspace` takes ~6–8 minutes locally; the light differential alone is ~3 minutes.
+
+## Hand-over
+1. Merge this worktree (`yxshadxw/fb4`): flake fix, selector dedup, docs, CI/release prep.
+2. Re-run `cargo test --workspace` after any packet or test-harness change, and the two drop tests
+   ten times in a row (`cargo test -p ferrite-server --lib`) if touching `playerdata`/tracking.
+3. Next feature work in priority order is in `docs/BACKLOG.md`; start with worldgen W2 and mobs.
