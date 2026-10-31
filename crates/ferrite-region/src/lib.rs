@@ -81,6 +81,10 @@ pub enum RegionState {
 /// World-owned state. `split` removes and returns data belonging to `sections`.
 pub trait RegionData: Default + Send + 'static {
     fn merge(&mut self, other: Self);
+    /// Folia RegioniserCallback.merge receives destination tick minus source tick.
+    fn merge_with_tick_offset(&mut self, other: Self, _offset: i64) {
+        self.merge(other);
+    }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self;
 }
 
@@ -89,6 +93,7 @@ struct Region<D> {
     merge_targets: HashSet<RegionId>,
     merge_from: HashSet<RegionId>,
     dead_sections: HashSet<SectionPos>,
+    tick_count: u64,
     sections: HashSet<SectionPos>,
     data: Option<D>,
     next_tick: Instant,
@@ -107,6 +112,7 @@ impl<D> Region<D> {
             merge_targets: HashSet::new(),
             merge_from: HashSet::new(),
             dead_sections: HashSet::new(),
+            tick_count: 0,
             sections,
             data: Some(data),
             next_tick: Instant::now(),
@@ -166,6 +172,12 @@ fn advance(deadline: &mut Instant, now: Instant, config: &SchedulerConfig) -> u6
     let skipped = (floor - *deadline).as_nanos().div_ceil(period);
     *deadline += Duration::from_nanos((skipped * period) as u64);
     skipped as u64
+}
+
+fn tick_offset(from: u64, into: u64) -> i64 {
+    i64::try_from(into)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(from).unwrap_or(i64::MAX))
 }
 
 /// Deadline of a merged region: the section-weighted mean of both deadlines.
@@ -371,7 +383,10 @@ impl<D: RegionData> Regionizer<D> {
                 (old.next_tick, old.sections.len()),
             );
             region.sections.extend(old.sections);
-            region.data.as_mut().unwrap().merge(old.data.unwrap());
+            region.data.as_mut().unwrap().merge_with_tick_offset(
+                old.data.unwrap(),
+                tick_offset(old.tick_count, region.tick_count),
+            );
         }
         self.sections.insert(section, (1, id));
         self.regions.get_mut(&id).unwrap().sections.insert(section);
@@ -425,6 +440,7 @@ impl<D: RegionData> Regionizer<D> {
         // Split pieces inherit the parent's deadline; starting them at `now`
         // would queue them behind every overdue region under overload.
         let next_tick = self.regions[&id].next_tick;
+        let tick_count = self.regions[&id].tick_count;
         self.regions.get_mut(&id).unwrap().sections = first;
         for component in components {
             let data = self
@@ -442,6 +458,7 @@ impl<D: RegionData> Regionizer<D> {
             }
             let mut region = Region::new(component, data);
             region.next_tick = next_tick;
+            region.tick_count = tick_count;
             self.regions.insert(new_id, region);
         }
         true
@@ -828,11 +845,10 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
             }
             let destination = s.topology.regions.get_mut(&id).unwrap();
             destination.sections.extend(old.sections);
-            destination
-                .data
-                .as_mut()
-                .unwrap()
-                .merge(old.data.take().unwrap());
+            destination.data.as_mut().unwrap().merge_with_tick_offset(
+                old.data.take().unwrap(),
+                tick_offset(old.tick_count, destination.tick_count),
+            );
             destination.tasks.append(&mut old.tasks);
             destination.dead_sections.extend(old.dead_sections);
             destination.merge_targets.extend(old.merge_targets);
@@ -1058,6 +1074,7 @@ fn worker<D: RegionData, G: Send + 'static>(
                 let mut s = shared.state.lock();
                 let r = s.topology.regions.get_mut(&id).unwrap();
                 r.data = Some(data);
+                r.tick_count = r.tick_count.saturating_add(1);
                 r.state = RegionState::Ready;
                 r.stats.last_mspt = started.elapsed().as_secs_f64() * 1000.0;
                 r.ticks.push_back(now);
@@ -1108,11 +1125,10 @@ fn worker<D: RegionData, G: Send + 'static>(
                     }
                     let destination = s.topology.regions.get_mut(&id).unwrap();
                     destination.sections.extend(old.sections);
-                    destination
-                        .data
-                        .as_mut()
-                        .unwrap()
-                        .merge(old.data.take().unwrap());
+                    destination.data.as_mut().unwrap().merge_with_tick_offset(
+                        old.data.take().unwrap(),
+                        tick_offset(old.tick_count, destination.tick_count),
+                    );
                     destination.tasks.append(&mut old.tasks);
                     destination.dead_sections.extend(old.dead_sections);
                 }
@@ -1264,4 +1280,29 @@ mod tests {
         assert_eq!(r.region_count(), 2);
         r.check_invariants().unwrap();
     }
+}
+#[test]
+fn merges_report_tick_offset_and_splits_inherit_tick() {
+    #[derive(Default)]
+    struct Clock(Vec<i64>);
+    impl RegionData for Clock {
+        fn merge(&mut self, _: Self) {}
+        fn merge_with_tick_offset(&mut self, _: Self, offset: i64) {
+            self.0.push(offset);
+        }
+        fn split(&mut self, _: &HashSet<SectionPos>) -> Self {
+            Self::default()
+        }
+    }
+    let mut regionizer = Regionizer::<Clock>::new(0, 1);
+    regionizer.add_chunk(ChunkPos(0, 0));
+    regionizer.add_chunk(ChunkPos(2, 0));
+    let left = regionizer.owner(ChunkPos(0, 0)).unwrap();
+    let right = regionizer.owner(ChunkPos(2, 0)).unwrap();
+    regionizer.regions.get_mut(&left).unwrap().tick_count = 10;
+    regionizer.regions.get_mut(&right).unwrap().tick_count = 4;
+    regionizer.add_chunk(ChunkPos(1, 0));
+    assert_eq!(regionizer.data_mut(left).unwrap().0, vec![6]);
+    regionizer.remove_chunk(ChunkPos(1, 0));
+    assert!(regionizer.regions.values().all(|r| r.tick_count == 10));
 }
