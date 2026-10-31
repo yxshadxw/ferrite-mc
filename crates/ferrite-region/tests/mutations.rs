@@ -510,3 +510,61 @@ fn dead_section_is_retired_after_its_tick() {
     }
     assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
+#[test]
+fn ticking_region_retains_existing_empty_sections_and_new_halo_is_transient() {
+    use ferrite_region::{RegionState, RegionizerConfig};
+    let mut topology = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 2,
+        max_dead_section_percent: 0.5,
+    });
+    topology.add_chunk(ChunkPos(0, 0));
+    let scheduler = Scheduler::new(topology, (), 2, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    let original = scheduler.owner(ChunkPos(0, 0));
+    scheduler.add_chunk(ChunkPos(2, 0));
+    let added = scheduler.owner(ChunkPos(2, 0)).unwrap();
+    assert_eq!(scheduler.region_state(added), Some(RegionState::Transient));
+    assert_eq!(scheduler.owner(ChunkPos(1, 0)), original);
+    assert_eq!(scheduler.owner(ChunkPos(3, 0)), Some(added));
+    release.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while scheduler.owner(ChunkPos(2, 0)) != scheduler.owner(ChunkPos(0, 0)) {
+        assert!(Instant::now() < until);
+        thread::yield_now();
+    }
+    scheduler.shutdown();
+}
+#[test]
+fn concurrent_halo_mutations_preserve_region_invariants() {
+    use ferrite_region::RegionizerConfig;
+    let topology = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 2,
+        max_dead_section_percent: 0.5,
+    });
+    let scheduler = Arc::new(Scheduler::new(topology, (), 4, |_| {}, |_| {}));
+    let mut workers = Vec::new();
+    for worker in 0..4 {
+        let scheduler = scheduler.clone();
+        workers.push(thread::spawn(move || {
+            for i in 0..300 {
+                let chunk = ChunkPos((i % 15) + worker * 20, (i / 15) % 15);
+                scheduler.add_chunk(chunk);
+                if i % 2 == 0 {
+                    scheduler.remove_chunk(chunk);
+                }
+                scheduler.check_invariants().unwrap();
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    scheduler.check_invariants().unwrap();
+    Arc::try_unwrap(scheduler).ok().unwrap().shutdown();
+}
