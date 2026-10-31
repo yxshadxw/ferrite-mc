@@ -50,14 +50,13 @@ impl PluginBridge {
                         online_mode: settings.online_mode,
                         banned_ips: Vec::new(),
                     },
+                    world: Some(settings.world.clone()),
                     player_handler: settings.player_handler,
                     ..Default::default()
                 },
             )
             .with_context(|| format!("loading plugins from {}", settings.directory.display()))?,
         );
-        host.register_world(&settings.world)
-            .context("publishing the main world to plugins")?;
         let bridge = Self { host };
         bridge.flush_logs();
         Ok(Some(bridge))

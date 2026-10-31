@@ -743,7 +743,15 @@ async fn run(
               if scheduler.owner(chunk).is_some(){scheduler.schedule_at_chunk(chunk,move |r|r.schedule_fluid((x,y,z)));}
             }
           },
-          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}command_state.lock().unwrap().set_position(uuid,pos,yaw,pitch);scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
+          Signal::Update{uuid,pos,yaw,pitch,ground}=>{
+            if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}
+            command_state.lock().unwrap().set_position(uuid,pos,yaw,pitch);
+            if let Some(plugins) = &settings.plugins {
+              let location = ferrite_plugin::PlayerLocation { world: ferrite_plugin::default_world_id(), x: pos[0], y: pos[1], z: pos[2], yaw, pitch };
+              if let Err(error) = plugins.update_player_location(uuid, &location) { tracing::warn!(%error, "updating the plugin player snapshot failed"); }
+            }
+            scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));
+          },
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
           Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
           Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);command_state.lock().unwrap().leave(uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
@@ -761,7 +769,21 @@ async fn run(
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
              command_state.lock().unwrap().tick(advance_time);
-             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
+             if let Some(plugins) = &settings.plugins {
+                 if let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
+                 // Paper's region scheduler: run each due task on the thread owning its chunk.
+                 for task in plugins.take_region_tasks() {
+                     if task.world != ferrite_plugin::default_world_id().to_string() {
+                         tracing::debug!(world = %task.world, "plugin region task for an unknown world");
+                         continue;
+                     }
+                     let chunk = ChunkPos(task.chunk_x, task.chunk_z);
+                     let plugins = Arc::clone(plugins);
+                     scheduler.schedule_at_chunk(chunk, move |_| {
+                         if let Err(error) = plugins.run_region_task(task) { tracing::warn!(%error, "plugin region task failed"); }
+                     });
+                 }
+             }
          }
         }
     }
