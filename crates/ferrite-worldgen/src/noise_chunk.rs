@@ -1,0 +1,248 @@
+//! Overworld noise, aquifers, and carving before surface rules and features.
+
+use crate::{
+    DensityFunction, FunctionContext, ResolveError, ResourceId, SeededNoise, WorldgenData,
+};
+use ferrite_world::{BlockStateRegistry, Chunk, ChunkError};
+use std::{cell::RefCell, collections::HashMap};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum NoiseChunkError {
+    #[error("missing overworld noise settings")]
+    MissingSettings,
+    #[error("unknown default block or biome: {0}")]
+    MissingState(String),
+    #[error("chunk coordinate outside block-coordinate range")]
+    Coordinates,
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+    #[error(transparent)]
+    Chunk(#[from] ChunkError),
+}
+
+/// Seeded overworld density router for filling new chunks.
+pub struct NoiseChunkGenerator {
+    density: DensityFunction,
+    pub(crate) noise: SeededNoise,
+    min_y: i32,
+    height: i32,
+    sea_level: i32,
+    default_block: String,
+    default_fluid: String,
+    seed: i64,
+    aquifer: Option<crate::aquifer::AquiferSpec>,
+}
+
+type CellCache = RefCell<HashMap<(usize, i32, i32, i32), f32>>;
+struct ChunkContext<'a> {
+    parent: crate::SeededContext<'a>,
+    cache: &'a CellCache,
+}
+impl FunctionContext for ChunkContext<'_> {
+    fn block_x(&self) -> i32 {
+        self.parent.block_x()
+    }
+    fn block_y(&self) -> i32 {
+        self.parent.block_y()
+    }
+    fn block_z(&self) -> i32 {
+        self.parent.block_z()
+    }
+    fn sample_noise(&self, id: &ResourceId, x: f64, y: f64, z: f64) -> f32 {
+        self.parent.sample_noise(id, x, y, z)
+    }
+    fn sample_blended(&self, settings: [f64; 5], x: i32, y: i32, z: i32) -> f32 {
+        self.parent.sample_blended(settings, x, y, z)
+    }
+    fn cached_cell(&self, node: usize, x: i32, y: i32, z: i32) -> Option<f32> {
+        self.cache.borrow().get(&(node, x, y, z)).copied()
+    }
+    fn store_cell(&self, node: usize, x: i32, y: i32, z: i32, value: f32) {
+        self.cache.borrow_mut().insert((node, x, y, z), value);
+    }
+}
+
+impl NoiseChunkGenerator {
+    pub fn new(data: &WorldgenData, seed: i64) -> Result<Self, NoiseChunkError> {
+        let settings = data
+            .noise_settings("minecraft:overworld")
+            .ok_or(NoiseChunkError::MissingSettings)?;
+        Ok(Self {
+            density: settings
+                .noise_router
+                .final_density
+                .resolve_references(data)?,
+            noise: SeededNoise::new(data, seed),
+            min_y: settings.noise.min_y,
+            height: settings.noise.height,
+            sea_level: settings.sea_level,
+            default_block: settings.default_block.to_string(),
+            default_fluid: settings.default_fluid.to_string(),
+            seed,
+            aquifer: settings
+                .aquifers
+                .as_ref()
+                .map(|value| crate::aquifer::AquiferSpec::new(value, data))
+                .transpose()?,
+        })
+    }
+
+    /// Fills the noise terrain, then applies the vanilla carving mask.
+    pub fn fill_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        registry: &impl BlockStateRegistry,
+    ) -> Result<Chunk, NoiseChunkError> {
+        let mut chunk = self.fill_noise_chunk(chunk_x, chunk_z, registry)?;
+        self.carve_chunk(&mut chunk, chunk_x, chunk_z, registry)?;
+        Ok(chunk)
+    }
+
+    /// Performs the noise and aquifer fill without surface rules or carvers.
+    pub fn fill_noise_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        registry: &impl BlockStateRegistry,
+    ) -> Result<Chunk, NoiseChunkError> {
+        let x0 = chunk_x
+            .checked_mul(16)
+            .and_then(|x| x.checked_add(15).map(|_| x))
+            .ok_or(NoiseChunkError::Coordinates)?;
+        let z0 = chunk_z
+            .checked_mul(16)
+            .and_then(|z| z.checked_add(15).map(|_| z))
+            .ok_or(NoiseChunkError::Coordinates)?;
+        let state = |id: &str| {
+            registry
+                .block_id(id, &Default::default())
+                .ok_or_else(|| NoiseChunkError::MissingState(id.to_owned()))
+        };
+        let air = state("minecraft:air")?;
+        let solid = state(&self.default_block)?;
+        let fluid = state(&self.default_fluid)?;
+        let lava = state("minecraft:lava")?;
+        let biome = registry
+            .biome_id("minecraft:plains")
+            .ok_or_else(|| NoiseChunkError::MissingState("minecraft:plains".into()))?;
+        let mut chunk = Chunk::new(
+            self.min_y,
+            self.height as u32,
+            air,
+            biome,
+            registry.block_bits(),
+            registry.biome_bits(),
+        )?;
+        let cache = CellCache::default();
+        let mut aquifer = self.aquifer.as_ref().map(|spec| {
+            crate::aquifer::Aquifer::new(
+                spec,
+                &self.noise,
+                self.seed,
+                self.sea_level,
+                chunk_x,
+                chunk_z,
+            )
+        });
+        for y in self.min_y..self.min_y + self.height {
+            for z in 0_u8..16 {
+                for x in 0_u8..16 {
+                    let ctx = ChunkContext {
+                        parent: self.noise.at(x0 + i32::from(x), y, z0 + i32::from(z)),
+                        cache: &cache,
+                    };
+                    let density = self.density.compute(&ctx);
+                    let world_x = x0 + i32::from(x);
+                    let world_z = z0 + i32::from(z);
+                    let substance = |fluid_type| match fluid_type {
+                        crate::aquifer::Fluid::Air => air,
+                        crate::aquifer::Fluid::Water => fluid,
+                        crate::aquifer::Fluid::Lava => lava,
+                    };
+                    let block = if let Some(aquifer) = aquifer.as_mut() {
+                        aquifer
+                            .substance(world_x, y, world_z, density)
+                            .map_or(solid, substance)
+                    } else if density > 0.0 {
+                        solid
+                    } else if y < self.sea_level {
+                        fluid
+                    } else {
+                        air
+                    };
+                    if block != air {
+                        chunk.set_block(x, y, z, block, registry)?;
+                    }
+                }
+            }
+        }
+        Ok(chunk)
+    }
+
+    /// Applies carving after surface rules, as in the vanilla terrain pipeline.
+    pub fn carve_chunk(
+        &self,
+        chunk: &mut Chunk,
+        chunk_x: i32,
+        chunk_z: i32,
+        registry: &impl BlockStateRegistry,
+    ) -> Result<(), NoiseChunkError> {
+        let x0 = chunk_x
+            .checked_mul(16)
+            .and_then(|x| x.checked_add(15).map(|_| x))
+            .ok_or(NoiseChunkError::Coordinates)?;
+        let z0 = chunk_z
+            .checked_mul(16)
+            .and_then(|z| z.checked_add(15).map(|_| z))
+            .ok_or(NoiseChunkError::Coordinates)?;
+        let state = |id: &str| {
+            registry
+                .block_id(id, &Default::default())
+                .ok_or_else(|| NoiseChunkError::MissingState(id.to_owned()))
+        };
+        let air = state("minecraft:air")?;
+        let water = state(&self.default_fluid)?;
+        let lava = state("minecraft:lava")?;
+        let bedrock = state("minecraft:bedrock")?;
+        let mask =
+            crate::carver::CarveMask::new(self.seed, chunk_x, chunk_z, self.min_y, self.height);
+        let mut aquifer = self.aquifer.as_ref().map(|spec| {
+            crate::aquifer::Aquifer::new(
+                spec,
+                &self.noise,
+                self.seed,
+                self.sea_level,
+                chunk_x,
+                chunk_z,
+            )
+        });
+        for y in self.min_y..self.min_y + self.height {
+            for z in 0_u8..16 {
+                for x in 0_u8..16 {
+                    if !mask.contains(x, y, z) || chunk.block(x, y, z) == Some(bedrock) {
+                        continue;
+                    }
+                    let substance = if let Some(aquifer) = aquifer.as_mut() {
+                        aquifer.substance(x0 + i32::from(x), y, z0 + i32::from(z), 0.0)
+                    } else {
+                        Some(if y < self.sea_level {
+                            crate::aquifer::Fluid::Water
+                        } else {
+                            crate::aquifer::Fluid::Air
+                        })
+                    };
+                    let block = match substance {
+                        None => continue,
+                        Some(crate::aquifer::Fluid::Air) => air,
+                        Some(crate::aquifer::Fluid::Water) => water,
+                        Some(crate::aquifer::Fluid::Lava) => lava,
+                    };
+                    chunk.set_block(x, y, z, block, registry)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
