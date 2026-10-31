@@ -268,7 +268,11 @@ impl<D: RegionData> Regionizer<D> {
                 {
                     return Err(format!(
                         "{section:?} (region {id}) and {neighbor:?} (region {other}) are \
-                         within merge radius but in different regions"
+                         within merge radius but in different regions: {:?} targets {:?}, {:?} targets {:?}",
+                        self.regions[&id].state,
+                        self.regions[&id].merge_targets,
+                        self.regions[&other].state,
+                        self.regions[&other].merge_targets
                     ));
                 }
             }
@@ -720,10 +724,9 @@ fn enqueue<D: RegionData, G>(s: &mut State<D, G>, id: RegionId) {
     }
 }
 fn is_free<D: RegionData, G>(s: &State<D, G>, id: RegionId) -> bool {
-    s.topology
-        .regions
-        .get(&id)
-        .is_some_and(|r| r.data.is_some() && r.mutations.is_empty())
+    s.topology.regions.get(&id).is_some_and(|r| {
+        r.data.is_some() && r.state == RegionState::Ready && r.mutations.is_empty()
+    })
 }
 /// Pending mutations whose section lies within the merge radius of `section`.
 fn nearby<D: RegionData, G>(s: &State<D, G>, section: SectionPos) -> Vec<u64> {
@@ -896,10 +899,9 @@ fn release<D: RegionData, G>(s: &mut State<D, G>, r: RegionId, id: u64, work: &m
 fn ready<D: RegionData, G>(s: &State<D, G>, id: u64) -> bool {
     let p = &s.pending[&id];
     p.regions.iter().all(|r| {
-        s.topology
-            .regions
-            .get(r)
-            .is_some_and(|r| r.data.is_some() && r.mutations.first() == Some(&id))
+        s.topology.regions.get(r).is_some_and(|r| {
+            r.data.is_some() && r.state == RegionState::Ready && r.mutations.first() == Some(&id)
+        })
     }) && nearby(s, p.section).into_iter().all(|other| other >= id)
 }
 fn apply_pending<D: RegionData, G>(s: &mut State<D, G>, id: u64, work: &mut BTreeSet<u64>) {
