@@ -58,6 +58,116 @@ fn template(key: &str) -> Option<&'static str> {
         "commands.whitelist.reloaded" => "Reloaded the whitelist",
         "commands.whitelist.remove.failed" => "Player is not whitelisted",
         "commands.whitelist.remove.success" => "Removed %s from the whitelist",
+        "commands.effect.clear.everything.failed" => "Target has no effects to remove",
+        "commands.effect.clear.everything.success.multiple" => {
+            "Removed every effect from %s targets"
+        }
+        "commands.effect.clear.everything.success.single" => "Removed every effect from %s",
+        "commands.effect.clear.specific.failed" => "Target doesn't have the requested effect",
+        "commands.effect.clear.specific.success.multiple" => "Removed effect %s from %s targets",
+        "commands.effect.clear.specific.success.single" => "Removed effect %s from %s",
+        "commands.effect.give.failed" => {
+            "Unable to apply this effect (target is either immune to effects, or has something stronger)"
+        }
+        "commands.effect.give.success.multiple" => "Applied effect %s to %s targets",
+        "commands.effect.give.success.single" => "Applied effect %s to %s",
+        "commands.enchant.failed" => {
+            "Nothing changed. Targets either have no item in their hands or the enchantment could not be applied"
+        }
+        "commands.enchant.failed.entity" => "%s is not a valid entity for this command",
+        "commands.enchant.failed.incompatible" => "%s cannot support that enchantment",
+        "commands.enchant.failed.itemless" => "%s is not holding any item",
+        "commands.enchant.failed.level" => {
+            "%s is higher than the maximum level of %s supported by that enchantment"
+        }
+        "commands.enchant.success.multiple" => "Applied enchantment %s to %s entities",
+        "commands.enchant.success.single" => "Applied enchantment %s to %s's item",
+        "commands.title.cleared.multiple" => "Cleared titles for %s players",
+        "commands.title.cleared.single" => "Cleared titles for %s",
+        "commands.title.reset.multiple" => "Reset title options for %s players",
+        "commands.title.reset.single" => "Reset title options for %s",
+        "commands.title.show.actionbar.multiple" => "Showing new actionbar title for %s players",
+        "commands.title.show.actionbar.single" => "Showing new actionbar title for %s",
+        "commands.title.show.subtitle.multiple" => "Showing new subtitle for %s players",
+        "commands.title.show.subtitle.single" => "Showing new subtitle for %s",
+        "commands.title.show.title.multiple" => "Showing new title for %s players",
+        "commands.title.show.title.single" => "Showing new title for %s",
+        "commands.title.times.multiple" => "Changed title display times for %s players",
+        "commands.title.times.single" => "Changed title display times for %s",
+        "commands.playsound.failed" => "The sound is too far away to be heard",
+        "commands.playsound.success.multiple" => "Played sound %s to %s players",
+        "commands.playsound.success.single" => "Played sound %s to %s",
+        "commands.stopsound.success.source.any" => "Stopped all '%s' sounds",
+        "commands.stopsound.success.source.sound" => "Stopped sound '%s' on source '%s'",
+        "commands.stopsound.success.sourceless.any" => "Stopped all sounds",
+        "commands.stopsound.success.sourceless.sound" => "Stopped sound '%s'",
+        "commands.particle.failed" => "The particle was not visible for anybody",
+        "commands.particle.success" => "Displaying particle %s",
+        "commands.spawnpoint.success.multiple" => {
+            "Set spawn point to %s, %s, %s [%s] in %s for %s players"
+        }
+        "commands.spawnpoint.success.multiple.new" => {
+            "Set spawn point to %s, %s, %s [%s, %s] in %s for %s players"
+        }
+        "commands.spawnpoint.success.single" => "Set spawn point to %s, %s, %s [%s] in %s for %s",
+        "commands.spawnpoint.success.single.new" => {
+            "Set spawn point to %s, %s, %s [%s, %s] in %s for %s"
+        }
+        "commands.setworldspawn.failure.not_overworld" => {
+            "Can only set the world spawn for the Overworld"
+        }
+        "commands.setworldspawn.success" => "Set the world spawn point to %s, %s, %s [%s]",
+        "commands.setworldspawn.success.new" => {
+            "Set the world spawn point to %s, %s, %s [%s, %s] in %s"
+        }
+        "commands.worldborder.center.failed" => {
+            "Nothing changed. The world border is already centered there"
+        }
+        "commands.worldborder.center.success" => "Set the center of the world border to %s, %s",
+        "commands.worldborder.damage.amount.failed" => {
+            "Nothing changed. The world border damage is already that amount"
+        }
+        "commands.worldborder.damage.amount.success" => {
+            "Set the world border damage to %s per block each second"
+        }
+        "commands.worldborder.damage.buffer.failed" => {
+            "Nothing changed. The world border damage buffer is already that distance"
+        }
+        "commands.worldborder.damage.buffer.success" => {
+            "Set the world border damage buffer to %s block(s)"
+        }
+        "commands.worldborder.get" => "The world border is currently %s block(s) wide",
+        "commands.worldborder.set.failed.big" => {
+            "World border cannot be bigger than %s blocks wide"
+        }
+        "commands.worldborder.set.failed.far" => {
+            "World border cannot be further out than %s blocks"
+        }
+        "commands.worldborder.set.failed.nochange" => {
+            "Nothing changed. The world border is already that size"
+        }
+        "commands.worldborder.set.failed.small" => {
+            "World border cannot be smaller than 1 block wide"
+        }
+        "commands.worldborder.set.grow" => {
+            "Growing the world border to %s block(s) wide over %s second(s)"
+        }
+        "commands.worldborder.set.immediate" => "Set the world border to %s block(s) wide",
+        "commands.worldborder.set.shrink" => {
+            "Shrinking the world border to %s block(s) wide over %s second(s)"
+        }
+        "commands.worldborder.warning.distance.failed" => {
+            "Nothing changed. The world border warning is already that distance"
+        }
+        "commands.worldborder.warning.distance.success" => {
+            "Set the world border warning distance to %s block(s)"
+        }
+        "commands.worldborder.warning.time.failed" => {
+            "Nothing changed. The world border warning is already that amount of time"
+        }
+        "commands.worldborder.warning.time.success" => {
+            "Set the world border warning time to %s second(s)"
+        }
         _ => return None,
     })
 }

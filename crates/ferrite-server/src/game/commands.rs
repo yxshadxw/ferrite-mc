@@ -10,7 +10,7 @@ use ferrite_command::{
     literal,
 };
 use ferrite_net::game::OutboundSender;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -38,11 +38,42 @@ impl Weather {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerEntry {
     pub uuid: Uuid,
     pub name: String,
     pub game_mode: i32,
+    /// `/spawnpoint`: block position, yaw and pitch; `None` until the player sets one.
+    pub spawn: Option<([i32; 3], f32, f32)>,
+    /// Active mob effects (`/effect`), effect id -> amplifier.
+    pub effects: BTreeMap<i32, i32>,
+}
+
+/// World border state shared by `/worldborder` and the packets its subcommands send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldBorderState {
+    pub center_x: f64,
+    pub center_z: f64,
+    pub diameter: f64,
+    pub warning_distance: i32,
+    /// Warning time in ticks.
+    pub warning_time: i32,
+    pub damage_per_block: f32,
+    pub damage_buffer: f32,
+}
+
+impl Default for WorldBorderState {
+    fn default() -> Self {
+        Self {
+            center_x: 0.0,
+            center_z: 0.0,
+            diameter: 59_999_968.0,
+            warning_distance: 5,
+            warning_time: 15,
+            damage_per_block: 0.2,
+            damage_buffer: 5.0,
+        }
+    }
 }
 
 /// Mutable world state needed by commands. Commands run on the game loop, so a short-lived
@@ -61,6 +92,12 @@ pub struct GameState {
     pub seed: i64,
     pub max_players: i32,
     pub players: Vec<PlayerEntry>,
+    /// World spawn (`/setworldspawn`), its yaw and pitch.
+    pub world_spawn: [i32; 3],
+    pub world_spawn_yaw: f32,
+    pub world_spawn_pitch: f32,
+    /// World border (`/worldborder`).
+    pub border: WorldBorderState,
 }
 
 impl GameState {
@@ -75,6 +112,10 @@ impl GameState {
             seed,
             max_players,
             players: Vec::new(),
+            world_spawn: [0, 64, 0],
+            world_spawn_yaw: 0.0,
+            world_spawn_pitch: 0.0,
+            border: WorldBorderState::default(),
         }
     }
 
@@ -84,6 +125,8 @@ impl GameState {
             uuid,
             name,
             game_mode,
+            spawn: None,
+            effects: BTreeMap::new(),
         });
         self.max_players = max_players;
     }
@@ -119,12 +162,14 @@ pub struct Feedback {
 
 impl Feedback {
     pub fn new(key: &'static str, args: Vec<String>) -> Self {
-        let template = translate(key).unwrap_or_else(|| english(key));
-        Self {
-            key,
-            text: render(template, &args),
-            args,
-        }
+        let text = match translate(key) {
+            Some(template) => render(template, &args),
+            None if english(key).is_empty() => {
+                super::feedback::render(key, &args.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            None => render(english(key), &args),
+        };
+        Self { key, text, args }
     }
 }
 
@@ -340,6 +385,29 @@ pub enum Action {
         args: Vec<String>,
     },
     World(super::commands_world::WorldCommand),
+    /// A clientbound packet for the given players, or every player when `targets` is empty.
+    Packets {
+        targets: Vec<Uuid>,
+        packet: super::commands_extras::PlayerPacket,
+    },
+    /// `/effect give`: apply a mob effect to the target players.
+    Effect {
+        targets: Vec<Uuid>,
+        effect: i32,
+        amplifier: i32,
+        duration: i32,
+    },
+    /// `/effect clear`: remove one mob effect from the target players.
+    RemoveEffect {
+        targets: Vec<Uuid>,
+        effect: i32,
+    },
+    /// `/enchant`: enchant the item in each target's main hand.
+    Enchant {
+        targets: Vec<Uuid>,
+        enchantment: String,
+        level: i32,
+    },
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
@@ -377,13 +445,14 @@ pub struct ResolvedPlayer {
 #[derive(Debug, Clone)]
 pub struct OnlinePlayer {
     pub name: String,
+    pub entity: i32,
     pub outbound: OutboundSender,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
 }
 
-fn send(source: &Source, action: Action) -> Result<i32, CommandError> {
+pub(crate) fn send(source: &Source, action: Action) -> Result<i32, CommandError> {
     source
         .actions
         .send(action)
@@ -460,7 +529,10 @@ fn check_entity_selector(source: &Source, target: &EntityTarget) -> Result<(), C
     Ok(())
 }
 
-fn coordinates(ctx: &CommandContext<Source>, name: &str) -> Result<Coordinates, CommandError> {
+pub(crate) fn coordinates(
+    ctx: &CommandContext<Source>,
+    name: &str,
+) -> Result<Coordinates, CommandError> {
     ctx.argument(name)
         .and_then(ArgumentValue::as_coordinates)
         .copied()
@@ -852,7 +924,7 @@ fn syntax_error(key: &'static str, args: Vec<String>, message: impl Into<String>
     CommandError::Syntax(CommandSyntaxError::new(key, args, message.into()))
 }
 
-fn player_only() -> CommandError {
+pub(crate) fn player_only() -> CommandError {
     syntax_error(
         "permissions.requires.player",
         Vec::new(),
@@ -860,7 +932,7 @@ fn player_only() -> CommandError {
     )
 }
 
-fn player_not_found() -> CommandError {
+pub(crate) fn player_not_found() -> CommandError {
     syntax_error(
         "argument.entity.notfound.player",
         Vec::new(),
@@ -896,7 +968,7 @@ fn difficulty_display(value: i32) -> &'static str {
     }
 }
 
-fn resolve_players(
+pub(crate) fn resolve_players(
     players: &[PlayerEntry],
     target: &EntityTarget,
     source: Option<Uuid>,
@@ -1294,7 +1366,10 @@ pub fn item_display(id: u16) -> String {
 }
 
 /// Resolves a player target against the online players in the command state.
-fn resolved_targets(ctx: &CommandContext<Source>, name: &str) -> Result<Vec<Uuid>, CommandError> {
+pub(crate) fn resolved_targets(
+    ctx: &CommandContext<Source>,
+    name: &str,
+) -> Result<Vec<Uuid>, CommandError> {
     let target = entity(ctx, name)?;
     let state = ctx.source().state.lock().unwrap();
     resolve_players(&state.players, &target, ctx.source().uuid)
@@ -1634,6 +1709,7 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
             .executes(|ctx| send(ctx.source(), Action::Stop)),
     );
     super::commands_world::register(&mut tree);
+    super::commands_extras::register(&mut tree);
     tree
 }
 
@@ -2277,6 +2353,7 @@ mod tests {
                 uuid,
                 OnlinePlayer {
                     name: name.into(),
+                    entity: 0,
                     outbound,
                     pos,
                     yaw: 0.0,

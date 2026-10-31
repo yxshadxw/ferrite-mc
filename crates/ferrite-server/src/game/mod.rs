@@ -11,6 +11,7 @@ mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod commands_extras;
 mod commands_world;
 mod container;
 mod crafting;
@@ -492,7 +493,7 @@ async fn run(
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
-           online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
+           online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
            let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
@@ -582,6 +583,7 @@ async fn run(
                   commands::Action::Clear { targets, item, max_count } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Clear { target, target_name, item, max_count, feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Give { targets, item, count, item_name } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Experience { operation, targets, amount, unit } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Experience { target, target_name, operation, amount, unit, feedback: Some(outbound.clone()) }); } } },
+                  commands::Action::Enchant { targets, enchantment, level } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Enchant { target, target_name, enchantment: enchantment.clone(), level, feedback: Some(outbound.clone()) }); } } },
                   other => { runtime.apply(other).await; }
               }}
           }},
@@ -640,6 +642,7 @@ async fn run(
                   commands::Action::Clear { targets, item, max_count } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Clear { target, target_name, item, max_count, feedback: None }); } } },
                   commands::Action::Give { targets, item, count, item_name } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), feedback: None }); } } },
                   commands::Action::Experience { operation, targets, amount, unit } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Experience { target, target_name, operation, amount, unit, feedback: None }); } } },
+                  commands::Action::Enchant { targets, enchantment, level } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Enchant { target, target_name, enchantment: enchantment.clone(), level, feedback: None }); } } },
                   other => { if runtime.apply(other).await { stop = true; } }
               }}
               let _ = complete.send(result.map(|_| stop));
@@ -862,7 +865,8 @@ impl CommandRuntime<'_> {
             | Action::Give { .. }
             | Action::Experience { .. }
             | Action::GameRule(..)
-            | Action::World(_) => false,
+            | Action::World(_)
+            | Action::Enchant { .. } => false,
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
@@ -1462,6 +1466,55 @@ impl CommandRuntime<'_> {
                         }
                     }
                     Err(error) => self.reply.text(&format!("Cannot stop profiling: {error}")),
+                }
+                false
+            }
+            Action::Packets { targets, packet } => {
+                if targets.is_empty() {
+                    for player in self.online.values() {
+                        packet.send_to(&player.outbound);
+                    }
+                } else {
+                    for target in &targets {
+                        if let Some(player) = self.online.get(target) {
+                            packet.send_to(&player.outbound);
+                        }
+                    }
+                }
+                false
+            }
+            Action::Effect {
+                targets,
+                effect,
+                amplifier,
+                duration,
+            } => {
+                for target in targets {
+                    if let Some(player) = self.online.get(&target) {
+                        let _ = player
+                            .outbound
+                            .send(ferrite_net::game::packet(&UpdateMobEffect {
+                                entity_id: VarInt(player.entity),
+                                effect: VarInt(effect),
+                                amplifier: VarInt(amplifier),
+                                duration: VarInt(duration),
+                                // ambient | show particles | show icon, like a normal potion effect.
+                                flags: 0b110,
+                            }));
+                    }
+                }
+                false
+            }
+            Action::RemoveEffect { targets, effect } => {
+                for target in targets {
+                    if let Some(player) = self.online.get(&target) {
+                        let _ = player
+                            .outbound
+                            .send(ferrite_net::game::packet(&RemoveMobEffect {
+                                entity_id: VarInt(player.entity),
+                                effect: VarInt(effect),
+                            }));
+                    }
                 }
                 false
             }
