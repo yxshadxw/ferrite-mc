@@ -19,6 +19,7 @@ use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
 use crate::item::ItemState;
 use crate::metadata::Metadata;
+use crate::mob::MobState;
 use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
 use std::collections::HashMap;
@@ -79,6 +80,8 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Living state, for the modelled mobs.
+    pub mob: Option<MobState>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -101,6 +104,7 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            mob: None,
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }

@@ -1,0 +1,471 @@
+//! Minimal living-mob framework: the first passive animals, their health, damage and
+//! knockback, death, fall damage and vanilla despawn rules.
+//!
+//! Kinds are resolved from the vanilla entity data (`ferrite_data::entity_props`), so
+//! dimensions, tracking, attributes and loot table names come from the 26.3 generated
+//! reports instead of being restated here. Active mob behaviour (goals, spawning) lives in
+//! [`crate::ai`] and [`crate::spawn`].
+
+use crate::id::{EntityKey, allocate_id, random_uuid};
+use crate::rng::Rng;
+use crate::store::{EntityData, EntityRecord, EntityStore, Flags};
+use ferrite_data::entity_props::{self, EntityProps};
+use ferrite_math::Vec3;
+
+/// Ticks a mob ignores further hits after being hurt (vanilla `invulnerableTime / 2`).
+pub const HURT_COOLDOWN: u16 = 10;
+/// Vanilla creature despawn distance (`MobCategory.CREATURE.getDespawnDistance()`).
+pub const DESPAWN_DISTANCE: f64 = 128.0;
+/// Inside this radius a mob's no-action timer resets (`getNoDespawnDistance()`).
+pub const NO_DESPAWN_DISTANCE: f64 = 32.0;
+/// Ticks without a nearby player before the random despawn roll starts.
+pub const NO_ACTION_TICKS: u32 = 600;
+
+/// The passive mobs this server knows how to simulate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobKind {
+    Chicken,
+    Cow,
+    Pig,
+    Sheep,
+}
+
+impl MobKind {
+    /// Every kind, in a fixed order for spawning.
+    pub const ALL: [Self; 4] = [Self::Chicken, Self::Cow, Self::Pig, Self::Sheep];
+
+    /// Vanilla entity type id, e.g. `"minecraft:cow"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chicken => "minecraft:chicken",
+            Self::Cow => "minecraft:cow",
+            Self::Pig => "minecraft:pig",
+            Self::Sheep => "minecraft:sheep",
+        }
+    }
+
+    /// Vanilla properties of this entity type.
+    pub fn props(self) -> &'static EntityProps {
+        entity_props::by_name(self.name()).expect("the vanilla data knows every mob kind")
+    }
+
+    /// Global protocol id of the entity type.
+    pub fn entity_type(self) -> u16 {
+        self.props().id
+    }
+
+    /// Base maximum health, from the type's default `minecraft:max_health` attribute.
+    pub fn max_health(self) -> f32 {
+        entity_props::default_attribute(self.entity_type(), "max_health").unwrap_or(10.0) as f32
+    }
+
+    /// Base movement speed, from the type's default `minecraft:movement_speed` attribute.
+    pub fn movement_speed(self) -> f64 {
+        entity_props::default_attribute(self.entity_type(), "movement_speed").unwrap_or(0.25)
+    }
+
+    /// The entity loot table, e.g. `minecraft:entities/cow`.
+    pub fn loot_table(self) -> &'static str {
+        match self {
+            Self::Chicken => "minecraft:entities/chicken",
+            Self::Cow => "minecraft:entities/cow",
+            Self::Pig => "minecraft:entities/pig",
+            Self::Sheep => "minecraft:entities/sheep",
+        }
+    }
+
+    /// The kind of an entity type id, when it is one of the modelled mobs.
+    pub fn from_entity_type(kind: u16) -> Option<Self> {
+        Self::ALL.into_iter().find(|mob| mob.entity_type() == kind)
+    }
+
+    /// The kind of a name, with or without the namespace.
+    pub fn from_name(name: &str) -> Option<Self> {
+        entity_props::by_name(name).and_then(|props| Self::from_entity_type(props.id))
+    }
+
+    /// Vanilla `Animal.removeWhenFarAway` is false: passive animals persist.
+    pub fn despawns_when_far(self) -> bool {
+        false
+    }
+}
+
+/// Living state of a mob; travels with the entity across region hand-offs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MobState {
+    pub kind: MobKind,
+    pub health: f32,
+    /// Ticks left before the mob can be hurt again.
+    pub hurt_time: u16,
+    /// Ticks since a player was last close enough to keep the mob active.
+    pub no_action_time: u32,
+    /// Blocks fallen since leaving the ground (vanilla `fallDistance`).
+    pub fall_distance: f32,
+    /// Vanilla `removeWhenFarAway`; animals keep this false.
+    pub despawns: bool,
+}
+
+impl MobState {
+    /// A full-health mob of `kind`.
+    pub fn new(kind: MobKind) -> Self {
+        Self {
+            kind,
+            health: kind.max_health(),
+            hurt_time: 0,
+            no_action_time: 0,
+            fall_distance: 0.0,
+            despawns: kind.despawns_when_far(),
+        }
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.health <= 0.0
+    }
+}
+
+/// The outcome of one hit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hurt {
+    /// The hit landed and the mob survived with this much health left.
+    Survived { health: f32 },
+    /// The hurt cooldown swallowed the hit.
+    Immune,
+    /// The hit was lethal; the mob is flagged for removal.
+    Died,
+}
+
+/// A new mob at `pos` with a random yaw, like vanilla's `Mob.finalizeSpawn`-created entity.
+pub fn new_mob(kind: MobKind, pos: Vec3, rng: &mut Rng) -> EntityRecord {
+    let props = kind.props();
+    let mut data = EntityData::new(
+        allocate_id(),
+        random_uuid(),
+        kind.entity_type(),
+        f64::from(props.width),
+        f64::from(props.height),
+    );
+    data.yaw = rng.next_f32() * 360.0;
+    data.mob = Some(MobState::new(kind));
+    EntityRecord {
+        pos,
+        vel: Vec3::ZERO,
+        flags: Flags::default(),
+        data,
+    }
+}
+
+/// Living state of an entity, if it is a mob.
+pub fn state(store: &EntityStore, key: EntityKey) -> Option<&MobState> {
+    store.data(key)?.mob.as_ref()
+}
+
+/// Mutable living state of an entity, if it is a mob.
+pub fn state_mut(store: &mut EntityStore, key: EntityKey) -> Option<&mut MobState> {
+    store.data_mut(key)?.mob.as_mut()
+}
+
+/// Whether a live, non-removed mob of one of the modelled kinds is at `key`.
+pub fn is_mob(store: &EntityStore, key: EntityKey) -> bool {
+    store.data(key).is_some_and(|data| data.mob.is_some())
+        && store
+            .flags(key)
+            .is_some_and(|flags| !flags.has(Flags::REMOVED))
+}
+
+/// Applies vanilla `LivingEntity.hurt` rules, simplified to a half-second hurt cooldown:
+/// knocks the mob away from `source` and flags the entity for removal when health runs out.
+pub fn hurt(
+    store: &mut EntityStore,
+    key: EntityKey,
+    amount: f32,
+    source: Option<Vec3>,
+) -> Option<Hurt> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return None;
+    }
+    if !is_mob(store, key) {
+        return None;
+    }
+    let state = *state(store, key)?;
+    if state.is_dead() {
+        return None;
+    }
+    if state.hurt_time > 0 {
+        return Some(Hurt::Immune);
+    }
+    let health = (state.health - amount).max(0.0);
+    {
+        let mob = state_mut(store, key)?;
+        mob.health = health;
+        mob.hurt_time = HURT_COOLDOWN;
+    }
+    if let Some(source) = source {
+        knockback(store, key, source);
+    }
+    if health <= 0.0 {
+        kill(store, key);
+        Some(Hurt::Died)
+    } else {
+        Some(Hurt::Survived { health })
+    }
+}
+
+/// Kills a mob outright (`/kill`, lethal effects), bypassing the hurt cooldown.
+pub fn kill(store: &mut EntityStore, key: EntityKey) -> bool {
+    if !is_mob(store, key) {
+        return false;
+    }
+    if let Some(mob) = state_mut(store, key) {
+        mob.health = 0.0;
+    }
+    if let Some(flags) = store.flags_mut(key) {
+        flags.set(Flags::REMOVED, true);
+    }
+    true
+}
+
+/// Vanilla `LivingEntity.knockback`: 0.4 blocks/tick away from the attacker, plus 0.4 upward
+/// while the mob stands on the ground.
+fn knockback(store: &mut EntityStore, key: EntityKey, source: Vec3) {
+    let Some(pos) = store.pos(key) else { return };
+    let mut dx = pos.x - source.x;
+    let mut dz = pos.z - source.z;
+    if dx * dx + dz * dz < 1.0e-5 {
+        // Vanilla draws a small random direction; a fixed diagonal keeps it deterministic.
+        dx = 0.01;
+        dz = 0.01;
+    }
+    let length = (dx * dx + dz * dz).sqrt();
+    let mut vel = store.vel(key).unwrap_or_default();
+    vel.x = dx / length * 0.4;
+    vel.z = dz / length * 0.4;
+    if store
+        .flags(key)
+        .is_some_and(|flags| flags.has(Flags::ON_GROUND))
+    {
+        vel.y = vel.y.max(0.4);
+    }
+    store.set_vel(key, vel);
+    if let Some(flags) = store.flags_mut(key) {
+        flags.set(Flags::NEEDS_SYNC, true);
+    }
+}
+
+/// Vanilla `LivingEntity.checkFallDamage`, applied with the type's `safe_fall_distance`.
+pub fn apply_fall_damage(store: &mut EntityStore, key: EntityKey, distance: f32) -> Option<Hurt> {
+    let kind = state(store, key)?.kind;
+    let safe = entity_props::default_attribute(kind.entity_type(), "safe_fall_distance")
+        .unwrap_or(3.0) as f32;
+    let damage = (distance - safe).floor();
+    if damage <= 0.0 {
+        return None;
+    }
+    hurt(store, key, damage, None)
+}
+
+/// Advances the per-mob clocks: `tickCount`, the hurt cooldown and the no-action timer.
+pub fn tick_clock(store: &mut EntityStore, key: EntityKey) {
+    let Some(data) = store.data_mut(key) else {
+        return;
+    };
+    data.tick_count = data.tick_count.saturating_add(1);
+    if let Some(mob) = &mut data.mob {
+        mob.hurt_time = mob.hurt_time.saturating_sub(1);
+        mob.no_action_time = mob.no_action_time.saturating_add(1);
+    }
+}
+
+/// Vanilla `Mob.checkDespawn` for the modelled kinds.
+///
+/// Passive animals never satisfy `removeWhenFarAway`, so only the peaceful rule (which they
+/// also do not use), the beyond-128-blocks rule and the 600-tick/no-player random roll can
+/// remove them; [`MobState::despawns`] is kept as the knob future hostile kinds will set.
+pub fn check_despawn(
+    store: &mut EntityStore,
+    key: EntityKey,
+    players: &[Vec3],
+    peaceful: bool,
+    rng: &mut Rng,
+) -> bool {
+    let Some(mob) = state(store, key).copied() else {
+        return false;
+    };
+    if mob.is_dead() || !is_mob(store, key) {
+        return false;
+    }
+    if peaceful {
+        // `Mob.shouldDespawnInPeaceful` is overridden only by monsters.
+        return false;
+    }
+    if !mob.despawns {
+        return false;
+    }
+    let nearest = players
+        .iter()
+        .map(|player| {
+            let dx = player.x - store.pos(key).unwrap_or_default().x;
+            let dz = player.z - store.pos(key).unwrap_or_default().z;
+            dx * dx + dz * dz
+        })
+        .fold(f64::INFINITY, f64::min);
+    let no_despawn = NO_DESPAWN_DISTANCE * NO_DESPAWN_DISTANCE;
+    if nearest > DESPAWN_DISTANCE * DESPAWN_DISTANCE {
+        return remove(store, key);
+    }
+    if mob.no_action_time > NO_ACTION_TICKS && nearest > no_despawn && rng.next_int(800) == 0 {
+        return remove(store, key);
+    }
+    if nearest < no_despawn
+        && let Some(mob) = state_mut(store, key)
+    {
+        mob.no_action_time = 0;
+    }
+    false
+}
+
+fn remove(store: &mut EntityStore, key: EntityKey) -> bool {
+    match store.flags_mut(key) {
+        Some(flags) => {
+            flags.set(Flags::REMOVED, true);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn(kind: MobKind) -> (EntityStore, EntityKey) {
+        let mut store = EntityStore::default();
+        let key = store.insert(new_mob(kind, Vec3::new(0.5, 64.0, 0.5), &mut Rng::new(1)));
+        (store, key)
+    }
+
+    #[test]
+    fn kinds_match_the_vanilla_entity_data() {
+        assert_eq!(MobKind::Cow.entity_type(), 30);
+        for kind in MobKind::ALL {
+            assert_eq!(MobKind::from_name(kind.name()), Some(kind));
+            assert_eq!(MobKind::from_entity_type(kind.entity_type()), Some(kind));
+            assert!(kind.max_health() > 0.0);
+            assert!(kind.movement_speed() > 0.0);
+            assert_eq!(kind.props().category, "creature");
+            assert!(kind.loot_table().starts_with("minecraft:entities/"));
+            assert!(!kind.despawns_when_far());
+        }
+        assert_eq!(MobKind::Cow.max_health(), 10.0);
+        assert_eq!(MobKind::Chicken.max_health(), 4.0);
+        assert_eq!(MobKind::from_name("villager"), None);
+    }
+
+    #[test]
+    fn damage_respects_the_hurt_cooldown_and_knocks_back() {
+        let (mut store, key) = spawn(MobKind::Cow);
+        let from = Vec3::new(-1.0, 64.0, 0.5);
+        assert_eq!(
+            hurt(&mut store, key, 1.0, Some(from)),
+            Some(Hurt::Survived { health: 9.0 })
+        );
+        // The mob is shoved east, away from the attacker.
+        assert!(store.vel(key).unwrap().x > 0.3);
+        assert_eq!(hurt(&mut store, key, 1.0, Some(from)), Some(Hurt::Immune));
+        for _ in 0..HURT_COOLDOWN {
+            tick_clock(&mut store, key);
+        }
+        assert_eq!(
+            hurt(&mut store, key, 2.0, None),
+            Some(Hurt::Survived { health: 7.0 })
+        );
+    }
+
+    #[test]
+    fn lethal_damage_removes_the_mob_and_reports_death() {
+        let (mut store, key) = spawn(MobKind::Sheep);
+        assert_eq!(
+            hurt(&mut store, key, MobKind::Sheep.max_health(), None),
+            Some(Hurt::Died)
+        );
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(state(&store, key).unwrap().health, 0.0);
+        assert!(!is_mob(&store, key));
+        assert_eq!(hurt(&mut store, key, 1.0, None), None);
+        // `/kill` skips the cooldown.
+        let (mut store, key) = spawn(MobKind::Pig);
+        assert!(kill(&mut store, key));
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+        assert!(!kill(&mut store, key));
+    }
+
+    #[test]
+    fn fall_damage_starts_above_the_safe_distance() {
+        let (mut store, key) = spawn(MobKind::Cow);
+        assert_eq!(apply_fall_damage(&mut store, key, 3.9), None);
+        assert_eq!(
+            apply_fall_damage(&mut store, key, 5.5),
+            Some(Hurt::Survived { health: 8.0 })
+        );
+        let (mut store, key) = spawn(MobKind::Cow);
+        assert_eq!(apply_fall_damage(&mut store, key, 40.0), Some(Hurt::Died));
+    }
+
+    #[test]
+    fn passive_mobs_persist_until_their_despawn_policy_allows_it() {
+        let (mut store, key) = spawn(MobKind::Cow);
+        let mut rng = Rng::new(3);
+        // Far from every player; animals still persist.
+        assert!(!check_despawn(
+            &mut store,
+            key,
+            &[Vec3::new(1000.0, 64.0, 1000.0)],
+            false,
+            &mut rng
+        ));
+        // A despawnable kind is removed beyond 128 blocks.
+        state_mut(&mut store, key).unwrap().despawns = true;
+        assert!(check_despawn(
+            &mut store,
+            key,
+            &[Vec3::new(1000.0, 64.0, 1000.0)],
+            false,
+            &mut rng
+        ));
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+
+        // Inside 32 blocks the no-action timer resets and nothing despawns.
+        let (mut store, key) = spawn(MobKind::Pig);
+        state_mut(&mut store, key).unwrap().despawns = true;
+        state_mut(&mut store, key).unwrap().no_action_time = NO_ACTION_TICKS + 1;
+        assert!(!check_despawn(
+            &mut store,
+            key,
+            &[Vec3::new(8.0, 64.0, 0.5)],
+            false,
+            &mut rng
+        ));
+        assert_eq!(state(&store, key).unwrap().no_action_time, 0);
+    }
+
+    #[test]
+    fn clocks_advance_and_state_survives_a_region_hand_off() {
+        let (mut store, key) = spawn(MobKind::Chicken);
+        state_mut(&mut store, key).unwrap().health = 2.0;
+        hurt(&mut store, key, 1.0, None);
+        tick_clock(&mut store, key);
+        assert_eq!(state(&store, key).unwrap().hurt_time, HURT_COOLDOWN - 1);
+        assert_eq!(store.data(key).unwrap().tick_count, 1);
+        // Walk into another region section: the record carries the living state.
+        let pos = store.pos(key).unwrap();
+        store.set_pos(key, Vec3::new(pos.x + 400.0, pos.y, pos.z));
+        let mut out = store.take_crossing();
+        assert_eq!(out.len(), 1);
+        let mut other = EntityStore::default();
+        other.insert(out.pop().unwrap());
+        let key = other.keys()[0];
+        let mob = state(&other, key).unwrap();
+        assert_eq!(mob.health, 1.0);
+        assert_eq!(mob.kind, MobKind::Chicken);
+        assert!(other.check_invariants().is_ok());
+    }
+}

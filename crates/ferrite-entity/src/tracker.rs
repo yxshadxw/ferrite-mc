@@ -435,6 +435,27 @@ fn send_changes(
     state.tick_count += 1;
 }
 
+/// Moves an entity with an explicit teleport (`Entity.teleportTo`): the next tracker tick
+/// sends `teleport_entity` instead of a movement delta.
+pub fn teleport(store: &mut EntityStore, key: crate::EntityKey, pos: Vec3, vel: Vec3) {
+    if store.data(key).is_none() {
+        return;
+    }
+    store.set_pos(key, pos);
+    store.set_vel(key, vel);
+    if let Some(flags) = store.flags_mut(key) {
+        flags.set(Flags::TELEPORTED, true);
+        flags.set(Flags::NEEDS_SYNC, true);
+    }
+}
+
+/// Flags an entity for removal, so its trackers receive `remove_entities` on the next tick.
+pub fn remove(store: &mut EntityStore, key: crate::EntityKey) {
+    if let Some(flags) = store.flags_mut(key) {
+        flags.set(Flags::REMOVED, true);
+    }
+}
+
 /// Sends a packet to every player tracking an entity (vanilla `sendToTrackingPlayers`).
 pub fn broadcast<P: Packet>(
     store: &EntityStore,
@@ -595,6 +616,45 @@ mod tests {
         store.set_pos(key, Vec3::new(9.0, 70.0, 9.0));
         store.flags_mut(key).unwrap().set(Flags::TELEPORTED, true);
         assert_eq!(ids(&tick(&mut store, &viewers)), [TeleportEntity::ID]);
+    }
+
+    #[test]
+    fn mobs_are_tracked_moved_teleported_and_removed() {
+        use crate::mob::{MobKind, new_mob};
+        let mut store = EntityStore::default();
+        let key = store.insert(new_mob(
+            MobKind::Cow,
+            Vec3::new(8.0, 64.0, 8.0),
+            &mut crate::Rng::new(1),
+        ));
+        let chunks = HashSet::from([(0, 0)]);
+        let viewers = [viewer((Uuid::from_u128(1), 0), 8.0, 8.0, 10, &chunks)];
+        let packets = tick(&mut store, &viewers);
+        assert_eq!(packets[0].1, AddEntity::ID);
+        let add = AddEntity::decode(&mut packets[0].2.as_slice()).unwrap();
+        assert_eq!(add.entity_type.0, i32::from(MobKind::Cow.entity_type()));
+        // A cow updates every 3 ticks; a forced sync sends the delta right away.
+        store.set_pos(key, Vec3::new(9.0, 64.0, 8.0));
+        store.flags_mut(key).unwrap().set(Flags::NEEDS_SYNC, true);
+        assert!(
+            tick(&mut store, &viewers)
+                .iter()
+                .any(|packet| matches!(packet.1, EntityMove::ID | EntityMoveRotation::ID))
+        );
+        // An explicit teleport is not a movement delta.
+        teleport(&mut store, key, Vec3::new(12.0, 66.0, 8.0), Vec3::ZERO);
+        assert!(
+            tick(&mut store, &viewers)
+                .iter()
+                .any(|packet| packet.1 == TeleportEntity::ID)
+        );
+        // Removal reaches the viewer.
+        remove(&mut store, key);
+        assert!(
+            tick(&mut store, &viewers)
+                .iter()
+                .any(|packet| packet.1 == RemoveEntities::ID)
+        );
     }
 
     #[test]

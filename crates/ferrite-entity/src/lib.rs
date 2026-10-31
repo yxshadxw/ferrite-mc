@@ -20,6 +20,7 @@ mod id;
 mod index;
 pub mod item;
 pub mod metadata;
+pub mod mob;
 pub mod physics;
 mod rng;
 mod store;
