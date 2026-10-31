@@ -17,6 +17,7 @@ public final class Bootstrap {
      * players before {@code onEnable} runs. Pair it with {@link #enablePlugins}.
      */
     public static void startServer() {
+        if (org.bukkit.Bukkit.getServer() != null) { server = (FerriteServer) org.bukkit.Bukkit.getServer(); return; }
         Native.link();
         if (!"false".equals(System.getProperty("ferrite.native"))) java.util.logging.Logger.getLogger("").addHandler(new java.util.logging.Handler() {
             public void publish(java.util.logging.LogRecord record) { Native.log(record.getMessage()); }
@@ -29,7 +30,11 @@ public final class Bootstrap {
     public static void enablePlugins(String[] paths, boolean[] regionAware) {
         synchronized (LEGACY_LOCK) { server.plugins.loadOrdered(paths, regionAware); }
     }
-    public static void registerWorld(String id, String name, long time, int x, int y, int z) { server.registerWorld(FerriteWorld.create(server, java.util.UUID.fromString(id), name, time, x, y, z)); }
+    public static void registerWorld(String id, String name, long time, int x, int y, int z) {
+        var world = FerriteWorld.create(server, java.util.UUID.fromString(id), name, time, x, y, z);
+        server.registerWorld(world);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.world.WorldLoadEvent(world)); }
+    }
     public static void setHeightSnapshot(String world, int x, int z, int y) { FerriteWorld.setHeight(server.getWorld(java.util.UUID.fromString(world)), x, z, y); }
     public static void setBlockSnapshot(String world, int x, int y, int z, String material) { FerriteWorld.setSnapshot(server.getWorld(java.util.UUID.fromString(world)), x, y, z, material); }
     public static void registerPlayer(String id, String name, boolean operator) { registerPlayer(id, name, operator, 20.0, 20, 0, null, 0, 0, 0, 0, 0); }
@@ -155,6 +160,113 @@ public final class Bootstrap {
         var event = new org.bukkit.event.player.PlayerCommandPreprocessEvent(ensurePlayer(id, name), message);
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled();
+    }
+    /** Fires Bukkit's {@code ChunkLoadEvent} for a chunk the host just streamed. */
+    public static void fireChunkLoad(String world, int x, int z, boolean newChunk) {
+        var resolved = server.getWorld(java.util.UUID.fromString(world));
+        if (resolved == null) return;
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.world.ChunkLoadEvent(FerriteEventObjects.chunk(resolved, x, z), newChunk)); }
+    }
+    /** Fires Bukkit's {@code ChunkUnloadEvent} for a chunk the host dropped. */
+    public static void fireChunkUnload(String world, int x, int z) {
+        var resolved = server.getWorld(java.util.UUID.fromString(world));
+        if (resolved == null) return;
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.world.ChunkUnloadEvent(FerriteEventObjects.chunk(resolved, x, z))); }
+    }
+    /** Fires Bukkit's {@code PlayerDeathEvent}; drops and experience stay host-owned. */
+    public static void firePlayerDeath(String id, String name, String cause, int droppedExp, String message) {
+        var player = ensurePlayer(id, name);
+        var event = new org.bukkit.event.entity.PlayerDeathEvent(player, damageSource(), new java.util.ArrayList<org.bukkit.inventory.ItemStack>(), droppedExp, message == null ? null : net.kyori.adventure.text.Component.text(message), true);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+    }
+    /** Fires Bukkit's {@code PlayerRespawnEvent}; returns the (possibly moved) spawn as "x y z yaw pitch". */
+    public static String firePlayerRespawn(String id, String name, double x, double y, double z, float yaw, float pitch, String reason) {
+        var player = ensurePlayer(id, name);
+        var location = new org.bukkit.Location(player.getWorld(), x, y, z, yaw, pitch);
+        org.bukkit.event.player.PlayerRespawnEvent.RespawnReason why;
+        try { why = org.bukkit.event.player.PlayerRespawnEvent.RespawnReason.valueOf(reason); }
+        catch (IllegalArgumentException e) { why = org.bukkit.event.player.PlayerRespawnEvent.RespawnReason.PLUGIN; }
+        var event = new org.bukkit.event.player.PlayerRespawnEvent(player, location, false, false, false, why);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        var spawn = event.getRespawnLocation();
+        return spawn.getX() + " " + spawn.getY() + " " + spawn.getZ() + " " + spawn.getYaw() + " " + spawn.getPitch();
+    }
+    /** Fires Bukkit's {@code EntityDamageEvent}; returns the final damage after listeners. */
+    public static double fireEntityDamage(String id, String name, String cause, double amount) {
+        var entity = entity(id, name);
+        var event = new org.bukkit.event.entity.EntityDamageEvent(entity, damageCause(cause), amount);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return event.isCancelled() ? 0.0 : event.getFinalDamage();
+    }
+    /** Fires Bukkit's {@code EntityDeathEvent} for a non-player entity the host removed. */
+    public static void fireEntityDeath(String id, String type, double x, double y, double z, int droppedExp) {
+        var entityType = org.bukkit.entity.EntityType.fromName(type);
+        if (entityType == null) return;
+        var entity = FerriteEventObjects.living(java.util.UUID.fromString(id), entityType, new org.bukkit.Location(defaultWorld(), x, y, z), 0.0);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.entity.EntityDeathEvent(entity, damageSource(), new java.util.ArrayList<org.bukkit.inventory.ItemStack>(), droppedExp)); }
+    }
+    /** Fires Bukkit's {@code WeatherChangeEvent}; false cancels the change. */
+    public static boolean fireWeatherChange(String world, boolean toWeatherState) {
+        var resolved = server.getWorld(java.util.UUID.fromString(world));
+        if (resolved == null) return true;
+        var event = new org.bukkit.event.weather.WeatherChangeEvent(resolved, toWeatherState);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
+    /** Fires Bukkit's {@code WorldLoadEvent} when the host publishes a world. */
+    public static void fireWorldLoad(String world) {
+        var resolved = server.getWorld(java.util.UUID.fromString(world));
+        if (resolved == null) return;
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.world.WorldLoadEvent(resolved)); }
+    }
+    /** Fires Bukkit's {@code PlayerLevelChangeEvent}; returns the level a listener selected. */
+    public static int firePlayerLevelChange(String id, String name, int oldLevel, int newLevel) {
+        var event = new org.bukkit.event.player.PlayerLevelChangeEvent(ensurePlayer(id, name), oldLevel, newLevel);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return event.getNewLevel();
+    }
+    /** Fires Bukkit's {@code PlayerExpChangeEvent}; returns the amount a listener selected. */
+    public static int firePlayerExpChange(String id, String name, int amount) {
+        var event = new org.bukkit.event.player.PlayerExpChangeEvent(ensurePlayer(id, name), amount);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return event.getAmount();
+    }
+    /** Fires Paper's {@code InventoryClickEvent}; false means a listener cancelled the click. */
+    public static boolean fireInventoryClick(String id, String name, int slot, String click, String action) {
+        var player = ensurePlayer(id, name);
+        var view = FerriteInventoryView.create(player, player.getInventory());
+        org.bukkit.event.inventory.ClickType clickType;
+        try { clickType = org.bukkit.event.inventory.ClickType.valueOf(click); }
+        catch (IllegalArgumentException e) { clickType = org.bukkit.event.inventory.ClickType.UNKNOWN; }
+        org.bukkit.event.inventory.InventoryAction inventoryAction;
+        try { inventoryAction = org.bukkit.event.inventory.InventoryAction.valueOf(action); }
+        catch (IllegalArgumentException e) { inventoryAction = org.bukkit.event.inventory.InventoryAction.UNKNOWN; }
+        var event = new org.bukkit.event.inventory.InventoryClickEvent(view, org.bukkit.event.inventory.InventoryType.SlotType.CONTAINER, slot, clickType, inventoryAction);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
+    /** Fires Bukkit's {@code InventoryCloseEvent} when the host closes a player's menu. */
+    public static void fireInventoryClose(String id, String name) {
+        var player = ensurePlayer(id, name);
+        var view = FerriteInventoryView.create(player, player.getInventory());
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(new org.bukkit.event.inventory.InventoryCloseEvent(view, org.bukkit.event.inventory.InventoryCloseEvent.Reason.PLUGIN)); }
+    }
+    /** A live player, or a stand-in entity for the mob ids the host sends. */
+    private static org.bukkit.entity.Entity entity(String id, String name) {
+        var uuid = java.util.UUID.fromString(id);
+        var player = server.getPlayer(uuid);
+        return player != null ? player : ensurePlayer(id, name);
+    }
+    /** The generic damage source for host events that only carry a cause name. */
+    private static org.bukkit.damage.DamageSource damageSource() {
+        return org.bukkit.damage.DamageSource.builder(org.bukkit.damage.DamageType.GENERIC_KILL).build();
+    }
+    /** Bukkit's damage cause for the host's lowercase names, defaulting to CUSTOM. */
+    private static org.bukkit.event.entity.EntityDamageEvent.DamageCause damageCause(String name) {
+        for (var cause : org.bukkit.event.entity.EntityDamageEvent.DamageCause.values()) {
+            if (cause.name().equalsIgnoreCase(name) || cause.name().replace('_', '-').equalsIgnoreCase(name)) return cause;
+        }
+        return org.bukkit.event.entity.EntityDamageEvent.DamageCause.CUSTOM;
     }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {

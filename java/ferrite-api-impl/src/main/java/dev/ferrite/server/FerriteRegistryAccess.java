@@ -31,6 +31,7 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
         if (type == org.bukkit.enchantments.Enchantment.class) return (org.bukkit.Registry<T>) cached("enchantment", FerriteRegistryAccess::enchantmentRegistry);
         if (type == org.bukkit.potion.PotionEffectType.class) return (org.bukkit.Registry<T>) cached("mob_effect", FerriteRegistryAccess::potionRegistry);
         if (type == org.bukkit.block.Biome.class) return (org.bukkit.Registry<T>) cached("worldgen/biome", () -> identityRegistry("worldgen/biome", org.bukkit.block.Biome.class));
+        if (type == org.bukkit.damage.DamageType.class) return (org.bukkit.Registry<T>) cached("damage_type", FerriteRegistryAccess::damageTypeRegistry);
         return unavailable(type.getName());
     }
     @Override public <T extends org.bukkit.Keyed> org.bukkit.Registry<T> getRegistry(io.papermc.paper.registry.RegistryKey<T> type) {
@@ -43,7 +44,33 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
         if (type.equals(io.papermc.paper.registry.RegistryKey.ATTRIBUTE)) return cast(cached("attribute", () -> identityRegistry("attribute", org.bukkit.attribute.Attribute.class)));
         if (type.equals(io.papermc.paper.registry.RegistryKey.SOUND_EVENT)) return cast(cached("sound_event", () -> identityRegistry("sound_event", org.bukkit.Sound.class)));
         if (type.equals(io.papermc.paper.registry.RegistryKey.BIOME)) return cast(cached("worldgen/biome", () -> identityRegistry("worldgen/biome", org.bukkit.block.Biome.class)));
+        if (type.equals(io.papermc.paper.registry.RegistryKey.DAMAGE_TYPE)) return cast(cached("damage_type", FerriteRegistryAccess::damageTypeRegistry));
         return unavailable(type.key().toString());
+    }
+    /** Vanilla damage types are data-driven; the registry identity is all plugins need here. */
+    private static org.bukkit.Registry<org.bukkit.damage.DamageType> damageTypeRegistry() {
+        return new BaseRegistry<org.bukkit.damage.DamageType>("damage_type") {
+            private final java.util.Map<org.bukkit.NamespacedKey, org.bukkit.damage.DamageType> entries = new java.util.concurrent.ConcurrentHashMap<>();
+            @Override public org.bukkit.damage.DamageType get(org.bukkit.NamespacedKey key) {
+                if (!contains("damage_type", key)) return null;
+                return entries.computeIfAbsent(key, k -> (org.bukkit.damage.DamageType) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.damage.DamageType.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "getKey", "key" -> k;
+                    case "getTranslationKey", "translationKey" -> "death.attack." + k.getKey();
+                    case "getDamageScaling" -> org.bukkit.damage.DamageScaling.NEVER;
+                    case "getDamageEffect" -> org.bukkit.damage.DamageEffect.HURT;
+                    case "getDeathMessageType" -> org.bukkit.damage.DeathMessageType.DEFAULT;
+                    case "getExhaustion" -> 0.1f;
+                    case "hashCode" -> k.hashCode();
+                    case "equals" -> args[0] instanceof org.bukkit.damage.DamageType other && k.equals(other.getKey());
+                    case "toString" -> "DamageType[" + k + "]";
+                    default -> throw new UnsupportedOperationException("Ferrite: not implemented: DamageType#" + method.getName());
+                }));
+            }
+            @Override public int size() { return KEYS.get("damage_type").size(); }
+            @Override public java.util.stream.Stream<org.bukkit.NamespacedKey> keyStream() { return KEYS.get("damage_type").stream().map(org.bukkit.NamespacedKey::fromString); }
+            @Override public java.util.stream.Stream<org.bukkit.damage.DamageType> stream() { return keyStream().map(this::get); }
+            @Override public java.util.Iterator<org.bukkit.damage.DamageType> iterator() { return stream().iterator(); }
+        };
     }
     @SuppressWarnings("unchecked") private static <T extends org.bukkit.Keyed> org.bukkit.Registry<T> menuRegistry() {
         return (org.bukkit.Registry<T>) new BaseRegistry<org.bukkit.inventory.MenuType>("menu") {

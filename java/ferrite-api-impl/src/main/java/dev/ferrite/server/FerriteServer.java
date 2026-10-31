@@ -300,4 +300,41 @@ public class FerriteServer extends ServerStubs {
     @Override public java.util.Set<org.bukkit.OfflinePlayer> getWhitelistedPlayers() { return java.util.Set.of(); }
     @Override public java.util.Set<org.bukkit.OfflinePlayer> getBannedPlayers() { return java.util.Set.of(); }
     @Override public String getWorldType() { return "normal"; }
+    /** Commands registered by plugins; the plain names map to their declared aliases. */
+    @Override public java.util.Map<String, String[]> getCommandAliases() {
+        var aliases = new java.util.LinkedHashMap<String, String[]>();
+        for (var command : commands.values()) {
+            if (!(command instanceof org.bukkit.command.PluginCommand)) continue;
+            aliases.putIfAbsent(command.getName(), command.getAliases().toArray(String[]::new));
+        }
+        return java.util.Map.copyOf(aliases);
+    }
+    private volatile org.bukkit.World respawnWorld;
+    @Override public org.bukkit.World getRespawnWorld() { var world = respawnWorld; return world != null ? world : getWorlds().stream().findFirst().orElse(null); }
+    @Override public void setRespawnWorld(org.bukkit.World world) { respawnWorld = world; }
+    private volatile org.bukkit.help.HelpMap helpMap;
+    /** A help map over the plugin command map; topics are generated from registered commands. */
+    @Override public org.bukkit.help.HelpMap getHelpMap() {
+        var map = helpMap;
+        if (map == null) synchronized (this) { map = helpMap; if (map == null) helpMap = map = new FerriteHelpMap(this); }
+        return map;
+    }
+    /** Every player name the host has seen, even while disconnected. */
+    @Override public org.bukkit.OfflinePlayer[] getOfflinePlayers() {
+        return offlineIds.values().stream().distinct().map(this::getOfflinePlayer).toArray(org.bukkit.OfflinePlayer[]::new);
+    }
+    @Override public int getSpawnLimit(org.bukkit.entity.SpawnCategory category) {
+        java.util.Objects.requireNonNull(category, "category");
+        return switch (category) {
+            case MONSTER -> 70;
+            case ANIMAL -> 10;
+            case WATER_ANIMAL -> 5;
+            case WATER_AMBIENT -> 20;
+            case WATER_UNDERGROUND_CREATURE -> 5;
+            case AMBIENT -> 15;
+            case AXOLOTL -> 5;
+            case MISC -> -1;
+        };
+    }
+    @Override public int getTicksPerSpawns(org.bukkit.entity.SpawnCategory category) { java.util.Objects.requireNonNull(category, "category"); return 1; }
 }
