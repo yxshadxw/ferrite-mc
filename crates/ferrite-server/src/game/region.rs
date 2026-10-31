@@ -7,6 +7,7 @@ use super::{
 use ferrite_entity::{
     BlockGetter, EntityRecord, EntityStore, Rng, ai, item,
     mob::{self, MobKind},
+    spawn::{self, SpawnEnv},
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
@@ -116,6 +117,25 @@ impl BlockGetter for TickBlocks<'_> {
             .borrow_mut()
             .entry((x, y, z))
             .or_insert_with(|| source.block(x, y, z).and_then(|s| u16::try_from(s).ok()))
+    }
+}
+impl SpawnEnv for TickBlocks<'_> {
+    fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if let Some(source) = self.source
+            && let Some(level) = source.brightness(x, y, z)
+        {
+            return level;
+        }
+        // Without stored light (a superflat test world) only open sky counts as daylight.
+        for scan in y..=y.saturating_add(64) {
+            match self.block_state(x, scan, z) {
+                Some(state)
+                    if usize::from(state) < ferrite_data::blocks::STATE_COUNT
+                        && ferrite_data::block_props::get(state).is_air => {}
+                _ => return 0,
+            }
+        }
+        15
     }
 }
 /// How many queued chunks to request ahead of the batch being sent.
@@ -1286,14 +1306,18 @@ impl Region {
         self.entities.insert(record);
         true
     }
-    /// Ticks the modelled mobs: movement, fall damage, despawn and death loot.
-    fn tick_mobs(&mut self, blocks: &impl BlockGetter) {
+    /// Ticks the modelled mobs: goals, movement, fall damage, despawn, natural spawning and
+    /// death loot.
+    fn tick_mobs(&mut self, blocks: &TickBlocks<'_>) {
         let players: Vec<_> = self
             .players
             .values()
             .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
             .collect();
         ai::tick(&mut self.entities, blocks, &players, &mut self.rng);
+        for record in spawn::natural_spawn(&self.entities, blocks, &players, &mut self.rng, 1) {
+            self.entities.insert(record);
+        }
         // Mobs that died this tick drop their entity loot table once (vanilla
         // `LivingEntity.dropFromLootTable`). The entity itself stays in the store until the
         // tracker has sent `remove_entities` and `sweep_removed` drops the record.

@@ -64,6 +64,11 @@ impl MobKind {
         entity_props::default_attribute(self.entity_type(), "movement_speed").unwrap_or(0.25)
     }
 
+    /// Jump impulse, from the type's default `minecraft:jump_strength` attribute.
+    pub fn jump_strength(self) -> f64 {
+        entity_props::default_attribute(self.entity_type(), "jump_strength").unwrap_or(0.42)
+    }
+
     /// The entity loot table, e.g. `minecraft:entities/cow`.
     pub fn loot_table(self) -> &'static str {
         match self {
@@ -115,6 +120,12 @@ pub struct MobState {
     pub despawns: bool,
     /// Whether the death loot was already rolled and spawned.
     pub loot_dropped: bool,
+    /// Ticks until the wander goal picks a new direction; zero picks now.
+    pub wander_timer: u32,
+    /// Yaw the wander goal walks along, in degrees.
+    pub wander_yaw: f32,
+    /// Whether the wander goal wants to move during this interval.
+    pub moving: bool,
 }
 
 impl MobState {
@@ -128,6 +139,9 @@ impl MobState {
             fall_distance: 0.0,
             despawns: kind.despawns_when_far(),
             loot_dropped: false,
+            wander_timer: 0,
+            wander_yaw: 0.0,
+            moving: false,
         }
     }
 

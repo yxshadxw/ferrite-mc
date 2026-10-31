@@ -24,6 +24,7 @@ pub mod metadata;
 pub mod mob;
 pub mod physics;
 mod rng;
+pub mod spawn;
 mod store;
 pub mod tracker;
 
