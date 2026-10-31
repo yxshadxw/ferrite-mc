@@ -797,12 +797,19 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     let location = wait_for_chat(&mut bot, "where world", &stdout, &stderr, &events);
     assert!(location.starts_with("where world "), "{location}");
     bot.raw(7, "typical give");
-    // Inventory writes need the host's player-inventory hook, which the live bridge does not
-    // register yet; the fixture reports it instead of swallowing the failure.
+    // `PlayerInventory#setItem` goes through `Native.playerInventory`; the game loop routes it
+    // to the region owning the player and syncs the slot back to the Bukkit inventory.
     assert_eq!(
-        wait_for_chat(&mut bot, "give unavailable", &stdout, &stderr, &events),
-        "give unavailable"
+        wait_for_chat(
+            &mut bot,
+            "gave minecraft:diamond",
+            &stdout,
+            &stderr,
+            &events
+        ),
+        "gave minecraft:diamond x2"
     );
+    wait_for_line(&events, "give DIAMOND 2", &stdout, &stderr);
     bot.raw(7, "typical info");
     let info = wait_for_chat(&mut bot, "info world", &stdout, &stderr, &events);
     assert!(

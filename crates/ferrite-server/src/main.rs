@@ -185,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         [0, 65, 0]
     };
+    // Plugins call the Bukkit API from their own threads; the game loop owns the world, so
+    // player mutations (inventory, teleport, gamemode, ...) arrive through this channel and are
+    // routed to the region that owns the player.
+    let (plugin_command_tx, plugin_commands) = tokio::sync::mpsc::unbounded_channel();
     let plugin_bridge =
         ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
             directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
@@ -209,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
                 blocks: Vec::new(),
                 heights: Vec::new(),
             },
+            player_handler: Some(std::sync::Arc::new(move |command| {
+                let _ = plugin_command_tx.send(command);
+            })),
         })
         .context("starting plugins")?;
     let settings = game::WorldSettings {
@@ -233,13 +240,8 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
         ),
+        plugin_commands: Some(plugin_commands),
     };
-    game::playerdata::init(
-        config
-            .world
-            .as_ref()
-            .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
-    );
     let terrain = match config.generator {
         WorldGenerator::Vanilla => Some(std::sync::Arc::new(
             game::VanillaTerrain::spawn(0).context("starting the vanilla world generator")?,

@@ -17,6 +17,9 @@ pub struct Settings {
     pub whitelist: bool,
     /// The main world, published before plugins can query the server.
     pub world: WorldSnapshot,
+    /// Receives player mutations a plugin made through the Bukkit API. The game loop routes
+    /// them to the region that owns the player.
+    pub player_handler: Option<ferrite_plugin::PlayerHandler>,
 }
 
 /// A running embedded JVM with the server's plugins enabled.
@@ -47,6 +50,7 @@ impl PluginBridge {
                         online_mode: settings.online_mode,
                         banned_ips: Vec::new(),
                     },
+                    player_handler: settings.player_handler,
                     ..Default::default()
                 },
             )

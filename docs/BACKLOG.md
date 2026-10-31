@@ -124,9 +124,11 @@ still stubs that answer "Command not implemented".
   `World#getPlayers` and join-time chat work against real values.
 - Fixed: `plugin.yml` permissions are registered on load and removed on disable, so
   `default: true` reaches players and command permission gates pass.
-- Open: `Native.playerInventory` still needs a `PlayerHandler`; until the server routes
-  `PlayerCommand::SetInventorySlot` et al., `PlayerInventory#setItem` reports "No player command
-  handler". The typical fixture asserts the `give unavailable` branch until then.
+- Fixed: `Native.playerInventory` is wired end to end. `main` forwards every `PlayerCommand`
+  through a channel; the game loop routes inventory writes, gamemode, operator and chat to the
+  owning region/player, and `PlayerInventory#setItem` now replaces the slot, sends
+  `SetPlayerInventory` and resyncs the menu. Teleports reuse the `/tp` mailbox path. Health,
+  food, titles, display names, sounds and kicks are still logged as unrouted.
 - Open: block snapshots are still opt-in via `setBlockSnapshot`, so `Block#getType` for arbitrary
   coordinates throws; and the remaining `Server` stubs throw (help map, recipes, boss bars, maps,
   world creation, tags, entity serialization). CraftBukkit shims cannot declare NMS-typed methods

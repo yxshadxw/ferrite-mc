@@ -55,6 +55,11 @@ pub enum Command {
         unit: XpUnit,
         feedback: Option<OutboundSender>,
     },
+    /// A plugin's `PlayerInventory#setItem`, applied on the owning region thread.
+    SetInventorySlot {
+        slot: u8,
+        item: Option<ferrite_plugin::ItemSnapshot>,
+    },
     /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
     Kill,
     Enchant {
@@ -815,6 +820,32 @@ impl Player {
             format!("Removed {removed} items from {target_name}"),
         );
     }
+    /// A plugin's `PlayerInventory#setItem`: replaces one slot and syncs it to the client.
+    fn set_inventory_slot(&mut self, slot: u8, item: Option<ferrite_plugin::ItemSnapshot>) {
+        let slot = usize::from(slot);
+        if slot >= ferrite_inventory::SIZE {
+            return;
+        }
+        let stack = match item {
+            None => ferrite_item::ItemStack::empty(),
+            Some(item) => {
+                let Some(id) = ferrite_item::item_id(&item.material) else {
+                    tracing::warn!(material = %item.material, "plugin set an unknown item");
+                    return;
+                };
+                ferrite_item::ItemStack::with_count(id, i32::from(item.amount))
+            }
+        };
+        self.inventory.set(slot, stack.clone());
+        send(
+            self,
+            &SetPlayerInventory {
+                slot: VarInt(slot as i32),
+                item: stack,
+            },
+        );
+        self.sync_containers();
+    }
     /// `/give`: places the stack back in the inventory, dropping what does not fit.
     fn give_items(
         &mut self,
@@ -1343,6 +1374,10 @@ impl Player {
                             feedback.as_ref(),
                         );
                     }
+                    continue;
+                }
+                Command::SetInventorySlot { slot, item } => {
+                    self.set_inventory_slot(slot, item);
                     continue;
                 }
                 Command::Kill => {

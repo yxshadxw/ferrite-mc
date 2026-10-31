@@ -83,6 +83,8 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
                 int amount = Math.max(1, getConfig().getInt("amount", 1));
                 try {
                     player.getInventory().setItem(0, new org.bukkit.inventory.ItemStack(material, amount));
+                    var now = player.getInventory().getItem(0);
+                    append("give " + now.getType() + " " + now.getAmount());
                     sender.sendMessage("gave " + material.getKey() + " x" + amount);
                 } catch (IllegalStateException e) {
                     sender.sendMessage("give unavailable");

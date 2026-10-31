@@ -92,7 +92,6 @@ pub enum PluginEventPolicy {
     /// Treat the failure like a cancellation: undo the action and resend block/teleport state.
     Deny,
 }
-#[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
     pub max_players: i32,
@@ -109,6 +108,8 @@ pub struct WorldSettings {
     /// worlds use: one process-wide directory made a bot resume the gamemode and position a
     /// same-named bot from another test world had saved.
     pub playerdata: Option<std::path::PathBuf>,
+    /// Player mutations plugins made through the Bukkit API, delivered to the owning region.
+    pub plugin_commands: Option<mpsc::UnboundedReceiver<ferrite_plugin::PlayerCommand>>,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -129,6 +130,7 @@ impl Default for WorldSettings {
             admin: None,
             whitelist: false,
             playerdata: None,
+            plugin_commands: None,
         }
     }
 }
@@ -364,7 +366,7 @@ async fn run(
     flat: bool,
     spawn: [i32; 3],
     metrics: LoopMetrics,
-    settings: WorldSettings,
+    mut settings: WorldSettings,
 ) {
     let Channels {
         mut events,
@@ -437,6 +439,7 @@ async fn run(
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
     let mut names: HashMap<Uuid, String> = HashMap::new();
+    let mut plugin_commands = settings.plugin_commands.take();
     let mut command_tree = commands::dispatcher();
     if let Some(plugins) = &settings.plugins {
         match plugins.plugin_commands() {
@@ -524,7 +527,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),playerdata:settings.playerdata.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins {
@@ -725,12 +728,73 @@ async fn run(
             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_left(uuid, &name) { tracing::warn!(%error, "player quit event failed"); }
             scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }},
+         command = async { match plugin_commands.as_mut() { Some(commands) => commands.recv().await, None => std::future::pending().await } }, if plugin_commands.is_some() => {
+             match command {
+                 Some(command) => route_plugin_command(command, &mailboxes, &mut permissions),
+                 // The plugin host dropped its sender (no plugins loaded): stop polling.
+                 None => plugin_commands = None,
+             }
+         },
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
              command_state.lock().unwrap().tick(advance_time);
              if let Some(plugins) = &settings.plugins && let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
          }
         }
+    }
+}
+/// Delivers a player mutation from the embedded JVM to the region that owns the player.
+///
+/// Inventory and gamemode changes ride the player's mailbox so a region hand-off moves them
+/// with the player; teleports and chat go through the existing dedicated paths.
+fn route_plugin_command(
+    command: ferrite_plugin::PlayerCommand,
+    mailboxes: &HashMap<Uuid, (u64, Mailbox, OutboundSender)>,
+    permissions: &mut HashMap<Uuid, u8>,
+) {
+    use ferrite_plugin::PlayerCommand;
+    match command {
+        PlayerCommand::SetInventorySlot { player, slot, item } => {
+            if let Some((_, mailbox, _)) = mailboxes.get(&player) {
+                mailbox
+                    .lock()
+                    .unwrap()
+                    .push_back(Command::SetInventorySlot { slot, item });
+            }
+        }
+        PlayerCommand::Teleport { player, location } => {
+            if location.world == ferrite_plugin::default_world_id()
+                && let Some((_, mailbox, _)) = mailboxes.get(&player)
+            {
+                mailbox.lock().unwrap().push_back(Command::Teleport {
+                    pos: [location.x, location.y, location.z],
+                    yaw: Some(location.yaw),
+                    pitch: Some(location.pitch),
+                });
+            }
+        }
+        PlayerCommand::SetGameMode { player, mode } => {
+            let mode = match mode {
+                ferrite_plugin::GameMode::Survival => 0,
+                ferrite_plugin::GameMode::Creative => 1,
+                ferrite_plugin::GameMode::Adventure => 2,
+                ferrite_plugin::GameMode::Spectator => 3,
+            };
+            if let Some((_, mailbox, _)) = mailboxes.get(&player) {
+                mailbox.lock().unwrap().push_back(Command::SetMode(mode));
+            }
+        }
+        PlayerCommand::SetOperator { player, operator } => {
+            permissions.insert(player, if operator { 4 } else { 0 });
+        }
+        PlayerCommand::Message { player, content } => {
+            if let Some((_, _, outbound)) = mailboxes.get(&player) {
+                chat(outbound, &plugin_message_text(&content));
+            }
+        }
+        // Health, food, titles, display names, sounds and kicks have no host path yet; report
+        // them instead of pretending the plugin's call succeeded.
+        other => tracing::debug!(?other, "plugin player command not routed"),
     }
 }
 fn defer_release(
