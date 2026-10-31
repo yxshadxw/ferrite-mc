@@ -41,6 +41,7 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
             .sum::<f64>()
             <= 10_000.0
 }
+mod fire;
 mod fluid;
 mod global;
 mod gravity;
@@ -79,9 +80,34 @@ pub enum PluginEventPolicy {
     /// Treat the failure like a cancellation: undo the action and resend block/teleport state.
     Deny,
 }
+/// The dimensions the server can run (`DimensionType`): beds only work in the overworld, and
+/// each dimension has its own `infiniburn` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dimension {
+    #[default]
+    Overworld,
+    Nether,
+    End,
+}
+
+impl Dimension {
+    /// Vanilla `DimensionType.infiniburn`.
+    pub fn infiniburn_tag(self) -> &'static str {
+        match self {
+            Self::Overworld => "infiniburn_overworld",
+            Self::Nether => "infiniburn_nether",
+            Self::End => "infiniburn_end",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
+    /// Which dimension this world is; `Dimension::Overworld` unless configured otherwise.
+    pub dimension: Dimension,
+    /// Whether it is currently raining, for fire and cauldron rules.
+    pub raining: bool,
     pub max_players: i32,
     pub ops: Vec<Operator>,
     /// Plugin event and command hooks; `None` when the server runs without plugins.
@@ -105,6 +131,8 @@ impl Default for WorldSettings {
     fn default() -> Self {
         Self {
             gamemode: 1,
+            dimension: Dimension::Overworld,
+            raining: false,
             max_players: 20,
             ops: Vec::new(),
             plugins: None,
@@ -359,6 +387,8 @@ async fn run(
         signals: signal_tx.clone(),
         tracking: tracking.clone(),
         source: source.clone(),
+        dimension: settings.dimension,
+        raining: settings.raining,
     };
     let LoopMetrics {
         game_rules,
@@ -501,7 +531,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),ignited:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }

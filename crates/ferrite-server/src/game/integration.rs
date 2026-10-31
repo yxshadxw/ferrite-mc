@@ -1431,6 +1431,8 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         signals: tx,
         tracking: Default::default(),
         source: None,
+        dimension: super::Dimension::Overworld,
+        raining: false,
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),

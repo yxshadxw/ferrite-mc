@@ -108,6 +108,10 @@ pub struct TickContext {
     pub tracking: Tracking,
     /// World blocks, for entity physics.
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// The dimension this world runs, for bed and fire rules.
+    pub dimension: super::Dimension,
+    /// Current weather, for fire and cauldron rules.
+    pub raining: bool,
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
 struct TickBlocks<'a> {
@@ -158,6 +162,8 @@ pub struct Player {
     pub changed_blocks: Vec<[i32; 3]>,
     /// TNT this player primed this tick, with the fuse length; spawned as `PrimedTnt`.
     pub primed_tnt: Vec<([i32; 3], i32)>,
+    /// Fire this player lit this tick; the region schedules `FireBlock` ticks for it.
+    pub ignited: Vec<[i32; 3]>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -199,6 +205,7 @@ pub struct Region {
     random_ticks: super::random_tick::RandomTicks,
     updates: super::neighbors::Updates,
     gravity: super::gravity::Gravity,
+    fire: super::fire::FireTicks,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -215,6 +222,7 @@ impl RegionData for Region {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
         self.gravity.merge(other.gravity);
+        self.fire.merge(other.fire);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -237,6 +245,9 @@ impl RegionData for Region {
             random_ticks: super::random_tick::RandomTicks::default(),
             updates: super::neighbors::Updates::default(),
             gravity: self.gravity.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            fire: self.fire.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             held_chunks: HashMap::new(),
@@ -614,16 +625,60 @@ impl Player {
         else {
             return;
         };
-        // Vanilla `FlintAndSteelItem.useOn` on TNT: prime it instead of placing the held item.
+        // Vanilla `FlintAndSteelItem.useOn` / `FireChargeItem.useOn` on TNT: prime it.
         let held = self.inventory.get(self.hand_slot(p.hand.0)).clone();
-        if held.name() == Some("minecraft:flint_and_steel")
-            && ferrite_data::blocks::state(clicked_state)
-                .is_some_and(|(name, _)| name == "minecraft:tnt")
+        if matches!(
+            held.name(),
+            Some("minecraft:flint_and_steel" | "minecraft:fire_charge")
+        ) && ferrite_data::blocks::state(clicked_state)
+            .is_some_and(|(name, _)| name == "minecraft:tnt")
         {
             if self.change_block(p.location, Some(u32::from(clicked_state)), 0) {
                 self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
                 self.primed_tnt
                     .push(([clicked.x, clicked.y, clicked.z], ferrite_entity::tnt::FUSE));
+                if self.gamemode == 0 && held.name() == Some("minecraft:fire_charge") {
+                    let slot = self.hand_slot(p.hand.0);
+                    self.inventory
+                        .set(slot, held.copy_with_count(held.count - 1));
+                }
+            }
+            return;
+        }
+        // Vanilla `FlintAndSteelItem.useOn` / `FireChargeItem.useOn`: light the block face.
+        if matches!(
+            held.name(),
+            Some("minecraft:flint_and_steel" | "minecraft:fire_charge")
+        ) {
+            let face = ferrite_math::Direction::ALL[p.face.0 as usize];
+            let (dx, dy, dz) = if ferrite_data::block_props::get(clicked_state).replaceable {
+                (0, 0, 0)
+            } else {
+                face.step()
+            };
+            let target = ferrite_protocol::types::BlockPos::new(
+                clicked.x + dx,
+                clicked.y + dy,
+                clicked.z + dz,
+            );
+            let Some(old) = source
+                .block(target.x, target.y, target.z)
+                .and_then(|s| u16::try_from(s).ok())
+            else {
+                return;
+            };
+            // Vanilla `BaseFireBlock.getState`: soul fire over soul sand or soul soil.
+            if let Some(state) =
+                super::fire::placement_state(source.as_ref(), [target.x, target.y, target.z])
+                && self.change_block(target.pack(), Some(u32::from(old)), u32::from(state))
+            {
+                self.changed_blocks.push([target.x, target.y, target.z]);
+                self.ignited.push([target.x, target.y, target.z]);
+                if self.gamemode == 0 && held.name() == Some("minecraft:fire_charge") {
+                    let slot = self.hand_slot(p.hand.0);
+                    self.inventory
+                        .set(slot, held.copy_with_count(held.count - 1));
+                }
             }
             return;
         }
@@ -1384,7 +1439,7 @@ impl Region {
         speed: u32,
     ) {
         self.random_ticks
-            .tick(source, &self.held_chunks, tracking, speed);
+            .tick(source, &self.held_chunks, tracking, speed, &mut self.fire);
     }
     pub fn tick_fluids(&mut self, source: &super::anvil::AnvilChunkSource, tracking: &Tracking) {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
@@ -1745,6 +1800,10 @@ impl Region {
             };
             self.spawn_thrown(&mut p);
             self.spawn_primed_tnt(&mut p);
+            for pos in p.ignited.drain(..) {
+                let delay = super::fire::tick_delay(&mut self.rng);
+                self.fire.schedule(pos, delay);
+            }
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -1780,7 +1839,34 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
-        let changed = self.tick_block_updates(ctx);
+        let mut changed = self.tick_block_updates(ctx);
+        // Vanilla `FireBlock.tick` runs on scheduled ticks and changes blocks through the same
+        // neighbor-update path as any other block change.
+        let mut fire_changed = Vec::new();
+        if let Some(source) = ctx.source.as_deref() {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            self.fire.tick(
+                &mut world,
+                ctx.dimension,
+                ctx.raining,
+                &mut self.rng,
+                &mut fire_changed,
+            );
+        }
+        if !fire_changed.is_empty() {
+            for pos in &fire_changed {
+                self.updates.block_changed(*pos);
+            }
+            if let Some(source) = ctx.source.as_deref() {
+                let mut broken = Vec::new();
+                self.apply_neighbor_updates(source, ctx, &mut broken);
+                for (pos, state) in broken {
+                    self.spawn_block_drops(pos, state);
+                }
+            }
+            changed.extend(fire_changed);
+        }
         if let Some(source) = ctx.source.as_deref() {
             self.schedule_gravity(source, &changed);
         }
@@ -1835,6 +1921,8 @@ mod tests {
             signals,
             tracking: Default::default(),
             source: None,
+            dimension: crate::game::Dimension::Overworld,
+            raining: false,
         });
 
         let report = timings.report_all(50.0);

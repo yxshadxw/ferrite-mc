@@ -183,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .context("starting plugins")?;
     let settings = game::WorldSettings {
+        dimension: game::Dimension::Overworld,
+        raining: false,
         gamemode: match config.gamemode {
             GameMode::Survival => 0,
             GameMode::Creative => 1,
