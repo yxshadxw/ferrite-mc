@@ -21,6 +21,7 @@ val generateRegistryKeys by tasks.registering(Exec::class) {
     inputs.file(vanilla.resolve("reports/registries.json"))
     inputs.dir(vanilla.resolve("data/minecraft/enchantment"))
     inputs.dir(vanilla.resolve("data/minecraft/worldgen/biome"))
+    inputs.dir(vanilla.resolve("data/minecraft/damage_type"))
     outputs.dir(registryOutput)
     commandLine("python", projectDir.resolve("tools/generate_registry_keys.py"), vanilla, registryOutput.get().file("ferrite/registry-keys.tsv").asFile)
 }

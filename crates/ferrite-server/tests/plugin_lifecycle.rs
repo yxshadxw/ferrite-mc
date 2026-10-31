@@ -515,6 +515,7 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Bot", &stdout, &stderr);
     wait_for_line(&events, "join Bot", &stdout, &stderr);
+    wait_for_prefix(&events, "chunk-load ", &stdout, &stderr);
     bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);

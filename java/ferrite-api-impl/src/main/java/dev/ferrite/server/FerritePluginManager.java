@@ -39,6 +39,8 @@ final class FerritePluginManager extends PluginManagerStubs {
     /** Whether any plugin registered a listener for the exact event class. */
     boolean hasListeners(Class<? extends org.bukkit.event.Event> type) { return listened.contains(type); }
     public synchronized void registerEvents(org.bukkit.event.Listener listener, Plugin owner) {
+        java.util.Objects.requireNonNull(listener, "listener");
+        requireLoaded(owner);
         Set<String> seen = new HashSet<>();
         for (Class<?> type = listener.getClass(); type != null; type = type.getSuperclass()) for (java.lang.reflect.Method method : type.getDeclaredMethods()) {
             if (method.isBridge() || method.isSynthetic() || !seen.add(method.getName() + java.util.Arrays.toString(method.getParameterTypes()))) continue;
@@ -55,6 +57,11 @@ final class FerritePluginManager extends PluginManagerStubs {
     }
     public void registerEvent(Class<? extends org.bukkit.event.Event> type, org.bukkit.event.Listener listener, org.bukkit.event.EventPriority priority, EventExecutor executor, Plugin plugin) { registerEvent(type, listener, priority, executor, plugin, false); }
     public synchronized void registerEvent(Class<? extends org.bukkit.event.Event> type, org.bukkit.event.Listener listener, org.bukkit.event.EventPriority priority, EventExecutor executor, Plugin plugin, boolean ignoreCancelled) {
+        java.util.Objects.requireNonNull(type, "type");
+        java.util.Objects.requireNonNull(listener, "listener");
+        java.util.Objects.requireNonNull(priority, "priority");
+        java.util.Objects.requireNonNull(executor, "executor");
+        requireLoaded(plugin);
         try {
             var method = java.lang.invoke.MethodHandles.lookup().findVirtual(EventExecutor.class, "execute", java.lang.invoke.MethodType.methodType(void.class, org.bukkit.event.Listener.class, org.bukkit.event.Event.class)).bindTo(executor).bindTo(listener);
             handlers.add(new Handler(type, priority, ignoreCancelled, plugin, method));
@@ -78,6 +85,11 @@ final class FerritePluginManager extends PluginManagerStubs {
     private final List<JavaPlugin> plugins = new ArrayList<>();
     private final Map<String, FerriteClassLoader> loaders = new java.util.concurrent.ConcurrentHashMap<>();
     FerritePluginManager(FerriteServer server) { this.server = server; }
+    /** Registration is only legal for a plugin this manager loaded and still tracks. */
+    private void requireLoaded(Plugin plugin) {
+        java.util.Objects.requireNonNull(plugin, "plugin");
+        if (!(plugin instanceof JavaPlugin javaPlugin) || !plugins.contains(javaPlugin)) throw new IllegalArgumentException("Plugin is not loaded: " + plugin.getName());
+    }
     @Override public void enablePlugin(Plugin plugin) {
         java.util.Objects.requireNonNull(plugin, "plugin");
         if (!(plugin instanceof JavaPlugin javaPlugin) || !plugins.contains(javaPlugin)) throw new IllegalArgumentException("Plugin is not loaded: " + plugin.getName());

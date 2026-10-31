@@ -20,10 +20,18 @@ final class FerriteWorld implements java.lang.reflect.InvocationHandler {
     }
     static void setHeight(org.bukkit.World world, int x, int z, int y) { ((FerriteWorld) java.lang.reflect.Proxy.getInvocationHandler(java.util.Objects.requireNonNull(world))).heights.put(new Column(x, z), y); }
     static void setSnapshot(org.bukkit.World world, int x, int y, int z, String material) {
-        var handler = (FerriteWorld) java.lang.reflect.Proxy.getInvocationHandler(java.util.Objects.requireNonNull(world));
         var type = org.bukkit.Material.matchMaterial(material);
         if (type == null) throw new IllegalArgumentException("Unknown material " + material);
-        handler.blocks.put(new Pos(x, y, z), type);
+        setSnapshot(world, x, y, z, type);
+    }
+    static void setSnapshot(org.bukkit.World world, int x, int y, int z, org.bukkit.Material type) {
+        var handler = (FerriteWorld) java.lang.reflect.Proxy.getInvocationHandler(java.util.Objects.requireNonNull(world));
+        handler.blocks.put(new Pos(x, y, z), java.util.Objects.requireNonNull(type, "type"));
+    }
+    /** A chunk proxy for hosts that only publish block snapshots, never entity lists. */
+    static org.bukkit.Chunk chunkAt(org.bukkit.World world, int x, int z) {
+        var handler = (FerriteWorld) java.lang.reflect.Proxy.getInvocationHandler(java.util.Objects.requireNonNull(world));
+        return handler.chunk(x, z);
     }
     private org.bukkit.Location location(Pos pos) { return new org.bukkit.Location(proxy, pos.x(), pos.y(), pos.z()); }
     private org.bukkit.Material typeAt(Pos pos) {

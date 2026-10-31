@@ -494,6 +494,9 @@ impl Player {
         for (x, z) in forget {
             send(self, &ForgetChunk { z, x });
             self.loaded.remove(&(x, z));
+            if let Some(plugins) = self.plugins.clone() {
+                let _ = plugins.chunk_unloaded(ferrite_plugin::default_world_id(), x, z);
+            }
             if let Some((loaded, _)) = self.tracking.lock().unwrap().get_mut(&self.uuid) {
                 loaded.remove(&(x, z));
             }
@@ -574,6 +577,9 @@ impl Player {
         for (x, z, packet) in chunks {
             let _ = self.outbound.send(Outbound::Packet(packet.into()));
             self.loaded.insert((x, z));
+            if let Some(plugins) = self.plugins.clone() {
+                let _ = plugins.chunk_loaded(ferrite_plugin::default_world_id(), x, z, true);
+            }
             if let Some((loaded, _)) = tracking.get_mut(&self.uuid) {
                 loaded.insert((x, z));
             }
@@ -1190,6 +1196,8 @@ impl Player {
             self.feedback(feedback, text);
             return;
         }
+        let old_level = self.experience_level;
+        let old_total = self.experience_total;
         match (operation, unit) {
             (XpOperation::Add, XpUnit::Points) => {
                 self.set_experience_total(i64::from(self.experience_total) + i64::from(amount));
@@ -1200,6 +1208,30 @@ impl Player {
             (XpOperation::Set, XpUnit::Points) => self.set_experience_total(i64::from(amount)),
             (XpOperation::Set, XpUnit::Levels) => self.set_experience_level(amount),
             (XpOperation::Query, _) => unreachable!(),
+        }
+        if let Some(plugins) = self.plugins.clone() {
+            if self.experience_level != old_level
+                && let Ok(level) = plugins.player_level_changed(
+                    self.uuid,
+                    &self.name,
+                    old_level,
+                    self.experience_level,
+                )
+            {
+                let level = level.clamp(0, 21_863);
+                if level != self.experience_level {
+                    self.set_experience_level(level);
+                }
+            }
+            let gained = self.experience_total - old_total;
+            if gained != 0
+                && let Ok(amount) = plugins.player_exp_changed(self.uuid, &self.name, gained)
+                && amount != gained
+            {
+                self.set_experience_total(
+                    i64::from(self.experience_total) + i64::from(amount - gained),
+                );
+            }
         }
         send(
             self,
@@ -1670,6 +1702,12 @@ impl Player {
     /// Vanilla `ServerPlayer.respawn`: a fresh survival state at the world spawn. The client
     /// discards every chunk on `respawn`, so the loaded set is released and re-queued.
     pub(crate) fn respawn(&mut self, spawn: [f64; 3]) {
+        let spawn = match self.plugins.clone() {
+            Some(plugins) => plugins
+                .player_respawned(self.uuid, &self.name, spawn, 0.0, 0.0)
+                .unwrap_or(spawn),
+            None => spawn,
+        };
         let old_loaded = std::mem::take(&mut self.loaded);
         for (x, z) in old_loaded {
             let _ = self.signals.send(Signal::Hold {
@@ -3152,6 +3190,11 @@ impl Region {
         p.breaking = None;
         p.close_container();
         let survival_mode = matches!(p.gamemode, 0 | 2);
+        let dropped_exp = if !rules.keep_inventory && survival_mode {
+            p.experience_level.saturating_mul(7).min(100)
+        } else {
+            0
+        };
         if !rules.keep_inventory && survival_mode {
             let pos = [
                 p.pos[0].floor() as i32,
@@ -3195,6 +3238,10 @@ impl Region {
         }
         let kind = p.survival.death_cause.unwrap_or(DamageKind::GenericKill);
         let message = kind.death_message(&p.name);
+        if let Some(plugins) = p.plugins.clone() {
+            let cause = format!("{kind:?}");
+            let _ = plugins.player_died(p.uuid, &p.name, &cause, dropped_exp, &message);
+        }
         send(
             p,
             &PlayerCombatKill {
