@@ -168,6 +168,106 @@ fn template(key: &str) -> Option<&'static str> {
         "commands.worldborder.warning.time.success" => {
             "Set the world border warning time to %s second(s)"
         }
+        "commands.bossbar.create.success" => "Created custom bossbar %s",
+        "commands.bossbar.get.max" => "Custom bossbar %s has a maximum of %s",
+        "commands.bossbar.get.players.none" => "Custom bossbar %s has no players currently online",
+        "commands.bossbar.get.players.some" => {
+            "Custom bossbar %s has %s player(s) currently online: %s"
+        }
+        "commands.bossbar.get.value" => "Custom bossbar %s has a value of %s",
+        "commands.bossbar.get.visible.hidden" => "Custom bossbar %s is currently hidden",
+        "commands.bossbar.get.visible.visible" => "Custom bossbar %s is currently visible",
+        "commands.bossbar.list.bars.none" => "There are no custom bossbars active",
+        "commands.bossbar.list.bars.some" => "There are %s custom bossbar(s) active: %s",
+        "commands.bossbar.remove.success" => "Removed custom bossbar %s",
+        "commands.bossbar.set.color.success" => "Custom bossbar %s has changed color",
+        "commands.bossbar.set.max.success" => "Custom bossbar %s has changed maximum to %s",
+        "commands.bossbar.set.name.success" => "Custom bossbar %s has been renamed",
+        "commands.bossbar.set.players.success.none" => {
+            "Custom bossbar %s no longer has any players"
+        }
+        "commands.bossbar.set.players.success.some" => "Custom bossbar %s now has %s player(s): %s",
+        "commands.bossbar.set.style.success" => "Custom bossbar %s has changed style",
+        "commands.bossbar.set.value.success" => "Custom bossbar %s has changed value to %s",
+        "commands.bossbar.set.visible.success.hidden" => "Custom bossbar %s is now hidden",
+        "commands.bossbar.set.visible.success.visible" => "Custom bossbar %s is now visible",
+        "commands.scoreboard.objectives.add.success" => "Created new objective %s",
+        "commands.scoreboard.objectives.display.cleared" => {
+            "Cleared any objectives in display slot %s"
+        }
+        "commands.scoreboard.objectives.display.set" => "Set display slot %s to show objective %s",
+        "commands.scoreboard.objectives.list.empty" => "There are no objectives",
+        "commands.scoreboard.objectives.list.success" => "There are %s objective(s): %s",
+        "commands.scoreboard.objectives.modify.displayname" => {
+            "Changed the display name of %s to %s"
+        }
+        "commands.scoreboard.objectives.modify.rendertype" => {
+            "Changed the render type of objective %s"
+        }
+        "commands.scoreboard.objectives.remove.success" => "Removed objective %s",
+        "commands.scoreboard.players.add.success.multiple" => "Added %s to %s for %s entities",
+        "commands.scoreboard.players.add.success.single" => "Added %s to %s for %s (now %s)",
+        "commands.scoreboard.players.enable.success.multiple" => {
+            "Enabled trigger %s for %s entities"
+        }
+        "commands.scoreboard.players.enable.success.single" => "Enabled trigger %s for %s",
+        "commands.scoreboard.players.get.success" => "%s has %s %s",
+        "commands.scoreboard.players.list.empty" => "There are no tracked entities",
+        "commands.scoreboard.players.list.entity.empty" => "%s has no scores to show",
+        "commands.scoreboard.players.list.entity.entry" => "%s: %s",
+        "commands.scoreboard.players.list.entity.success" => "%s has %s score(s):",
+        "commands.scoreboard.players.list.success" => "There are %s tracked entity/entities: %s",
+        "commands.scoreboard.players.operation.success.multiple" => "Updated %s for %s entities",
+        "commands.scoreboard.players.operation.success.single" => "Set %s for %s to %s",
+        "commands.scoreboard.players.remove.success.multiple" => {
+            "Removed %s from %s for %s entities"
+        }
+        "commands.scoreboard.players.remove.success.single" => "Removed %s from %s for %s (now %s)",
+        "commands.scoreboard.players.reset.all.multiple" => "Reset all scores for %s entities",
+        "commands.scoreboard.players.reset.all.single" => "Reset all scores for %s",
+        "commands.scoreboard.players.reset.specific.multiple" => "Reset %s for %s entities",
+        "commands.scoreboard.players.reset.specific.single" => "Reset %s for %s",
+        "commands.scoreboard.players.set.success.multiple" => "Set %s for %s entities to %s",
+        "commands.scoreboard.players.set.success.single" => "Set %s for %s to %s",
+        "commands.tag.add.success.multiple" => "Added tag '%s' to %s entities",
+        "commands.tag.add.success.single" => "Added tag '%s' to %s",
+        "commands.tag.list.multiple.empty" => "There are no tags on the %s entities",
+        "commands.tag.list.multiple.success" => "The %s entities have %s total tag(s): %s",
+        "commands.tag.list.single.empty" => "%s has no tags",
+        "commands.tag.list.single.success" => "%s has %s tag(s): %s",
+        "commands.tag.remove.success.multiple" => "Removed tag '%s' from %s entities",
+        "commands.tag.remove.success.single" => "Removed tag '%s' from %s",
+        "commands.team.add.success" => "Created team %s",
+        "commands.team.empty.success" => "Removed %s member(s) from team %s",
+        "commands.team.join.success.multiple" => "Added %s members to team %s",
+        "commands.team.join.success.single" => "Added %s to team %s",
+        "commands.team.leave.success.multiple" => "Removed %s members from any team",
+        "commands.team.leave.success.single" => "Removed %s from any team",
+        "commands.team.list.members.empty" => "There are no members on team %s",
+        "commands.team.list.members.success" => "Team %s has %s member(s): %s",
+        "commands.team.list.teams.empty" => "There are no teams",
+        "commands.team.list.teams.success" => "There are %s team(s): %s",
+        "commands.team.option.collisionRule.success" => "Collision rule for team %s is now \"%s\"",
+        "commands.team.option.color.clear.success" => "Cleared the color for team %s",
+        "commands.team.option.color.success" => "Updated the color for team %s to %s",
+        "commands.team.option.deathMessageVisibility.success" => {
+            "Death message visibility for team %s is now \"%s\""
+        }
+        "commands.team.option.friendlyfire.disabled" => "Disabled friendly fire for team %s",
+        "commands.team.option.friendlyfire.enabled" => "Enabled friendly fire for team %s",
+        "commands.team.option.name.success" => "Updated the name of team %s",
+        "commands.team.option.nametagVisibility.success" => {
+            "Nametag visibility for team %s is now \"%s\""
+        }
+        "commands.team.option.prefix.success" => "Team prefix set to %s",
+        "commands.team.option.seeFriendlyInvisibles.disabled" => {
+            "Team %s can no longer see invisible teammates"
+        }
+        "commands.team.option.seeFriendlyInvisibles.enabled" => {
+            "Team %s can now see invisible teammates"
+        }
+        "commands.team.option.suffix.success" => "Team suffix set to %s",
+        "commands.team.remove.success" => "Removed team %s",
         _ => return None,
     })
 }

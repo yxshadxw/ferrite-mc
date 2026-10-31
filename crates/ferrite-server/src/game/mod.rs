@@ -12,6 +12,7 @@ mod chat;
 mod chunk;
 mod commands;
 mod commands_extras;
+mod commands_meta;
 mod commands_world;
 mod container;
 mod crafting;

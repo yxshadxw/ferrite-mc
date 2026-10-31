@@ -10,7 +10,7 @@ use ferrite_command::{
     literal,
 };
 use ferrite_net::game::OutboundSender;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,6 +47,50 @@ pub struct PlayerEntry {
     pub spawn: Option<([i32; 3], f32, f32)>,
     /// Active mob effects (`/effect`), effect id -> amplifier.
     pub effects: BTreeMap<i32, i32>,
+    /// `/tag` names on this player.
+    pub tags: BTreeSet<String>,
+    /// `/team join` membership, if any.
+    pub team: Option<String>,
+}
+
+/// A `/scoreboard objectives` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Objective {
+    pub criteria: String,
+    pub display_name: String,
+    /// Objective render type: 0 = integer, 1 = hearts.
+    pub render_type: i32,
+}
+
+/// A `/bossbar` entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BossBarState {
+    pub uuid: Uuid,
+    pub name: String,
+    pub progress: f32,
+    pub value: i32,
+    pub max: i32,
+    pub color: i32,
+    /// 0 = progress, 1 = notched_6, 2 = notched_10, 3 = notched_12, 4 = notched_20.
+    pub overlay: i32,
+    pub visible: bool,
+    /// Players who see the bar; empty means every player.
+    pub players: BTreeSet<Uuid>,
+}
+
+/// A `/team` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamState {
+    pub display_name: String,
+    pub color: i32,
+    pub prefix: String,
+    pub suffix: String,
+    pub friendly_fire: bool,
+    pub see_friendly_invisibles: bool,
+    pub nametag_visibility: String,
+    pub collision_rule: String,
+    pub death_message_visibility: String,
+    pub members: BTreeSet<Uuid>,
 }
 
 /// World border state shared by `/worldborder` and the packets its subcommands send.
@@ -98,6 +142,16 @@ pub struct GameState {
     pub world_spawn_pitch: f32,
     /// World border (`/worldborder`).
     pub border: WorldBorderState,
+    /// Scoreboard objectives by name.
+    pub objectives: BTreeMap<String, Objective>,
+    /// Scores keyed by `(holder, objective)`.
+    pub scores: BTreeMap<(String, String), i32>,
+    /// Display slot -> objective name.
+    pub displays: BTreeMap<i32, String>,
+    /// Custom boss bars by id.
+    pub bossbars: BTreeMap<String, BossBarState>,
+    /// Scoreboard teams by name.
+    pub teams: BTreeMap<String, TeamState>,
 }
 
 impl GameState {
@@ -116,6 +170,11 @@ impl GameState {
             world_spawn_yaw: 0.0,
             world_spawn_pitch: 0.0,
             border: WorldBorderState::default(),
+            objectives: BTreeMap::new(),
+            scores: BTreeMap::new(),
+            displays: BTreeMap::new(),
+            bossbars: BTreeMap::new(),
+            teams: BTreeMap::new(),
         }
     }
 
@@ -127,6 +186,8 @@ impl GameState {
             game_mode,
             spawn: None,
             effects: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            team: None,
         });
         self.max_players = max_players;
     }
@@ -1710,6 +1771,7 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
     );
     super::commands_world::register(&mut tree);
     super::commands_extras::register(&mut tree);
+    super::commands_meta::register(&mut tree);
     tree
 }
 

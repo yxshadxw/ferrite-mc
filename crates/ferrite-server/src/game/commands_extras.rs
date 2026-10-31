@@ -15,9 +15,10 @@ use ferrite_net::game::{OutboundSender, packet};
 use ferrite_protocol::{
     VarLong,
     packets::play::{
-        ClearTitles, DefaultSpawn, LevelParticles, SetActionBarText, SetBorderCenter,
-        SetBorderLerpSize, SetBorderSize, SetBorderWarningDelay, SetBorderWarningDistance,
-        SetSubtitleText, SetTitleText, SetTitlesAnimation, SoundEffect, StopSound, SystemChat,
+        BossBar, ClearTitles, DefaultSpawn, LevelParticles, PlayerTeam, ResetScore,
+        SetActionBarText, SetBorderCenter, SetBorderLerpSize, SetBorderSize, SetBorderWarningDelay,
+        SetBorderWarningDistance, SetDisplayObjective, SetObjective, SetScore, SetSubtitleText,
+        SetTitleText, SetTitlesAnimation, SoundEffect, StopSound, SystemChat,
     },
     types::{BlockPos, PlainText},
 };
@@ -48,6 +49,12 @@ pub enum PlayerPacket {
     BorderWarningDelay(SetBorderWarningDelay),
     BorderWarningDistance(SetBorderWarningDistance),
     DefaultSpawn(DefaultSpawn),
+    SetObjective(SetObjective),
+    SetScore(SetScore),
+    ResetScore(ResetScore),
+    SetDisplayObjective(SetDisplayObjective),
+    BossBar(BossBar),
+    PlayerTeam(PlayerTeam),
 }
 
 impl PlayerPacket {
@@ -99,6 +106,24 @@ impl PlayerPacket {
             Self::DefaultSpawn(p) => {
                 let _ = outbound.send(packet(p));
             }
+            Self::SetObjective(p) => {
+                let _ = outbound.send(packet(p));
+            }
+            Self::SetScore(p) => {
+                let _ = outbound.send(packet(p));
+            }
+            Self::ResetScore(p) => {
+                let _ = outbound.send(packet(p));
+            }
+            Self::SetDisplayObjective(p) => {
+                let _ = outbound.send(packet(p));
+            }
+            Self::BossBar(p) => {
+                let _ = outbound.send(packet(p));
+            }
+            Self::PlayerTeam(p) => {
+                let _ = outbound.send(packet(p));
+            }
         }
     }
 }
@@ -123,7 +148,7 @@ fn gamemasters() -> impl Fn(&Source) -> bool + Send + Sync + 'static {
     |source| source.permission >= 2
 }
 
-fn packets(
+pub(crate) fn packets(
     ctx: &CommandContext<Source>,
     targets: Vec<Uuid>,
     packet: PlayerPacket,
@@ -131,7 +156,7 @@ fn packets(
     send(ctx.source(), Action::Packets { targets, packet })
 }
 
-fn feedback(
+pub(crate) fn feedback(
     ctx: &CommandContext<Source>,
     key: &'static str,
     args: Vec<String>,
@@ -239,7 +264,7 @@ fn rotation(ctx: &CommandContext<Source>, name: &str) -> Result<(f32, f32), Comm
     }
 }
 
-fn component_text(raw: &str) -> String {
+pub(crate) fn component_text(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('{')
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
