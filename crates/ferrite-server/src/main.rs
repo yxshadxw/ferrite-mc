@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
             GameMode::Survival => 0,
             GameMode::Creative => 1,
         },
+        max_players: i32::try_from(config.max_players).unwrap_or(i32::MAX),
         ops,
         plugins: plugin_bridge
             .as_ref()

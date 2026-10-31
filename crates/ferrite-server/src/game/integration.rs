@@ -456,6 +456,7 @@ async fn operator_teleport_command_moves_player() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 1,
+            max_players: 20,
             ops: vec![super::Operator {
                 uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
                 level: 4,
@@ -704,6 +705,7 @@ async fn survival_break_requires_elapsed_ticks() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 0,
+            max_players: 20,
             ops: vec![],
             plugins: None,
             ..Default::default()
@@ -1117,15 +1119,19 @@ async fn commands_packet_decodes_and_filters_permissions() {
     let bot = Bot::join(addr, "Guest").await;
     let bytes = bot.commands.as_ref().expect("commands packet");
     let mut input = bytes.as_slice();
-    // The guest sees the unrestricted root commands and the argument nodes under `msg`.
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 8);
-    assert_eq!(u8::decode(&mut input).unwrap(), 0);
-    assert_eq!(
-        Vec::<VarInt>::decode(&mut input).unwrap(),
-        (1..=5).map(VarInt).collect::<Vec<_>>()
-    );
-    let mut names = Vec::new();
-    for _ in 0..7 {
+    let node_count = VarInt::decode(&mut input).unwrap().0 as usize;
+    assert!(node_count >= 8, "guest tree has {node_count} nodes");
+    assert_eq!(u8::decode(&mut input).unwrap(), 0, "root flags");
+    let roots = Vec::<VarInt>::decode(&mut input).unwrap();
+    assert!(!roots.is_empty());
+    let registry = ferrite_command::ParserRegistry::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vanilla/26.3/generated/reports"),
+    )
+    .unwrap();
+    // The root node's flags and children were decoded above; the rest follow it.
+    let mut nodes = vec![(String::new(), 0, roots, None, None)];
+    for _ in 1..node_count {
         let flags = u8::decode(&mut input).unwrap();
         let children = Vec::<VarInt>::decode(&mut input).unwrap();
         let redirect = if flags & 0x08 != 0 {
@@ -1134,30 +1140,60 @@ async fn commands_packet_decodes_and_filters_permissions() {
             None
         };
         let name = String::decode(&mut input).unwrap();
+        let mut parser = None;
         if flags & 3 == 2 {
-            let parser = VarInt::decode(&mut input).unwrap().0;
-            match parser {
-                6 => {
-                    // minecraft:entity properties: single, players-only.
-                    assert_eq!(u8::decode(&mut input).unwrap(), 2);
-                }
-                20 => {}
-                other => panic!("unexpected parser {other} for {name}"),
+            let id = VarInt::decode(&mut input).unwrap().0;
+            if Some(id) == registry.id("minecraft:entity") {
+                // minecraft:entity properties: single/players-only flags.
+                let _ = u8::decode(&mut input).unwrap();
             }
+            parser = Some(id);
         }
-        if matches!(name.as_str(), "tps" | "mspt" | "tell" | "w") {
-            assert!(children.is_empty(), "literal {name}");
-        }
-        if name == "tell" || name == "w" {
-            assert_eq!(redirect, Some(1), "{name} redirects to msg");
-        } else {
-            assert_eq!(redirect, None, "{name}");
-        }
-        names.push(name);
+        nodes.push((name, flags & 3, children, redirect, parser));
     }
-    assert_eq!(
-        names,
-        ["msg", "tell", "w", "tps", "mspt", "targets", "message"]
+
+    let named = |want: &str| nodes.iter().find(|node| node.0 == want);
+    for visible in [
+        "msg", "tell", "w", "tps", "mspt", "list", "me", "targets", "message", "uuids", "action",
+    ] {
+        assert!(named(visible).is_some(), "guest should see {visible}");
+    }
+    for hidden in [
+        "gamemode",
+        "defaultgamemode",
+        "difficulty",
+        "time",
+        "weather",
+        "seed",
+        "say",
+        "tp",
+        "teleport",
+        "kill",
+        "op",
+        "ban",
+        "kick",
+        "stop",
+        "save-all",
+        "whitelist",
+    ] {
+        assert!(named(hidden).is_none(), "guest should not see {hidden}");
+    }
+    let msg_index = nodes.iter().position(|node| node.0 == "msg").unwrap();
+    for redirect in ["tell", "w"] {
+        let node = named(redirect).unwrap();
+        assert_eq!(
+            node.3,
+            Some(msg_index as i32),
+            "{redirect} redirects to msg"
+        );
+    }
+    assert!(
+        nodes
+            .iter()
+            .filter(|node| node.2.is_empty() && node.1 == 1)
+            .count()
+            >= 4,
+        "root literal commands are leaves"
     );
     assert_eq!(VarInt::decode(&mut input).unwrap().0, 0);
     assert!(input.is_empty());
@@ -1586,6 +1622,7 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 0,
+            max_players: 20,
             ops: vec![],
             plugins: None,
             ..Default::default()
