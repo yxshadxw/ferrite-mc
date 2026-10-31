@@ -203,6 +203,14 @@ impl MultiNoiseBiomeSource {
 
     /// Selects using vanilla's R-tree ordering and last-result hint.
     pub fn find_biome_vanilla(&self, target: ClimateTargetPoint) -> &ResourceId {
+        &self.entries[self.find_biome_vanilla_index(target)].biome
+    }
+
+    /// The parameter-list index [`Self::find_biome_vanilla`] selects.
+    ///
+    /// Callers that memoize selections per climate cell keep the index instead of cloning
+    /// the id for every query.
+    pub fn find_biome_vanilla_index(&self, target: ClimateTargetPoint) -> usize {
         fn search(
             node: &Node,
             target: &[i64; 6],
@@ -238,6 +246,11 @@ impl MultiNoiseBiomeSource {
         )
         .expect("nonempty tree");
         self.vanilla_hint.set(Some(index));
+        index
+    }
+
+    /// The biome at a parameter-list index (duplicates included).
+    pub fn biome_by_index(&self, index: usize) -> &ResourceId {
         &self.entries[index].biome
     }
 

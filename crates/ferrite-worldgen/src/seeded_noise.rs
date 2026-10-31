@@ -19,6 +19,14 @@ impl SeededNoise {
     pub(crate) fn named_random(&self, name: &str) -> Box<dyn RandomSource> {
         self.factory.from_hash_of(name)
     }
+    /// The positional factory for a named random, for callers that sample many positions
+    /// with one name (surface rules ask for the same random once per block).
+    pub(crate) fn positional_factory(&self, name: &ResourceId) -> Box<dyn PositionalRandomFactory> {
+        self.factory
+            .from_hash_of(&name.to_string())
+            .fork_positional()
+    }
+
     pub(crate) fn positional_random(
         &self,
         name: Option<&str>,

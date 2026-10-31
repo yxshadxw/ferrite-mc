@@ -4,13 +4,10 @@ use crate::{
     MaterialRuleNode, MultiNoiseBiomeSource, MultiNoiseError, NoiseChunkGenerator, NoiseRouter,
     ResolveError, ResourceId, SurfaceType, VerticalAnchor, WorldgenData,
 };
-use ferrite_noise::{LegacyRandomSource, RandomSource, SimplexNoise};
+use ferrite_noise::{LegacyRandomSource, PositionalRandomFactory, RandomSource, SimplexNoise};
 use ferrite_world::{BlockStateRegistry, Chunk, ChunkError, HeightmapKind};
 use sha2::{Digest, Sha256};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-};
+use std::{cell::RefCell, collections::HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,15 +36,158 @@ pub enum SurfaceError {
 pub struct SurfaceGenerator<'a> {
     data: &'a WorldgenData,
     noise: &'a NoiseChunkGenerator,
-    root: &'a MaterialRule,
+    /// The material rule tree with every named reference inlined once at construction:
+    /// evaluating a block must not look a rule or condition up by id again.
+    root: MaterialRule,
     router: NoiseRouter,
     biomes: MultiNoiseBiomeSource,
     biome_seed: i64,
-    biome_cache: RefCell<HashMap<(i32, i32, i32), ResourceId>>,
-    resolved: RefCell<BTreeMap<ResourceId, DensityFunction>>,
+    biome_cache: RefCell<BiomeCache>,
     bands: Vec<ResourceId>,
     frozen_temperature: [SimplexNoise; 3],
     biome_info: SimplexNoise,
+    surface_noise: ResourceId,
+    secondary_noise: ResourceId,
+    clay_bands_offset: ResourceId,
+    /// Positional factories by `random_name`, for `vertical_gradient` (one per surface
+    /// column in vanilla; forking one for every block was measurable).
+    positional_factories: RefCell<Vec<(usize, Box<dyn PositionalRandomFactory>)>>,
+}
+
+/// Dense memo of biome selections for the chunk currently being processed.
+///
+/// Surface rules ask for the biome of nearly every block, always at a 4-block quart cell.
+/// A flat array of parameter-list indices replaces a hash map plus an id clone per query.
+/// Positions outside the chunk (`/locate biome`, feature placement at chunk borders) fall
+/// back to a direct lookup.
+struct BiomeCache {
+    origin: [i32; 3],
+    dims: [i32; 3],
+    entries: Vec<i32>,
+}
+
+impl BiomeCache {
+    fn empty() -> Self {
+        Self {
+            origin: [0; 3],
+            dims: [0; 3],
+            entries: Vec::new(),
+        }
+    }
+
+    /// Covers every quart cell a block of this chunk can select, plus one cell of margin.
+    fn reset(&mut self, chunk_x: i32, chunk_z: i32, min_y: i32, height: i32) {
+        self.origin = [chunk_x * 4 - 1, min_y.div_euclid(4) - 1, chunk_z * 4 - 1];
+        self.dims = [6, height / 4 + 2, 6];
+        let len = (self.dims[0] * self.dims[1] * self.dims[2]) as usize;
+        self.entries.clear();
+        self.entries.resize(len, -1);
+    }
+
+    fn slot(&self, quart: (i32, i32, i32)) -> Option<usize> {
+        let x = quart.0 - self.origin[0];
+        let y = quart.1 - self.origin[1];
+        let z = quart.2 - self.origin[2];
+        if x < 0 || y < 0 || z < 0 || x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
+            return None;
+        }
+        Some((x + self.dims[0] * (y + self.dims[1] * z)) as usize)
+    }
+
+    fn get(&self, slot: usize) -> Option<usize> {
+        let value = self.entries[slot];
+        (value >= 0).then_some(value as usize)
+    }
+
+    fn set(&mut self, slot: usize, index: usize) {
+        self.entries[slot] = index as i32;
+    }
+}
+
+/// Inlines every named rule and condition reference so evaluating a block never looks one
+/// up by id. The vanilla overworld tree is a chain of named sequences and conditions, so
+/// this showed up once per block per reference in the surface pass.
+fn flatten_rule(
+    data: &WorldgenData,
+    rule: &MaterialRule,
+    depth: usize,
+) -> Result<MaterialRule, SurfaceError> {
+    if depth > 128 {
+        return Err(SurfaceError::Recursion);
+    }
+    Ok(match rule {
+        MaterialRule::Reference(id) => {
+            let target = data
+                .material_rules
+                .get(id)
+                .ok_or_else(|| SurfaceError::MissingRule(id.clone()))?;
+            flatten_rule(data, target, depth + 1)?
+        }
+        MaterialRule::Node(MaterialRuleNode::Sequence { sequence }) => {
+            MaterialRule::Node(MaterialRuleNode::Sequence {
+                sequence: sequence
+                    .iter()
+                    .map(|entry| flatten_rule(data, entry, depth + 1))
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        MaterialRule::Node(MaterialRuleNode::Condition { if_true, then_run }) => {
+            MaterialRule::Node(MaterialRuleNode::Condition {
+                if_true: flatten_condition(data, if_true, depth + 1)?,
+                then_run: Box::new(flatten_rule(data, then_run, depth + 1)?),
+            })
+        }
+        MaterialRule::Node(MaterialRuleNode::OreVein {
+            density,
+            filler_block,
+            filler_gap,
+            ore_block,
+            raw_ore_block,
+            raw_ore_chance,
+            richness,
+        }) => MaterialRule::Node(MaterialRuleNode::OreVein {
+            density: Box::new(density.resolve_references(data)?),
+            filler_block: filler_block.clone(),
+            filler_gap: Box::new(filler_gap.resolve_references(data)?),
+            ore_block: ore_block.clone(),
+            raw_ore_block: raw_ore_block.clone(),
+            raw_ore_chance: *raw_ore_chance,
+            richness: Box::new(richness.resolve_references(data)?),
+        }),
+        MaterialRule::Node(MaterialRuleNode::Block { result_state }) => {
+            MaterialRule::Node(MaterialRuleNode::Block {
+                result_state: result_state.clone(),
+            })
+        }
+        MaterialRule::Node(MaterialRuleNode::Bandlands) => {
+            MaterialRule::Node(MaterialRuleNode::Bandlands)
+        }
+    })
+}
+
+fn flatten_condition(
+    data: &WorldgenData,
+    condition: &MaterialCondition,
+    depth: usize,
+) -> Result<MaterialCondition, SurfaceError> {
+    if depth > 128 {
+        return Err(SurfaceError::Recursion);
+    }
+    Ok(match condition {
+        MaterialCondition::Reference(id) => {
+            let target = data
+                .material_conditions
+                .get(id)
+                .ok_or_else(|| SurfaceError::MissingCondition(id.clone()))?;
+            flatten_condition(data, target, depth + 1)?
+        }
+        MaterialCondition::Node(MaterialConditionNode::Not { invert }) => {
+            MaterialCondition::Node(MaterialConditionNode::Not {
+                invert: Box::new(flatten_condition(data, invert, depth + 1)?),
+            })
+        }
+        MaterialCondition::Node(node) => MaterialCondition::Node(node.clone()),
+    })
 }
 
 struct Point {
@@ -101,14 +241,32 @@ impl<'a> SurfaceGenerator<'a> {
             biome_info,
             data,
             noise,
-            root,
+            root: flatten_rule(data, root, 0)?,
             router: settings.noise_router.resolve_references(data)?,
             biomes: MultiNoiseBiomeSource::from_worldgen(data, "minecraft:overworld")?,
             biome_seed,
-            biome_cache: RefCell::new(HashMap::new()),
-            resolved: RefCell::new(BTreeMap::new()),
+            biome_cache: RefCell::new(BiomeCache::empty()),
             bands,
+            surface_noise: ResourceId::parse("surface").expect("known id"),
+            secondary_noise: ResourceId::parse("surface_secondary").expect("known id"),
+            clay_bands_offset: ResourceId::parse("clay_bands_offset").expect("known id"),
+            positional_factories: RefCell::new(Vec::new()),
         })
+    }
+
+    /// The positional random for `name`, forked once and reused.
+    fn positional_float(&self, name: &ResourceId, x: i32, y: i32, z: i32) -> f32 {
+        let key = name as *const ResourceId as usize;
+        {
+            let factories = self.positional_factories.borrow();
+            if let Some((_, factory)) = factories.iter().find(|(cached, _)| *cached == key) {
+                return factory.at(x, y, z).next_float();
+            }
+        }
+        let factory = self.noise.noise.positional_factory(name);
+        let value = factory.at(x, y, z).next_float();
+        self.positional_factories.borrow_mut().push((key, factory));
+        value
     }
     fn make_bands(random: &mut dyn RandomSource) -> Vec<ResourceId> {
         let id = |name: &str| ResourceId::parse(name).expect("known id");
@@ -169,7 +327,7 @@ impl<'a> SurfaceGenerator<'a> {
         self.noise.noise.at(0, 0, 0).sample_noise(&id, x, 0.0, z)
     }
     // Biome.TemperatureModifier.FROZEN, queried at sea level by MaterialSystem.
-    fn iceberg_melts(&self, biome: &str, x: i32, z: i32) -> bool {
+    fn iceberg_melts(&self, biome: &ResourceId, x: i32, z: i32) -> bool {
         let x = f64::from(x);
         let z = f64::from(z);
         let mut frozen = 0.0_f32;
@@ -183,7 +341,7 @@ impl<'a> SurfaceGenerator<'a> {
         let modified =
             f64::from(frozen * 7.0) + f64::from(self.biome_info.get_2d(x * 0.2, z * 0.2)) < 0.3
                 && f64::from(self.biome_info.get_2d(x * 0.09, z * 0.09)) < 0.8;
-        modified || biome == "minecraft:deep_frozen_ocean"
+        modified || (biome.namespace() == "minecraft" && biome.path() == "deep_frozen_ocean")
     }
     fn badlands_extension(
         &self,
@@ -240,7 +398,7 @@ impl<'a> SurfaceGenerator<'a> {
         &self,
         chunk: &mut Chunk,
         registry: &impl BlockStateRegistry,
-        biome: &str,
+        biome: &ResourceId,
         column: (u8, u8, i32, i32),
         bounds: (i32, i32),
     ) -> Result<(), SurfaceError> {
@@ -311,45 +469,41 @@ impl<'a> SurfaceGenerator<'a> {
         Ok(())
     }
     fn density(&self, function: &DensityFunction, p: &Point) -> Result<f32, SurfaceError> {
-        let ctx = self.noise.noise.at(p.x, p.y, p.z);
-        match function {
-            DensityFunction::Reference(id) => {
-                if !self.resolved.borrow().contains_key(id) {
-                    let resolved = function.resolve_references(self.data)?;
-                    self.resolved.borrow_mut().insert(id.clone(), resolved);
-                }
-                Ok(self
-                    .resolved
-                    .borrow()
-                    .get(id)
-                    .expect("resolved density")
-                    .compute(&ctx) as f32)
-            }
-            _ if function.reference_count() == 0 => Ok(function.compute(&ctx) as f32),
-            _ => Ok(function.resolve_references(self.data)?.compute(&ctx) as f32),
-        }
+        Ok(function.compute(&self.noise.noise.at(p.x, p.y, p.z)) as f32)
     }
-    /// Returns the biome selected for a block position by the overworld biome source.
-    pub fn biome_at(&self, x: i32, y: i32, z: i32) -> ResourceId {
+    /// The parameter-list index of the biome selected for a block position.
+    fn biome_index_at(&self, x: i32, y: i32, z: i32) -> usize {
         let key = self.biome_quart_at(x, y, z);
-        if let Some(value) = self.biome_cache.borrow().get(&key) {
-            return value.clone();
+        let slot = self.biome_cache.borrow().slot(key);
+        if let Some(slot) = slot
+            && let Some(index) = self.biome_cache.borrow().get(slot)
+        {
+            return index;
         }
         let ctx = self.noise.noise.at(key.0 * 4, key.1 * 4, key.2 * 4);
         let sample = |df: &DensityFunction| df.compute(&ctx) as f32;
-        let biome = self
+        let index = self
             .biomes
-            .find_biome_vanilla(crate::ClimateTargetPoint::quantized(
+            .find_biome_vanilla_index(crate::ClimateTargetPoint::quantized(
                 sample(&self.router.temperature),
                 sample(&self.router.vegetation),
                 sample(&self.router.continents),
                 sample(&self.router.erosion),
                 sample(&self.router.depth),
                 sample(&self.router.ridges),
-            ))
-            .clone();
-        self.biome_cache.borrow_mut().insert(key, biome.clone());
-        biome
+            ));
+        if let Some(slot) = slot {
+            self.biome_cache.borrow_mut().set(slot, index);
+        }
+        index
+    }
+    /// The biome selected for a block position, borrowed from the parameter list.
+    fn biome_ref_at(&self, x: i32, y: i32, z: i32) -> &ResourceId {
+        self.biomes.biome_by_index(self.biome_index_at(x, y, z))
+    }
+    /// Returns the biome selected for a block position by the overworld biome source.
+    pub fn biome_at(&self, x: i32, y: i32, z: i32) -> ResourceId {
+        self.biome_ref_at(x, y, z).clone()
     }
     #[doc(hidden)]
     pub fn biome_quart_at(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
@@ -415,9 +569,9 @@ impl<'a> SurfaceGenerator<'a> {
             )?,
             MaterialCondition::Node(node) => match node {
                 MaterialConditionNode::AbovePreliminarySurface => p.y >= p.min_surface,
-                MaterialConditionNode::Biome { biome_is } => {
-                    biome_is.as_slice().contains(&self.biome_at(p.x, p.y, p.z))
-                }
+                MaterialConditionNode::Biome { biome_is } => biome_is
+                    .as_slice()
+                    .contains(self.biome_ref_at(p.x, p.y, p.z)),
                 MaterialConditionNode::Hole => p.surface_depth <= 0,
                 MaterialConditionNode::NoiseThreshold {
                     noise,
@@ -448,13 +602,7 @@ impl<'a> SurfaceGenerator<'a> {
                         false
                     } else {
                         let probability = 1.0 - f64::from(p.y - bottom) / f64::from(top - bottom);
-                        let mut r = self.noise.noise.positional_random(
-                            Some(&random_name.to_string()),
-                            p.x,
-                            p.y,
-                            p.z,
-                        );
-                        f64::from(r.next_float()) < probability
+                        f64::from(self.positional_float(random_name, p.x, p.y, p.z)) < probability
                     }
                 }
                 MaterialConditionNode::YAbove {
@@ -500,12 +648,12 @@ impl<'a> SurfaceGenerator<'a> {
             },
         })
     }
-    fn rule(
-        &self,
-        rule: &MaterialRule,
+    fn rule<'r>(
+        &'r self,
+        rule: &'r MaterialRule,
         p: &Point,
         nesting: usize,
-    ) -> Result<Option<ResourceId>, SurfaceError> {
+    ) -> Result<Option<&'r ResourceId>, SurfaceError> {
         if nesting > 128 {
             return Err(SurfaceError::Recursion);
         }
@@ -519,7 +667,7 @@ impl<'a> SurfaceGenerator<'a> {
                 nesting + 1,
             ),
             MaterialRule::Node(node) => match node {
-                MaterialRuleNode::Block { result_state } => Ok(Some(result_state.clone())),
+                MaterialRuleNode::Block { result_state } => Ok(Some(result_state)),
                 MaterialRuleNode::Sequence { sequence } => {
                     for entry in sequence {
                         if let Some(result) = self.rule(entry, p, nesting + 1)? {
@@ -536,12 +684,10 @@ impl<'a> SurfaceGenerator<'a> {
                     }
                 }
                 MaterialRuleNode::Bandlands => {
-                    let id = ResourceId::parse("clay_bands_offset").expect("known id");
                     let offset =
-                        (self.noise_value(&id, p.x, 0, p.z) as f32 * 4.0 + 0.5).floor() as i32;
-                    Ok(Some(
-                        self.bands[(p.y + offset).rem_euclid(192) as usize].clone(),
-                    ))
+                        (self.noise_value(&self.clay_bands_offset, p.x, 0, p.z) as f32 * 4.0 + 0.5)
+                            .floor() as i32;
+                    Ok(Some(&self.bands[(p.y + offset).rem_euclid(192) as usize]))
                 }
                 MaterialRuleNode::OreVein {
                     density,
@@ -565,16 +711,13 @@ impl<'a> SurfaceGenerator<'a> {
                     }
                     let richness = self.density(richness, p)?;
                     if random.next_float() < richness && self.density(filler_gap, p)? < 0.0 {
-                        Ok(Some(
-                            if random.next_float() < *raw_ore_chance {
-                                raw_ore_block
-                            } else {
-                                ore_block
-                            }
-                            .clone(),
-                        ))
+                        Ok(Some(if random.next_float() < *raw_ore_chance {
+                            raw_ore_block
+                        } else {
+                            ore_block
+                        }))
                     } else {
-                        Ok(Some(filler_block.clone()))
+                        Ok(Some(filler_block))
                     }
                 }
             },
@@ -598,9 +741,10 @@ impl<'a> SurfaceGenerator<'a> {
             .ok_or(SurfaceError::Coordinates)?;
         let min_y = chunk.min_y();
         let max_y = min_y + chunk.height_blocks() as i32 - 1;
-        let surface = ResourceId::parse("surface").expect("known id");
-        let secondary = ResourceId::parse("surface_secondary").expect("known id");
-        let mut states = BTreeMap::<ResourceId, u32>::new();
+        self.biome_cache
+            .borrow_mut()
+            .reset(chunk_x, chunk_z, min_y, chunk.height_blocks() as i32);
+        let mut states = HashMap::<&ResourceId, u32>::new();
         for x in 0_u8..16 {
             for z in 0_u8..16 {
                 let wx = x0 + i32::from(x);
@@ -611,8 +755,11 @@ impl<'a> SurfaceGenerator<'a> {
                             .height(HeightmapKind::WorldSurfaceWg, x, z)
                             .expect("column"),
                     );
-                let surface_biome = self.biome_at(wx, starting_height, wz).to_string();
-                if surface_biome == "minecraft:eroded_badlands" {
+                let surface_biome = self.biome_ref_at(wx, starting_height, wz);
+                let minecraft_biome = |name: &str| {
+                    surface_biome.namespace() == "minecraft" && surface_biome.path() == name
+                };
+                if minecraft_biome("eroded_badlands") {
                     self.badlands_extension(chunk, registry, (x, z, wx, wz), starting_height)?;
                 }
                 let height = |xx, zz| {
@@ -627,10 +774,10 @@ impl<'a> SurfaceGenerator<'a> {
                 let start = min_y + height(x, z);
 
                 let mut random = self.noise.noise.positional_random(None, wx, 0, wz);
-                let surface_depth = (self.noise_value(&surface, wx, 0, wz) * 2.75
+                let surface_depth = (self.noise_value(&self.surface_noise, wx, 0, wz) * 2.75
                     + 3.0
                     + random.next_double() * 0.25) as i32;
-                let secondary = self.noise_value(&secondary, wx, 0, wz);
+                let secondary = self.noise_value(&self.secondary_noise, wx, 0, wz);
                 let min_surface = self
                     .router
                     .chunk_surface_level
@@ -683,8 +830,8 @@ impl<'a> SurfaceGenerator<'a> {
                         gradient_x,
                         gradient_z,
                     };
-                    if let Some(id) = self.rule(self.root, &point, 0)? {
-                        let block = if let Some(value) = states.get(&id) {
+                    if let Some(id) = self.rule(&self.root, &point, 0)? {
+                        let block = if let Some(value) = states.get(id) {
                             *value
                         } else {
                             let value = registry
@@ -698,13 +845,11 @@ impl<'a> SurfaceGenerator<'a> {
                         }
                     }
                 }
-                if surface_biome == "minecraft:frozen_ocean"
-                    || surface_biome == "minecraft:deep_frozen_ocean"
-                {
+                if minecraft_biome("frozen_ocean") || minecraft_biome("deep_frozen_ocean") {
                     self.frozen_extension(
                         chunk,
                         registry,
-                        &surface_biome,
+                        surface_biome,
                         (x, z, wx, wz),
                         (start, min_surface),
                     )?;
