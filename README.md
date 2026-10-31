@@ -5,11 +5,13 @@
 > Bukkit/Spigot/Paper/Folia plugins, with multiple Minecraft versions supported later.
 > Target: Minecraft Java 26.3, protocol 777. Current status: **playable survival basics on
 > bot-verified worlds** — login/encryption, signed chat, server-list ping (players, favicon),
-> block break/place with drops, inventory/crafting/chests, item entities, random ticks, fluids,
-> ~60 vanilla commands, plugin events, a Folia-style regionizer and Starlight-style lighting
-> (0 mismatches vs vanilla). World generation (density functions, noise chunks, aquifers,
-> surface rules) matches the vanilla Java reference on the fixture world; carvers, features and
-> structures are still in progress. **Honest caveat: it has been verified with protocol-level
+> block break/place with drops, inventory/crafting/chests, item entities, survival (health,
+> hunger, death, XP), redstone, falling blocks and explosions, passive mobs, random ticks, fluids,
+> ~70 vanilla commands (including execute and data), plugin events, multi-version client
+> translation, a Folia-style regionizer and Starlight-style lighting (0 mismatches vs vanilla).
+> World generation (density functions, noise chunks, aquifers, surface rules, carvers) matches
+> the vanilla Java reference on the fixture world; terrain features and structures are still in
+> progress. **Honest caveat: it has been verified with protocol-level
 > bots and Java differential harnesses, not yet with a real 26.3 client.**
 > Build with Rust stable + Java 25, generate vanilla data with `python tools/fetch_vanilla.py`,
 > then `cargo test --workspace`. No Mojang code or assets are distributed here; see the legal
@@ -41,24 +43,38 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   랜덤 틱(잔디 번짐·나뭇잎 소멸), 유체(물/용암)
 - **게임플레이** — 블록 캐기/설치와 드롭, 아이템 엔티티와 줍기, 인벤토리 클릭, 2x2/작업대
   크래프팅, 상자·통 메뉴, 게임룰 59종과 저장
-- **명령(약 60개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
+- **생존** — 체력·피해(낙하/익사/용암/불/공허), 허기와 포화도, 음식 먹기, 사망·리스폰
+  (`keepInventory` 반영), 경험치 오브와 사망 시 경험치 드롭
+- **블록 변화** — 이웃 업데이트와 `canSurvive` 규칙, 낙하 블록(모래·자갈·콘크리트 가루·모루),
+  바닐라 폭발 알고리즘(TNT, 크리퍼 위력 상수)
+- **레드스톤** — 와이어 신호 감쇠, 레버·버튼·압력판·횃불(번아웃)·관찰자·반복기·비교기,
+  램프·문·트랩도어·펜스 게이트·노트 블록 반응
+- **몹 (진행 중)** — 몹 프레임워크(체력·피해·넉백·전리품·디스폰), 수동 몹(돼지·소·양·닭)의
+  배회/주시 목표와 자연 스폰, `/summon`
+- **명령(약 70개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
   `give`, `clear`, `xp`, `effect`, `enchant`, `title`, `scoreboard`, `bossbar`, `team`,
-  `worldborder`, `setblock`, `fill`, `clone`, `op`, `ban`, `whitelist`, `stop` 등.
+  `worldborder`, `setblock`, `fill`, `clone`, `execute`(as/at/if/unless/store/run 등),
+  `data`(get/merge/modify/remove), `op`, `ban`, `whitelist`, `stop` 등.
   선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능합니다.
 - **플러그인** — `plugin.yml`/`paper-plugin.yml` 로딩, 내장 JVM(Java 25) 위에서 플러그인
   `onEnable` 실행, 플레이어 이동·상호작용·블록 파괴/설치·명령 이벤트(취소 가능),
   오류 정책 `plugins.on-event-error = allow | deny`
 - **관리** — `/tps`, `/mspt`, `/profile`
-- **월드젠 (진행 중)** — 밀도 함수, 노이즈 청크, aquifer, 표면 규칙이 바닐라 Java 참조
-  구현과 일치하는 것을 확인했습니다. 동굴, 지형 지물(광물·나무), 구조물은 진행 중입니다.
+- **월드젠 (진행 중)** — 밀도 함수, 노이즈 청크, aquifer, 표면 규칙, 동굴·협곡 카버가
+  바닐라 Java 참조 구현과 일치하는 것을 확인했습니다. 서버는 전용 생성 스레드에서 바닐라
+  지형을 생성합니다(`generator = vanilla | superflat`). 청크 생성 처리량 개선, 지형 지물
+  (광물·나무), 구조물은 진행 중입니다.
+- **다중 버전** — `ferrite-translate`가 연결 단위로 구버전 클라이언트 패킷을 변환합니다
+  (`supported-versions = all | native`, 네이티브 클라이언트 경로는 할당 없음).
 
 아직 아닌 것(솔직하게):
 
 - **실제 클라이언트로 접속 테스트를 하지 않았습니다.**
-- 몹 AI·전투·생존 메커니즘(체력/허기)과 레드스톤은 개발 브랜치에서 진행 중입니다.
+- 적대 몹 AI·전투, 상태 효과·포션, 화재, 피스톤은 개발 중이거나 아직 없습니다.
 - 플러그인 API는 Paper `Server` 기준 일부만 구현되어 있고, EssentialsX 같은 대형 플러그인용
   CraftBukkit 호환 계층은 아직 없습니다.
-- 다중 버전 지원, 바닐라와 동일한 구조물 생성은 아직입니다.
+- 바닐라와 동일한 구조물 생성은 아직입니다. 다중 버전 변환은 26.2 클라이언트 등 일부
+  버전만 확인되어 있습니다.
 
 설정 키와 실행 방법은 [`docs/CONFIG.md`](docs/CONFIG.md)에 정리되어 있습니다. 진행
 상황은 아래 로드맵 기준으로만 판단해 주세요.
@@ -73,7 +89,7 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 | 4 | 플러그인 브리지 v1 — 내장 JVM에서 Bukkit 이벤트/커맨드 실행 | 진행 중 |
 | 5 | 게임플레이 — 인벤토리, 엔티티, 전투, 크래프팅 등 | 진행 중 |
 | 6 | 바닐라 동일 월드 생성 — 지형/구조물/시드 호환 | 진행 중 |
-| 7 | 다중 버전 지원 — 하나의 바이너리로 여러 프로토콜 버전 | 개발 브랜치 |
+| 7 | 다중 버전 지원 — 하나의 바이너리로 여러 프로토콜 버전 | 진행 중 |
 | 8 | Paper 기능 동등성 — Paper API/설정/최적화 정렬 | 예정 |
 | 9 | 호환성 확장 — 플러그인 생태계 커버리지 확대 | 예정 |
 
@@ -87,7 +103,8 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 | `ferrite-world` | 청크, 팔레트 컨테이너, Anvil IO |
 | `ferrite-light` | Starlight 스타일 라이팅 엔진 |
 | `ferrite-worldgen`, `ferrite-noise` | 밀도 함수, 노이즈, 청크 생성, 표면 규칙 |
-| `ferrite-entity`, `ferrite-fluid` | 리전 로컬 엔티티 저장소, 유체 |
+| `ferrite-entity`, `ferrite-fluid` | 리전 로컬 엔티티 저장소와 몹, 유체 |
+| `ferrite-translate` | 다중 버전 프로토콜 변환 계층 |
 | `ferrite-inventory`, `ferrite-item`, `ferrite-recipe`, `ferrite-loot` | 인벤토리 메뉴, 아이템, 레시피, 전리품 |
 | `ferrite-command`, `ferrite-admin` | 브리가디어식 명령 디스패처, 게임룰, 권한/관리 |
 | `ferrite-plugin`, `ferrite-plugin-meta`, `ferrite-jvm` | 플러그인 로딩, `plugin.yml`, 내장 JVM |
