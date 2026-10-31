@@ -19,6 +19,10 @@ pub enum ServerboundPlay {
     CreativeSlot(CreativeSlot<ferrite_item::ItemStack>),
     ContainerClick(ContainerClick<ferrite_item::HashedSlot>),
     ContainerClose(i32),
+    /// Vanilla `ServerboundContainerButtonClickPacket` (enchant choice, stonecutter recipe).
+    ContainerButtonClick(ContainerButtonClick),
+    /// Vanilla `ServerboundRenameItemPacket` (anvil).
+    RenameItem(RenameItem),
     Position(MovePosition),
     PositionRotation(MovePositionRotation),
     Rotation(MoveRotation),
@@ -266,9 +270,13 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         18 => Some(ServerboundPlay::ContainerClick(ContainerClick::decode(
             &mut b,
         )?)),
+        17 => Some(ServerboundPlay::ContainerButtonClick(
+            ContainerButtonClick::decode(&mut b)?,
+        )),
         19 => Some(ServerboundPlay::ContainerClose(
             ServerboundContainerClose::decode(&mut b)?.window.0,
         )),
+        49 => Some(ServerboundPlay::RenameItem(RenameItem::decode(&mut b)?)),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
         42 => Some(ServerboundPlay::PlayerCommand(
             ServerboundPlayerCommand::decode(&mut b)?,

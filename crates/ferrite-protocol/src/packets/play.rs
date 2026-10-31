@@ -419,6 +419,13 @@ packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
 packet!(ClientboundContainerClose,17,Clientbound,{window:VarInt});
 packet!(SetHeldSlot,107,Clientbound,{slot:VarInt});
 packet!(OpenScreen,60,Clientbound,{window:VarInt,menu:VarInt,title:crate::types::Translatable});
+// Vanilla `ClientboundContainerSetDataPacket`: one menu property (furnace lit/progress, anvil
+// cost, enchanting costs and seed, stonecutter selection).
+packet!(ContainerSetData,19,Clientbound,{window:VarInt,id:i16,value:i16});
+// Vanilla `ServerboundContainerButtonClickPacket`: enchant choice, stonecutter recipe, ...
+packet!(ContainerButtonClick,17,Serverbound,{window:VarInt,button:VarInt});
+// Vanilla `ServerboundRenameItemPacket` (anvil): the name field is capped at 50 by the server.
+packet!(RenameItem,49,Serverbound,{name:String});
 
 /// Vanilla `ServerboundContainerClickPacket.MAX_SLOT_COUNT`.
 pub const CONTAINER_CLICK_MAX_SLOTS: usize = 128;
@@ -1130,6 +1137,18 @@ mod interaction_tests {
             window: VarInt(1),
             menu: VarInt(12),
             title: crate::types::Translatable("container.crafting".into()),
+        });
+        roundtrip(ContainerSetData {
+            window: VarInt(1),
+            id: 4,
+            value: 200,
+        });
+        roundtrip(ContainerButtonClick {
+            window: VarInt(1),
+            button: VarInt(7),
+        });
+        roundtrip(RenameItem {
+            name: "Excalibur".into(),
         });
         // More than 128 changed slots is rejected like vanilla.
         let mut bytes = Vec::new();
