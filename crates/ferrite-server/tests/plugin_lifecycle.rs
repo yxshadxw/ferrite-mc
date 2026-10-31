@@ -778,6 +778,10 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
     // Published before onEnable, so the fixture can target it with Paper's region scheduler.
     wait_for_line(&events, "region task false", &stdout, &stderr);
+    // The Bukkit scheduler runs immediate, delayed and asynchronous tasks.
+    wait_for_line(&events, "scheduler task", &stdout, &stderr);
+    wait_for_line(&events, "later task", &stdout, &stderr);
+    wait_for_line(&events, "async task", &stdout, &stderr);
     wait_for_line(&events, "task 1", &stdout, &stderr);
     wait_for_line(&events, "task 3", &stdout, &stderr);
     assert!(
