@@ -8,6 +8,8 @@
 //! - [`Metadata`]: synched entity data with dirty tracking.
 //! - [`item`]: item entities (vanilla physics against block shapes, merging, pickup into a
 //!   player inventory, despawning), with [`physics`] underneath.
+//! - [`experience`]: experience orbs (award split, merge scan, attraction to players, pickup).
+//! - [`effect`]: mob effects (instances, vanilla tick timings, attribute modifiers).
 //! - [`allocate_id`] / [`random_uuid`]: the process-wide network id counter (shared with
 //!   players) and entity UUIDs.
 //!
@@ -17,6 +19,8 @@
 //! owner through that region's task queue.
 
 pub mod ai;
+pub mod effect;
+pub mod experience;
 pub mod falling;
 mod id;
 mod index;
@@ -24,6 +28,7 @@ pub mod item;
 pub mod metadata;
 pub mod mob;
 pub mod physics;
+pub mod potion;
 mod rng;
 pub mod spawn;
 mod store;

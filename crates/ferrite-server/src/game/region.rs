@@ -8,8 +8,11 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, ai, item,
+    BlockGetter, EntityRecord, EntityStore, Rng, ai,
+    effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
+    experience, item,
     mob::{self, MobKind},
+    potion::PotionContents,
     spawn::{self, SpawnEnv},
     tracker::{self, Viewer, ViewerKey},
 };
@@ -47,6 +50,7 @@ pub enum Command {
         item: u16,
         count: i32,
         item_name: String,
+        components: Vec<(u16, ferrite_nbt::Tag)>,
         feedback: Option<OutboundSender>,
     },
     Experience {
@@ -59,6 +63,20 @@ pub enum Command {
     },
     /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
     Kill,
+    /// `/effect give`: apply a mob effect on the owning region thread.
+    ApplyEffect {
+        effect: i32,
+        amplifier: i32,
+        duration: i32,
+        /// The world loop already sent `update_mob_effect` in command order.
+        notify: bool,
+    },
+    /// `/effect clear`: remove one effect, or every effect when `effect` is `None`.
+    RemoveEffect {
+        effect: Option<i32>,
+        /// The world loop already sent `remove_mob_effect` in command order.
+        notify: bool,
+    },
     Enchant {
         target: Uuid,
         target_name: String,
@@ -221,6 +239,8 @@ pub struct Player {
     pub rate: f32,
     /// Vanilla `ServerPlayer` survival state: health, absorption, food, air, fire, fall.
     pub survival: Survival,
+    /// `LivingEntity.activeEffects`: the region owns the authoritative effect store.
+    pub effects: ActiveEffects,
     /// Dimension type id from `CommonPlayerSpawnInfo`, echoed in `respawn`.
     pub dimension_type: i32,
     pub seed: i64,
@@ -864,13 +884,18 @@ impl Player {
         &mut self,
         item: u16,
         count: i32,
+        components: &[(u16, ferrite_nbt::Tag)],
         item_name: &str,
         target_name: &str,
         feedback: Option<&OutboundSender>,
     ) {
-        let leftover = self
-            .inventory
-            .place_back(ferrite_item::ItemStack::with_count(item, count));
+        let mut stack = ferrite_item::ItemStack::with_count(item, count);
+        for (id, tag) in components {
+            stack
+                .components
+                .insert(*id, ferrite_item::Component::from_nbt(*id, tag));
+        }
+        let leftover = self.inventory.place_back(stack);
         let given = count - leftover.as_ref().map_or(0, |stack| stack.count);
         if let Some(leftover) = leftover {
             self.menus.thrown.push(leftover);
@@ -1019,6 +1044,14 @@ impl Player {
         if self.gamemode == 3 || (self.gamemode == 1 && kind.ignores_creative()) {
             return false;
         }
+        // `FireResistanceMobEffect`: immune to fire and lava, and the fire goes out.
+        if self.effects.fire_resistance() && matches!(kind, DamageKind::Lava | DamageKind::Fire) {
+            self.survival.fire_ticks = 0;
+            return false;
+        }
+        // `LivingEntity.getDamageAfterArmorAbsorb` includes the resistance attribute.
+        let reduction = self.effects.attributes().damage_reduction as f32;
+        let amount = (amount * (1.0 - reduction)).max(0.0);
         if !self.survival.damage(kind, amount) {
             return false;
         }
@@ -1026,11 +1059,153 @@ impl Player {
         self.survival.food.add_exhaustion(0.1);
         self.breaking = None;
         self.survival.eating = None;
+        // `Player.checkTotemDeathProtection`: the totem revives before `ServerPlayer.die`.
+        if self.survival.dead && self.try_totem() {
+            self.sync_health();
+            return true;
+        }
         // Vanilla `ServerPlayer.die` sends the combat-kill packet before the zero-health update,
         // so fatal damage is synced by the region's death processing instead.
         if !self.survival.dead {
             self.sync_health();
         }
+        true
+    }
+
+    /// Applies one effect instance and, when it is not instantaneous, sends
+    /// `ClientboundUpdateMobEffectPacket` (unless a stronger instance kept the slot).
+    fn apply_effect(&mut self, instance: MobEffectInstance) {
+        let kind = instance.kind();
+        let instant = kind.is_instant();
+        self.apply_effect_quiet(instance);
+        if !instant
+            && self
+                .effects
+                .get(kind)
+                .is_some_and(|current| *current == instance)
+        {
+            send(
+                self,
+                &UpdateMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(instance.effect),
+                    amplifier: VarInt(instance.amplifier),
+                    duration: VarInt(instance.duration),
+                    flags: instance.flags(),
+                },
+            );
+        }
+    }
+
+    /// Stores the effect without a packet (the world loop already announced it).
+    fn apply_effect_quiet(&mut self, instance: MobEffectInstance) {
+        let events = self.effects.add(instance);
+        self.apply_effect_events(events);
+        self.refresh_attributes();
+    }
+
+    /// `LivingEntity.tickEffects`: ticks the store and sends removals for expired effects.
+    fn tick_effects(&mut self) {
+        let ticks = self.effects.tick();
+        for expired in &ticks.expired {
+            send(
+                self,
+                &RemoveMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(expired.effect),
+                },
+            );
+        }
+        self.apply_effect_events(ticks.events);
+        self.refresh_attributes();
+    }
+
+    /// Milk and respawn: remove every effect, telling the client about each one.
+    fn clear_effects(&mut self) {
+        let (removed, events) = self.effects.clear();
+        for instance in removed {
+            send(
+                self,
+                &RemoveMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(instance.effect),
+                },
+            );
+        }
+        self.apply_effect_events(events);
+        self.refresh_attributes();
+    }
+
+    /// Applies the health, food and absorption side of the ticked effects.
+    fn apply_effect_events(&mut self, events: Vec<EffectEvent>) {
+        for event in events {
+            match event {
+                EffectEvent::Heal(amount) => {
+                    self.survival.heal(amount);
+                }
+                EffectEvent::Damage {
+                    amount,
+                    can_kill,
+                    wither,
+                } => {
+                    // `PoisonMobEffect` cannot take the last health point.
+                    let allowed = if can_kill {
+                        amount
+                    } else {
+                        (self.survival.health - 1.0).max(0.0).min(amount)
+                    };
+                    if allowed > 0.0 {
+                        self.hurt(
+                            if wither {
+                                DamageKind::Wither
+                            } else {
+                                DamageKind::Magic
+                            },
+                            allowed,
+                        );
+                    }
+                }
+                EffectEvent::Exhaustion(amount) => self.survival.food.add_exhaustion(amount),
+                EffectEvent::Food => {
+                    self.survival.food.food = (self.survival.food.food + 1).min(MAX_FOOD);
+                    self.survival.food.saturation =
+                        (self.survival.food.saturation + 1.0).min(self.survival.food.food as f32);
+                }
+                EffectEvent::Absorb(amount) => self.survival.absorption += amount,
+                EffectEvent::RemoveAbsorb(amount) => {
+                    self.survival.absorption = (self.survival.absorption - amount).max(0.0);
+                }
+            }
+        }
+    }
+
+    /// Feeds `Attributes.MAX_HEALTH` (health boost) into the survival state.
+    fn refresh_attributes(&mut self) {
+        let bonus = self.effects.attributes().max_health_bonus;
+        self.survival.set_max_health(MAX_HEALTH + bonus);
+    }
+
+    /// `Player.checkTotemDeathProtection`: consume a totem and revive with the vanilla buffs.
+    fn try_totem(&mut self) -> bool {
+        let Some(slot) = (0..ferrite_inventory::SIZE).find(|&slot| {
+            matches!(
+                self.inventory.get(slot).name(),
+                Some("minecraft:totem_of_undying")
+            )
+        }) else {
+            return false;
+        };
+        if !matches!(self.gamemode, 1 | 3) {
+            self.inventory.remove(slot, 1);
+        }
+        self.survival.health = 1.0;
+        self.survival.dead = false;
+        self.survival.death_cause = None;
+        self.survival.death_processed = false;
+        self.survival.absorption = 4.0;
+        self.apply_effect(MobEffectInstance::new(Effect::Regeneration.id(), 900, 1));
+        self.apply_effect(MobEffectInstance::new(Effect::Absorption.id(), 100, 1));
+        self.apply_effect(MobEffectInstance::new(Effect::FireResistance.id(), 800, 0));
         true
     }
 
@@ -1073,6 +1248,15 @@ impl Player {
         let eye_fluid = ferrite_fluid::fluid_state(u32::from(eye_state)).kind;
         let fire =
             super::survival::is_fire_block(feet_state) || super::survival::is_fire_block(eye_state);
+        let fire_resistance = self.effects.fire_resistance();
+        let water_breathing = self.effects.water_breathing();
+        let slow_falling = self.effects.slow_falling();
+        if fire_resistance {
+            self.survival.fire_ticks = 0;
+        }
+        if water_breathing {
+            self.survival.air = super::survival::MAX_AIR;
+        }
         let damage = self.survival.environment_tick(
             self.pos,
             self.ground,
@@ -1083,6 +1267,12 @@ impl Player {
             self.survival.sprinting,
         );
         for (kind, amount) in damage.into_iter().flatten() {
+            if (fire_resistance && matches!(kind, DamageKind::Lava | DamageKind::Fire))
+                || (water_breathing && kind == DamageKind::Drown)
+                || (slow_falling && kind == DamageKind::Fall)
+            {
+                continue;
+            }
             self.hurt(kind, amount);
         }
         if !self.survival.dead {
@@ -1099,6 +1289,7 @@ impl Player {
                 }
                 FoodTick::None => {}
             }
+            self.tick_effects();
             self.tick_eating();
         }
         if !self.survival.dead {
@@ -1121,6 +1312,29 @@ impl Player {
         }
         let slot = self.hand_slot(p.hand.0);
         let stack = self.inventory.get(slot).clone();
+        // Milk bucket: `MilkBucketItem.finishUsingItem` removes every effect and leaves a bucket.
+        if matches!(stack.name(), Some("minecraft:milk_bucket")) {
+            self.clear_effects();
+            if !matches!(self.gamemode, 1 | 3)
+                && let Some(bucket) = ferrite_item::ItemStack::from_name("bucket")
+            {
+                self.inventory.set(slot, bucket.clone());
+                send(
+                    self,
+                    &SetPlayerInventory {
+                        slot: VarInt(slot as i32),
+                        item: ItemStack {
+                            count: bucket.count,
+                            item_id: i32::from(bucket.item),
+                        },
+                    },
+                );
+            }
+            return;
+        }
+        if self.use_potion(slot) {
+            return;
+        }
         let Some(ferrite_item::Component::Food(food)) =
             stack.effective_component(ferrite_item::component_ids::FOOD)
         else {
@@ -1135,6 +1349,25 @@ impl Player {
         });
     }
 
+    /// `PotionItem.use`: potions have `minecraft:consumable`, not `minecraft:food`, so they
+    /// start the same use duration and finish through [`Player::tick_eating`].
+    fn use_potion(&mut self, slot: usize) -> bool {
+        let stack = self.inventory.get(slot);
+        if stack
+            .effective_component(ferrite_item::component_ids::POTION_CONTENTS)
+            .is_none()
+        {
+            return false;
+        }
+        if self.survival.eating.is_none() {
+            self.survival.eating = Some(Eating {
+                slot,
+                remaining: EAT_TICKS,
+            });
+        }
+        true
+    }
+
     /// `LivingEntity.updateUsingItem`/`ItemStack.finishUsingItem`: count the use ticks down,
     /// then apply the food component (`FoodData.eat`) and shrink the stack in survival.
     fn tick_eating(&mut self) {
@@ -1146,21 +1379,49 @@ impl Player {
             return;
         }
         let stack = self.inventory.get(eating.slot).clone();
-        let Some(ferrite_item::Component::Food(food)) =
-            stack.effective_component(ferrite_item::component_ids::FOOD)
-        else {
+        let food = match stack.effective_component(ferrite_item::component_ids::FOOD) {
+            Some(ferrite_item::Component::Food(food)) => Some(food),
+            _ => None,
+        };
+        let potion = match stack.effective_component(ferrite_item::component_ids::POTION_CONTENTS) {
+            Some(ferrite_item::Component::PotionContents(contents)) => {
+                Some(ferrite_entity::potion::effects_from_component(&contents))
+            }
+            Some(ferrite_item::Component::Opaque(tag)) => {
+                PotionContents::from_tag(&tag).map(|contents| contents.all_effects())
+            }
+            _ => None,
+        };
+        if food.is_none() && potion.is_none() {
             self.survival.eating = None;
             return;
-        };
+        }
         eating.remaining -= 1;
         if eating.remaining > 0 {
             self.survival.eating = Some(eating);
             return;
         }
-        self.survival.food.eat(food.nutrition, food.saturation);
+        if let Some(food) = food {
+            self.survival.food.eat(food.nutrition, food.saturation);
+        } else if let Some(effects) = potion {
+            // `PotionContents.applyToLivingEntity`: instant effects act immediately, the rest
+            // enter the normal effect store and tick down.
+            for instance in effects {
+                self.apply_effect(instance);
+            }
+        }
         // `Player.hasInfiniteMaterials`: creative does not use the item up.
         if !matches!(self.gamemode, 1 | 3) {
+            let remainder = stack.effective_component(ferrite_item::component_ids::USE_REMAINDER);
             self.inventory.remove(eating.slot, 1);
+            if self.inventory.get(eating.slot).is_empty()
+                && let Some(ferrite_item::Component::Opaque(ferrite_nbt::Tag::Compound(compound))) =
+                    remainder
+                && let Some(ferrite_nbt::Tag::String(name)) = compound.get("id")
+                && let Some(item) = ferrite_item::ItemStack::from_name(name)
+            {
+                self.inventory.set(eating.slot, item);
+            }
         }
         send(
             self,
@@ -1186,6 +1447,7 @@ impl Player {
         if let Some((loaded, _)) = self.tracking.lock().unwrap().get_mut(&self.uuid) {
             loaded.clear();
         }
+        self.clear_effects();
         self.survival = Survival::new();
         self.survival.last_pos = spawn;
         self.respawn_requested = false;
@@ -1358,10 +1620,18 @@ impl Player {
                     item,
                     count,
                     item_name,
+                    components,
                     feedback,
                 } => {
                     if target == self.uuid {
-                        self.give_items(item, count, &item_name, &target_name, feedback.as_ref());
+                        self.give_items(
+                            item,
+                            count,
+                            &components,
+                            &item_name,
+                            &target_name,
+                            feedback.as_ref(),
+                        );
                     }
                     continue;
                 }
@@ -1388,6 +1658,51 @@ impl Player {
                     // Vanilla `/kill` uses `damageSources().genericKill()`: it bypasses
                     // invulnerability and creative mode, but absorption still absorbs first.
                     self.hurt(DamageKind::GenericKill, f32::MAX);
+                    continue;
+                }
+                Command::ApplyEffect {
+                    effect,
+                    amplifier,
+                    duration,
+                    notify,
+                } => {
+                    let instance = MobEffectInstance::new(effect, duration, amplifier);
+                    if notify {
+                        self.apply_effect(instance);
+                    } else {
+                        self.apply_effect_quiet(instance);
+                    }
+                    continue;
+                }
+                Command::RemoveEffect { effect, notify } => {
+                    match effect {
+                        Some(effect) => {
+                            let kind = Effect::from_id(effect);
+                            if self.effects.has(kind) {
+                                let events = self.effects.remove(kind);
+                                if notify {
+                                    send(
+                                        self,
+                                        &RemoveMobEffect {
+                                            entity_id: VarInt(self.entity),
+                                            effect: VarInt(effect),
+                                        },
+                                    );
+                                }
+                                self.apply_effect_events(events);
+                                self.refresh_attributes();
+                            }
+                        }
+                        None => {
+                            if notify {
+                                self.clear_effects();
+                            } else {
+                                let (_, events) = self.effects.clear();
+                                self.apply_effect_events(events);
+                                self.refresh_attributes();
+                            }
+                        }
+                    }
                     continue;
                 }
                 Command::Enchant {
@@ -1967,6 +2282,37 @@ impl Region {
             .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
     }
 
+    /// Awards the experience orbs each player touches (`ExperienceOrb.playerTouch`) and syncs
+    /// the bar. The take animation packets go out after every player was processed.
+    fn pick_up_experience(&mut self, ctx: &TickContext) {
+        let mut sent = Vec::new();
+        for p in self.players.values_mut() {
+            if p.gamemode == 3 || p.survival.dead {
+                continue;
+            }
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let gained = experience::player_touch(
+                &mut self.entities,
+                p.entity,
+                feet,
+                &mut |viewer, bytes| sent.push((viewer, bytes.to_vec())),
+            );
+            if gained > 0 {
+                p.set_experience_total(i64::from(p.experience_total) + i64::from(gained));
+                send(
+                    p,
+                    &SetExperience {
+                        progress: p.experience_progress,
+                        level: VarInt(p.experience_level),
+                        total: VarInt(p.experience_total),
+                    },
+                );
+            }
+        }
+        for (viewer, bytes) in sent {
+            deliver(&self.players, ctx, viewer, &bytes);
+        }
+    }
     /// Spawns the TNT a player lit (vanilla `PrimedTnt` at the block position).
     fn spawn_primed_tnt(&mut self, p: &mut Player) {
         for (pos, fuse) in p.primed_tnt.drain(..) {
@@ -2190,10 +2536,15 @@ impl Region {
                 self.entities
                     .insert(item::pop_resource(pos, plain, &mut self.rng));
             }
-            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, then reset the bar.
-            // `ferrite-entity` has no experience-orb entity yet, so the points are lost rather
-            // than spawned as pickupable orbs.
+            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, split by
+            // `ExperienceOrb.award` and spawned where the player died.
             let dropped = p.experience_level.saturating_mul(7).min(100);
+            if dropped > 0 {
+                let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                for record in experience::award(feet, dropped) {
+                    self.entities.insert(record);
+                }
+            }
             p.experience_level = 0;
             p.experience_progress = 0.0;
             p.experience_total = 0;
@@ -2205,7 +2556,7 @@ impl Region {
                     total: VarInt(0),
                 },
             );
-            tracing::info!(player = %p.name, dropped, "player died; experience orbs are not modelled yet");
+            tracing::info!(player = %p.name, dropped, "player died; experience orbs dropped");
         }
         let kind = p.survival.death_cause.unwrap_or(DamageKind::GenericKill);
         let message = kind.death_message(&p.name);
@@ -2305,6 +2656,14 @@ impl Region {
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.tick_mobs(&blocks);
+        let alive: Vec<ferrite_math::Vec3> = self
+            .players
+            .values()
+            .filter(|p| p.gamemode != 3 && !p.survival.dead)
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        experience::tick_orbs(&mut self.entities, &blocks, &alive, &mut self.rng);
+        self.pick_up_experience(ctx);
         self.pick_up_items(ctx);
         self.tick_falling(ctx);
         self.tick_tnt(ctx);

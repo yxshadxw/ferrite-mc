@@ -3517,3 +3517,272 @@ async fn effect_and_title_commands_reach_the_client() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effect_command_expires_and_sends_remove() {
+    use ferrite_protocol::packets::play::{RemoveMobEffect, UpdateMobEffect};
+    let (world, addr, server) = op_world(None, 1, &["Runner"]).await;
+    let mut bot = Bot::join(addr, "Runner").await;
+    bot.until(46).await;
+    let speed = ferrite_data::registries::id("minecraft:mob_effect", "minecraft:speed").unwrap();
+    bot.raw(7, "effect give @s speed 1 1").await;
+    let body = bot.until(UpdateMobEffect::ID).await;
+    let effect = UpdateMobEffect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        (effect.effect.0, effect.amplifier.0, effect.duration.0),
+        (speed, 1, 20)
+    );
+    // ambient | show particles | show icon.
+    assert_eq!(effect.flags, 0b110);
+    // `MobEffectInstance.tick` expires it after twenty ticks and the region removes it.
+    let body = bot.until(RemoveMobEffect::ID).await;
+    assert_eq!(
+        RemoveMobEffect::decode(&mut body.as_slice())
+            .unwrap()
+            .effect
+            .0,
+        speed
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resistance_reduces_fall_damage_with_bot() {
+    use ferrite_protocol::packets::play::{MovePosition, SetHealth, UpdateMobEffect};
+    let spawn = [0, 65, 0];
+    let world = World::start_configured(
+        None,
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Tank"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Tank").await;
+    bot.raw(7, "effect give @s resistance 5 1").await;
+    bot.until(UpdateMobEffect::ID).await;
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 70.0,
+        z: 0.5,
+        flags: 0,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 64.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    // Fall damage 3, reduced by Resistance II (40%) to 1.8.
+    assert!(
+        (health.health - 18.2).abs() < 1e-3,
+        "resistance fall damage: {}",
+        health.health
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn milk_bucket_clears_effects_with_bot() {
+    use ferrite_protocol::packets::play::{
+        RemoveMobEffect, ServerboundUseItem, SetPlayerInventory, UpdateMobEffect,
+    };
+    let (world, addr, server) = op_world(None, 0, &["Milker"]).await;
+    let mut bot = Bot::join(addr, "Milker").await;
+    bot.until(46).await;
+    let speed = ferrite_data::registries::id("minecraft:mob_effect", "minecraft:speed").unwrap();
+    bot.raw(7, "effect give @s speed 10").await;
+    bot.until(UpdateMobEffect::ID).await;
+    world
+        .console_command("give Milker milk_bucket 1".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&ServerboundUseItem {
+        hand: VarInt(0),
+        sequence: VarInt(1),
+        yaw: 0.0,
+        pitch: 0.0,
+    })
+    .await;
+    let body = bot.until(RemoveMobEffect::ID).await;
+    assert_eq!(
+        RemoveMobEffect::decode(&mut body.as_slice())
+            .unwrap()
+            .effect
+            .0,
+        speed
+    );
+    // Drinking leaves an empty bucket in the used hotbar slot.
+    let body = bot
+        .until(SetPlayerInventory::<ferrite_protocol::packets::play::ItemStack>::ID)
+        .await;
+    let slot: SetPlayerInventory<ferrite_protocol::packets::play::ItemStack> =
+        SetPlayerInventory::decode(&mut body.as_slice()).unwrap();
+    let bucket = ferrite_data::registries::id("minecraft:item", "minecraft:bucket").unwrap();
+    assert_eq!((slot.slot.0, slot.item.item_id), (0, bucket));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn potion_drinking_applies_vanilla_effects_with_bot() {
+    use ferrite_protocol::packets::play::{
+        ServerboundUseItem, SetPlayerInventory, UpdateMobEffect,
+    };
+    let (world, addr, server) = op_world(None, 0, &["Drinker"]).await;
+    let mut bot = Bot::join(addr, "Drinker").await;
+    bot.until(46).await;
+    // `minecraft:potion_contents.potion` is the registry id of `Potions.SWIFTNESS`.
+    bot.raw(
+        7,
+        r#"give @s potion[potion_contents={potion:"minecraft:swiftness"}]"#,
+    )
+    .await;
+    bot.chat_containing("Gave 1 Potion").await;
+    bot.send(&ServerboundUseItem {
+        hand: VarInt(0),
+        sequence: VarInt(1),
+        yaw: 0.0,
+        pitch: 0.0,
+    })
+    .await;
+    // `PotionContents.applyToLivingEntity` adds speed for 180 s.
+    let body = bot.until(UpdateMobEffect::ID).await;
+    let effect = UpdateMobEffect::decode(&mut body.as_slice()).unwrap();
+    let speed = ferrite_data::registries::id("minecraft:mob_effect", "minecraft:speed").unwrap();
+    assert_eq!(
+        (
+            effect.effect.0,
+            effect.amplifier.0,
+            effect.duration.0,
+            effect.flags
+        ),
+        (speed, 0, 3600, 0b110)
+    );
+    // `ItemStack.finishUsingItem` leaves the `minecraft:use_remainder` glass bottle.
+    let body = bot
+        .until(SetPlayerInventory::<ferrite_item::ItemStack>::ID)
+        .await;
+    let slot: SetPlayerInventory<ferrite_item::ItemStack> =
+        SetPlayerInventory::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(slot.slot.0, 0);
+    assert_eq!(slot.item.name(), Some("minecraft:glass_bottle"));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn totem_of_undying_prevents_death_with_bot() {
+    use ferrite_protocol::packets::play::{SetHealth, UpdateMobEffect};
+    let (world, addr, server) = op_world(None, 0, &["Lucky"]).await;
+    let mut bot = Bot::join(addr, "Lucky").await;
+    bot.until(46).await;
+    world
+        .console_command("give Lucky totem_of_undying 1".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.raw(7, "kill @s").await;
+    // `Player.checkTotemDeathProtection` revives at one health and applies the three buffs;
+    // the death screen (`player_combat_kill`) must not open.
+    let body = bot.until(UpdateMobEffect::ID).await;
+    let effect = UpdateMobEffect::decode(&mut body.as_slice()).unwrap();
+    let regeneration =
+        ferrite_data::registries::id("minecraft:mob_effect", "minecraft:regeneration").unwrap();
+    assert_eq!((effect.effect.0, effect.amplifier.0), (regeneration, 1));
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.health, 1.0);
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_death_drops_experience_that_is_picked_up_after_respawn() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, Respawn, ServerboundClientCommand, SetExperience, SetHealth,
+    };
+    let spawn = [0, 65, 0];
+    let world = World::start_configured(
+        None,
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Soul"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Soul").await;
+    bot.raw(7, "xp set @s 2 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (2, 16));
+    world.console_command("kill Soul".into()).await.unwrap();
+    bot.until(PlayerCombatKill::ID).await;
+    let body = bot.until(SetHealth::ID).await;
+    assert_eq!(SetHealth::decode(&mut body.as_slice()).unwrap().health, 0.0);
+    bot.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    bot.until(Respawn::ID).await;
+    // `ServerPlayer.dropExperience` drops `min(level * 7, 100) = 14` points as two 7-value
+    // orbs at the death spot; respawn puts the player back there, so the next ticks award them.
+    // The orbs merge into one count-2 entity first (`ExperienceOrb.scanForMerges`), so vanilla
+    // awards 7 per `playerTouch` and the bar reaches 14 over two ticks.
+    let gained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let body = bot.until(SetExperience::ID).await;
+            let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+            if xp.total.0 >= 14 {
+                break xp;
+            }
+        }
+    })
+    .await
+    .expect("death experience orbs are picked up");
+    assert_eq!((gained.level.0, gained.total.0), (1, 14));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
