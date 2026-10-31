@@ -8,7 +8,7 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, ai,
+    BlockGetter, EntityRecord, EntityStore, Flags, Rng, ai,
     effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
     experience, item,
     mob::{self, MobKind},
@@ -146,6 +146,8 @@ pub struct TickContext {
     pub rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
     /// World spawn, where a player without a bed respawns (`ServerPlayer.respawn`).
     pub spawn: [f64; 3],
+    /// Command-visible entity snapshot this region publishes at the end of each tick.
+    pub command_entities: Arc<Mutex<super::entity_index::EntityIndex>>,
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
 pub(super) struct TickBlocks<'a> {
@@ -292,6 +294,8 @@ pub struct Region {
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
     rng: Rng,
+    /// UUIDs this region last published into `TickContext::command_entities`.
+    published_entities: HashSet<Uuid>,
 }
 impl RegionData for Region {
     fn merge(&mut self, mut other: Self) {
@@ -307,6 +311,7 @@ impl RegionData for Region {
         self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
+        self.published_entities.extend(other.published_entities);
         self.generator.merge(other.generator);
     }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
@@ -341,6 +346,7 @@ impl RegionData for Region {
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
+            published_entities: HashSet::new(),
         };
         let moving: Vec<_> = self
             .held_chunks
@@ -2882,6 +2888,59 @@ impl Region {
                 entity: Box::new(entity),
             });
         }
+        self.publish_command_entities(&ctx.command_entities);
+    }
+
+    /// Publishes this region's entities for command selectors. Folia keeps the store region
+    /// local; commands read the snapshot and route mutations back to this region.
+    fn publish_command_entities(&mut self, index: &Arc<Mutex<super::entity_index::EntityIndex>>) {
+        index
+            .lock()
+            .unwrap()
+            .sync(&mut self.published_entities, &self.entities);
+    }
+
+    /// Marks one entity for removal (`/kill`). The tracker still sends the remove packet and
+    /// the normal sweep drops it on this tick or the next.
+    pub fn kill_entity(&mut self, uuid: Uuid) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::REMOVED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
+    }
+
+    /// Moves one entity (`/tp`). When the destination left this region section, the normal
+    /// `take_crossing` pass hands it to the owning region by value on the next tick.
+    pub fn teleport_entity(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        self.entities
+            .set_pos(key, ferrite_math::Vec3::new(pos[0], pos[1], pos[2]));
+        if let Some(data) = self.entities.data_mut(key) {
+            data.yaw = yaw;
+            data.pitch = pitch;
+            data.head_yaw = yaw;
+        }
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::TELEPORTED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
     }
 }
 #[cfg(test)]
@@ -2916,6 +2975,7 @@ mod tests {
             raining: false,
             rules: Default::default(),
             spawn: [0.0, 65.0, 0.0],
+            command_entities: Default::default(),
         });
 
         let report = timings.report_all(50.0);

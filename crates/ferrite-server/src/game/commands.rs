@@ -57,6 +57,8 @@ pub struct PlayerEntry {
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// Experience level, matched by the `level=` selector option.
+    pub xp_level: i32,
 }
 
 /// A `/scoreboard objectives` entry.
@@ -162,6 +164,8 @@ pub struct GameState {
     pub storage: BTreeMap<String, Tag>,
     /// Datapack functions loaded from the world's `datapacks` folder.
     pub functions: Arc<super::functions::FunctionStore>,
+    /// Region-published entity snapshot used by entity selectors.
+    pub entities: Arc<Mutex<super::entity_index::EntityIndex>>,
 }
 
 impl GameState {
@@ -187,6 +191,7 @@ impl GameState {
             teams: BTreeMap::new(),
             storage: BTreeMap::new(),
             functions: Arc::new(super::functions::FunctionStore::default()),
+            entities: Arc::new(Mutex::new(super::entity_index::EntityIndex::default())),
         }
     }
 
@@ -203,6 +208,7 @@ impl GameState {
             pos: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            xp_level: 0,
         });
         self.max_players = max_players;
     }

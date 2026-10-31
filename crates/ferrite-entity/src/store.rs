@@ -24,7 +24,7 @@ use crate::metadata::Metadata;
 use crate::mob::MobState;
 use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
 /// Chunk shift of a region section, matching `ferrite_region::Regionizer::default()`.
@@ -92,6 +92,8 @@ pub struct EntityData {
     pub block_state: Option<u16>,
     /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
     pub fuse: Option<i32>,
+    /// Scoreboard tags (`/tag`), which entity selectors match with `tag=`.
+    pub tags: BTreeSet<String>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -119,6 +121,7 @@ impl EntityData {
             effects: ActiveEffects::default(),
             block_state: None,
             fuse: None,
+            tags: BTreeSet::new(),
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }
