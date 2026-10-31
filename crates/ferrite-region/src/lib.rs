@@ -748,31 +748,86 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
         s.topology.sections.get_mut(&section).unwrap().0 += 1;
         return;
     }
-    // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: a new
-    // section adjacent only to ticking regions receives a transient owner.
+    // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: attach new
+    // sections to a non-ticking region and defer merges into ticking regions.
     if matches!(mutation, Mutation::Add(_))
         && !s.topology.sections.contains_key(&section)
         && nearby(s, section).is_empty()
         && !affected.is_empty()
-        && affected.iter().all(|id| {
-            s.topology.regions[id].state == RegionState::Ticking
-                && s.topology.regions[id].mutations.is_empty()
-        })
+        && affected
+            .iter()
+            .any(|id| s.topology.regions[id].state != RegionState::Ready)
+        && affected
+            .iter()
+            .all(|id| s.topology.regions[id].mutations.is_empty())
     {
-        let id = s.topology.next_id;
-        s.topology.next_id += 1;
-        let mut region = Region::new(HashSet::from([section]), D::default());
-        region.state = RegionState::Transient;
-        region.merge_targets = affected.clone();
-        s.topology.regions.insert(id, region);
-        for &target in &affected {
+        let mut idle: Vec<_> = affected
+            .iter()
+            .copied()
+            .filter(|id| s.topology.regions[id].state != RegionState::Ticking)
+            .collect();
+        idle.sort_unstable();
+        let id = if let Some(id) = idle.first().copied() {
+            id
+        } else {
+            let id = s.topology.next_id;
+            s.topology.next_id += 1;
+            s.topology
+                .regions
+                .insert(id, Region::new(HashSet::new(), D::default()));
+            id
+        };
+        for source in idle.into_iter().filter(|source| *source != id) {
+            let mut old = s.topology.regions.remove(&source).unwrap();
+            for section in &old.sections {
+                s.topology.sections.get_mut(section).unwrap().1 = id;
+            }
+            for target in &old.merge_targets {
+                let ticking = s.topology.regions.get_mut(target).unwrap();
+                ticking.merge_from.remove(&source);
+                ticking.merge_from.insert(id);
+            }
+            let destination = s.topology.regions.get_mut(&id).unwrap();
+            destination.sections.extend(old.sections);
+            destination
+                .data
+                .as_mut()
+                .unwrap()
+                .merge(old.data.take().unwrap());
+            destination.tasks.append(&mut old.tasks);
+            destination.merge_targets.extend(old.merge_targets);
+        }
+        let ticking: Vec<_> = affected
+            .iter()
+            .copied()
+            .filter(|other| {
+                *other != id
+                    && s.topology
+                        .regions
+                        .get(other)
+                        .is_some_and(|r| r.state == RegionState::Ticking)
+            })
+            .collect();
+        for target in ticking {
             s.topology
                 .regions
                 .get_mut(&target)
                 .unwrap()
                 .merge_from
                 .insert(id);
+            s.topology
+                .regions
+                .get_mut(&id)
+                .unwrap()
+                .merge_targets
+                .insert(target);
         }
+        let region = s.topology.regions.get_mut(&id).unwrap();
+        if !region.merge_targets.is_empty() {
+            region.state = RegionState::Transient;
+            region.generation += 1;
+        }
+        region.sections.insert(section);
         s.topology.sections.insert(section, (1, id));
         *s.topology.chunks.entry(chunk).or_default() += 1;
         if let Some(tasks) = s.parked.remove(&section) {
