@@ -5,10 +5,10 @@
 //! `MaterialSystem.buildSurface` ([`ferrite_worldgen::SurfaceGenerator`]), then
 //! the carvers. It runs on a dedicated thread so a region tick never evaluates
 //! density functions; callers wait for a result from a `spawn_blocking` task.
+use crossbeam::channel::{Receiver, Sender, bounded};
 use ferrite_world::{
     BlockInfo, BlockStateRegistry, Chunk, HeightmapKind, LightData, LightSection, RuntimeRegistry,
 };
-use crossbeam::channel::{Receiver, Sender, bounded};
 use ferrite_worldgen::{FeatureGenerator, NoiseChunkGenerator, SurfaceGenerator, WorldgenData};
 use std::{path::PathBuf, sync::Arc};
 
@@ -41,6 +41,19 @@ pub enum TerrainKind {
 pub struct Generated {
     pub chunk: Chunk,
     pub light: LightData,
+    /// Wall-clock milliseconds per pipeline stage, for the throughput benchmark.
+    pub timings: StageTimings,
+}
+
+/// Wall-clock time spent in each worldgen stage, in milliseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimings {
+    pub noise_ms: f64,
+    pub surface_ms: f64,
+    pub carve_ms: f64,
+    pub biomes_ms: f64,
+    pub features_ms: f64,
+    pub light_ms: f64,
 }
 
 enum Job {
@@ -156,12 +169,7 @@ impl VanillaTerrain {
     }
 }
 
-fn worker(
-    data: Arc<WorldgenData>,
-    registry: Arc<RuntimeRegistry>,
-    seed: i64,
-    jobs: Receiver<Job>,
-) {
+fn worker(data: Arc<WorldgenData>, registry: Arc<RuntimeRegistry>, seed: i64, jobs: Receiver<Job>) {
     let noise = match NoiseChunkGenerator::new(&data, seed) {
         Ok(noise) => noise,
         Err(error) => {
@@ -210,30 +218,14 @@ fn worker(
             }
             Job::Chunk { x, z, reply } => {
                 let result = match &surface {
-                    Some(source) => generate(
-                        &data,
-                        &registry,
-                        &noise,
-                        source,
-                        &mut features,
-                        x,
-                        z,
-                    ),
+                    Some(source) => generate(&data, &registry, &noise, source, &mut features, x, z),
                     None => Err("the overworld surface generator is unavailable".into()),
                 };
                 let _ = reply.send(result);
             }
             Job::Height { x, z, reply } => {
                 let result = match &surface {
-                    Some(source) => generate(
-                        &data,
-                        &registry,
-                        &noise,
-                        source,
-                        &mut features,
-                        x,
-                        z,
-                    ),
+                    Some(source) => generate(&data, &registry, &noise, source, &mut features, x, z),
                     None => Err("the overworld surface generator is unavailable".into()),
                 }
                 .map(|column| {
@@ -301,18 +293,28 @@ fn generate(
     x: i32,
     z: i32,
 ) -> Result<Generated, String> {
+    let mut timings = StageTimings::default();
+    let mark = std::time::Instant::now();
     let mut chunk = noise
         .fill_noise_chunk(x, z, registry)
         .map_err(|error| format!("noise fill for chunk {x},{z}: {error}"))?;
+    timings.noise_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     surface
         .apply(&mut chunk, x, z, registry)
         .map_err(|error| format!("surface for chunk {x},{z}: {error}"))?;
+    timings.surface_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     noise
         .carve_chunk(&mut chunk, x, z, registry)
         .map_err(|error| format!("carving chunk {x},{z}: {error}"))?;
+    timings.carve_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     fill_biomes(&mut chunk, &surface, registry, x, z)
         .map_err(|error| format!("biomes for chunk {x},{z}: {error}"))?;
+    timings.biomes_ms = mark.elapsed().as_secs_f64() * 1000.0;
     let _ = data;
+    let mark = std::time::Instant::now();
     features
         .decorate(
             &mut chunk,
@@ -322,8 +324,15 @@ fn generate(
             registry,
         )
         .map_err(|error| format!("features for chunk {x},{z}: {error}"))?;
+    timings.features_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     let light = sky_light(&chunk, registry);
-    Ok(Generated { chunk, light })
+    timings.light_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    Ok(Generated {
+        chunk,
+        light,
+        timings,
+    })
 }
 
 /// Writes vanilla `MultiNoiseBiomeSource` selections into the chunk's 4x4x4 biome cells.

@@ -4,7 +4,7 @@ pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
 mod block_tests;
 mod blocks;
 mod terrain;
-pub use terrain::{Generated, TerrainKind, VanillaTerrain};
+pub use terrain::{Generated, StageTimings, TerrainKind, VanillaTerrain};
 pub mod playerdata;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
