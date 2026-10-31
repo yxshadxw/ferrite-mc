@@ -406,7 +406,7 @@ mod tests {
         }
         {
             let _fast = profiler.timings().scope("fast");
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(1));
         }
         let report = profiler.stop_profile().unwrap();
 

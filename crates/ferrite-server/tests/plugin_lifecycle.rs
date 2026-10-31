@@ -247,15 +247,6 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
-    fn raw(&mut self, id: i32, text: &str) {
-        let mut body = Vec::new();
-        VarInt(id).encode(&mut body);
-        text.encode(&mut body);
-        let mut wire = Vec::new();
-        self.encoder.encode(&body, &mut wire);
-        self.stream.write_all(&wire).unwrap();
-    }
-
     /// Sends an unsigned chat message (an offline-mode client's packet shape).
     fn chat(&mut self, text: &str) {
         self.send(&ServerboundChat {
@@ -265,6 +256,15 @@ impl Bot {
             signature: None,
             last_seen: LastSeenUpdate::new(0, &[], 0),
         });
+    }
+
+    fn raw(&mut self, id: i32, text: &str) {
+        let mut body = Vec::new();
+        VarInt(id).encode(&mut body);
+        text.encode(&mut body);
+        let mut wire = Vec::new();
+        self.encoder.encode(&body, &mut wire);
+        self.stream.write_all(&wire).unwrap();
     }
 
     fn read_frame(&mut self) -> Option<Vec<u8>> {
@@ -559,6 +559,12 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     });
     wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
     wait_for_prefix(&events, "break 0 64 0", &stdout, &stderr);
+    wait_for_line(
+        &events,
+        "break-type minecraft:grass_block world",
+        &stdout,
+        &stderr,
+    );
     assert_eq!(
         wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
         0,

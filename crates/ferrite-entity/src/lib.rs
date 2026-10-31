@@ -7,7 +7,7 @@
 //! - [`tracker`]: the vanilla entity tracker, run per region against the region's players.
 //! - [`Metadata`]: synched entity data with dirty tracking.
 //! - [`item`]: item entities (vanilla physics against block shapes, merging, pickup into a
-//!   player inventory, despawning), with [`physics`] and [`inventory`] underneath.
+//!   player inventory, despawning), with [`physics`] underneath.
 //! - [`allocate_id`] / [`random_uuid`]: the process-wide network id counter (shared with
 //!   players) and entity UUIDs.
 //!
@@ -18,7 +18,6 @@
 
 mod id;
 mod index;
-pub mod inventory;
 pub mod item;
 pub mod metadata;
 pub mod physics;

@@ -13,6 +13,8 @@ struct Config {
     online_mode: bool,
     enforce_secure_profile: bool,
     motd: String,
+    /// 64x64 PNG shown in the server list. Missing or malformed files are only a warning.
+    server_icon: Option<std::path::PathBuf>,
     max_players: u32,
     view_distance: u8,
     compression_threshold: usize,
@@ -23,8 +25,27 @@ struct Config {
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
     plugin_bridge: Option<std::path::PathBuf>,
+    /// Plugin bridge settings from the `[plugins]` table.
+    plugins: PluginSettings,
     /// Enforce `whitelist.json` for new connections.
     whitelist: bool,
+}
+
+/// Plugin bridge settings from the `[plugins]` table.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct PluginSettings {
+    /// What a failed plugin event means for the action it guards.
+    on_event_error: EventErrorPolicy,
+}
+
+/// What a failed plugin event means for the action it guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EventErrorPolicy {
+    #[default]
+    Allow,
+    Deny,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +118,7 @@ impl Default for Config {
             online_mode: true,
             enforce_secure_profile: true,
             motd: "A Ferrite server".into(),
+            server_icon: Some("server-icon.png".into()),
             max_players: 20,
             view_distance: 10,
             compression_threshold: 256,
@@ -107,6 +129,7 @@ impl Default for Config {
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
             plugin_bridge: None,
+            plugins: PluginSettings::default(),
             whitelist: false,
         }
     }
@@ -127,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let ops = parse_ops(config.ops)?;
     let forwarding = build_forwarding(config.forwarding, &config.forwarding_secret)?;
+    let favicon = config.server_icon.as_deref().and_then(load_favicon);
     if forwarding.is_proxy() && config.online_mode {
         tracing::warn!(
             "online-mode is ignored when player forwarding is enabled; authenticate players on the proxy"
@@ -163,10 +187,15 @@ async fn main() -> anyhow::Result<()> {
             GameMode::Survival => 0,
             GameMode::Creative => 1,
         },
+        max_players: i32::try_from(config.max_players).unwrap_or(i32::MAX),
         ops,
         plugins: plugin_bridge
             .as_ref()
             .map(ferrite_server::plugins::PluginBridge::hooks),
+        plugin_event_errors: match config.plugins.on_event_error {
+            EventErrorPolicy::Allow => game::PluginEventPolicy::Allow,
+            EventErrorPolicy::Deny => game::PluginEventPolicy::Deny,
+        },
         admin: Some(admin),
         whitelist: config.whitelist,
     };
@@ -196,7 +225,11 @@ async fn main() -> anyhow::Result<()> {
             compression_threshold: config.compression_threshold,
             view_distance: config.view_distance,
             forwarding,
+            favicon,
+            status: Default::default(),
+            read_timeout: ferrite_net::DEFAULT_READ_TIMEOUT,
             game: Some(world.sender.clone()),
+            ..Default::default()
         },
     ));
     let (console_tx, mut console_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -245,9 +278,103 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Load the server-list icon, keeping the server up when it is missing or malformed.
+fn load_favicon(path: &std::path::Path) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                "server icon not found; continuing without a favicon"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "cannot read server icon; continuing without a favicon"
+            );
+            return None;
+        }
+    };
+    match favicon_data_uri(&bytes) {
+        Ok(uri) => Some(uri),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "ignoring server icon; continuing without a favicon"
+            );
+            None
+        }
+    }
+}
+
+/// Validate a 64x64 PNG and encode it as the `data:image/png;base64,...` favicon vanilla expects.
+fn favicon_data_uri(png: &[u8]) -> Result<String, String> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if png.len() < 33 || png[..8] != SIGNATURE {
+        return Err("not a PNG file".into());
+    }
+    if png[8..12] != 13u32.to_be_bytes() || &png[12..16] != b"IHDR" {
+        return Err("missing PNG IHDR header".into());
+    }
+    let width = u32::from_be_bytes(png[16..20].try_into().expect("four bytes"));
+    let height = u32::from_be_bytes(png[20..24].try_into().expect("four bytes"));
+    if (width, height) != (64, 64) {
+        return Err(format!("server icon must be 64x64, got {width}x{height}"));
+    }
+    use base64::Engine;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG signature plus an IHDR chunk with the given dimensions (payload otherwise absent).
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&[8, 6, 0, 0, 0]);
+        out.extend_from_slice(&[0; 4]);
+        out
+    }
+
+    #[test]
+    fn favicon_encodes_a_64x64_png() {
+        let source = png(64, 64);
+        let uri = favicon_data_uri(&source).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"));
+        use base64::Engine;
+        let encoded = uri.trim_start_matches("data:image/png;base64,");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn favicon_rejects_wrong_size_and_non_png() {
+        let wrong = favicon_data_uri(&png(32, 64)).unwrap_err();
+        assert!(wrong.contains("64x64"), "{wrong}");
+        assert!(favicon_data_uri(b"not a png").is_err());
+    }
+
+    #[test]
+    fn missing_icon_is_only_a_warning() {
+        assert!(load_favicon(std::path::Path::new("missing-server-icon.png")).is_none());
+    }
+
     #[test]
     fn config_defaults_and_overrides() {
         let defaults: Config = toml::from_str("").unwrap();
@@ -273,6 +400,13 @@ mod tests {
             Some(std::path::Path::new("plugins"))
         );
         assert_eq!(defaults.plugin_bridge, None);
+        assert_eq!(defaults.plugins.on_event_error, EventErrorPolicy::Allow);
+        let denied: Config = toml::from_str("[plugins]\non-event-error = 'deny'").unwrap();
+        assert_eq!(denied.plugins.on_event_error, EventErrorPolicy::Deny);
+        assert_eq!(
+            defaults.server_icon.as_deref(),
+            Some(std::path::Path::new("server-icon.png"))
+        );
         assert!(parse_ops(vec![OpConfig::Uuid("Alice".into())]).is_err());
         let parsed = parse_ops(vec![OpConfig::Detailed {
             uuid: "00000000-0000-0000-0000-00000000000a".into(),

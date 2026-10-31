@@ -15,6 +15,9 @@ enforce-secure-profile = true
 # 서버 목록에 표시되는 설명 문구.
 motd = "A Ferrite server"
 
+# 서버 목록 아이콘 (64x64 PNG). 파일이 없거나 크기가 다르면 경고만 남기고 아이콘 없이 시작합니다.
+server-icon = "server-icon.png"
+
 # 최대 동시 접속자 수.
 max-players = 20
 
@@ -23,6 +26,14 @@ view-distance = 10
 
 # 이 크기(바이트) 이상인 패킷을 압축합니다.
 compression-threshold = 256
+
+# 플러그인 브리지 설정입니다.
+[plugins]
+# 플러그인 이벤트 처리 중 오류(예: JVM 예외)가 발생했을 때의 정책입니다.
+# "allow"는 Bukkit처럼 동작을 그대로 진행하고, "deny"는 이벤트가 취소된 것처럼
+# 동작을 막은 뒤 블록/텔레포트 상태를 클라이언트에 다시 보냅니다.
+on-event-error = "allow"
+
 
 # 플레이어 정보 전달 방식: "none", "velocity", "bungee".
 # 프록시 뒤에서 online-mode 인증은 프록시가 담당하므로 서버의 online-mode는 무시됩니다.

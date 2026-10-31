@@ -2,20 +2,199 @@
 //!
 //! Parsing, permission requirements and selectors live here (as in Brigadier); the
 //! world state changes those commands describe are applied by the game loop.
-
+use ferrite_admin::AdminLists;
+use ferrite_command::{
+    ArgumentType, ArgumentValue, CommandContext, CommandDispatcher, CommandError,
+    CommandSyntaxError, EntityAnchor, argument,
+    arguments::{Coordinates, EntityTarget, GameMode, SelectorKind, WorldCoordinate},
+    literal,
+};
+use ferrite_net::game::OutboundSender;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
-
-use ferrite_admin::AdminLists;
-use ferrite_command::arguments::{Coordinates, EntityTarget, SelectorKind, WorldCoordinate};
-use ferrite_command::{
-    ArgumentType, ArgumentValue, CommandContext, CommandDispatcher, CommandError, EntityAnchor,
-    argument, literal,
-};
-use ferrite_net::game::Outbound;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
+
+/// The overworld clock's registry name, used by `/time` feedback.
+pub const OVERWORLD_CLOCK: &str = "minecraft:overworld";
+const SERVER_NAME: &str = "Server";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weather {
+    Clear,
+    Rain,
+    Thunder,
+}
+
+impl Weather {
+    fn feedback_key(self) -> &'static str {
+        match self {
+            Self::Clear => "commands.weather.set.clear",
+            Self::Rain => "commands.weather.set.rain",
+            Self::Thunder => "commands.weather.set.thunder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerEntry {
+    pub uuid: Uuid,
+    pub name: String,
+    pub game_mode: i32,
+}
+
+/// Mutable world state needed by commands. Commands run on the game loop, so a short-lived
+/// mutex keeps `/list`, `/gamemode <mode> <target>`, and the clocks consistent with joins,
+/// leaves, and each other.
+#[derive(Debug, Clone)]
+pub struct GameState {
+    pub default_gamemode: i32,
+    pub difficulty: i32,
+    /// Ticks of the overworld clock (`/time set` and `/time add`).
+    pub clock_time: i64,
+    /// Total world ticks (`/time query gametime`).
+    pub game_time: i64,
+    pub weather: Weather,
+    pub weather_duration: i32,
+    pub seed: i64,
+    pub max_players: i32,
+    pub players: Vec<PlayerEntry>,
+}
+
+impl GameState {
+    pub fn new(default_gamemode: i32, seed: i64, max_players: i32) -> Self {
+        Self {
+            default_gamemode,
+            difficulty: 2,
+            clock_time: 0,
+            game_time: 0,
+            weather: Weather::Clear,
+            weather_duration: 6_000,
+            seed,
+            max_players,
+            players: Vec::new(),
+        }
+    }
+
+    pub fn join(&mut self, uuid: Uuid, name: String, game_mode: i32, max_players: i32) {
+        self.leave(uuid);
+        self.players.push(PlayerEntry {
+            uuid,
+            name,
+            game_mode,
+        });
+        self.max_players = max_players;
+    }
+
+    pub fn leave(&mut self, uuid: Uuid) {
+        self.players.retain(|player| player.uuid != uuid);
+    }
+
+    /// Advances the world tick. The overworld clock only moves while
+    /// `advance_time` (vanilla `doDaylightCycle`) is enabled.
+    pub fn tick(&mut self, advance_time: bool) {
+        self.game_time += 1;
+        if advance_time {
+            self.clock_time += 1;
+        }
+    }
+}
+
+impl Default for GameState {
+    fn default() -> Self {
+        Self::new(1, 0, 20)
+    }
+}
+
+/// A vanilla translation key, its arguments, and the English rendering used by the
+/// current plain-text chat packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Feedback {
+    pub key: &'static str,
+    pub args: Vec<String>,
+    pub text: String,
+}
+
+impl Feedback {
+    pub fn new(key: &'static str, args: Vec<String>) -> Self {
+        let template = translate(key).unwrap_or_else(|| english(key));
+        Self {
+            key,
+            text: render(template, &args),
+            args,
+        }
+    }
+}
+
+/// Vanilla's `reports/lang_en_us.json`, installed once at server startup so feedback
+/// text is the exact 26.3 string for each key. Without it (unit tests, data-less
+/// deployments) [`english`] supplies the same strings.
+static LANG: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Installs the English translations from `reports/lang_en_us.json`.
+pub fn load_lang(reports: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(reports.join("lang_en_us.json")) else {
+        return;
+    };
+    let Ok(table) = serde_json::from_str::<HashMap<String, String>>(&text) else {
+        return;
+    };
+    let _ = LANG.set(table);
+}
+
+fn translate(key: &str) -> Option<&'static str> {
+    LANG.get()?.get(key).map(String::as_str)
+}
+
+fn english(key: &str) -> &'static str {
+    match key {
+        "commands.gamemode.success.self" => "Set own game mode to %s",
+        "commands.gamemode.success.other" => "Set %s's game mode to %s",
+        "gameMode.changed" => "Your game mode has been updated to %s",
+        "commands.defaultgamemode.success" => "The default game mode is now %s",
+        "commands.difficulty.success" => "The difficulty has been set to %s",
+        "commands.difficulty.query" => "The difficulty is %s",
+        "commands.time.set.absolute" => "Set %s to %s tick(s)",
+        "commands.time.query.absolute" => "Clock %s is at %s tick(s)",
+        "commands.time.query.gametime" => "The game time is %s tick(s)",
+        "commands.weather.set.clear" => "Set the weather to clear",
+        "commands.weather.set.rain" => "Set the weather to rain",
+        "commands.weather.set.thunder" => "Set the weather to rain and thunder",
+        "commands.seed.success" => "Seed: %s",
+        "commands.list.players" => "There are %s of a max of %s players online: %s",
+        "chat.type.announcement" => "[%s] %s",
+        "chat.type.emote" => "* %s %s",
+        _ => "",
+    }
+}
+
+fn render(template: &str, args: &[String]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut args = args.iter();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some('s') => {
+                chars.next();
+                if let Some(value) = args.next() {
+                    out.push_str(value);
+                }
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
+}
 
 /// A parsed teleport destination. Locations are already resolved against the source.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,10 +217,24 @@ pub enum TeleportDestination {
     Entity(EntityTarget),
 }
 
+/// An `/xp` (vanilla `/experience`) operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpOperation {
+    Add,
+    Set,
+    Query,
+}
+
+/// Whether an `/xp` amount counts experience points or levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpUnit {
+    Points,
+    Levels,
+}
+
 /// A command's effect, applied by the game loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    GameMode(i32),
     Teleport {
         targets: EntityTarget,
         destination: TeleportDestination,
@@ -96,7 +289,48 @@ pub enum Action {
     },
     SaveOn,
     SaveOff,
-    Say(String),
+    GameRule(String, Option<String>),
+    GameMode {
+        mode: i32,
+        targets: Vec<Uuid>,
+    },
+    DefaultGameMode(i32),
+    Difficulty(i32),
+    TimeSet(i32),
+    TimeAdd(i32),
+    Weather {
+        kind: Weather,
+        duration: Option<i32>,
+    },
+    /// Feedback for the command source.
+    Feedback(Feedback),
+    /// Feedback for one player (for example `gameMode.changed`).
+    PlayerFeedback {
+        uuid: Uuid,
+        feedback: Feedback,
+    },
+    /// Chat visible to every player (`say`, `me`).
+    Broadcast(Feedback),
+    /// `/clear`: remove matching items from the targets' inventories.
+    Clear {
+        targets: Vec<Uuid>,
+        item: Option<u16>,
+        max_count: Option<i32>,
+    },
+    /// `/give`: place items in each target's inventory.
+    Give {
+        targets: Vec<Uuid>,
+        item: u16,
+        count: i32,
+        item_name: String,
+    },
+    /// `/xp` (vanilla `/experience`): add, set or query points or levels.
+    Experience {
+        operation: XpOperation,
+        targets: Vec<Uuid>,
+        amount: i32,
+        unit: XpUnit,
+    },
     Tps,
     Mspt,
     ProfileStart,
@@ -105,6 +339,7 @@ pub enum Action {
         name: String,
         args: Vec<String>,
     },
+    World(super::commands_world::WorldCommand),
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
@@ -115,12 +350,21 @@ pub struct Source {
     pub origin: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    pub uuid: Option<Uuid>,
+    pub name: Option<String>,
+    pub state: Arc<Mutex<GameState>>,
     pub actions: UnboundedSender<Action>,
 }
 
 /// Vanilla's `commands/entity_selectors` permission maps to gamemasters: any `@` selector
 /// in a command argument requires this level, even for commands open to every player.
 pub const SELECTOR_PERMISSION: u8 = 2;
+
+impl Source {
+    fn sender_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| SERVER_NAME.into())
+    }
+}
 
 /// A player resolved from an entity argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +377,7 @@ pub struct ResolvedPlayer {
 #[derive(Debug, Clone)]
 pub struct OnlinePlayer {
     pub name: String,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -195,10 +439,25 @@ fn plugin_command_node(literal_name: &str) -> ferrite_command::NodeBuilder<Sourc
 }
 
 fn entity(ctx: &CommandContext<Source>, name: &str) -> Result<EntityTarget, CommandError> {
-    ctx.argument(name)
+    let target = ctx
+        .argument(name)
         .and_then(ArgumentValue::as_entity)
         .cloned()
-        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))
+        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))?;
+    check_entity_selector(ctx.source(), &target)?;
+    Ok(target)
+}
+
+/// Vanilla `EntitySelector.checkPermissions`: any selector needs permission level 2.
+fn check_entity_selector(source: &Source, target: &EntityTarget) -> Result<(), CommandError> {
+    if source.permission < 2 && matches!(target, EntityTarget::Selector { .. }) {
+        return Err(syntax_error(
+            "argument.entity.selector.not_allowed",
+            Vec::new(),
+            "Selector not allowed",
+        ));
+    }
+    Ok(())
 }
 
 fn coordinates(ctx: &CommandContext<Source>, name: &str) -> Result<Coordinates, CommandError> {
@@ -585,6 +844,523 @@ fn save_all_builder() -> ferrite_command::NodeBuilder<Source> {
 }
 
 /// The full server command graph.
+fn emit(source: &Source, action: Action) -> Result<(), CommandError> {
+    send(source, action).map(|_| ())
+}
+
+fn syntax_error(key: &'static str, args: Vec<String>, message: impl Into<String>) -> CommandError {
+    CommandError::Syntax(CommandSyntaxError::new(key, args, message.into()))
+}
+
+fn player_only() -> CommandError {
+    syntax_error(
+        "permissions.requires.player",
+        Vec::new(),
+        "A player is required to run this command here",
+    )
+}
+
+fn player_not_found() -> CommandError {
+    syntax_error(
+        "argument.entity.notfound.player",
+        Vec::new(),
+        "No player was found",
+    )
+}
+
+fn game_mode_id(mode: GameMode) -> i32 {
+    match mode {
+        GameMode::Survival => 0,
+        GameMode::Creative => 1,
+        GameMode::Adventure => 2,
+        GameMode::Spectator => 3,
+    }
+}
+
+fn game_mode_display(mode: GameMode) -> &'static str {
+    match mode {
+        GameMode::Survival => "Survival Mode",
+        GameMode::Creative => "Creative Mode",
+        GameMode::Adventure => "Adventure Mode",
+        GameMode::Spectator => "Spectator Mode",
+    }
+}
+
+fn difficulty_display(value: i32) -> &'static str {
+    match value {
+        0 => "Peaceful",
+        1 => "Easy",
+        2 => "Normal",
+        3 => "Hard",
+        _ => "Normal",
+    }
+}
+
+fn resolve_players(
+    players: &[PlayerEntry],
+    target: &EntityTarget,
+    source: Option<Uuid>,
+) -> Result<Vec<Uuid>, CommandError> {
+    let selected: Vec<&PlayerEntry> = match target {
+        EntityTarget::Name(name) => players
+            .iter()
+            .filter(|player| player.name.eq_ignore_ascii_case(name))
+            .collect(),
+        EntityTarget::Uuid(id) => {
+            let Ok(id) = Uuid::parse_str(id) else {
+                return Err(player_not_found());
+            };
+            players.iter().filter(|player| player.uuid == id).collect()
+        }
+        EntityTarget::Selector { kind, options } => {
+            let mut selected: Vec<&PlayerEntry> = match kind {
+                SelectorKind::Myself => source
+                    .and_then(|uuid| players.iter().find(|player| player.uuid == uuid))
+                    .into_iter()
+                    .collect(),
+                SelectorKind::NearestPlayer | SelectorKind::NearestEntity => {
+                    players.iter().take(1).collect()
+                }
+                SelectorKind::RandomPlayer => players.iter().take(1).collect(),
+                SelectorKind::AllPlayers | SelectorKind::AllEntities => players.iter().collect(),
+            };
+            for option in options {
+                match option.key.as_str() {
+                    "name" => selected.retain(|player| player.name == option.value),
+                    "limit" => {
+                        if let Ok(limit) = option.value.parse::<usize>() {
+                            selected.truncate(limit.max(1));
+                        }
+                    }
+                    "gamemode" => {
+                        if let Some(mode) = GameMode::from_name(&option.value) {
+                            selected.retain(|player| player.game_mode == game_mode_id(mode));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            selected
+        }
+    };
+    if selected.is_empty() {
+        return Err(player_not_found());
+    }
+    Ok(selected.into_iter().map(|player| player.uuid).collect())
+}
+
+fn gamemode(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let mode = ctx
+        .argument("gamemode")
+        .and_then(|value| value.as_gamemode())
+        .ok_or_else(|| CommandError::failed("missing gamemode"))?;
+    let target = if ctx.argument("target").is_some() {
+        Some(entity(ctx, "target")?)
+    } else {
+        None
+    };
+    let source = ctx.source();
+    let mode_id = game_mode_id(mode);
+    let mut state = source.state.lock().unwrap();
+    let targets = match target {
+        Some(target) => resolve_players(&state.players, &target, source.uuid)?,
+        None => vec![source.uuid.ok_or_else(player_only)?],
+    };
+    let mut changed = Vec::new();
+    let mut feedback = Vec::new();
+    for uuid in targets {
+        let Some(index) = state.players.iter().position(|player| player.uuid == uuid) else {
+            continue;
+        };
+        if state.players[index].game_mode == mode_id {
+            continue;
+        }
+        state.players[index].game_mode = mode_id;
+        changed.push(uuid);
+        if Some(uuid) == source.uuid {
+            feedback.push(Action::Feedback(Feedback::new(
+                "commands.gamemode.success.self",
+                vec![game_mode_display(mode).into()],
+            )));
+        } else {
+            feedback.push(Action::PlayerFeedback {
+                uuid,
+                feedback: Feedback::new("gameMode.changed", vec![game_mode_display(mode).into()]),
+            });
+            feedback.push(Action::Feedback(Feedback::new(
+                "commands.gamemode.success.other",
+                vec![
+                    state.players[index].name.clone(),
+                    game_mode_display(mode).into(),
+                ],
+            )));
+        }
+    }
+    drop(state);
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    emit(
+        source,
+        Action::GameMode {
+            mode: mode_id,
+            targets: changed.clone(),
+        },
+    )?;
+    for action in feedback {
+        emit(source, action)?;
+    }
+    Ok(changed.len() as i32)
+}
+
+fn default_gamemode(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let mode = ctx
+        .argument("gamemode")
+        .and_then(|value| value.as_gamemode())
+        .ok_or_else(|| CommandError::failed("missing gamemode"))?;
+    let source = ctx.source();
+    source.state.lock().unwrap().default_gamemode = game_mode_id(mode);
+    emit(source, Action::DefaultGameMode(game_mode_id(mode)))?;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.defaultgamemode.success",
+            vec![game_mode_display(mode).into()],
+        )),
+    )?;
+    Ok(1)
+}
+
+fn difficulty_query(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let source = ctx.source();
+    let value = source.state.lock().unwrap().difficulty;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.difficulty.query",
+            vec![difficulty_display(value).into()],
+        )),
+    )?;
+    Ok(value)
+}
+
+fn set_difficulty(ctx: &CommandContext<Source>, value: i32) -> Result<i32, CommandError> {
+    let source = ctx.source();
+    {
+        let mut state = source.state.lock().unwrap();
+        if state.difficulty == value {
+            let display = difficulty_display(value);
+            return Err(syntax_error(
+                "commands.difficulty.failure",
+                vec![display.into()],
+                format!("The difficulty did not change; it is already set to {display}"),
+            ));
+        }
+        state.difficulty = value;
+    }
+    emit(source, Action::Difficulty(value))?;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.difficulty.success",
+            vec![difficulty_display(value).into()],
+        )),
+    )?;
+    Ok(0)
+}
+
+fn time_set(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let ticks = ctx
+        .integer("time")
+        .ok_or_else(|| CommandError::failed("missing time"))?;
+    let source = ctx.source();
+    {
+        let mut state = source.state.lock().unwrap();
+        if state.clock_time == i64::from(ticks) {
+            return Err(syntax_error(
+                "commands.time.set.already_at_time",
+                vec![OVERWORLD_CLOCK.into(), ticks.to_string()],
+                format!("Clock {OVERWORLD_CLOCK} is already set to {ticks} tick(s)"),
+            ));
+        }
+        state.clock_time = i64::from(ticks);
+    }
+    emit(source, Action::TimeSet(ticks))?;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.time.set.absolute",
+            vec![OVERWORLD_CLOCK.into(), ticks.to_string()],
+        )),
+    )?;
+    Ok(ticks)
+}
+
+fn time_add(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let delta = ctx
+        .integer("time")
+        .ok_or_else(|| CommandError::failed("missing time"))?;
+    let source = ctx.source();
+    let total = {
+        let mut state = source.state.lock().unwrap();
+        state.clock_time = state.clock_time.saturating_add(i64::from(delta));
+        state.clock_time
+    };
+    emit(source, Action::TimeAdd(delta))?;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.time.set.absolute",
+            vec![OVERWORLD_CLOCK.into(), total.to_string()],
+        )),
+    )?;
+    Ok(total as i32)
+}
+
+fn time_query(ctx: &CommandContext<Source>, game_time: bool) -> Result<i32, CommandError> {
+    let source = ctx.source();
+    let ticks = {
+        let state = source.state.lock().unwrap();
+        if game_time {
+            state.game_time
+        } else {
+            state.clock_time
+        }
+    };
+    let feedback = if game_time {
+        Feedback::new("commands.time.query.gametime", vec![ticks.to_string()])
+    } else {
+        Feedback::new(
+            "commands.time.query.absolute",
+            vec![OVERWORLD_CLOCK.into(), ticks.to_string()],
+        )
+    };
+    emit(source, Action::Feedback(feedback))?;
+    Ok(ticks as i32)
+}
+
+fn set_weather(ctx: &CommandContext<Source>, kind: Weather) -> Result<i32, CommandError> {
+    let duration = ctx.integer("duration");
+    let source = ctx.source();
+    {
+        let mut state = source.state.lock().unwrap();
+        state.weather = kind;
+        if let Some(duration) = duration {
+            state.weather_duration = duration;
+        }
+    }
+    emit(source, Action::Weather { kind, duration })?;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(kind.feedback_key(), Vec::new())),
+    )?;
+    Ok(duration.unwrap_or(0))
+}
+
+fn seed(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let source = ctx.source();
+    let seed = source.state.lock().unwrap().seed;
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.seed.success",
+            vec![seed.to_string()],
+        )),
+    )?;
+    Ok(seed as i32)
+}
+
+fn list_players(ctx: &CommandContext<Source>, uuids: bool) -> Result<i32, CommandError> {
+    let source = ctx.source();
+    let (count, max_players, list) = {
+        let state = source.state.lock().unwrap();
+        let names: Vec<String> = state
+            .players
+            .iter()
+            .map(|player| {
+                if uuids {
+                    format!("{} ({})", player.name, player.uuid)
+                } else {
+                    player.name.clone()
+                }
+            })
+            .collect();
+        (state.players.len(), state.max_players, names.join(", "))
+    };
+    emit(
+        source,
+        Action::Feedback(Feedback::new(
+            "commands.list.players",
+            vec![count.to_string(), max_players.to_string(), list],
+        )),
+    )?;
+    Ok(count as i32)
+}
+
+fn say(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let message = ctx.string("message").unwrap_or_default().to_owned();
+    let sender = ctx.source().sender_name();
+    emit(
+        ctx.source(),
+        Action::Broadcast(Feedback::new(
+            "chat.type.announcement",
+            vec![sender, message],
+        )),
+    )?;
+    Ok(1)
+}
+
+fn me(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let action = ctx.string("action").unwrap_or_default().to_owned();
+    let sender = ctx.source().sender_name();
+    emit(
+        ctx.source(),
+        Action::Broadcast(Feedback::new("chat.type.emote", vec![sender, action])),
+    )?;
+    Ok(1)
+}
+
+/// `gamerule <rule> [value]` for one rule, using the type and bounds from the 26.3
+/// generated command tree.
+fn gamerule_node(
+    label: impl Into<String>,
+    spec: &'static ferrite_command::gamerule::RuleSpec,
+) -> ferrite_command::NodeBuilder<Source> {
+    use ferrite_command::gamerule::RuleKind;
+    let query_name = spec.name.to_owned();
+    let set_name = spec.name.to_owned();
+    let kind = spec.kind;
+    let value = match kind {
+        RuleKind::Boolean => ArgumentType::bool(),
+        RuleKind::Integer { min, max } => ArgumentType::integer_range(min, max),
+    };
+    literal::<Source>(label)
+        .executes(move |ctx| send(ctx.source(), Action::GameRule(query_name.clone(), None)))
+        .then(argument::<Source>("value", value).executes(move |ctx| {
+            let value = match kind {
+                RuleKind::Boolean => ctx
+                    .argument("value")
+                    .and_then(|value| value.as_bool())
+                    .map(|value| value.to_string()),
+                RuleKind::Integer { .. } => ctx.integer("value").map(|value| value.to_string()),
+            }
+            .ok_or_else(|| CommandError::failed("invalid game rule value"))?;
+            send(
+                ctx.source(),
+                Action::GameRule(set_name.clone(), Some(value)),
+            )
+        }))
+}
+
+/// `random_tick_speed` -> `randomTickSpeed`, the pre-26.3 spelling players know.
+fn camel_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            upper = true;
+        } else if upper {
+            out.push(ch.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Resolves an item argument (`stone`, `minecraft:stone`) to its protocol id.
+/// Component patches are not supported yet; the bare id is what `/give` uses.
+pub fn parse_item(raw: &str) -> Result<u16, CommandError> {
+    let base = raw.split(['[', '{']).next().unwrap_or(raw).trim();
+    ferrite_item::item_id(base)
+        .ok_or_else(|| CommandError::failed(format!("Unknown item '{base}'")))
+}
+
+/// Vanilla's item display name for a stack, e.g. `diamond_sword` -> "Diamond Sword".
+pub fn item_display(id: u16) -> String {
+    let name = ferrite_item::item_name(id).unwrap_or("minecraft:air");
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    path.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Resolves a player target against the online players in the command state.
+fn resolved_targets(ctx: &CommandContext<Source>, name: &str) -> Result<Vec<Uuid>, CommandError> {
+    let target = entity(ctx, name)?;
+    let state = ctx.source().state.lock().unwrap();
+    resolve_players(&state.players, &target, ctx.source().uuid)
+}
+
+fn clear_action(
+    ctx: &CommandContext<Source>,
+    item: Option<&str>,
+    max_count: Option<i32>,
+) -> Result<i32, CommandError> {
+    let targets = if ctx.argument("targets").is_some() {
+        resolved_targets(ctx, "targets")?
+    } else {
+        vec![ctx.source().uuid.ok_or_else(player_only)?]
+    };
+    let item = item.map(parse_item).transpose()?;
+    send(
+        ctx.source(),
+        Action::Clear {
+            targets,
+            item,
+            max_count,
+        },
+    )
+}
+
+fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
+    let raw = ctx
+        .string("item")
+        .ok_or_else(|| CommandError::failed("Missing item"))?;
+    let item = parse_item(raw)?;
+    let count = ctx.integer("count").unwrap_or(1);
+    let max = ferrite_item::item_defaults(item).map_or(64, |defaults| defaults.max_stack_size);
+    if count > max {
+        return Err(CommandError::failed(format!(
+            "Can't give more than {max} of {}",
+            item_display(item)
+        )));
+    }
+    send(
+        ctx.source(),
+        Action::Give {
+            targets: resolved_targets(ctx, "targets")?,
+            item,
+            count,
+            item_name: item_display(item),
+        },
+    )
+}
+
+fn experience_action(
+    ctx: &CommandContext<Source>,
+    operation: XpOperation,
+    unit: XpUnit,
+) -> Result<i32, CommandError> {
+    send(
+        ctx.source(),
+        Action::Experience {
+            operation,
+            targets: resolved_targets(ctx, "target")?,
+            amount: ctx.integer("amount").unwrap_or(0),
+            unit,
+        },
+    )
+}
+
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
     tree.set_selector_requirement(|source: &Source| source.permission >= SELECTOR_PERMISSION);
@@ -644,24 +1420,201 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
             .executes(|ctx| send(ctx.source(), Action::SaveOff)),
     );
 
+    // ---- gamerule: one literal per rule in the generated 26.3 command tree ----
+    let mut gamerule = literal::<Source>("gamerule")
+        .requires(|source| source.permission >= 2)
+        .restricted(true);
+    for spec in ferrite_command::gamerule::specs() {
+        gamerule = gamerule.then(gamerule_node(spec.name, spec));
+        gamerule = gamerule.then(gamerule_node(format!("minecraft:{}", spec.name), spec));
+        gamerule = gamerule.then(gamerule_node(camel_case(spec.name), spec));
+    }
+    for (alias, canonical) in ferrite_command::gamerule::aliases() {
+        if let Some(spec) = ferrite_command::gamerule::spec(canonical) {
+            gamerule = gamerule.then(gamerule_node(*alias, spec));
+        }
+    }
+    tree.register(gamerule);
+
+    // ---- inventory and experience ----
+    tree.register(
+        literal::<Source>("clear")
+            .requires(|source| source.permission >= 2)
+            .executes(|ctx| clear_action(ctx, None, None))
+            .then(
+                argument("targets", ArgumentType::players())
+                    .executes(|ctx| clear_action(ctx, None, None))
+                    .then(
+                        argument("item", ArgumentType::opaque("minecraft:item_predicate"))
+                            .executes(|ctx| clear_action(ctx, ctx.string("item"), None))
+                            .then(
+                                argument("maxCount", ArgumentType::integer_range(0, i32::MAX))
+                                    .executes(|ctx| {
+                                        clear_action(
+                                            ctx,
+                                            ctx.string("item"),
+                                            ctx.integer("maxCount"),
+                                        )
+                                    }),
+                            ),
+                    ),
+            ),
+    );
+    tree.register(
+        literal::<Source>("give")
+            .requires(|source| source.permission >= 2)
+            .then(
+                argument("targets", ArgumentType::players()).then(
+                    argument("item", ArgumentType::opaque("minecraft:item_stack"))
+                        .executes(give_action)
+                        .then(
+                            argument("count", ArgumentType::integer_range(1, i32::MAX))
+                                .executes(give_action),
+                        ),
+                ),
+            ),
+    );
+    let experience = tree.register(
+        literal::<Source>("experience")
+            .requires(|source| source.permission >= 2)
+            .then(
+                literal("add").then(
+                    argument("target", ArgumentType::players()).then(
+                        argument("amount", ArgumentType::integer())
+                            .executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Points)
+                            })
+                            .then(literal("points").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Points)
+                            }))
+                            .then(literal("levels").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Add, XpUnit::Levels)
+                            })),
+                    ),
+                ),
+            )
+            .then(
+                literal("set").then(
+                    argument("target", ArgumentType::players()).then(
+                        argument("amount", ArgumentType::integer_range(0, i32::MAX))
+                            .executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Points)
+                            })
+                            .then(literal("points").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Points)
+                            }))
+                            .then(literal("levels").executes(|ctx| {
+                                experience_action(ctx, XpOperation::Set, XpUnit::Levels)
+                            })),
+                    ),
+                ),
+            )
+            .then(
+                literal("query").then(
+                    argument("target", ArgumentType::player())
+                        .then(literal("points").executes(|ctx| {
+                            experience_action(ctx, XpOperation::Query, XpUnit::Points)
+                        }))
+                        .then(literal("levels").executes(|ctx| {
+                            experience_action(ctx, XpOperation::Query, XpUnit::Levels)
+                        })),
+                ),
+            ),
+    );
+    // Vanilla registers the tree as `experience` and aliases it as `xp`.
+    tree.register(
+        literal::<Source>("xp")
+            .requires(|source| source.permission >= 2)
+            .redirect(experience),
+    );
+
     // ---- gamemode (owned by the gamemode worker) ----
     tree.register(
         literal::<Source>("gamemode")
-            .requires(|s| s.permission >= 2)
-            .then(literal("creative").executes(|ctx| send(ctx.source(), Action::GameMode(1))))
-            .then(literal("survival").executes(|ctx| send(ctx.source(), Action::GameMode(0)))),
+            .requires(|source| source.permission >= 2)
+            .then(
+                argument("gamemode", ArgumentType::Gamemode)
+                    .executes(gamemode)
+                    .then(argument("target", ArgumentType::players()).executes(gamemode)),
+            ),
+    );
+    tree.register(
+        literal::<Source>("defaultgamemode")
+            .requires(|source| source.permission >= 2)
+            .then(argument("gamemode", ArgumentType::Gamemode).executes(default_gamemode)),
+    );
+    tree.register(
+        literal::<Source>("difficulty")
+            .requires(|source| source.permission >= 2)
+            .executes(difficulty_query)
+            .then(literal("peaceful").executes(|ctx| set_difficulty(ctx, 0)))
+            .then(literal("easy").executes(|ctx| set_difficulty(ctx, 1)))
+            .then(literal("normal").executes(|ctx| set_difficulty(ctx, 2)))
+            .then(literal("hard").executes(|ctx| set_difficulty(ctx, 3))),
+    );
+    tree.register(
+        literal::<Source>("time")
+            .requires(|source| source.permission >= 2)
+            .then(
+                literal("set")
+                    .then(argument("time", ArgumentType::Time { min: 0 }).executes(time_set)),
+            )
+            .then(
+                literal("add").then(
+                    argument("time", ArgumentType::Time { min: i32::MIN }).executes(time_add),
+                ),
+            )
+            .then(
+                literal("query")
+                    .then(literal("time").executes(|ctx| time_query(ctx, false)))
+                    .then(literal("gametime").executes(|ctx| time_query(ctx, true))),
+            ),
+    );
+    tree.register(
+        literal::<Source>("weather")
+            .requires(|source| source.permission >= 2)
+            .then(
+                literal("clear")
+                    .executes(|ctx| set_weather(ctx, Weather::Clear))
+                    .then(
+                        argument("duration", ArgumentType::Time { min: 1 })
+                            .executes(|ctx| set_weather(ctx, Weather::Clear)),
+                    ),
+            )
+            .then(
+                literal("rain")
+                    .executes(|ctx| set_weather(ctx, Weather::Rain))
+                    .then(
+                        argument("duration", ArgumentType::Time { min: 1 })
+                            .executes(|ctx| set_weather(ctx, Weather::Rain)),
+                    ),
+            )
+            .then(
+                literal("thunder")
+                    .executes(|ctx| set_weather(ctx, Weather::Thunder))
+                    .then(
+                        argument("duration", ArgumentType::Time { min: 1 })
+                            .executes(|ctx| set_weather(ctx, Weather::Thunder)),
+                    ),
+            ),
+    );
+    tree.register(
+        literal::<Source>("seed")
+            .requires(|source| source.permission >= 2)
+            .executes(seed),
+    );
+    tree.register(
+        literal::<Source>("list")
+            .executes(|ctx| list_players(ctx, false))
+            .then(literal("uuids").executes(|ctx| list_players(ctx, true))),
     );
     tree.register(
         literal::<Source>("say")
-            .requires(|s| s.permission >= 2)
-            .then(
-                argument("message", ArgumentType::greedy_string()).executes(|ctx| {
-                    send(
-                        ctx.source(),
-                        Action::Say(ctx.string("message").unwrap_or_default().to_owned()),
-                    )
-                }),
-            ),
+            .requires(|source| source.permission >= 2)
+            .then(argument("message", ArgumentType::Message).executes(say)),
+    );
+    tree.register(
+        literal::<Source>("me").then(argument("action", ArgumentType::Message).executes(me)),
     );
     tree.register(literal::<Source>("tps").executes(|ctx| send(ctx.source(), Action::Tps)));
     tree.register(literal::<Source>("mspt").executes(|ctx| send(ctx.source(), Action::Mspt)));
@@ -675,6 +1628,12 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
                 literal::<Source>("stop").executes(|ctx| send(ctx.source(), Action::ProfileStop)),
             ),
     );
+    tree.register(
+        literal::<Source>("stop")
+            .requires(|source| source.permission >= 4 && source.uuid.is_none())
+            .executes(|ctx| send(ctx.source(), Action::Stop)),
+    );
+    super::commands_world::register(&mut tree);
     tree
 }
 
@@ -943,6 +1902,9 @@ mod tests {
             origin: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            uuid: None,
+            name: None,
+            state: Arc::new(Mutex::new(GameState::default())),
             actions,
         }
     }
@@ -1310,7 +2272,7 @@ mod tests {
             (bob, "Bob", [100.0, 64.0, 0.0]),
             (carol, "Carol", [10.0, 64.0, 0.0]),
         ] {
-            let (outbound, _) = tokio::sync::mpsc::unbounded_channel();
+            let (outbound, _) = OutboundSender::channel(1 << 20);
             online.insert(
                 uuid,
                 OnlinePlayer {
@@ -1506,6 +2468,325 @@ mod tests {
         assert_eq!(only("save-off", 4), Action::SaveOff);
     }
 
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    const ALICE: u128 = 1;
+    const BOB: u128 = 2;
+
+    fn state_with(players: &[(u128, &str, i32)]) -> Arc<Mutex<GameState>> {
+        let mut state = GameState::default();
+        for &(uuid, name, mode) in players {
+            state.join(Uuid::from_u128(uuid), name.into(), mode, 20);
+        }
+        Arc::new(Mutex::new(state))
+    }
+
+    fn player_source(
+        permission: u8,
+        player: Option<(u128, &str)>,
+        state: Arc<Mutex<GameState>>,
+    ) -> (Source, UnboundedReceiver<Action>) {
+        let (actions, received) = unbounded_channel();
+        let (uuid, name) = match player {
+            Some((uuid, name)) => (Some(Uuid::from_u128(uuid)), Some(name.to_owned())),
+            None => (None, None),
+        };
+        (
+            Source {
+                permission,
+                origin: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                uuid,
+                name,
+                state,
+                actions,
+            },
+            received,
+        )
+    }
+
+    fn next_feedback(received: &mut UnboundedReceiver<Action>) -> Feedback {
+        loop {
+            if let Action::Feedback(feedback) = received.try_recv().expect("expected an action") {
+                return feedback;
+            }
+        }
+    }
+
+    fn error_key(error: CommandError) -> String {
+        match error {
+            CommandError::Syntax(error) => error.translation_key().to_owned(),
+            other => panic!("expected a syntax error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamemode_sets_self_and_reports_missing_target() {
+        let state = state_with(&[(ALICE, "Alice", 1), (BOB, "Bob", 1)]);
+        let tree = dispatcher();
+        let (alice, mut received) = player_source(2, Some((ALICE, "Alice")), state.clone());
+        assert_eq!(tree.execute("gamemode survival", alice).unwrap(), 1);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::GameMode { mode: 0, ref targets } if targets == &[Uuid::from_u128(ALICE)]
+        ));
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.gamemode.success.self");
+        assert_eq!(feedback.text, "Set own game mode to Survival Mode");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .players
+                .iter()
+                .find(|player| player.uuid == Uuid::from_u128(ALICE))
+                .unwrap()
+                .game_mode,
+            0
+        );
+
+        let (alice, _) = player_source(2, Some((ALICE, "Alice")), state);
+        let error = tree.execute("gamemode creative Nobody", alice).unwrap_err();
+        assert_eq!(error_key(error), "argument.entity.notfound.player");
+    }
+
+    #[test]
+    fn defaultgamemode_updates_state_and_requires_an_argument() {
+        let state = state_with(&[]);
+        let tree = dispatcher();
+        let (console, mut received) = player_source(4, None, state.clone());
+        assert_eq!(
+            tree.execute("defaultgamemode creative", console).unwrap(),
+            1
+        );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::DefaultGameMode(1)
+        ));
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.defaultgamemode.success");
+        assert_eq!(feedback.text, "The default game mode is now Creative Mode");
+        assert_eq!(state.lock().unwrap().default_gamemode, 1);
+
+        let (console, _) = player_source(4, None, state);
+        let error = tree.execute("defaultgamemode", console).unwrap_err();
+        assert_eq!(error_key(error), "command.unknown.command");
+    }
+
+    #[test]
+    fn difficulty_queries_sets_and_rejects_the_same_value() {
+        let state = state_with(&[]);
+        let tree = dispatcher();
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("difficulty", console).unwrap(), 2);
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.difficulty.query");
+        assert_eq!(feedback.text, "The difficulty is Normal");
+
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("difficulty hard", console).unwrap(), 0);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::Difficulty(3)
+        ));
+        assert_eq!(
+            next_feedback(&mut received).key,
+            "commands.difficulty.success"
+        );
+        assert_eq!(state.lock().unwrap().difficulty, 3);
+
+        let (console, _) = player_source(2, None, state);
+        let error = tree.execute("difficulty hard", console).unwrap_err();
+        assert_eq!(error_key(error), "commands.difficulty.failure");
+    }
+
+    #[test]
+    fn time_sets_adds_queries_and_rejects_negative_ticks() {
+        let state = state_with(&[]);
+        let tree = dispatcher();
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("time set 1000", console).unwrap(), 1000);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::TimeSet(1000)
+        ));
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.time.set.absolute");
+        assert_eq!(feedback.text, "Set minecraft:overworld to 1000 tick(s)");
+
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("time add 20", console).unwrap(), 1020);
+        assert!(matches!(received.try_recv().unwrap(), Action::TimeAdd(20)));
+        assert_eq!(
+            next_feedback(&mut received).text,
+            "Set minecraft:overworld to 1020 tick(s)"
+        );
+
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("time query time", console).unwrap(), 1020);
+        assert_eq!(
+            next_feedback(&mut received).text,
+            "Clock minecraft:overworld is at 1020 tick(s)"
+        );
+
+        let (console, _) = player_source(2, None, state);
+        let error = tree.execute("time set -1", console).unwrap_err();
+        assert_eq!(error_key(error), "argument.time.tick_count_too_low");
+    }
+
+    #[test]
+    fn weather_sets_duration_and_rejects_zero() {
+        let state = state_with(&[]);
+        let tree = dispatcher();
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("weather thunder 200", console).unwrap(), 200);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Action::Weather {
+                kind: Weather::Thunder,
+                duration: Some(200)
+            }
+        ));
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.weather.set.thunder");
+        assert_eq!(feedback.text, "Set the weather to rain and thunder");
+        assert_eq!(state.lock().unwrap().weather, Weather::Thunder);
+
+        let (console, _) = player_source(2, None, state);
+        let error = tree.execute("weather rain 0", console).unwrap_err();
+        assert_eq!(error_key(error), "argument.time.tick_count_too_low");
+    }
+
+    #[test]
+    fn seed_reports_world_seed_and_requires_permission() {
+        let game_state = GameState {
+            seed: 12345,
+            ..GameState::default()
+        };
+        let state = Arc::new(Mutex::new(game_state));
+        let tree = dispatcher();
+        let (console, mut received) = player_source(2, None, state.clone());
+        assert_eq!(tree.execute("seed", console).unwrap(), 12345);
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.seed.success");
+        assert_eq!(feedback.text, "Seed: 12345");
+
+        let (guest, _) = player_source(0, None, state);
+        assert!(tree.execute("seed", guest).is_err());
+    }
+
+    #[test]
+    fn list_formats_players_and_rejects_unknown_subcommands() {
+        let state = state_with(&[(ALICE, "Alice", 1), (BOB, "Bob", 0)]);
+        let tree = dispatcher();
+        let (guest, mut received) = player_source(0, Some((ALICE, "Alice")), state.clone());
+        assert_eq!(tree.execute("list", guest).unwrap(), 2);
+        let feedback = next_feedback(&mut received);
+        assert_eq!(feedback.key, "commands.list.players");
+        assert_eq!(
+            feedback.text,
+            "There are 2 of a max of 20 players online: Alice, Bob"
+        );
+
+        let (guest, mut received) = player_source(0, Some((ALICE, "Alice")), state.clone());
+        tree.execute("list uuids", guest).unwrap();
+        let feedback = next_feedback(&mut received);
+        assert_eq!(
+            feedback.text,
+            format!(
+                "There are 2 of a max of 20 players online: Alice ({}), Bob ({})",
+                Uuid::from_u128(ALICE),
+                Uuid::from_u128(BOB)
+            )
+        );
+
+        let (guest, _) = player_source(0, Some((ALICE, "Alice")), state);
+        assert!(tree.execute("list nonsense", guest).is_err());
+    }
+
+    #[test]
+    fn say_broadcasts_with_announcement_chat_type_and_checks_permission() {
+        let state = state_with(&[(ALICE, "Alice", 1)]);
+        let tree = dispatcher();
+        let (alice, mut received) = player_source(2, Some((ALICE, "Alice")), state.clone());
+        assert_eq!(tree.execute("say hello world", alice).unwrap(), 1);
+        let Action::Broadcast(feedback) = received.try_recv().unwrap() else {
+            panic!("expected broadcast")
+        };
+        assert_eq!(feedback.key, "chat.type.announcement");
+        assert_eq!(feedback.args, ["Alice", "hello world"]);
+        assert_eq!(feedback.text, "[Alice] hello world");
+
+        let (guest, _) = player_source(0, Some((ALICE, "Alice")), state);
+        assert!(tree.execute("say nope", guest).is_err());
+    }
+
+    #[test]
+    fn me_broadcasts_as_emote_and_requires_an_action() {
+        let state = state_with(&[(ALICE, "Alice", 1)]);
+        let tree = dispatcher();
+        let (alice, mut received) = player_source(0, Some((ALICE, "Alice")), state.clone());
+        assert_eq!(tree.execute("me waves", alice).unwrap(), 1);
+        let Action::Broadcast(feedback) = received.try_recv().unwrap() else {
+            panic!("expected broadcast")
+        };
+        assert_eq!(feedback.key, "chat.type.emote");
+        assert_eq!(feedback.args, ["Alice", "waves"]);
+        assert_eq!(feedback.text, "* Alice waves");
+
+        let (alice, _) = player_source(0, Some((ALICE, "Alice")), state);
+        assert!(tree.execute("me", alice).is_err());
+    }
+
+    #[test]
+    fn entity_selectors_require_permission_level_two() {
+        let state = state_with(&[(ALICE, "Alice", 1)]);
+        let tree = dispatcher();
+        for selector in ["@a", "@p", "@r", "@s"] {
+            let (guest, _) = player_source(0, Some((ALICE, "Alice")), state.clone());
+            let error = tree
+                .execute(&format!("msg {selector} hi"), guest)
+                .unwrap_err();
+            assert_eq!(
+                error_key(error),
+                "argument.entity.selector.not_allowed",
+                "{selector} must be rejected below permission 2"
+            );
+        }
+        // `msg` only accepts player selectors, so cover the entity-only `@e` directly.
+        let (guest, _) = player_source(0, None, state.clone());
+        let all_entities = EntityTarget::Selector {
+            kind: SelectorKind::AllEntities,
+            options: Vec::new(),
+        };
+        assert_eq!(
+            error_key(check_entity_selector(&guest, &all_entities).unwrap_err()),
+            "argument.entity.selector.not_allowed"
+        );
+        let (operator, _received) = player_source(2, Some((ALICE, "Alice")), state);
+        let result = tree.execute("msg @a hi", operator);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn tps_mspt_and_profile_use_the_profiler_and_require_permission() {
+        let state = state_with(&[]);
+        let tree = dispatcher();
+        let (guest, _) = player_source(0, Some((ALICE, "Alice")), state.clone());
+        assert!(tree.execute("profile start", guest).is_err());
+
+        let (operator, mut received) = player_source(2, Some((ALICE, "Alice")), state);
+        tree.execute("tps", operator.clone()).unwrap();
+        assert!(matches!(received.try_recv().unwrap(), Action::Tps));
+        tree.execute("mspt", operator.clone()).unwrap();
+        assert!(matches!(received.try_recv().unwrap(), Action::Mspt));
+        tree.execute("profile start", operator.clone()).unwrap();
+        assert!(matches!(received.try_recv().unwrap(), Action::ProfileStart));
+        tree.execute("profile stop", operator).unwrap();
+        assert!(matches!(received.try_recv().unwrap(), Action::ProfileStop));
+    }
+
     #[test]
     fn plugin_commands_register_aliases_and_forward_arguments() {
         let mut tree = dispatcher();
@@ -1524,6 +2805,9 @@ mod tests {
             origin: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
+            uuid: None,
+            name: None,
+            state: Arc::new(Mutex::new(GameState::default())),
             actions: tx,
         };
         tree.execute("testping", source.clone()).unwrap();
@@ -1542,5 +2826,173 @@ mod tests {
                 args: vec!["one".into(), "two".into()]
             }
         );
+    }
+
+    #[test]
+    fn gamerule_commands_use_vanilla_names_types_and_bounds() {
+        assert_eq!(
+            only("gamerule random_tick_speed 0", 2),
+            Action::GameRule("random_tick_speed".into(), Some("0".into()))
+        );
+        assert_eq!(
+            only("gamerule minecraft:random_tick_speed 1", 2),
+            Action::GameRule("random_tick_speed".into(), Some("1".into()))
+        );
+        assert_eq!(
+            only("gamerule keep_inventory", 2),
+            Action::GameRule("keep_inventory".into(), None)
+        );
+        // Pre-26.3 spellings map onto the renamed rules.
+        assert_eq!(
+            only("gamerule doDaylightCycle false", 2),
+            Action::GameRule("advance_time".into(), Some("false".into()))
+        );
+        assert_eq!(
+            only("gamerule randomTickSpeed 0", 2),
+            Action::GameRule("random_tick_speed".into(), Some("0".into()))
+        );
+        // The generated parsers reject the wrong type and out-of-range integers.
+        assert!(run("gamerule random_tick_speed -1", 2).0.is_err());
+        assert!(run("gamerule keep_inventory 42", 2).0.is_err());
+        assert!(run("gamerule does_not_exist", 2).0.is_err());
+    }
+
+    fn inventory_source(permission: u8) -> (Source, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+        let alice = Uuid::from_u128(1);
+        let mut state = GameState::default();
+        state.join(alice, "Alice".into(), 1, 20);
+        state.join(Uuid::from_u128(2), "Bob".into(), 1, 20);
+        let (actions, received) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Source {
+                permission,
+                origin: [0.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                uuid: Some(alice),
+                name: Some("Alice".into()),
+                state: Arc::new(Mutex::new(state)),
+                actions,
+            },
+            received,
+        )
+    }
+
+    #[test]
+    fn clear_and_give_resolve_targets_items_and_counts() {
+        let tree = dispatcher();
+        let (source, mut rx) = inventory_source(2);
+        let stone = ferrite_item::item_id("minecraft:stone").unwrap();
+        tree.execute("clear", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Clear {
+                targets: vec![Uuid::from_u128(1)],
+                item: None,
+                max_count: None
+            }
+        );
+        tree.execute("clear Bob minecraft:stone 5", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Clear {
+                targets: vec![Uuid::from_u128(2)],
+                item: Some(stone),
+                max_count: Some(5)
+            }
+        );
+        tree.execute("give @s stone 3", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Give {
+                targets: vec![Uuid::from_u128(1)],
+                item: stone,
+                count: 3,
+                item_name: "Stone".into()
+            }
+        );
+        tree.execute("give @p apple", source.clone()).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Action::Give { targets, count: 1, .. } if targets == vec![Uuid::from_u128(1)]
+        ));
+        assert!(
+            tree.execute("give @s diamond_sword 2", source.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("Can't give more than 1 of Diamond Sword")
+        );
+        assert!(tree.execute("give @s stone 65", source.clone()).is_err());
+        assert_eq!(
+            tree.execute("give @s not_an_item", source.clone())
+                .unwrap_err()
+                .to_string(),
+            "Unknown item 'not_an_item'"
+        );
+        let (guest, mut guest_rx) = inventory_source(1);
+        assert!(tree.execute("clear", guest.clone()).is_err());
+        assert!(tree.execute("give @s stone", guest).is_err());
+        assert!(guest_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn xp_resolves_operations_units_and_permissions() {
+        let tree = dispatcher();
+        let (source, mut rx) = inventory_source(2);
+        tree.execute("xp add @s 5", source.clone()).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Add,
+                targets: vec![Uuid::from_u128(1)],
+                amount: 5,
+                unit: XpUnit::Points
+            }
+        );
+        tree.execute("experience add Bob -3 levels", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Add,
+                targets: vec![Uuid::from_u128(2)],
+                amount: -3,
+                unit: XpUnit::Levels
+            }
+        );
+        tree.execute("xp set @p 7 levels", source.clone()).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Set,
+                amount: 7,
+                unit: XpUnit::Levels,
+                ..
+            }
+        ));
+        tree.execute("xp query Alice points", source.clone())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Experience {
+                operation: XpOperation::Query,
+                targets: vec![Uuid::from_u128(1)],
+                amount: 0,
+                unit: XpUnit::Points
+            }
+        );
+        assert!(tree.execute("xp set @s -1", source.clone()).is_err());
+        let (guest, _) = inventory_source(1);
+        assert!(tree.execute("xp add @s 1", guest).is_err());
+    }
+
+    #[test]
+    fn advance_time_only_stops_the_clock() {
+        let mut state = GameState::default();
+        state.tick(true);
+        state.tick(false);
+        assert_eq!(state.clock_time, 1);
+        assert_eq!(state.game_time, 2);
     }
 }

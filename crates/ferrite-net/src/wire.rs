@@ -3,8 +3,11 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{
+    TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 pub struct Wire {
     stream: TcpStream,
@@ -27,6 +30,61 @@ impl Wire {
     pub fn enable_encryption(&mut self, key: &[u8; 16]) {
         self.read = Some(Cfb8::new(key));
         self.write = Some(Cfb8::new(key));
+    }
+    /// Split into independent read and write halves. Each direction keeps its own CFB8 state,
+    /// exactly as the single-stream implementation did.
+    pub fn into_split(self) -> (WireReader, WireWriter) {
+        let (read, write) = self.stream.into_split();
+        (
+            WireReader {
+                stream: read,
+                cipher: self.read,
+            },
+            WireWriter {
+                stream: write,
+                cipher: self.write,
+            },
+        )
+    }
+}
+/// Read half of a [`Wire`]. Decryption stays inside `poll_read`, so the reader never has to
+/// buffer or copy a whole frame just to decrypt it.
+pub struct WireReader {
+    stream: OwnedReadHalf,
+    cipher: Option<Cfb8>,
+}
+/// Write half of a [`Wire`]. Encryption is applied once, in place, to a whole batch of frames
+/// immediately before it is handed to the socket.
+pub struct WireWriter {
+    stream: OwnedWriteHalf,
+    cipher: Option<Cfb8>,
+}
+impl WireWriter {
+    /// Encrypt `batch` in place (single CFB8 pass) and write it as one unit.
+    pub async fn write_batch(&mut self, batch: &mut [u8]) -> std::io::Result<()> {
+        if let Some(cipher) = &mut self.cipher {
+            cipher.encrypt(batch);
+        }
+        self.stream.write_all(batch).await?;
+        self.stream.flush().await
+    }
+}
+impl AsyncRead for WireReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.stream).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if let Some(cipher) = &mut self.cipher {
+                    cipher.decrypt(&mut buf.filled_mut()[before..]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            v => v,
+        }
     }
 }
 impl AsyncRead for Wire {
@@ -109,6 +167,37 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const KEY: [u8; 16] = *b"ferrite-test-key";
+
+    /// Frames queued behind the socket are encrypted as one batch by the writer half.
+    #[tokio::test]
+    async fn split_halves_encrypt_and_decrypt_a_batch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut client = Wire::new(client);
+        client.enable_encryption(&KEY);
+        let (mut client_read, mut client_write) = client.into_split();
+        let mut server = Wire::new(server);
+        server.enable_encryption(&KEY);
+        let (mut server_read, mut server_write) = server.into_split();
+        let plain = b"two frames in one write\x00\x01\x02".to_vec();
+        let mut batch = plain.clone();
+        client_write.write_batch(&mut batch).await.unwrap();
+        assert_ne!(batch, plain, "bytes must be encrypted on the wire");
+        let mut buffer = vec![0u8; plain.len()];
+        client_read_bypass(&mut server_read, &mut buffer).await;
+        assert_eq!(buffer, plain);
+        let mut reply = b"pong".to_vec();
+        server_write.write_batch(&mut reply).await.unwrap();
+        let mut buffer = [0u8; 4];
+        client_read_bypass(&mut client_read, &mut buffer).await;
+        assert_eq!(&buffer, b"pong");
+    }
+
+    async fn client_read_bypass<R: AsyncRead + Unpin>(reader: &mut R, buffer: &mut [u8]) {
+        reader.read_exact(buffer).await.unwrap();
+    }
 
     /// A 3 MiB payload forces the socket buffers full, so the writer goes
     /// through `Pending` and short writes instead of the happy path only.

@@ -91,24 +91,43 @@ public final class Bootstrap {
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled();
     }
+    /** The world block event proxies report; the Rust host currently runs one overworld. */
+    static synchronized org.bukkit.World defaultWorld() {
+        if (defaultWorld == null) {
+            var worlds = server.getWorlds();
+            if (!worlds.isEmpty()) defaultWorld = worlds.get(0);
+            else {
+                defaultWorld = FerriteWorld.create(server, java.util.UUID.fromString("00000000-0000-0000-0000-000000000001"), "world", 0L, 0, 64, 0);
+                server.registerWorld(defaultWorld);
+            }
+        }
+        return defaultWorld;
+    }
+    private static org.bukkit.World defaultWorld;
+    /** Bukkit material for the namespaced block id the host sends with an event. */
+    private static org.bukkit.Material material(String key) {
+        var material = org.bukkit.Material.matchMaterial(key);
+        if (material == null) throw new IllegalArgumentException("Unknown block material " + key);
+        return material;
+    }
     /** Fires Bukkit's {@code PlayerInteractEvent} for a block click; false means cancelled. */
-    public static boolean firePlayerInteract(String id, String name, int action, int x, int y, int z, int face) {
-        var event = new org.bukkit.event.player.PlayerInteractEvent(ensurePlayer(id, name), action == 0 ? org.bukkit.event.block.Action.LEFT_CLICK_BLOCK : org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK, null, FerriteEventObjects.block(x, y, z), FerriteEventObjects.face(face), org.bukkit.inventory.EquipmentSlot.HAND);
+    public static boolean firePlayerInteract(String id, String name, int action, int x, int y, int z, int face, String type) {
+        var event = new org.bukkit.event.player.PlayerInteractEvent(ensurePlayer(id, name), action == 0 ? org.bukkit.event.block.Action.LEFT_CLICK_BLOCK : org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK, null, FerriteEventObjects.block(x, y, z, material(type)), FerriteEventObjects.face(face), org.bukkit.inventory.EquipmentSlot.HAND);
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled() && event.useInteractedBlock() != org.bukkit.event.Event.Result.DENY;
     }
     /** Fires Bukkit's {@code BlockBreakEvent}; false means a listener cancelled the break. */
-    public static boolean fireBlockBreak(String id, String name, int x, int y, int z) {
-        var event = new org.bukkit.event.block.BlockBreakEvent(FerriteEventObjects.block(x, y, z), ensurePlayer(id, name));
+    public static boolean fireBlockBreak(String id, String name, int x, int y, int z, String type) {
+        var event = new org.bukkit.event.block.BlockBreakEvent(FerriteEventObjects.block(x, y, z, material(type)), ensurePlayer(id, name));
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled();
     }
     /** Fires Bukkit's {@code BlockPlaceEvent}; false means a listener cancelled the placement. */
-    public static boolean fireBlockPlace(String id, String name, int x, int y, int z, int face) {
-        var block = FerriteEventObjects.block(x, y, z);
+    public static boolean fireBlockPlace(String id, String name, int x, int y, int z, int face, String placed, String replaced) {
+        var block = FerriteEventObjects.block(x, y, z, material(placed));
         var blockFace = FerriteEventObjects.face(face);
-        var against = FerriteEventObjects.block(x - blockFace.getModX(), y - blockFace.getModY(), z - blockFace.getModZ());
-        var event = new org.bukkit.event.block.BlockPlaceEvent(block, FerriteEventObjects.state(block), against, null, ensurePlayer(id, name), true, org.bukkit.inventory.EquipmentSlot.HAND);
+        var against = FerriteEventObjects.block(x - blockFace.getModX(), y - blockFace.getModY(), z - blockFace.getModZ(), block.getType());
+        var event = new org.bukkit.event.block.BlockPlaceEvent(block, FerriteEventObjects.state(block, material(replaced)), against, null, ensurePlayer(id, name), true, org.bukkit.inventory.EquipmentSlot.HAND);
         synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
         return !event.isCancelled() && event.canBuild();
     }
