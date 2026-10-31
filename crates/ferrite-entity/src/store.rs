@@ -15,6 +15,7 @@
 //! follow the regionizer, and [`EntityStore::take_crossing`] removes entities that walked into
 //! another region section so the caller can hand them to the owner of their new chunk.
 
+use crate::experience::OrbState;
 use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
 use crate::item::ItemState;
@@ -79,6 +80,8 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Experience-orb state, for `minecraft:experience_orb`.
+    pub orb: Option<OrbState>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -101,6 +104,7 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            orb: None,
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }

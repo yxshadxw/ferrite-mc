@@ -19,6 +19,11 @@ pub mod item {
     pub const ITEM: u8 = 8;
 }
 
+/// Accessor indices of experience orbs (vanilla `ExperienceOrb`).
+pub mod experience {
+    pub const VALUE: u8 = 8;
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Item {
     index: u8,

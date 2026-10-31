@@ -2915,3 +2915,65 @@ async fn effect_and_title_commands_reach_the_client() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_death_drops_experience_that_is_picked_up_after_respawn() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, Respawn, ServerboundClientCommand, SetExperience, SetHealth,
+    };
+    let spawn = [0, 65, 0];
+    let world = World::start_configured(
+        None,
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Soul"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Soul").await;
+    bot.raw(7, "xp set @s 2 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (2, 16));
+    world.console_command("kill Soul".into()).await.unwrap();
+    bot.until(PlayerCombatKill::ID).await;
+    let body = bot.until(SetHealth::ID).await;
+    assert_eq!(SetHealth::decode(&mut body.as_slice()).unwrap().health, 0.0);
+    bot.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    bot.until(Respawn::ID).await;
+    // `ServerPlayer.dropExperience` drops `min(level * 7, 100) = 14` points as two 7-value
+    // orbs at the death spot; respawn puts the player back there, so the next ticks award them.
+    // The orbs merge into one count-2 entity first (`ExperienceOrb.scanForMerges`), so vanilla
+    // awards 7 per `playerTouch` and the bar reaches 14 over two ticks.
+    let gained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let body = bot.until(SetExperience::ID).await;
+            let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+            if xp.total.0 >= 14 {
+                break xp;
+            }
+        }
+    })
+    .await
+    .expect("death experience orbs are picked up");
+    assert_eq!((gained.level.0, gained.total.0), (1, 14));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

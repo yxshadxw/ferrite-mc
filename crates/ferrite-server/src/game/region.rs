@@ -8,7 +8,7 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, item,
+    BlockGetter, EntityRecord, EntityStore, Rng, experience, item,
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
@@ -1682,6 +1682,37 @@ impl Region {
             deliver(&self.players, ctx, viewer, &bytes);
         }
     }
+    /// Awards the experience orbs each player touches (`ExperienceOrb.playerTouch`) and syncs
+    /// the bar. The take animation packets go out after every player was processed.
+    fn pick_up_experience(&mut self, ctx: &TickContext) {
+        let mut sent = Vec::new();
+        for p in self.players.values_mut() {
+            if p.gamemode == 3 || p.survival.dead {
+                continue;
+            }
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let gained = experience::player_touch(
+                &mut self.entities,
+                p.entity,
+                feet,
+                &mut |viewer, bytes| sent.push((viewer, bytes.to_vec())),
+            );
+            if gained > 0 {
+                p.set_experience_total(i64::from(p.experience_total) + i64::from(gained));
+                send(
+                    p,
+                    &SetExperience {
+                        progress: p.experience_progress,
+                        level: VarInt(p.experience_level),
+                        total: VarInt(p.experience_total),
+                    },
+                );
+            }
+        }
+        for (viewer, bytes) in sent {
+            deliver(&self.players, ctx, viewer, &bytes);
+        }
+    }
     /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
     /// entities in front of it. Item entities hold plain stacks for now, so components are not
     /// carried over.
@@ -1752,10 +1783,15 @@ impl Region {
                 self.entities
                     .insert(item::pop_resource(pos, plain, &mut self.rng));
             }
-            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, then reset the bar.
-            // `ferrite-entity` has no experience-orb entity yet, so the points are lost rather
-            // than spawned as pickupable orbs.
+            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, split by
+            // `ExperienceOrb.award` and spawned where the player died.
             let dropped = p.experience_level.saturating_mul(7).min(100);
+            if dropped > 0 {
+                let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                for record in experience::award(feet, dropped) {
+                    self.entities.insert(record);
+                }
+            }
             p.experience_level = 0;
             p.experience_progress = 0.0;
             p.experience_total = 0;
@@ -1767,7 +1803,7 @@ impl Region {
                     total: VarInt(0),
                 },
             );
-            tracing::info!(player = %p.name, dropped, "player died; experience orbs are not modelled yet");
+            tracing::info!(player = %p.name, dropped, "player died; experience orbs dropped");
         }
         let kind = p.survival.death_cause.unwrap_or(DamageKind::GenericKill);
         let message = kind.death_message(&p.name);
@@ -1855,6 +1891,14 @@ impl Region {
             self.players.insert(id, p);
         }
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
+        let alive: Vec<ferrite_math::Vec3> = self
+            .players
+            .values()
+            .filter(|p| p.gamemode != 3 && !p.survival.dead)
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        experience::tick_orbs(&mut self.entities, &blocks, &alive, &mut self.rng);
+        self.pick_up_experience(ctx);
         self.pick_up_items(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
