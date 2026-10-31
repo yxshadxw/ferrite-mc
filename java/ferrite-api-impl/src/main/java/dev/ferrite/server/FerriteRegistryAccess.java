@@ -4,7 +4,15 @@ package dev.ferrite.server;
 public final class FerriteRegistryAccess implements io.papermc.paper.registry.RegistryAccess {
     private static final java.util.Map<String, java.util.Set<String>> KEYS = loadKeys();
     private static final java.util.Map<String, org.bukkit.Registry<?>> REGISTRIES = new java.util.concurrent.ConcurrentHashMap<>();
-    private static org.bukkit.Registry<?> cached(String name, java.util.function.Supplier<org.bukkit.Registry<?>> factory) { return REGISTRIES.computeIfAbsent(name, ignored -> factory.get()); }
+    /** {@link org.bukkit.Registry}'s static initializer calls back into this class, so memoize without computeIfAbsent. */
+    @SuppressWarnings("unchecked")
+    private static <T extends org.bukkit.Keyed> org.bukkit.Registry<T> cached(String name, java.util.function.Supplier<org.bukkit.Registry<?>> factory) {
+        var existing = (org.bukkit.Registry<T>) REGISTRIES.get(name);
+        if (existing != null) return existing;
+        var created = (org.bukkit.Registry<T>) factory.get();
+        var prior = (org.bukkit.Registry<T>) REGISTRIES.putIfAbsent(name, created);
+        return prior == null ? created : prior;
+    }
     private static java.util.Map<String, java.util.Set<String>> loadKeys() {
         var result = new java.util.HashMap<String, java.util.Set<String>>();
         try (var stream = java.util.Objects.requireNonNull(FerriteRegistryAccess.class.getResourceAsStream("/ferrite/registry-keys.tsv"), "Missing generated registry keys"); var reader = new java.io.BufferedReader(new java.io.InputStreamReader(stream, java.nio.charset.StandardCharsets.UTF_8))) {
@@ -59,6 +67,7 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                     case "getKey", "key" -> k;
                     case "typed" -> proxy;
                     case "createItemStack" -> new FerriteItemStack(material, args == null || args.length == 0 ? 1 : (int) args[0]);
+                    case "translationKey", "getTranslationKey" -> (material != null && material.isBlock() ? "block." : "item.") + k.getNamespace() + "." + k.getKey();
                     case "hashCode" -> k.hashCode();
                     case "equals" -> proxy == args[0];
                     case "toString" -> "ItemType[" + k + "]";
@@ -81,6 +90,7 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                     case "isAir" -> key.getKey().equals("air") || key.getKey().equals("cave_air") || key.getKey().equals("void_air");
                     case "hasItemType" -> contains("item", key);
                     case "getItemType" -> org.bukkit.Registry.ITEM.get(key);
+                    case "translationKey", "getTranslationKey" -> "block." + key.getNamespace() + "." + key.getKey();
                     case "hashCode" -> key.hashCode();
                     case "equals" -> proxy == args[0];
                     case "toString" -> "BlockType[" + key + "]";
