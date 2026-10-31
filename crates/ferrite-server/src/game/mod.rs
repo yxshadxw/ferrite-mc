@@ -58,6 +58,7 @@ mod global;
 mod gravity;
 mod neighbors;
 mod random_tick;
+mod redstone;
 mod region;
 mod survival;
 
