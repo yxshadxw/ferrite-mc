@@ -67,6 +67,8 @@ pub enum MobEvent {
         player: Uuid,
         damage: f32,
         from: Vec3,
+        /// The attacking mob, so a raised shield can knock it back.
+        attacker: crate::EntityKey,
     },
     /// A skeleton fires an arrow.
     Arrow {
@@ -124,7 +126,7 @@ pub fn look_at(pos: Vec3, eye_height: f64, players: &[Vec3]) -> Option<(f32, f32
 }
 
 /// The nearest player within `range` blocks horizontally and eight blocks vertically.
-fn nearest_target<'a>(players: &'a [Target], pos: Vec3, range: f64) -> Option<&'a Target> {
+fn nearest_target(players: &[Target], pos: Vec3, range: f64) -> Option<&Target> {
     players
         .iter()
         .filter(|target| {
@@ -265,6 +267,7 @@ pub fn tick_with(
                                     player: target.uuid,
                                     damage: kind.attack_damage(),
                                     from: start,
+                                    attacker: key,
                                 });
                                 if let Some(state) = mob::state_mut(store, key) {
                                     state.attack_cooldown = MELEE_COOLDOWN;

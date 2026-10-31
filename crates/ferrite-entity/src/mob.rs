@@ -381,7 +381,7 @@ pub fn kill(store: &mut EntityStore, key: EntityKey) -> bool {
 
 /// Vanilla `LivingEntity.knockback`: 0.4 blocks/tick away from the attacker, plus 0.4 upward
 /// while the mob stands on the ground.
-fn knockback(store: &mut EntityStore, key: EntityKey, source: Vec3) {
+pub fn knockback(store: &mut EntityStore, key: EntityKey, source: Vec3) {
     let Some(pos) = store.pos(key) else { return };
     let mut dx = pos.x - source.x;
     let mut dz = pos.z - source.z;

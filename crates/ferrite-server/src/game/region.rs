@@ -1906,7 +1906,7 @@ impl Player {
                 Command::Input(msg) => msg,
             };
             match msg {
-                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3 | 4 | 5 | 6) => {
+                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3..=6) => {
                     match p.status.0 {
                         3 => self.drop_selected(true),
                         4 => self.drop_selected(false),
@@ -2295,7 +2295,8 @@ impl Region {
                     player,
                     damage,
                     from,
-                } => self.damage_player(player, damage, DamageKind::Mob, from),
+                    attacker,
+                } => self.damage_player(player, damage, DamageKind::Mob, from, Some(attacker)),
                 ai::MobEvent::Arrow {
                     from,
                     direction,
@@ -2520,6 +2521,7 @@ impl Region {
         amount: f32,
         kind: DamageKind,
         from: ferrite_math::Vec3,
+        attacker: Option<ferrite_entity::EntityKey>,
     ) {
         let Some(p) = self.players.get_mut(&uuid) else {
             return;
@@ -2528,23 +2530,30 @@ impl Region {
             // A blocked hit costs no health: the shield is disabled for its cooldown and the
             // attacker is knocked back (`LivingEntity.blockUsingShield`).
             p.shield_disabled = 5;
+            if let Some(attacker) = attacker {
+                let source = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                mob::knockback(&mut self.entities, attacker, source);
+            }
+            return;
+        }
+        if p.hurt(kind, amount) {
+            // Vanilla `Mob.doHurtTarget` knocks the hurt player away from the attacker.
             let dx = p.pos[0] - from.x;
             let dz = p.pos[2] - from.z;
             let length = (dx * dx + dz * dz).sqrt().max(1.0e-4);
+            let y = if p.ground { 0.4 } else { 0.0 };
             send(
                 p,
                 &SetEntityMotion {
                     id: VarInt(p.entity),
                     velocity: ferrite_protocol::types::LpVec3([
-                        dx / length * 0.5,
-                        0.1,
-                        dz / length * 0.5,
+                        dx / length * 0.4,
+                        y,
+                        dz / length * 0.4,
                     ]),
                 },
             );
-            return;
         }
-        p.hurt(kind, amount);
     }
 
     /// Advances arrow flight and applies arrow hits to the players of this region.

@@ -138,10 +138,9 @@ pub fn tick_arrows(
         // Vanilla `AbstractArrow.onHitEntity` ignores only its shooter, and only during the
         // first [`OWNER_GRACE`] ticks; every other player in the flight path is hit at once.
         let owner_grace = arrow.age <= OWNER_GRACE;
-        if let Some((uuid, _)) = players
-            .iter()
-            .find(|(uuid, box_)| box_.intersects(bbox) && !(owner_grace && arrow.owner == Some(*uuid)))
-        {
+        if let Some((uuid, _)) = players.iter().find(|(uuid, box_)| {
+            box_.intersects(bbox) && !(owner_grace && arrow.owner == Some(*uuid))
+        }) {
             hits.push(PlayerHit {
                 uuid: *uuid,
                 damage: arrow.damage,
@@ -175,12 +174,7 @@ mod tests {
         store.insert(new_arrow(pos, vel, 4.0, None, &mut Rng::new(1)))
     }
 
-    fn spawn_arrow_from(
-        store: &mut EntityStore,
-        pos: Vec3,
-        vel: Vec3,
-        owner: Uuid,
-    ) -> EntityKey {
+    fn spawn_arrow_from(store: &mut EntityStore, pos: Vec3, vel: Vec3, owner: Uuid) -> EntityKey {
         store.insert(new_arrow(pos, vel, 4.0, Some(owner), &mut Rng::new(1)))
     }
 

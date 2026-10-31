@@ -141,7 +141,7 @@ pub fn find_path(
             // Level ground first, then a step up, then drops up to three blocks.
             let mut next = None;
             for dy in [0, 1, -1, -2, -3] {
-                if dy < 0 && dy < -MAX_DROP {
+                if dy < -MAX_DROP {
                     continue;
                 }
                 let y = node[1] + dy;
@@ -233,10 +233,7 @@ mod tests {
         assert!(!path.is_empty());
         let last = *path.last().unwrap();
         // The search stops at the first node within one block of the goal.
-        assert!(
-            (last[0] - 5).abs() <= 1 && last[2].abs() <= 1,
-            "{last:?}"
-        );
+        assert!((last[0] - 5).abs() <= 1 && last[2].abs() <= 1, "{last:?}");
         assert!(path.len() <= MAX_PATH);
         assert!(find_path(&world, [0, 64, 0], [5, 64, 0], 2).is_empty());
         assert!(find_path(&world, [0, 64, 0], [0, 64, 0], 8).is_empty());
