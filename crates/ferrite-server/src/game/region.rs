@@ -8,7 +8,7 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Flags, Rng, ai, arrow, combat,
+    BlockGetter, EntityRecord, EntityStore, Flags, Rng, ai, arrow, chunk_of, combat,
     effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
     experience, item,
     mob::{self, MobKind},
@@ -122,6 +122,12 @@ pub enum Signal {
         uuid: Uuid,
         chunk: ChunkPos,
         held: Vec<ChunkPos>,
+    },
+    /// The entities a chunk held when its last holder released it, for the world loop to write
+    /// to the chunk's sidecar before the chunk is unloaded.
+    SaveEntities {
+        chunk: ChunkPos,
+        entities: Vec<EntityRecord>,
     },
     /// An entity walked into another region section; the main loop hands it to the region
     /// owning `to` through that region's task queue (Folia: only the owner touches it).
@@ -2290,6 +2296,37 @@ impl Region {
                 self.held_chunks.remove(&chunk);
             }
         }
+    }
+    /// Removes and returns every entity standing in `chunk`, so the world loop can persist the
+    /// chunk's entities when it unloads. Entities in chunks that stay loaded are untouched.
+    pub fn take_chunk_entities(&mut self, chunk: ChunkPos) -> Vec<EntityRecord> {
+        let keys: Vec<_> = self
+            .entities
+            .keys()
+            .iter()
+            .copied()
+            .filter(|&key| {
+                self.entities
+                    .pos(key)
+                    .is_some_and(|pos| chunk_of(pos) == (chunk.0, chunk.1))
+            })
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.entities.remove(key))
+            .collect()
+    }
+    /// Puts entities loaded from a chunk sidecar back into this region.
+    pub fn add_entities(&mut self, records: Vec<EntityRecord>) {
+        for record in records {
+            self.entities.insert(record);
+        }
+    }
+    /// Removes every entity from the region, for the shutdown save.
+    pub fn drain_entities(&mut self) -> Vec<EntityRecord> {
+        let keys: Vec<_> = self.entities.keys().to_vec();
+        keys.into_iter()
+            .filter_map(|key| self.entities.remove(key))
+            .collect()
     }
     pub fn schedule_fluid(&mut self, pos: (i32, i32, i32)) {
         let chunk = ChunkPos(pos.0.div_euclid(16), pos.2.div_euclid(16));
