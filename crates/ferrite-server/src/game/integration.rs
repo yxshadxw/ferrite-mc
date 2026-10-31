@@ -23,6 +23,8 @@ struct Bot {
     encoder: FrameEncoder,
     decoder: FrameDecoder,
     commands: Option<Vec<u8>>,
+    /// Chunks per tick sent in automatic `ChunkBatchReceived` acknowledgements.
+    chunks_per_tick: f32,
 }
 impl Bot {
     async fn send<P: Packet>(&mut self, p: &P) {
@@ -87,7 +89,7 @@ impl Bot {
             }
             11 => {
                 self.send(&ChunkBatchReceived {
-                    chunks_per_tick: 64.0,
+                    chunks_per_tick: self.chunks_per_tick,
                 })
                 .await
             }
@@ -125,6 +127,7 @@ impl Bot {
             encoder: FrameEncoder::default(),
             decoder: FrameDecoder::default(),
             commands: None,
+            chunks_per_tick: 64.0,
         };
         b.send(&Intention {
             protocol_version: 777,
@@ -162,7 +165,13 @@ impl Bot {
     }
     /// Joins and waits until the server positions the player in play state.
     async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+        Self::join_with_rate(addr, name, 64.0).await
+    }
+    /// Joins with a specific chunk-batch rate, so a test can keep the per-connection queue
+    /// small without a normal reader overflowing it during the initial chunk burst.
+    async fn join_with_rate(addr: std::net::SocketAddr, name: &str, chunks_per_tick: f32) -> Self {
         let mut b = Self::begin_join(addr, name).await;
+        b.chunks_per_tick = chunks_per_tick;
         b.until(73).await;
         b
     }
@@ -2422,6 +2431,140 @@ async fn gamerule_zero_stops_grass_spread_for_bot() {
     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
     assert_eq!(source.block(8, y, 8), Some(block("dirt")));
     drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// `/setblock` writes through the shared block-change path, so another player tracking the
+/// chunk receives the ordinary `BlockUpdate`, and the source gets vanilla feedback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setblock_command_updates_block_for_tracking_player() {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let world = World::start_configured(
+        Some(source.clone()),
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut builder = Bot::join(addr, "Alice").await;
+    let mut observer = Bot::join(addr, "Observer").await;
+    builder.until(46).await;
+    observer.until(46).await;
+    builder.raw(7, "setblock 10 64 0 minecraft:stone").await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), observer.until(8))
+        .await
+        .unwrap();
+    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(BlockPos::unpack(update.location), BlockPos::new(10, 64, 0));
+    let stone = ferrite_data::blocks::default_state("minecraft:stone").unwrap();
+    assert_eq!(update.block_state.0, i32::from(stone));
+    assert_eq!(source.block(10, 64, 0), Some(u32::from(stone)));
+    let feedback = builder.chat_containing("Changed the block").await;
+    assert!(feedback.contains("10, 64, 0"), "{feedback}");
+    drop(builder);
+    drop(observer);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// A bot that stops reading must be disconnected as timed out, and its blocked writer must not
+/// slow down the region ticks or the other players' connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_reader_is_disconnected_without_stalling_ticks() {
+    use ferrite_protocol::packets::play::{ClientboundPlayerChat, PlayDisconnect};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 24,
+            send_queue_bytes: 128 * 1024,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut slow = Bot::join_with_rate(addr, "Slow", 1.0).await;
+    let mut fast = Bot::join_with_rate(addr, "Fast", 1.0).await;
+    let before = world.tick_samples.lock().unwrap().len();
+    // One acknowledgement makes the next tick queue a full 64-chunk batch; the bot never reads
+    // it, so the per-connection queue fills while its writer is stuck on the socket. The ack is
+    // fully written before the server can drop the connection, so the disconnect is not lost
+    // to a reset.
+    slow.send(&ChunkBatchReceived {
+        chunks_per_tick: 64.0,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Other players are unaffected: their chat still arrives while the slow bot is blocked.
+    fast.chat("still moving").await;
+    let chat = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let body = fast.until(66).await;
+            let message = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+            if message.body.content == "still moving" {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(chat.is_ok(), "chat stalled while a slow client was blocked");
+    // Let the slow bot read again; it must receive the timed-out disconnect.
+    let mut reason = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Ok((id, body)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), slow.next_play()).await
+        else {
+            break;
+        };
+        if id == PlayDisconnect::ID {
+            reason = Some(
+                PlayDisconnect::decode(&mut body.as_slice())
+                    .unwrap()
+                    .reason
+                    .0,
+            );
+            break;
+        }
+    }
+    assert_eq!(
+        reason.as_deref(),
+        Some("Timed out"),
+        "slow reader must be disconnected as timed out"
+    );
+    let samples = world.tick_samples.lock().unwrap().clone();
+    assert!(
+        samples.len() > before + 5,
+        "ticks stopped while a slow client was writing: {before} -> {}",
+        samples.len()
+    );
+    let worst = samples[before..].iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        worst < 250.0,
+        "a slow client stalled region ticks: worst {worst:.1} ms"
+    );
+    drop(fast);
+    drop(slow);
     world.shutdown().await.unwrap();
     server.abort();
 }
