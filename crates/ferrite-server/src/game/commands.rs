@@ -9,6 +9,7 @@ use ferrite_command::{
     arguments::{Coordinates, EntityTarget, GameMode, SelectorKind, WorldCoordinate},
     literal,
 };
+use ferrite_nbt::Tag;
 use ferrite_net::game::OutboundSender;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -51,6 +52,10 @@ pub struct PlayerEntry {
     pub tags: BTreeSet<String>,
     /// `/team join` membership, if any.
     pub team: Option<String>,
+    /// Last known position and rotation (`execute at`, `/data`, `/tp`).
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// A `/scoreboard objectives` entry.
@@ -152,6 +157,8 @@ pub struct GameState {
     pub bossbars: BTreeMap<String, BossBarState>,
     /// Scoreboard teams by name.
     pub teams: BTreeMap<String, TeamState>,
+    /// Command storage (`/data ... storage` and `execute store ... storage`).
+    pub storage: BTreeMap<String, Tag>,
 }
 
 impl GameState {
@@ -175,6 +182,7 @@ impl GameState {
             displays: BTreeMap::new(),
             bossbars: BTreeMap::new(),
             teams: BTreeMap::new(),
+            storage: BTreeMap::new(),
         }
     }
 
@@ -188,8 +196,20 @@ impl GameState {
             effects: BTreeMap::new(),
             tags: BTreeSet::new(),
             team: None,
+            pos: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
         });
         self.max_players = max_players;
+    }
+
+    /// Records a player's last known position for commands that resolve entity state.
+    pub fn set_position(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) {
+        if let Some(player) = self.players.iter_mut().find(|player| player.uuid == uuid) {
+            player.pos = pos;
+            player.yaw = yaw;
+            player.pitch = pitch;
+        }
     }
 
     pub fn leave(&mut self, uuid: Uuid) {
@@ -469,11 +489,13 @@ pub enum Action {
         enchantment: String,
         level: i32,
     },
+    /// `/data` on a block entity, applied by the game loop against the chunk source.
+    Data(super::commands_data::BlockData),
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
 /// coordinates, and the channel actions are sent on.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Source {
     pub permission: u8,
     pub origin: [f64; 3],
@@ -481,6 +503,10 @@ pub struct Source {
     pub pitch: f32,
     pub uuid: Option<Uuid>,
     pub name: Option<String>,
+    /// `execute anchored`: `eyes` lifts the source position by the eye height.
+    pub anchor: EntityAnchor,
+    /// Chunk source when the command runs inside a world (block tests, `/data block`).
+    pub world: Option<Arc<super::anvil::AnvilChunkSource>>,
     pub state: Arc<Mutex<GameState>>,
     pub actions: UnboundedSender<Action>,
 }
@@ -1772,6 +1798,10 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
     super::commands_world::register(&mut tree);
     super::commands_extras::register(&mut tree);
     super::commands_meta::register(&mut tree);
+    super::commands_data::register(&mut tree);
+    // `execute` registers last: its `run` and every modifier redirect back to the root, so
+    // the rest of the tree must already be in place.
+    super::commands_exec::register(&mut tree);
     tree
 }
 
@@ -2044,6 +2074,8 @@ mod tests {
             name: None,
             state: Arc::new(Mutex::new(GameState::default())),
             actions,
+            anchor: ferrite_command::EntityAnchor::Feet,
+            world: None,
         }
     }
 
@@ -2640,6 +2672,8 @@ mod tests {
                 name,
                 state,
                 actions,
+                anchor: ferrite_command::EntityAnchor::Feet,
+                world: None,
             },
             received,
         )
@@ -2946,6 +2980,8 @@ mod tests {
             pitch: 0.0,
             uuid: None,
             name: None,
+            anchor: EntityAnchor::Feet,
+            world: None,
             state: Arc::new(Mutex::new(GameState::default())),
             actions: tx,
         };
@@ -3012,6 +3048,8 @@ mod tests {
                 name: Some("Alice".into()),
                 state: Arc::new(Mutex::new(state)),
                 actions,
+                anchor: ferrite_command::EntityAnchor::Feet,
+                world: None,
             },
             received,
         )
