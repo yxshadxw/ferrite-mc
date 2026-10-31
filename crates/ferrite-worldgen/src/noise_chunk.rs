@@ -56,7 +56,8 @@ impl CellGrid {
         }
         let size = [cell[0] as usize, cell[1] as usize, cell[0] as usize];
         for axis in 0..3 {
-            if !size[axis].is_power_of_two() || extent[axis] as usize % size[axis] != 0 {
+            if !size[axis].is_power_of_two() || !(extent[axis] as usize).is_multiple_of(size[axis])
+            {
                 return None;
             }
         }

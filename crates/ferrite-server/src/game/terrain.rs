@@ -310,7 +310,7 @@ fn generate(
         .map_err(|error| format!("carving chunk {x},{z}: {error}"))?;
     timings.carve_ms = mark.elapsed().as_secs_f64() * 1000.0;
     let mark = std::time::Instant::now();
-    fill_biomes(&mut chunk, &surface, registry, x, z)
+    fill_biomes(&mut chunk, surface, registry, x, z)
         .map_err(|error| format!("biomes for chunk {x},{z}: {error}"))?;
     timings.biomes_ms = mark.elapsed().as_secs_f64() * 1000.0;
     let _ = data;

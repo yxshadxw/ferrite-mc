@@ -13,8 +13,9 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 > **English summary** — Ferrite is a Minecraft Java server written in Rust (target 26.3,
 > protocol 777) with Folia-style regionized multithreading and an embedded JVM for
 > Bukkit/Paper plugins. It currently runs a bot-verified survival server: login/encryption,
-> signed chat, server-list ping, blocks and items, inventory/crafting/chests/furnaces/anvils,
-> survival, redstone, mobs (passive and hostile) with combat, ~70 commands, plugin events and a
+> signed chat, server-list ping, blocks and items, inventory/crafting/chests/furnaces/anvils, villagers and trading,
+> hoppers and dispensers, survival, redstone, mobs (passive and hostile) with combat, ~70 commands,
+> plugin events and a
 > Folia-style scheduler, vanilla world generation on a dedicated thread, and a 26.3 → 26.2
 > protocol translation layer. **It has not yet been tested with a real 26.3 client.** No Mojang
 > code or assets are distributed here; vanilla data is generated locally from the official jar.
@@ -23,9 +24,9 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 
 | 구분 | 내용 |
 |---|---|
-| ✅ **완료 (봇 검증)** | 접속·암호화·서명 채팅, 서버 목록, 리전 멀티스레딩, 월드 IO·조명, 블록/아이템, 인벤토리·제작·컨테이너, 생존, 전투·몹, 레드스톤, 유체·화재, 명령 약 70개, 플러그인 브리지, 바닐라 지형 생성 |
-| 🔧 **진행 중** | 월드젠 처리량(현저히 느림), 나무·구조물 생성, 피스톤, 플러그인 API 확장 |
-| ⛔ **아직 없음** | 실제 클라이언트 검증, 네더·엔드 차원, 주민·거래, 엔티티 영속화, 양조·비컨 |
+| ✅ **완료 (봇 검증)** | 접속·암호화·서명 채팅, 서버 목록, 리전 멀티스레딩, 월드 IO·조명, 블록/아이템, 인벤토리·제작·컨테이너, 생존, 전투·몹, 주민·거래, 레드스톤·호퍼·디스펜서, 유체·화재, 명령 약 70개, 플러그인 브리지, 엔티티 영속화, 바닐라 지형 생성 |
+| 🔧 **진행 중** | 월드젠 처리량(1스레드 4.6→6.2, 8스레드 23.5→38.9 chunks/s, 10x 목표 미달), 나무·구조물, 피스톤, 양조·비컨, 플러그인 API 확장 |
+| ⛔ **아직 없음** | 실제 클라이언트 검증, 네더·엔드 차원, 구조물, 명령 블록 |
 | 🔬 **검증 수준** | 전체 테스트 105개 바이너리 통과, `clippy -D warnings`·`fmt --check` 클린, 월드젠은 바닐라 Java와 대조 |
 
 ## 무엇이 되나
@@ -46,6 +47,8 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 - 인벤토리 클릭, 2x2·작업대 크래프팅, 상자·통
 - **제작대**: 용광로·용해로·훈연기 제련(연료·조리 진행도·경험치), 모루 수리·이름·레벨 비용,
   마법 부여대, 숫돌, 석재 절단기, 대장장이 작업대, 베틀
+- **호퍼·디스펜서**: 8틱 아이템 이동(위에서 당기고 앞으로 밀기, 레드스톤 차단, 비교기 출력),
+  드로퍼/디스펜서(화살·눈덩이·달걀 발사)
 - 게임룰 59종과 저장
 
 ### 생존과 전투
@@ -54,6 +57,7 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 - **몹**: 프레임워크(체력·피해·전리품·디스폰), 수동 몹(돼지·소·양·닭)과 적대 몹(좀비·스켈레톤·
   거미·크리퍼·엔더맨), 목표 기반 AI, 블록 격자 길찾기, 화살, 몬스터 자연 스폰(밝기·몹 캡),
   `/summon`
+- **주민**: 직업과 작업대 연동, UUID별 결정적 거래 목록, 가격·사용 횟수·XP, 상인 메뉴
 
 ### 블록과 레드스톤
 - 이웃 업데이트와 `canSurvive`, 낙하 블록(모래·자갈·콘크리트 가루·모루)
@@ -77,10 +81,11 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 
 ### 플러그인 (내장 JVM)
 - `plugin.yml`·`paper-plugin.yml` 로딩, Java 25 내장 JVM에서 `onEnable`/`onDisable` 실행
-- 이벤트: 플레이어 이동·상호작용·블록 파괴/설치·명령(취소 가능), 오류 정책
+- 이벤트: 플레이어 이동·상호작용·블록 파괴/설치·명령, 인벤토리 클릭/닫기, 사망·리스폰,
+  엔티티 피해/사망, 청크 로드/언로드, 날씨·월드 로드, 레벨/경험치(취소 가능한 이벤트는 취소 반영), 오류 정책
   `plugins.on-event-error = allow | deny`
 - Bukkit `Server`/`Player`/`World`/`Inventory`/`Scheduler`/`ConfigurationSection`의 자주 쓰는
-  표면(약 120/206 메서드)과 최소 `org.bukkit.craftbukkit` shim
+  표면(확장 중)과 최소 `org.bukkit.craftbukkit` shim
 - Bukkit 스케줄러는 Folia 규칙대로 리전/글로벌/async 스케줄러로 라우팅
 - 월드·플레이어 위치/모드/OP 스냅샷, `Native.playerInventory`(인벤토리 쓰기 → 패킷·메뉴 재동기화)
 
@@ -97,10 +102,10 @@ Rust로 작성된 **Minecraft Java 서버**입니다. Folia 스타일의 리전(
 
 - **실제 26.3 클라이언트로 접속해 검증하지 않았습니다.** 지금까지는 프로토콜 봇과 Java
   대조 하네스로만 검증했습니다.
-- 월드젠 처리량이 낮습니다 — 200봇 벤치마크에서 30초에 69청크 수준입니다.
-- 나무·구조물 생성, 피스톤은 진행 중입니다.
+- 월드젠 처리량은 1스레드 6.2 chunks/s, 8스레드 38.9 chunks/s까지 개선됐지만 10x 목표에는
+  못 미칩니다(청크 출력은 바이너리와 동일).
+- 나무·구조물 생성, 피스톤, 양조·비컨 메뉴는 진행 중입니다.
 - 네더·엔드 차원이 없고 차원은 오버월드로 고정되어 있습니다.
-- 주민·거래, 엔티티 영속화(`playerdata`식 저장), 양조·비컨·지도 제작대 메뉴는 없습니다.
 - 플러그인 API는 Paper `Server`의 일부만 구현했습니다. EssentialsX 같은 대형 플러그인의 모든
   호출 경로는 동작하지 않고, NMS 타입에 의존하는 메서드는 `UnsupportedOperationException`을
   던집니다.
@@ -143,7 +148,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-- 최근 전체 실행: **105개 테스트 바이너리 전부 통과**, clippy·fmt 클린.
+- 최근 전체 실행: 전체 테스트 통과, clippy·fmt 클린.
 - 월드젠은 `crates/ferrite-worldgen/tests/java`의 Java 대조 하네스로 바닐라와 비교합니다.
 - 서버 동작은 `crates/ferrite-server/tests`의 프로토콜 봇 세션으로 검증합니다.
 - `ferrite-translate`의 26.2 검증은 `vanilla/26.2` 리포트가 있을 때만 실행됩니다.
