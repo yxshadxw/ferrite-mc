@@ -22,7 +22,7 @@ pub use inventory::{
 pub use menu::{
     ClickInput, Clicker, CookingOutput, Crafter, FURNACE_BURN_LEFT, FURNACE_BURN_TOTAL,
     FURNACE_COOK_PROGRESS, FURNACE_COOK_TOTAL, FURNACE_DATA_SLOTS, FURNACE_LIT, FurnaceKind,
-    FurnaceState, Menu, MenuKind, NoCrafting, SLOT_OUTSIDE, Sync, craft_remainder,
+    FurnaceState, Menu, MenuKind, NoCrafting, SLOT_OUTSIDE, Sync, Trade, craft_remainder,
 };
 
 #[cfg(test)]
