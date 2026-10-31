@@ -269,3 +269,72 @@ fn shift_node_scales_all_three_coordinates() {
     });
     assert_eq!(function.compute(&CoordinateNoise), 1284.0);
 }
+
+#[test]
+fn interval_select_uses_next_interval_on_threshold() {
+    for (input, expected) in [(-1.0, 10.0), (0.0, 20.0), (1.0, 30.0)] {
+        let function = node(DensityNode::IntervalSelect {
+            input: c(input),
+            thresholds: vec![0.0, 1.0],
+            functions: vec![*c(10.0), *c(20.0), *c(30.0)],
+        });
+        assert_eq!(function.compute(&Pos(0, 0, 0)), expected);
+    }
+}
+
+#[test]
+fn find_top_surface_steps_down_from_aligned_upper_bound() {
+    let function = node(DensityNode::FindTopSurface {
+        density: Box::new(node(DensityNode::Gradient {
+            axis: ferrite_worldgen::Axis::Y,
+            from_coordinate: 0.0,
+            to_coordinate: 16.0,
+            from_value: 1.0,
+            to_value: -1.0,
+        })),
+        upper_bound: c(19.0),
+        lower_bound: -16,
+        cell_height: 4,
+    });
+    assert_eq!(function.compute(&Pos(0, 0, 0)), 4.0);
+}
+
+#[test]
+fn interpolation_samples_cell_corners_for_negative_coordinates() {
+    let x = node(DensityNode::Gradient {
+        axis: ferrite_worldgen::Axis::X,
+        from_coordinate: -8.0,
+        to_coordinate: 8.0,
+        from_value: -8.0,
+        to_value: 8.0,
+    });
+    let function = node(DensityNode::Interpolated {
+        input: Box::new(node(DensityNode::Square { input: Box::new(x) })),
+        cell_size_xz: 4,
+        cell_size_y: 8,
+    });
+    assert_eq!(function.compute(&Pos(-2, 0, 0)), 8.0);
+}
+
+#[test]
+fn lerp_at_endpoints_returns_exact_selected_value() {
+    let function = node(DensityNode::Lerp {
+        alpha: c(1.0),
+        first: c(1.0),
+        second: c(1.0e-8),
+    });
+    assert_eq!(function.compute(&Pos(0, 0, 0)), f64::from(1.0e-8_f32));
+}
+
+#[test]
+fn gradient_uses_vanillas_precomputed_float_slope() {
+    let gradient = node(DensityNode::Gradient {
+        axis: ferrite_worldgen::Axis::Y,
+        from_coordinate: 0.0,
+        to_coordinate: 24.0,
+        from_value: 0.0,
+        to_value: 1.0,
+    });
+    let expected = 7.0_f32 * (1.0_f32 / 24.0_f32);
+    assert_eq!(gradient.compute(&Pos(0, 7, 0)), f64::from(expected));
+}
