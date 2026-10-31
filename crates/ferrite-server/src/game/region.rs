@@ -8,7 +8,7 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, ai, arrow, combat,
+    BlockGetter, EntityRecord, EntityStore, Flags, Rng, ai, arrow, combat,
     effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
     experience, item,
     mob::{self, MobKind},
@@ -146,6 +146,8 @@ pub struct TickContext {
     pub rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
     /// World spawn, where a player without a bed respawns (`ServerPlayer.respawn`).
     pub spawn: [f64; 3],
+    /// Command-visible entity snapshot this region publishes at the end of each tick.
+    pub command_entities: Arc<Mutex<super::entity_index::EntityIndex>>,
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
 pub(super) struct TickBlocks<'a> {
@@ -306,6 +308,8 @@ pub struct Region {
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
     rng: Rng,
+    /// UUIDs this region last published into `TickContext::command_entities`.
+    published_entities: HashSet<Uuid>,
 }
 impl RegionData for Region {
     fn merge(&mut self, mut other: Self) {
@@ -321,6 +325,7 @@ impl RegionData for Region {
         self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
+        self.published_entities.extend(other.published_entities);
         self.generator.merge(other.generator);
     }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
@@ -355,6 +360,7 @@ impl RegionData for Region {
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
+            published_entities: HashSet::new(),
         };
         let moving: Vec<_> = self
             .held_chunks
@@ -3270,6 +3276,59 @@ impl Region {
                 entity: Box::new(entity),
             });
         }
+        self.publish_command_entities(&ctx.command_entities);
+    }
+
+    /// Publishes this region's entities for command selectors. Folia keeps the store region
+    /// local; commands read the snapshot and route mutations back to this region.
+    fn publish_command_entities(&mut self, index: &Arc<Mutex<super::entity_index::EntityIndex>>) {
+        index
+            .lock()
+            .unwrap()
+            .sync(&mut self.published_entities, &self.entities);
+    }
+
+    /// Marks one entity for removal (`/kill`). The tracker still sends the remove packet and
+    /// the normal sweep drops it on this tick or the next.
+    pub fn kill_entity(&mut self, uuid: Uuid) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::REMOVED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
+    }
+
+    /// Moves one entity (`/tp`). When the destination left this region section, the normal
+    /// `take_crossing` pass hands it to the owning region by value on the next tick.
+    pub fn teleport_entity(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        self.entities
+            .set_pos(key, ferrite_math::Vec3::new(pos[0], pos[1], pos[2]));
+        if let Some(data) = self.entities.data_mut(key) {
+            data.yaw = yaw;
+            data.pitch = pitch;
+            data.head_yaw = yaw;
+        }
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::TELEPORTED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
     }
 }
 #[cfg(test)]
@@ -3304,6 +3363,7 @@ mod tests {
             raining: false,
             rules: Default::default(),
             spawn: [0.0, 65.0, 0.0],
+            command_entities: Default::default(),
         });
 
         let report = timings.report_all(50.0);
@@ -3311,6 +3371,36 @@ mod tests {
             report.rows.iter().any(|row| row.path == "region-tick"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn kill_and_teleport_apply_to_region_entities_and_hand_off() {
+        use ferrite_entity::{EntityData, EntityRecord, allocate_id, random_uuid};
+        use ferrite_math::Vec3;
+        let mut region = Region::default();
+        let record = |x: f64| EntityRecord {
+            pos: Vec3::new(x, 64.0, 0.5),
+            vel: Vec3::ZERO,
+            flags: Flags::default(),
+            data: EntityData::new(allocate_id(), random_uuid(), 71, 0.25, 0.25),
+        };
+
+        let key = region.entities.insert(record(1.5));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.kill_entity(uuid));
+        assert!(region.entities.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(region.entities.sweep_removed().len(), 1);
+
+        // Teleporting across the default region section hands the record to the owner of the
+        // destination chunk on the next crossing pass.
+        let key = region.entities.insert(record(250.0));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.teleport_entity(uuid, [300.5, 64.0, 0.5], 90.0, 10.0));
+        assert_eq!(region.entities.data(key).unwrap().yaw, 90.0);
+        assert!(region.entities.flags(key).unwrap().has(Flags::TELEPORTED));
+        let out = region.entities.take_crossing();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk(), (18, 0));
     }
 
     #[test]

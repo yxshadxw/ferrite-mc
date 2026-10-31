@@ -1164,9 +1164,61 @@ async fn commands_packet_decodes_and_filters_permissions() {
         let mut parser = None;
         if flags & 3 == 2 {
             let id = VarInt::decode(&mut input).unwrap().0;
-            if Some(id) == registry.id("minecraft:entity") {
-                // minecraft:entity properties: single/players-only flags.
+            let mut number_bits = || {
+                let bits = u8::decode(&mut input).unwrap();
+                (bits & 1 != 0, bits & 2 != 0)
+            };
+            if Some(id) == registry.id("minecraft:entity")
+                || Some(id) == registry.id("minecraft:score_holder")
+            {
+                // minecraft:entity / score_holder properties: single / multiple flags.
                 let _ = u8::decode(&mut input).unwrap();
+            } else if Some(id) == registry.id("brigadier:string")
+                || Some(id) == registry.id("minecraft:time")
+            {
+                let _ = VarInt::decode(&mut input).unwrap();
+            } else if Some(id) == registry.id("brigadier:float") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = f32::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = f32::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:double") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = f64::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = f64::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:integer") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = VarInt::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = VarInt::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:long") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = i64::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = i64::decode(&mut input).unwrap();
+                }
+            } else if ferrite_command::arguments::RegistryParser::ALL
+                .iter()
+                .any(|kind| registry.id(kind.id()) == Some(id))
+            {
+                // Registry parsers send the target registry identifier.
+                let _ = String::decode(&mut input).unwrap();
+            }
+            if flags & 0x10 != 0 {
+                // Suggestion type follows the parser properties.
+                let _ = VarInt::decode(&mut input).unwrap();
             }
             parser = Some(id);
         }
@@ -1449,6 +1501,7 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         raining: false,
         rules: Default::default(),
         spawn: [0.0, 65.0, 0.0],
+        command_entities: Default::default(),
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),

@@ -57,6 +57,8 @@ pub struct PlayerEntry {
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// Experience level, matched by the `level=` selector option.
+    pub xp_level: i32,
 }
 
 /// A `/scoreboard objectives` entry.
@@ -162,6 +164,12 @@ pub struct GameState {
     pub storage: BTreeMap<String, Tag>,
     /// Datapack functions loaded from the world's `datapacks` folder.
     pub functions: Arc<super::functions::FunctionStore>,
+    /// Region-published entity snapshot used by entity selectors.
+    pub entities: Arc<Mutex<super::entity_index::EntityIndex>>,
+    /// `/schedule function`: function id -> due gametimes, oldest first.
+    pub schedules: BTreeMap<String, Vec<i64>>,
+    /// Trigger objectives a player has "primed" with `scoreboard players enable`.
+    pub trigger_enabled: BTreeSet<(String, String)>,
 }
 
 impl GameState {
@@ -187,6 +195,9 @@ impl GameState {
             teams: BTreeMap::new(),
             storage: BTreeMap::new(),
             functions: Arc::new(super::functions::FunctionStore::default()),
+            entities: Arc::new(Mutex::new(super::entity_index::EntityIndex::default())),
+            schedules: BTreeMap::new(),
+            trigger_enabled: BTreeSet::new(),
         }
     }
 
@@ -203,6 +214,7 @@ impl GameState {
             pos: [0.0, 64.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            xp_level: 0,
         });
         self.max_players = max_players;
     }
@@ -221,12 +233,24 @@ impl GameState {
     }
 
     /// Advances the world tick. The overworld clock only moves while
-    /// `advance_time` (vanilla `doDaylightCycle`) is enabled.
-    pub fn tick(&mut self, advance_time: bool) {
+    /// `advance_time` (vanilla `doDaylightCycle`) is enabled. Returns the scheduled functions
+    /// that are due this tick, once per function.
+    pub fn tick(&mut self, advance_time: bool) -> Vec<String> {
         self.game_time += 1;
         if advance_time {
             self.clock_time += 1;
         }
+        let now = self.game_time;
+        let mut due = Vec::new();
+        for (name, times) in &mut self.schedules {
+            let before = times.len();
+            times.retain(|due| *due > now);
+            if times.len() != before {
+                due.push(name.clone());
+            }
+        }
+        self.schedules.retain(|_, times| !times.is_empty());
+        due
     }
 }
 
@@ -294,6 +318,36 @@ fn english(key: &str) -> &'static str {
         "commands.weather.set.thunder" => "Set the weather to rain and thunder",
         "commands.seed.success" => "Seed: %s",
         "commands.list.players" => "There are %s of a max of %s players online: %s",
+        "commands.locate.biome.success" => "The nearest %s is at [%s, %s, %s]",
+        "commands.locate.biome.not_found" => "Could not find a valid biome in the vicinity",
+        "commands.locate.poi.not_found" => {
+            "Could not find a valid point of interest in the vicinity"
+        }
+        "commands.locate.structure.not_found" => "Could not find a valid structure in the vicinity",
+        "commands.reload.success" => "Reloading!",
+        "commands.reload.failure" => "Failed to reload: %s",
+        "commands.datapack.unknown" => "Unknown data pack '%s'",
+        "commands.datapack.list.enabled.success" => "There are %s data packs enabled: %s",
+        "commands.datapack.list.enabled.none" => "There are no data packs enabled",
+        "commands.datapack.list.available.success" => "There are %s data packs available: %s",
+        "commands.datapack.enable.success" => "Enabled data pack '%s'",
+        "commands.datapack.disable.success" => "Disabled data pack '%s'",
+        "commands.datapack.enable.failed" => "Data pack '%s' is already enabled",
+        "commands.datapack.disable.failed" => "Data pack '%s' is already disabled",
+        "commands.help.header" => "--- Showing help page %s of %s (/help <page>) ---",
+        "commands.help.command" => "%s",
+        "commands.help.usage" => "Usage: %s",
+        "commands.failed.help" => "Unknown command, please try to use /help",
+        "commands.schedule.created.function" => {
+            "%s has been scheduled to run in %s tick(s) at gametime %s"
+        }
+        "commands.schedule.cleared.success" => "Removed %s scheduled function(s) for %s",
+        "commands.schedule.cleared.failure" => "There were no schedules for %s",
+        "commands.schedule.same_tick" => "Can't schedule for the current tick",
+        "commands.trigger.add.success" => "Added %s to %s",
+        "commands.trigger.set.success" => "Set %s to %s",
+        "commands.trigger.disabled" => "Trigger %s is not enabled",
+        "commands.trigger.invalid_objective" => "Objective %s not found",
         "chat.type.announcement" => "[%s] %s",
         "chat.type.emote" => "* %s %s",
         _ => "",
@@ -502,6 +556,15 @@ pub enum Action {
     },
     /// `/data` on a block entity, applied by the game loop against the chunk source.
     Data(super::commands_data::BlockData),
+    /// `/reload`: rebuild the datapack function store from disk.
+    Reload,
+    /// `/datapack list`: report enabled and disabled packs.
+    DatapackList,
+    /// `/datapack enable|disable`: persist the choice and reload functions.
+    DatapackSet {
+        pack: String,
+        enable: bool,
+    },
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
@@ -1903,6 +1966,7 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
     );
     super::commands_world::register(&mut tree);
     super::commands_extras::register(&mut tree);
+    super::commands_server::register(&mut tree);
     super::commands_meta::register(&mut tree);
     super::commands_data::register(&mut tree);
     super::functions::register(&mut tree);
@@ -2189,10 +2253,11 @@ mod tests {
     }
 
     fn run(input: &str, permission: u8) -> (Result<i32, CommandError>, Vec<Action>) {
-        let tree = dispatcher();
+        let tree = Arc::new(dispatcher());
         let (actions, mut received) = tokio::sync::mpsc::unbounded_channel();
         let mut source = source(permission);
         source.actions = actions;
+        source.tree = Some(tree.clone());
         let result = tree.execute(input, source);
         (
             result,
@@ -2211,6 +2276,302 @@ mod tests {
         let (result, actions) = run(input, 0);
         assert!(result.is_err(), "{input} should be denied");
         assert!(actions.is_empty(), "{input} produced {actions:?}");
+    }
+
+    fn run_with_state(
+        input: &str,
+        permission: u8,
+        state: Arc<Mutex<GameState>>,
+        uuid: Option<Uuid>,
+        name: Option<&str>,
+    ) -> (Result<i32, CommandError>, Vec<Action>) {
+        let tree = Arc::new(dispatcher());
+        let (actions, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut source = source(permission);
+        source.actions = actions;
+        source.state = state;
+        source.uuid = uuid;
+        source.name = name.map(str::to_owned);
+        source.tree = Some(tree.clone());
+        let result = tree.execute(input, source);
+        (
+            result,
+            std::iter::from_fn(|| received.try_recv().ok()).collect(),
+        )
+    }
+
+    fn feedback_key(actions: &[Action]) -> Option<&'static str> {
+        actions.iter().find_map(|action| match action {
+            Action::Feedback(feedback) => Some(feedback.key),
+            _ => None,
+        })
+    }
+
+    fn function_world() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ferrite-command-test-{}", Uuid::new_v4()));
+        let functions = dir.join("datapacks/test/data/minecraft/function");
+        std::fs::create_dir_all(&functions).unwrap();
+        std::fs::write(functions.join("foo.mcfunction"), "say scheduled\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn locate_biome_and_the_structure_stubs_report_feedback() {
+        let (result, actions) = run("locate biome minecraft:plains", 2);
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.locate.biome.not_found")
+        );
+
+        let (result, actions) = run("locate structure minecraft:village_plains", 2);
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.locate.structure.not_found")
+        );
+        let (result, actions) = run("locate poi minecraft:home", 2);
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.locate.poi.not_found")
+        );
+
+        denied("locate biome minecraft:plains");
+        assert!(run("locate biome", 2).0.is_err());
+    }
+
+    #[test]
+    fn reload_and_datapack_commands_produce_actions() {
+        assert_eq!(only("reload", 4), Action::Reload);
+        denied("reload");
+        assert_eq!(only("datapack list", 4), Action::DatapackList);
+        assert_eq!(
+            only("datapack enable pack", 4),
+            Action::DatapackSet {
+                pack: "pack".into(),
+                enable: true,
+            }
+        );
+        assert_eq!(
+            only("datapack disable pack", 4),
+            Action::DatapackSet {
+                pack: "pack".into(),
+                enable: false,
+            }
+        );
+        denied("datapack list");
+        assert!(run("datapack enable", 4).0.is_err());
+    }
+
+    #[test]
+    fn help_lists_commands_and_reports_unknown_names() {
+        let (result, actions) = run("help", 0);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Feedback(feedback) if feedback.key == "commands.help.command"
+        )));
+
+        let (result, actions) = run("help list", 0);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(feedback_key(&actions), Some("commands.help.usage"));
+
+        assert!(run("help not_a_command", 0).0.is_err());
+    }
+
+    #[test]
+    fn schedule_replaces_clears_and_becomes_due() {
+        let dir = function_world();
+        let mut game = GameState::default();
+        game.functions = Arc::new(crate::game::functions::FunctionStore::load(Some(&dir)));
+        let state = Arc::new(Mutex::new(game));
+
+        let (result, actions) = run_with_state(
+            "schedule function minecraft:foo 40t",
+            2,
+            state.clone(),
+            None,
+            None,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.schedule.created.function")
+        );
+        assert_eq!(state.lock().unwrap().schedules["minecraft:foo"], vec![40]);
+
+        // The append form keeps both entries; replace keeps only the new one.
+        assert!(
+            run_with_state(
+                "schedule function minecraft:foo 5t append",
+                2,
+                state.clone(),
+                None,
+                None
+            )
+            .0
+            .is_ok()
+        );
+        assert_eq!(state.lock().unwrap().schedules["minecraft:foo"].len(), 2);
+        assert!(
+            run_with_state(
+                "schedule function minecraft:foo 5t replace",
+                2,
+                state.clone(),
+                None,
+                None
+            )
+            .0
+            .is_ok()
+        );
+        assert_eq!(state.lock().unwrap().schedules["minecraft:foo"], vec![5]);
+        let (result, actions) =
+            run_with_state("schedule clear minecraft:foo", 2, state.clone(), None, None);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.schedule.cleared.success")
+        );
+        let (result, actions) =
+            run_with_state("schedule clear minecraft:foo", 2, state.clone(), None, None);
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(
+            feedback_key(&actions),
+            Some("commands.schedule.cleared.failure")
+        );
+
+        // A schedule becomes due once and leaves the map.
+        assert!(
+            run_with_state(
+                "schedule function minecraft:foo 3t",
+                2,
+                state.clone(),
+                None,
+                None
+            )
+            .0
+            .is_ok()
+        );
+        let mut due = Vec::new();
+        for _ in 0..3 {
+            due = state.lock().unwrap().tick(true);
+        }
+        assert_eq!(due, vec!["minecraft:foo".to_owned()]);
+        assert!(state.lock().unwrap().schedules.is_empty());
+
+        // Unknown functions and non-gamemasters are rejected.
+        assert!(
+            run_with_state(
+                "schedule function minecraft:missing 1t",
+                2,
+                state.clone(),
+                None,
+                None
+            )
+            .0
+            .is_err()
+        );
+        denied("schedule function minecraft:foo 1t");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trigger_respects_objective_and_enable_state() {
+        let mut game = GameState::default();
+        let uuid = Uuid::new_v4();
+        game.join(uuid, "Alice".into(), 0, 20);
+        game.objectives.insert(
+            "test:obj".into(),
+            Objective {
+                criteria: "minecraft:trigger".into(),
+                display_name: "Obj".into(),
+                render_type: 0,
+            },
+        );
+        let state = Arc::new(Mutex::new(game));
+
+        // The scoreboard enable command primes the trigger for Alice.
+        let (result, _) = run_with_state(
+            "scoreboard players enable Alice test:obj",
+            2,
+            state.clone(),
+            None,
+            None,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .trigger_enabled
+                .contains(&("test:obj".into(), "Alice".into()))
+        );
+
+        let (result, actions) = run_with_state(
+            "trigger test:obj add 5",
+            0,
+            state.clone(),
+            Some(uuid),
+            Some("Alice"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            state.lock().unwrap().scores[&("Alice".into(), "test:obj".into())],
+            5
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Packets { .. }))
+        );
+        assert!(
+            !state
+                .lock()
+                .unwrap()
+                .trigger_enabled
+                .contains(&("test:obj".into(), "Alice".into()))
+        );
+
+        // A used (or never primed) trigger is disabled, and unknown objectives fail.
+        assert!(
+            run_with_state(
+                "trigger test:obj add 1",
+                0,
+                state.clone(),
+                Some(uuid),
+                Some("Alice")
+            )
+            .0
+            .is_err()
+        );
+        assert!(
+            run_with_state(
+                "trigger test:missing add 1",
+                0,
+                state.clone(),
+                Some(uuid),
+                Some("Alice")
+            )
+            .0
+            .is_err()
+        );
+        assert!(
+            run_with_state("trigger test:obj add 1", 0, state.clone(), None, None)
+                .0
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn list_has_plain_and_uuid_forms_and_rejects_extra_arguments() {
+        let (result, actions) = run("list", 0);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(feedback_key(&actions), Some("commands.list.players"));
+        let (result, actions) = run("list uuids", 0);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(feedback_key(&actions), Some("commands.list.players"));
+        assert!(run("list nope", 0).0.is_err());
     }
 
     #[test]

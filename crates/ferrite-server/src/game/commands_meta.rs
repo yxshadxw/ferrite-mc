@@ -831,12 +831,18 @@ fn enable_trigger(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
     let targets = holders(ctx, "targets")?;
     let objective = objective_name(ctx);
     {
-        let state = ctx.source().state.lock().unwrap();
-        let objective = require_objective(&state, &objective)?;
-        if !objective.criteria.ends_with("trigger") {
+        let mut state = ctx.source().state.lock().unwrap();
+        let entry = require_objective(&state, &objective)?;
+        if !entry.criteria.ends_with("trigger") {
             return Err(CommandError::failed(
                 "Enable only works on trigger-objectives",
             ));
+        }
+        // `/trigger` only accepts scores a player primed for that objective.
+        for target in &targets {
+            state
+                .trigger_enabled
+                .insert((objective.clone(), target.clone()));
         }
     }
     let objective = objective_name(ctx);

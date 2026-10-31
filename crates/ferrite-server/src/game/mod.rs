@@ -30,10 +30,12 @@ mod commands_data;
 mod commands_exec;
 mod commands_extras;
 mod commands_meta;
+mod commands_server;
 mod commands_world;
 mod container;
 mod crafting;
 mod drops;
+mod entity_index;
 pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
 mod explosion;
 mod feedback;
@@ -69,6 +71,7 @@ mod neighbors;
 mod random_tick;
 mod redstone;
 mod region;
+mod selectors;
 mod survival;
 
 use self::{
@@ -430,6 +433,7 @@ async fn run(
         spawn[1] as f64,
         spawn[2] as f64 + 0.5,
     ];
+    let command_entities: Arc<Mutex<entity_index::EntityIndex>> = Default::default();
     let ctx = TickContext {
         signals: signal_tx.clone(),
         tracking: tracking.clone(),
@@ -438,6 +442,7 @@ async fn run(
         spawn: spawn_pos,
         dimension: settings.dimension,
         raining: settings.raining,
+        command_entities: command_entities.clone(),
     };
     let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
@@ -509,8 +514,12 @@ async fn run(
     let positions = Arc::new(Mutex::new(HashMap::new()));
     commands::load_lang(&registry_dir);
     let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
-    initial_state.functions = Arc::new(functions::FunctionStore::load(
-        source.as_ref().and_then(|source| source.path()),
+    initial_state.entities = command_entities;
+    let world_path = source.as_ref().and_then(|source| source.path());
+    let disabled_packs = world_path.map(functions::read_disabled).unwrap_or_default();
+    initial_state.functions = Arc::new(functions::FunctionStore::load_with_disabled(
+        world_path,
+        &disabled_packs,
     ));
     let command_state = Arc::new(Mutex::new(initial_state));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -649,6 +658,7 @@ async fn run(
                   source_uuid: Some(uuid),
                   source_name,
                   origin,
+                  state: &command_state,
                   online: &mut online,
                   permissions: &mut permissions,
                   admin: &mut admin,
@@ -715,6 +725,7 @@ async fn run(
                   source_uuid: None,
                   source_name: "Server".to_owned(),
                   origin: [0.0; 3],
+                  state: &command_state,
                   online: &mut online,
                   permissions: &mut permissions,
                   admin: &mut admin,
@@ -815,9 +826,18 @@ async fn run(
          },
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
-             command_state.lock().unwrap().tick(advance_time);
+             let due = command_state.lock().unwrap().tick(advance_time);
+             for function in due {
+                 let (complete, _unused) = oneshot::channel();
+                 let _ = event_tx.send(GameMessage::Console {
+                     command: format!("function {function}"),
+                     complete,
+                 });
+             }
              if let Some(plugins) = &settings.plugins {
-                 if let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
+                 if let Err(error) = plugins.tick() {
+                     tracing::warn!(%error, "plugin tick failed");
+                 }
                  // Paper's region scheduler: run each due task on the thread owning its chunk.
                  for task in plugins.take_region_tasks() {
                      if task.world != ferrite_plugin::default_world_id().to_string() {
@@ -827,11 +847,13 @@ async fn run(
                      let chunk = ChunkPos(task.chunk_x, task.chunk_z);
                      let plugins = Arc::clone(plugins);
                      scheduler.schedule_at_chunk(chunk, move |_| {
-                         if let Err(error) = plugins.run_region_task(task) { tracing::warn!(%error, "plugin region task failed"); }
+                         if let Err(error) = plugins.run_region_task(task) {
+                             tracing::warn!(%error, "plugin region task failed");
+                         }
                      });
                  }
              }
-              // Vanilla runs `minecraft:load` once at startup and `minecraft:tick` every
+             // Vanilla runs `minecraft:load` once at startup and `minecraft:tick` every
              // tick. Both go through the console command path so their actions
              // (setblock, say, ...) are applied like any other command.
              let tags: &[&str] = if load_ran {
@@ -961,6 +983,7 @@ struct CommandRuntime<'a> {
     source_uuid: Option<Uuid>,
     source_name: String,
     origin: [f64; 3],
+    state: &'a Arc<Mutex<commands::GameState>>,
     online: &'a mut HashMap<Uuid, commands::OnlinePlayer>,
     permissions: &'a mut HashMap<Uuid, u8>,
     admin: &'a mut Option<Arc<AdminLists>>,
@@ -1048,9 +1071,62 @@ impl CommandRuntime<'_> {
         }
     }
 
+    fn selection(
+        &self,
+        target: &ferrite_command::arguments::EntityTarget,
+    ) -> Result<Vec<selectors::SelectedEntity>, ferrite_command::CommandError> {
+        let state = self.state.lock().unwrap();
+        selectors::resolve_selection(&state, target, self.source_uuid, self.origin)
+    }
+
+    /// Applies one teleport to players (through their mailbox) and region entities (through
+    /// the region that owns them, so the hand-off still moves the entity between regions).
+    fn teleport_selection(
+        &mut self,
+        targets: &[selectors::SelectedEntity],
+        pos: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+    ) {
+        for target in targets {
+            if target.player {
+                self.teleport_player(target.uuid, pos, yaw, pitch);
+            } else {
+                self.teleport_entity(target.uuid, target.pos, pos, yaw, pitch);
+            }
+        }
+    }
+
+    fn teleport_entity(&self, uuid: Uuid, from: [f64; 3], pos: [f64; 3], yaw: f32, pitch: f32) {
+        let chunk = ChunkPos((from[0].floor() as i32) >> 4, (from[2].floor() as i32) >> 4);
+        if self.scheduler.owner(chunk).is_some() {
+            self.scheduler.schedule_at_chunk(chunk, move |region| {
+                region.teleport_entity(uuid, pos, yaw, pitch);
+            });
+        }
+    }
+
+    fn kill_entity(&self, uuid: Uuid, from: [f64; 3]) {
+        let from = self
+            .state
+            .lock()
+            .unwrap()
+            .entities
+            .lock()
+            .unwrap()
+            .get(uuid)
+            .map_or(from, |entity| entity.pos);
+        let chunk = ChunkPos((from[0].floor() as i32) >> 4, (from[2].floor() as i32) >> 4);
+        if self.scheduler.owner(chunk).is_some() {
+            self.scheduler.schedule_at_chunk(chunk, move |region| {
+                region.kill_entity(uuid);
+            });
+        }
+    }
+
     fn teleport_feedback(
         &self,
-        targets: &[commands::ResolvedPlayer],
+        targets: &[selectors::SelectedEntity],
         pos: [f64; 3],
         entity: Option<&str>,
     ) {
@@ -1132,50 +1208,140 @@ impl CommandRuntime<'_> {
                 }
                 false
             }
+            Action::Reload => {
+                let world = self
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.path())
+                    .map(std::path::Path::to_path_buf);
+                match functions::reload(world.as_deref(), self.state) {
+                    Ok(()) => self.reply.key("commands.reload.success", &[]),
+                    Err(error) => self.reply.key("commands.reload.failure", &[&error]),
+                }
+                false
+            }
+            Action::DatapackList => {
+                let world = self.source.as_ref().and_then(|source| source.path());
+                let packs = functions::datapack_names(world);
+                if packs.is_empty() {
+                    self.reply.key("commands.datapack.list.enabled.none", &[]);
+                    return false;
+                }
+                let disabled = world.map(functions::read_disabled).unwrap_or_default();
+                let enabled: Vec<&str> = packs
+                    .iter()
+                    .filter(|pack| !disabled.contains(*pack))
+                    .map(String::as_str)
+                    .collect();
+                if enabled.is_empty() {
+                    self.reply.key("commands.datapack.list.enabled.none", &[]);
+                } else {
+                    self.reply.key(
+                        "commands.datapack.list.enabled.success",
+                        &[&enabled.len().to_string(), &enabled.join(", ")],
+                    );
+                }
+                let available: Vec<&str> = packs
+                    .iter()
+                    .filter(|pack| disabled.contains(*pack))
+                    .map(String::as_str)
+                    .collect();
+                if !available.is_empty() {
+                    self.reply.key(
+                        "commands.datapack.list.available.success",
+                        &[&available.len().to_string(), &available.join(", ")],
+                    );
+                }
+                false
+            }
+            Action::DatapackSet { pack, enable } => {
+                let Some(world) = self
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.path())
+                    .map(std::path::Path::to_path_buf)
+                else {
+                    self.reply.key("commands.datapack.unknown", &[&pack]);
+                    return false;
+                };
+                let packs = functions::datapack_names(Some(&world));
+                if !packs.contains(&pack) {
+                    self.reply.key("commands.datapack.unknown", &[&pack]);
+                    return false;
+                }
+                let mut disabled = functions::read_disabled(&world);
+                let already = !disabled.contains(&pack);
+                if enable == already {
+                    self.reply.key(
+                        if enable {
+                            "commands.datapack.enable.failed"
+                        } else {
+                            "commands.datapack.disable.failed"
+                        },
+                        &[&pack],
+                    );
+                    return false;
+                }
+                if enable {
+                    disabled.remove(&pack);
+                } else {
+                    disabled.insert(pack.clone());
+                }
+                if let Err(error) = functions::write_disabled(&world, &disabled) {
+                    self.reply
+                        .key("commands.reload.failure", &[&error.to_string()]);
+                    return false;
+                }
+                match functions::reload(Some(&world), self.state) {
+                    Ok(()) => self.reply.key(
+                        if enable {
+                            "commands.datapack.enable.success"
+                        } else {
+                            "commands.datapack.disable.success"
+                        },
+                        &[&pack],
+                    ),
+                    Err(error) => self.reply.key("commands.reload.failure", &[&error]),
+                }
+                false
+            }
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
                 targets,
                 destination,
             } => {
-                let targets = match self.targets(&targets) {
+                let targets = match self.selection(&targets) {
                     Ok(targets) => targets,
-                    Err(key) => {
-                        self.reply.key(key, &[]);
+                    Err(error) => {
+                        self.reply.text(&error.to_string());
                         return false;
                     }
                 };
                 match destination {
                     TeleportDestination::Entity(destination) => {
-                        let destination = match self.targets(&destination) {
-                            Ok(players) if players.len() == 1 => {
-                                players.into_iter().next().unwrap()
-                            }
+                        let destination = match self.selection(&destination) {
+                            Ok(mut entities) if entities.len() == 1 => entities.remove(0),
                             Ok(_) => {
                                 self.reply.key("argument.entity.notfound.player", &[]);
                                 return false;
                             }
-                            Err(key) => {
-                                self.reply.key(key, &[]);
+                            Err(error) => {
+                                self.reply.text(&error.to_string());
                                 return false;
                             }
                         };
-                        let Some((pos, yaw, pitch)) = self
-                            .online
-                            .get(&destination.uuid)
-                            .map(|player| (player.pos, player.yaw, player.pitch))
-                        else {
-                            self.reply.key("argument.entity.notfound.player", &[]);
-                            return false;
-                        };
-                        if !valid_teleport(pos) {
+                        if !valid_teleport(destination.pos) {
                             self.reply.key("commands.teleport.invalidPosition", &[]);
                             return false;
                         }
-                        for target in &targets {
-                            self.teleport_player(target.uuid, pos, yaw, pitch);
-                        }
-                        self.teleport_feedback(&targets, pos, Some(&destination.name));
+                        self.teleport_selection(
+                            &targets,
+                            destination.pos,
+                            destination.yaw,
+                            destination.pitch,
+                        );
+                        self.teleport_feedback(&targets, destination.pos, Some(&destination.name));
                     }
                     TeleportDestination::Location { pos, yaw, pitch } => {
                         if !valid_teleport(pos) {
@@ -1183,15 +1349,11 @@ impl CommandRuntime<'_> {
                             return false;
                         }
                         for target in &targets {
-                            let (target_yaw, target_pitch) = self
-                                .online
-                                .get(&target.uuid)
-                                .map_or((0.0, 0.0), |player| (player.yaw, player.pitch));
-                            self.teleport_player(
-                                target.uuid,
+                            self.teleport_selection(
+                                std::slice::from_ref(target),
                                 pos,
-                                yaw.unwrap_or(target_yaw),
-                                pitch.unwrap_or(target_pitch),
+                                yaw.unwrap_or(target.yaw),
+                                pitch.unwrap_or(target.pitch),
                             );
                         }
                         self.teleport_feedback(&targets, pos, None);
@@ -1201,10 +1363,8 @@ impl CommandRuntime<'_> {
                             self.reply.key("commands.teleport.invalidPosition", &[]);
                             return false;
                         }
-                        for player in &targets {
-                            let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], target);
-                            self.teleport_player(player.uuid, pos, yaw, pitch);
-                        }
+                        let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], target);
+                        self.teleport_selection(&targets, pos, yaw, pitch);
                         self.teleport_feedback(&targets, pos, None);
                     }
                     TeleportDestination::FacingEntity {
@@ -1216,32 +1376,24 @@ impl CommandRuntime<'_> {
                             self.reply.key("commands.teleport.invalidPosition", &[]);
                             return false;
                         }
-                        let target = match self.targets(&entity) {
-                            Ok(players) if players.len() == 1 => {
-                                players.into_iter().next().unwrap()
-                            }
+                        let facing = match self.selection(&entity) {
+                            Ok(mut entities) if entities.len() == 1 => entities.remove(0),
                             Ok(_) => {
                                 self.reply.key("argument.entity.notfound.player", &[]);
                                 return false;
                             }
-                            Err(key) => {
-                                self.reply.key(key, &[]);
+                            Err(error) => {
+                                self.reply.text(&error.to_string());
                                 return false;
                             }
-                        };
-                        let Some(facing) = self.online.get(&target.uuid) else {
-                            self.reply.key("argument.entity.notfound.player", &[]);
-                            return false;
                         };
                         let point = [
                             facing.pos[0],
                             facing.pos[1] + anchor.offset(),
                             facing.pos[2],
                         ];
-                        for player in &targets {
-                            let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], point);
-                            self.teleport_player(player.uuid, pos, yaw, pitch);
-                        }
+                        let (yaw, pitch) = look_angles([pos[0], pos[1] + 1.62, pos[2]], point);
+                        self.teleport_selection(&targets, pos, yaw, pitch);
                         self.teleport_feedback(&targets, pos, None);
                     }
                 }
@@ -1283,17 +1435,21 @@ impl CommandRuntime<'_> {
                 false
             }
             Action::Kill { targets } => {
-                let targets = match self.targets(&targets) {
+                let targets = match self.selection(&targets) {
                     Ok(targets) => targets,
-                    Err(key) => {
-                        self.reply.key(key, &[]);
+                    Err(error) => {
+                        self.reply.text(&error.to_string());
                         return false;
                     }
                 };
                 for target in &targets {
-                    // `/kill` deals `genericKill` damage on the region that owns the player.
-                    if let Some((_, mailbox, _)) = self.mailboxes.get(&target.uuid) {
-                        mailbox.lock().unwrap().push_back(Command::Kill);
+                    if target.player {
+                        // `/kill` deals `genericKill` damage on the region owning the player.
+                        if let Some((_, mailbox, _)) = self.mailboxes.get(&target.uuid) {
+                            mailbox.lock().unwrap().push_back(Command::Kill);
+                        }
+                    } else {
+                        self.kill_entity(target.uuid, target.pos);
                     }
                 }
                 if targets.len() == 1 {
