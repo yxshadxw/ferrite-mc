@@ -20,19 +20,47 @@ pub const DESPAWN_DISTANCE: f64 = 128.0;
 pub const NO_DESPAWN_DISTANCE: f64 = 32.0;
 /// Ticks without a nearby player before the random despawn roll starts.
 pub const NO_ACTION_TICKS: u32 = 600;
+/// Ticks a passive mob flees after being hurt (vanilla panic goal duration is 100-200).
+pub const PANIC_TICKS: u16 = 100;
 
-/// The passive mobs this server knows how to simulate.
+/// The mobs this server knows how to simulate: the first passive animals and the hostile
+/// monsters of the overworld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MobKind {
     Chicken,
     Cow,
     Pig,
     Sheep,
+    Zombie,
+    Skeleton,
+    Spider,
+    Creeper,
+    Enderman,
 }
 
 impl MobKind {
-    /// Every kind, in a fixed order for spawning.
+    /// The passive kinds, in a fixed order for creature spawning.
     pub const ALL: [Self; 4] = [Self::Chicken, Self::Cow, Self::Pig, Self::Sheep];
+    /// The hostile kinds, in a fixed order for monster spawning.
+    pub const HOSTILE: [Self; 5] = [
+        Self::Zombie,
+        Self::Skeleton,
+        Self::Spider,
+        Self::Creeper,
+        Self::Enderman,
+    ];
+    /// Every modelled kind.
+    pub const ALL_MOBS: [Self; 9] = [
+        Self::Chicken,
+        Self::Cow,
+        Self::Pig,
+        Self::Sheep,
+        Self::Zombie,
+        Self::Skeleton,
+        Self::Spider,
+        Self::Creeper,
+        Self::Enderman,
+    ];
 
     /// Vanilla entity type id, e.g. `"minecraft:cow"`.
     pub fn name(self) -> &'static str {
@@ -41,6 +69,44 @@ impl MobKind {
             Self::Cow => "minecraft:cow",
             Self::Pig => "minecraft:pig",
             Self::Sheep => "minecraft:sheep",
+            Self::Zombie => "minecraft:zombie",
+            Self::Skeleton => "minecraft:skeleton",
+            Self::Spider => "minecraft:spider",
+            Self::Creeper => "minecraft:creeper",
+            Self::Enderman => "minecraft:enderman",
+        }
+    }
+
+    /// Whether this kind hunts players (vanilla `Monster`/`Enemy`).
+    pub fn is_hostile(self) -> bool {
+        matches!(
+            self,
+            Self::Zombie | Self::Skeleton | Self::Spider | Self::Creeper | Self::Enderman
+        )
+    }
+
+    /// Vanilla `MobCategory` name from the generated entity data.
+    pub fn category(self) -> &'static str {
+        self.props().category
+    }
+
+    /// Melee damage, from the type's default `minecraft:attack_damage` attribute.
+    pub fn attack_damage(self) -> f32 {
+        entity_props::default_attribute(self.entity_type(), "attack_damage").unwrap_or(2.0) as f32
+    }
+
+    /// How far the mob notices and follows a player (`follow_range` attribute).
+    pub fn follow_range(self) -> f64 {
+        entity_props::default_attribute(self.entity_type(), "follow_range")
+            .unwrap_or(16.0)
+            .clamp(8.0, 48.0)
+    }
+
+    /// Vanilla melee reach of the modelled monsters.
+    pub fn attack_reach(self) -> f64 {
+        match self {
+            Self::Zombie | Self::Spider | Self::Enderman => 2.5,
+            _ => 2.0,
         }
     }
 
@@ -76,12 +142,19 @@ impl MobKind {
             Self::Cow => "minecraft:entities/cow",
             Self::Pig => "minecraft:entities/pig",
             Self::Sheep => "minecraft:entities/sheep",
+            Self::Zombie => "minecraft:entities/zombie",
+            Self::Skeleton => "minecraft:entities/skeleton",
+            Self::Spider => "minecraft:entities/spider",
+            Self::Creeper => "minecraft:entities/creeper",
+            Self::Enderman => "minecraft:entities/enderman",
         }
     }
 
     /// The kind of an entity type id, when it is one of the modelled mobs.
     pub fn from_entity_type(kind: u16) -> Option<Self> {
-        Self::ALL.into_iter().find(|mob| mob.entity_type() == kind)
+        Self::ALL_MOBS
+            .into_iter()
+            .find(|mob| mob.entity_type() == kind)
     }
 
     /// The kind of a name, with or without the namespace.
@@ -96,12 +169,17 @@ impl MobKind {
             Self::Cow => "Cow",
             Self::Pig => "Pig",
             Self::Sheep => "Sheep",
+            Self::Zombie => "Zombie",
+            Self::Skeleton => "Skeleton",
+            Self::Spider => "Spider",
+            Self::Creeper => "Creeper",
+            Self::Enderman => "Enderman",
         }
     }
 
-    /// Vanilla `Animal.removeWhenFarAway` is false: passive animals persist.
+    /// Vanilla `Animal.removeWhenFarAway` is false; monsters despawn when far away.
     pub fn despawns_when_far(self) -> bool {
-        false
+        self.is_hostile()
     }
 }
 
@@ -126,6 +204,24 @@ pub struct MobState {
     pub wander_yaw: f32,
     /// Whether the wander goal wants to move during this interval.
     pub moving: bool,
+    /// Player this mob is hunting, for hostile kinds (vanilla `Mob.target`).
+    pub target: Option<uuid::Uuid>,
+    /// Ticks until the next melee attack (`Mob.attackStrengthTicker`-like cooldown).
+    pub attack_cooldown: u16,
+    /// Ticks of panic left after being hurt (vanilla `PanicGoal`).
+    pub panic: u16,
+    /// Where the panic flee goal runs from.
+    pub panic_from: Option<Vec3>,
+    /// Creeper swell counter (`Creeper.swell`).
+    pub swell: u16,
+    /// Ticks until the skeleton's next arrow.
+    pub bow_timer: u16,
+    /// Path waypoints as block positions (`PathNavigation.getPath`).
+    pub path: [[i32; 3]; crate::path::MAX_PATH],
+    pub path_len: u8,
+    pub path_index: u8,
+    /// Ticks until the path is recomputed.
+    pub path_timer: u16,
 }
 
 impl MobState {
@@ -142,6 +238,16 @@ impl MobState {
             wander_timer: 0,
             wander_yaw: 0.0,
             moving: false,
+            target: None,
+            attack_cooldown: 0,
+            panic: 0,
+            panic_from: None,
+            swell: 0,
+            bow_timer: 0,
+            path: [[0; 3]; crate::path::MAX_PATH],
+            path_len: 0,
+            path_index: 0,
+            path_timer: 0,
         }
     }
 
@@ -229,12 +335,34 @@ pub fn hurt(
     if let Some(source) = source {
         knockback(store, key, source);
     }
+    // Passive mobs panic and flee from the attacker (vanilla `PanicGoal`); monsters keep
+    // hunting (the region sets their target from the attacker).
+    if let Some(source) = source
+        && let Some(mob) = state_mut(store, key)
+        && !mob.kind.is_hostile()
+    {
+        mob.panic = PANIC_TICKS;
+        mob.panic_from = Some(source);
+    }
     if health <= 0.0 {
         kill(store, key);
         Some(Hurt::Died)
     } else {
         Some(Hurt::Survived { health })
     }
+}
+
+/// Makes a hostile mob hunt `player` after being attacked (vanilla `Mob.setTarget` in
+/// `LivingEntity.hurt`'s retaliation hook).
+pub fn retaliate(store: &mut EntityStore, key: EntityKey, player: uuid::Uuid) -> bool {
+    let Some(mob) = state_mut(store, key) else {
+        return false;
+    };
+    if !mob.kind.is_hostile() {
+        return false;
+    }
+    mob.target = Some(player);
+    true
 }
 
 /// Kills a mob outright (`/kill`, lethal effects), bypassing the hurt cooldown.
@@ -253,7 +381,7 @@ pub fn kill(store: &mut EntityStore, key: EntityKey) -> bool {
 
 /// Vanilla `LivingEntity.knockback`: 0.4 blocks/tick away from the attacker, plus 0.4 upward
 /// while the mob stands on the ground.
-fn knockback(store: &mut EntityStore, key: EntityKey, source: Vec3) {
+pub fn knockback(store: &mut EntityStore, key: EntityKey, source: Vec3) {
     let Some(pos) = store.pos(key) else { return };
     let mut dx = pos.x - source.x;
     let mut dz = pos.z - source.z;
@@ -322,7 +450,7 @@ pub fn check_despawn(
     }
     if peaceful {
         // `Mob.shouldDespawnInPeaceful` is overridden only by monsters.
-        return false;
+        return mob.kind.is_hostile() && remove(store, key);
     }
     if !mob.despawns {
         return false;
