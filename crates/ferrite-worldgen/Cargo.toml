@@ -15,3 +15,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 ferrite-nbt = { path = "../ferrite-nbt" }
+ferrite-noise = { path = "../ferrite-noise" }

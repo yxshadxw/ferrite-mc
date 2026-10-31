@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::WorldgenData;
+use crate::feature::{BlockStateProvider, BlockTag};
 use crate::id::ResourceId;
 
 /// Failure while loading a worldgen data set.
@@ -68,6 +69,13 @@ pub(crate) fn load(dir: &Path, strict: bool) -> Result<WorldgenData, LoadError> 
             strict,
         )?,
         material_rules: load_dir(&data_root.join("worldgen").join("material_rule"), strict)?,
+        configured_features: load_dir(&data_root.join("worldgen").join("feature"), strict)?,
+        placed_features: load_dir(&data_root.join("worldgen").join("placed_feature"), strict)?,
+        block_state_providers: load_dir::<BlockStateProvider>(
+            &data_root.join("worldgen").join("block_state_provider"),
+            strict,
+        )?,
+        block_tags: load_tags(&data_root.join("tags").join("block"), strict)?,
         dimension_types: load_dir(&data_root.join("dimension_type"), strict)?,
         dimensions: load_dir(&data_root.join("dimension"), strict)?,
         world_presets: load_dir(&data_root.join("worldgen").join("world_preset"), strict)?,
@@ -79,6 +87,10 @@ pub(crate) fn load(dir: &Path, strict: bool) -> Result<WorldgenData, LoadError> 
         )?,
         biome_parameters,
     })
+}
+
+fn load_tags(root: &Path, strict: bool) -> Result<BTreeMap<ResourceId, BlockTag>, LoadError> {
+    load_dir(root, strict)
 }
 
 fn resolve_roots(dir: &Path) -> Result<(PathBuf, Option<PathBuf>), LoadError> {

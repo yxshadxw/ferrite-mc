@@ -88,11 +88,13 @@ fn main() {
         // Keep the workspace buildable on a checkout without the older version's
         // gitignored reports: generate identity tables and state what to run. The real
         // remaps appear as soon as `python tools/fetch_vanilla.py <older>` has run.
-        let older = if vanilla
+        // Watch the older version's report even while it does not exist, so fetching it
+        // later reruns this script instead of keeping the identity tables built before.
+        let older_marker = vanilla
             .join(pair.older)
-            .join("generated/reports/packets.json")
-            .exists()
-        {
+            .join("generated/reports/packets.json");
+        println!("cargo:rerun-if-changed={}", older_marker.display());
+        let older = if older_marker.exists() {
             Version::load(&vanilla, pair.older)
         } else {
             println!(

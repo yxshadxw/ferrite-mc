@@ -44,6 +44,35 @@ fn property(state: u32, key: &str, value: &str) -> bool {
 fn default_block(name: &str) -> u32 {
     u32::from(ferrite_data::blocks::default_state(name).expect("vanilla block"))
 }
+
+/// Adapts the random-tick world to `fire::FireWorld` so `LavaFluid.randomTick` can light fire.
+struct FireView<'a>(&'a mut dyn RandomWorld);
+
+impl super::fire::FireWorld for FireView<'_> {
+    fn block(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        u16::try_from(self.0.block((x, y, z))).ok()
+    }
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u16) {
+        self.0.set_block((x, y, z), u32::from(state));
+    }
+    fn owns(&self, _: i32, _: i32) -> bool {
+        true
+    }
+}
+
+// Vanilla `LavaFluid.randomTick`: lava beside flammable blocks starts a fire and schedules it.
+fn lava_tick(
+    world: &mut dyn RandomWorld,
+    pos: Pos,
+    rng: &mut XoroshiroRandomSource,
+    fire: &mut super::fire::FireTicks,
+) {
+    let mut view = FireView(world);
+    if let Some(target) = super::fire::lava_ignites(&mut view, [pos.0, pos.1, pos.2], rng) {
+        let delay = super::fire::tick_delay(rng);
+        fire.schedule(target, delay);
+    }
+}
 // SpreadingSnowyBlock.canStayAlive / canPropagate, including LightEngine.getLightDampeningInto.
 fn can_stay(world: &dyn RandomWorld, p: Pos, grass: u32) -> bool {
     let above = world.block((p.0, p.1 + 1, p.2));
@@ -202,6 +231,7 @@ impl RandomTicks {
         held: &HashMap<ChunkPos, usize>,
         tracking: &Tracking,
         speed: u32,
+        fire: &mut super::fire::FireTicks,
     ) {
         let mut world = RegionFluidWorld::new(source, held, tracking);
         for chunk in held.keys() {
@@ -231,7 +261,7 @@ impl RandomTicks {
                     {
                         handler(&mut world, pos, state, &mut rng.borrow_mut());
                     }
-                    // LavaFluid.randomTick only starts fire, which is out of scope.
+                    // Vanilla `LavaFluid.randomTick`: lava ignites nearby flammable blocks.
                     if matches!(
                         props.fluid,
                         Some((
@@ -241,7 +271,7 @@ impl RandomTicks {
                             _
                         ))
                     ) {
-                        no_op(&mut world, pos, state, &mut rng.borrow_mut());
+                        lava_tick(&mut world, pos, &mut rng.borrow_mut(), fire);
                     }
                 },
             );

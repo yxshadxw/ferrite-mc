@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ferrite_worldgen::{ClimateTargetPoint, MultiNoiseBiomeSource, WorldgenData};
+use ferrite_worldgen::{ClimateTargetPoint, FeatureGenerator, MultiNoiseBiomeSource, WorldgenData};
 
 const SAMPLE_COUNT: usize = 20_000;
 const DEFAULT_JAVA_HOME: &str = "C:/Program Files/Eclipse Adoptium/jdk-25.0.5.8-hotspot";
@@ -285,6 +285,112 @@ fn density_router_matches_vanilla() {
     }
     assert_eq!(count, 2000);
     println!("density differential: {count} points, maximum error {max_error}");
+}
+
+#[test]
+fn feature_order_matches_vanilla() {
+    let root = project_root();
+    let Some(home) = java_home() else {
+        eprintln!("skipping Java feature-order differential: Java 25 not found");
+        return;
+    };
+    let Some((separator, dependencies)) = classpath(&root) else {
+        eprintln!("skipping Java feature-order differential: server jar missing");
+        return;
+    };
+    let output_dir = java_output_dir();
+    let classes = output_dir.join("feature-order-classes");
+    fs::create_dir_all(&classes).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/java/FeatureOrderDump.java");
+    let executable = |name: &str| {
+        home.join("bin").join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        })
+    };
+    let compile = Command::new(executable("javac"))
+        .args(["-encoding", "UTF-8", "-cp"])
+        .arg(&dependencies)
+        .arg("-d")
+        .arg(&classes)
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "javac: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let dump = output_dir.join("feature_order.tsv");
+    let cp = format!("{}{}{}", classes.display(), separator, dependencies);
+    let run = Command::new(executable("java"))
+        .current_dir(&output_dir)
+        .arg("-cp")
+        .arg(cp)
+        .arg("FeatureOrderDump")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "java: {}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let data = WorldgenData::load(generated_root()).unwrap();
+    let generator = FeatureGenerator::new(&data, -540_760_265, -64, 384);
+    let contents = fs::read_to_string(dump).unwrap();
+    let mut decoration = None;
+    let mut compared = 0;
+    let mut seeds = 0;
+    for line in contents.lines() {
+        if line.starts_with("#chunk\t") {
+            decoration = line
+                .split('\t')
+                .nth(4)
+                .and_then(|value| value.parse::<i64>().ok());
+        }
+        if let Some(rest) = line.strip_prefix("#feature_seed\t") {
+            let fields: Vec<&str> = rest.split('\t').collect();
+            let step: i32 = fields[0].parse().unwrap();
+            let index: i32 = fields[1].parse().unwrap();
+            let expected: i64 = fields[2].parse().unwrap();
+            let seed = ferrite_worldgen::feature_seed(decoration.unwrap(), index, step);
+            let mut random = ferrite_worldgen::WorldgenRandom::new(seed);
+            let actual = ferrite_noise::RandomSource::next_long(&mut random);
+            assert_eq!(
+                actual, expected,
+                "feature seed mismatch at step {step} index {index}"
+            );
+            seeds += 1;
+            continue;
+        }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let step: usize = fields[0].parse().unwrap();
+        let index: usize = fields[1].parse().unwrap();
+        let expected = fields[2];
+        let actual = generator
+            .step_features(step)
+            .get(index)
+            .map_or_else(|| "<missing>".to_owned(), ToString::to_string);
+        assert_eq!(
+            actual, expected,
+            "feature order mismatch at step {step} index {index}"
+        );
+        compared += 1;
+    }
+    // The 26.3 overworld FeatureSorter emits 171 entries across steps 0..10.
+    assert_eq!(compared, 171, "unexpected Java feature-order count");
+    assert!(seeds > 0, "Java dump had no feature seeds");
+    println!(
+        "feature order: {compared} entries and {seeds} feature seeds match the 26.3 \
+         FeatureSorter"
+    );
 }
 
 #[test]
