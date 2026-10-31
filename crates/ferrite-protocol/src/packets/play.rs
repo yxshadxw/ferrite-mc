@@ -396,6 +396,7 @@ macro_rules! item_packet {($name:ident<$g:ident $(= $d:ty)?>,$id:expr,$bound:ide
 item_packet!(CreativeSlot<I = ItemStack>,57,Serverbound,{slot:i16,item:I});
 item_packet!(ContainerContent<I = ItemStack>,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<I>,carried:I});
 item_packet!(ContainerSlot<I = ItemStack>,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:I});
+packet!(SetExperience,105,Clientbound,{progress:f32,level:VarInt,total:VarInt});
 item_packet!(SetCursorItem<I = ItemStack>,98,Clientbound,{item:I});
 item_packet!(SetPlayerInventory<I = ItemStack>,110,Clientbound,{slot:VarInt,item:I});
 packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
@@ -1183,6 +1184,11 @@ mod interaction_tests {
             state: VarInt(3),
             slot: 36,
             item: ItemStack::default(),
+        });
+        roundtrip(SetExperience {
+            progress: 0.5,
+            level: VarInt(12),
+            total: VarInt(456),
         });
     }
     #[test]

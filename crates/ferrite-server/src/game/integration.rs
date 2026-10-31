@@ -2568,3 +2568,48 @@ async fn slow_reader_is_disconnected_without_stalling_ticks() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_give_and_xp_commands_act_on_a_bot_session() {
+    use ferrite_protocol::packets::play::SetExperience;
+    let (world, addr, server) = op_world(None, 1, &["Giver"]).await;
+    let mut bot = join_with_inventory(addr, "Giver").await;
+    let stone = ferrite_data::registries::id("minecraft:item", "minecraft:stone").unwrap();
+
+    // `/give` places the items in the live inventory and syncs the slots.
+    bot.raw(7, "give @s stone 5").await;
+    bot.chat_containing("Gave 5 Stone to Giver").await;
+    let slots = inventory_of(&mut bot).await;
+    assert!(
+        slots
+            .iter()
+            .any(|stack| stack.item_id == stone && stack.count == 5)
+    );
+
+    // `/clear` removes matching items again.
+    bot.raw(7, "clear @s minecraft:stone").await;
+    bot.chat_containing("Removed 5 items from Giver").await;
+    let slots = inventory_of(&mut bot).await;
+    assert!(
+        !slots
+            .iter()
+            .any(|stack| stack.item_id == stone && stack.count > 0)
+    );
+
+    // `/xp` set and add follow the vanilla curve and send `set_experience`.
+    bot.raw(7, "xp set @s 7 points").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (1, 7));
+    assert_eq!(xp.progress, 0.0);
+    bot.raw(7, "xp add @s 1 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (2, 16));
+    bot.raw(7, "xp query @s levels").await;
+    bot.chat_containing("Giver has 2 experience levels").await;
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
