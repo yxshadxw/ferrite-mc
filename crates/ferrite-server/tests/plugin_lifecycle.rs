@@ -177,8 +177,11 @@ impl Bot {
                 Err(error) => panic!("connecting to {addr}: {error}"),
             }
         };
+        // The first response waits for the whole world startup (vanilla registry and
+        // recipe preload), which is minutes in a debug build on a loaded machine. Every
+        // plugin deadline below keeps its own 60 s budget.
         stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
+            .set_read_timeout(Some(Duration::from_secs(300)))
             .unwrap();
         let mut bot = Self {
             stream,
@@ -776,6 +779,14 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
         "the plugin.yml default permission was not granted: {joined}"
     );
     wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
+    // Published before onEnable, so the fixture can target it with Paper's region scheduler.
+    wait_for_line(&events, "region task false", &stdout, &stderr);
+    // The Bukkit scheduler runs immediate, delayed and asynchronous tasks.
+    wait_for_line(&events, "scheduler task", &stdout, &stderr);
+    wait_for_line(&events, "later task", &stdout, &stderr);
+    wait_for_line(&events, "async task", &stdout, &stderr);
+    wait_for_line(&events, "later async task", &stdout, &stderr);
+    wait_for_line(&events, "timer async task", &stdout, &stderr);
     wait_for_line(&events, "task 1", &stdout, &stderr);
     wait_for_line(&events, "task 3", &stdout, &stderr);
     assert!(
@@ -793,9 +804,14 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
         wait_for_chat(&mut bot, "pong Typical", &stdout, &stderr, &events),
         "pong Typical"
     );
+    bot.move_to(5.5, 65.0, 5.5);
+    std::thread::sleep(Duration::from_millis(400));
     bot.raw(7, "typical where");
     let location = wait_for_chat(&mut bot, "where world", &stdout, &stderr, &events);
-    assert!(location.starts_with("where world "), "{location}");
+    assert_eq!(
+        location, "where world 5 65 5",
+        "the plugin did not see the moved player"
+    );
     bot.raw(7, "typical give");
     // `PlayerInventory#setItem` goes through `Native.playerInventory`; the game loop routes it
     // to the region owning the player and syncs the slot back to the Bukkit inventory.

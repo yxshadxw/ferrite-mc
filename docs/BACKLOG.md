@@ -129,6 +129,16 @@ still stubs that answer "Command not implemented".
   owning region/player, and `PlayerInventory#setItem` now replaces the slot, sends
   `SetPlayerInventory` and resyncs the menu. Teleports reuse the `/tp` mailbox path. Health,
   food, titles, display names, sounds and kicks are still logged as unrouted.
+- Fixed: Paper's region scheduler is live. `RegionScheduler#run`, `runDelayed` and
+  `runAtFixedRate` tasks come back from `PluginHost::take_region_tasks` and the game loop runs
+  each on the region that owns its chunk (a task for a world the server does not own is dropped
+  with a debug log). Bukkit's sync scheduler stays on the global tick, and
+  `runTaskAsynchronously`, `runTaskLaterAsynchronously` and `runTaskTimerAsynchronously` run on
+  Paper's async scheduler.
+- Fixed: the Bukkit server is created before plugins enable and the main world is published
+  first, so `onEnable` can already call `getWorlds()`; every accepted movement now refreshes the
+  player snapshot (`updatePlayerLocation`), so `Player#getLocation` follows the live player and
+  `registerPlayer` updates the existing `FerritePlayer` instead of replacing it.
 - Open: block snapshots are still opt-in via `setBlockSnapshot`, so `Block#getType` for arbitrary
   coordinates throws; and the remaining `Server` stubs throw (help map, recipes, boss bars, maps,
   world creation, tags, entity serialization). CraftBukkit shims cannot declare NMS-typed methods
