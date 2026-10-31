@@ -374,3 +374,28 @@ state of the project can be read at a glance.
   not accept new prompts, so it needs a fresh session.
 - **Pistons** (`task_94b5018a1e91`) and **plugin API breadth** (`task_0c86a661ea7c`) are created
   but not started; the oc7 and oc4 sessions went idle, and oc4 hit its quota.
+
+---
+# Day 7 (2026-11-01, Freebuff coordinator)
+
+`origin/main = f5ba1e8`. Five worker branches merged and pushed in one cycle:
+
+| Commit | What landed |
+|---|---|
+| `deb2bea` | oc10: villagers, professions, deterministic trade offers, merchant menu and trading |
+| `22c5b47` | oc12: hopper transfers (8-tick, powered, comparator), droppers and dispensers |
+| `0e8b35d` | oc14: Bukkit `Server`/`PluginManager` surface and inventory/death/chunk/weather events |
+| `81e8d76` | oc6b: per-chunk density grids, memoized biomes and surface rules, worker pool — 4.59 -> 6.18 chunks/s (1 thread), 23.49 -> 38.92 (8 threads), chunk output identical; the 10x target is not reached |
+| `3a766aa` | oc11: entity and block-entity persistence across restarts |
+
+Verification: `cargo check --workspace --all-targets`, `cargo test --workspace` (all green before
+the oc11 merge), `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` green after the two fixes in `f5ba1e8`. oc11 landed after the full-suite
+run and was checked with `cargo check`, clippy, fmt and `cargo test -p ferrite-worldgen` only.
+
+oc9 (pistons) and oc13 (command blocks) were stopped by the user before finishing; nothing from
+them was merged and their empty worktrees were removed. Their specs stay in
+`docs/handoff/day7-tasks/`. Ten merged or old worktrees were removed to free disk (65 GB free).
+Worker branches are backed up as `origin/yxshadxw/oc6`, `oc10`, `oc11`, `oc12` and `oc14`.
+Still open: worldgen 10x, trees/structures, pistons, brewing/beacons, command blocks,
+nether/end dimensions and a real 26.3 client test.
