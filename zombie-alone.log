@@ -1,9 +1,0 @@
-   Compiling ferrite-server v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-server)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
-     Running unittests src\lib.rs (target\debug\deps\ferrite_server-9bb13972cddf4c6d.exe)
-
-running 1 test
-test game::integration::a_zombie_reaches_and_damages_a_bot ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 223 filtered out; finished in 9.13s
-
