@@ -335,10 +335,16 @@ pub trait ServerHooks: Send + Sync {
         action: InteractAction,
         block: BlockPosition,
         face: u8,
+        material: &str,
     ) -> Result<bool, Error>;
     /// Fires Bukkit's `BlockBreakEvent` before a block is removed; `false` means cancelled.
-    fn block_broken(&self, id: uuid::Uuid, name: &str, block: BlockPosition)
-    -> Result<bool, Error>;
+    fn block_broken(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        material: &str,
+    ) -> Result<bool, Error>;
     /// Fires Bukkit's `BlockPlaceEvent` before a block is placed; `false` means cancelled.
     fn block_placed(
         &self,
@@ -346,6 +352,8 @@ pub trait ServerHooks: Send + Sync {
         name: &str,
         block: BlockPosition,
         face: u8,
+        placed: &str,
+        replaced: &str,
     ) -> Result<bool, Error>;
     /// Fires Bukkit's `PlayerCommandPreprocessEvent`; `false` means cancelled.
     fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error>;
@@ -921,6 +929,7 @@ extern "system" fn player_interact(
     y: i32,
     z: i32,
     face: i32,
+    material: JString,
 ) -> u8 {
     let Ok(player) = env.get_string(&player) else {
         return 1;
@@ -933,13 +942,18 @@ extern "system" fn player_interact(
         return 1;
     };
     let name: String = name.into();
+    let Ok(material) = env.get_string(&material) else {
+        return 1;
+    };
+    let material: String = material.into();
     let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
         let player = env.new_string(player.to_string()).ok()?;
         let name = env.new_string(name).ok()?;
+        let material = env.new_string(material).ok()?;
         env.call_static_method(
             BOOTSTRAP,
             "firePlayerInteract",
-            "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+            "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
             &[
                 JValue::Object(player.as_ref()),
                 JValue::Object(name.as_ref()),
@@ -948,6 +962,7 @@ extern "system" fn player_interact(
                 JValue::Int(y),
                 JValue::Int(z),
                 JValue::Int(face),
+                JValue::Object(material.as_ref()),
             ],
         )
         .ok()?
@@ -964,6 +979,7 @@ extern "system" fn block_break(
     x: i32,
     y: i32,
     z: i32,
+    material: JString,
 ) -> u8 {
     let Ok(player) = env.get_string(&player) else {
         return 1;
@@ -976,19 +992,25 @@ extern "system" fn block_break(
         return 1;
     };
     let name: String = name.into();
+    let Ok(material) = env.get_string(&material) else {
+        return 1;
+    };
+    let material: String = material.into();
     let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
         let player = env.new_string(player.to_string()).ok()?;
         let name = env.new_string(name).ok()?;
+        let material = env.new_string(material).ok()?;
         env.call_static_method(
             BOOTSTRAP,
             "fireBlockBreak",
-            "(Ljava/lang/String;Ljava/lang/String;III)Z",
+            "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
             &[
                 JValue::Object(player.as_ref()),
                 JValue::Object(name.as_ref()),
                 JValue::Int(x),
                 JValue::Int(y),
                 JValue::Int(z),
+                JValue::Object(material.as_ref()),
             ],
         )
         .ok()?
@@ -1006,6 +1028,8 @@ extern "system" fn block_place(
     y: i32,
     z: i32,
     face: i32,
+    placed: JString,
+    replaced: JString,
 ) -> u8 {
     let Ok(player) = env.get_string(&player) else {
         return 1;
@@ -1018,13 +1042,23 @@ extern "system" fn block_place(
         return 1;
     };
     let name: String = name.into();
+    let Ok(placed) = env.get_string(&placed) else {
+        return 1;
+    };
+    let placed: String = placed.into();
+    let Ok(replaced) = env.get_string(&replaced) else {
+        return 1;
+    };
+    let replaced: String = replaced.into();
     let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
         let player = env.new_string(player.to_string()).ok()?;
         let name = env.new_string(name).ok()?;
+        let placed = env.new_string(placed).ok()?;
+        let replaced = env.new_string(replaced).ok()?;
         env.call_static_method(
             BOOTSTRAP,
             "fireBlockPlace",
-            "(Ljava/lang/String;Ljava/lang/String;IIII)Z",
+            "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
             &[
                 JValue::Object(player.as_ref()),
                 JValue::Object(name.as_ref()),
@@ -1032,6 +1066,8 @@ extern "system" fn block_place(
                 JValue::Int(y),
                 JValue::Int(z),
                 JValue::Int(face),
+                JValue::Object(placed.as_ref()),
+                JValue::Object(replaced.as_ref()),
             ],
         )
         .ok()?
@@ -1280,17 +1316,17 @@ impl PluginHost {
                 ),
                 NativeMethod::new(
                     "playerInteract",
-                    "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
                     player_interact as *mut _,
                 ),
                 NativeMethod::new(
                     "blockBreak",
-                    "(Ljava/lang/String;Ljava/lang/String;III)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
                     block_break as *mut _,
                 ),
                 NativeMethod::new(
                     "blockPlace",
-                    "(Ljava/lang/String;Ljava/lang/String;IIII)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
                     block_place as *mut _,
                 ),
                 NativeMethod::new(
@@ -1832,6 +1868,7 @@ impl PluginHost {
         action: InteractAction,
         block: BlockPosition,
         face: u8,
+        material: &str,
     ) -> Result<bool, Error> {
         if !self.listens_for(PLAYER_INTERACT_EVENT) {
             return Ok(true);
@@ -1839,11 +1876,12 @@ impl PluginHost {
         Ok(self.jvm.with_env(|env| {
             let id = env.new_string(id.to_string())?;
             let name = env.new_string(name)?;
+            let material = env.new_string(material)?;
             let allowed = env
                 .call_static_method(
                     BOOTSTRAP,
                     "firePlayerInteract",
-                    "(Ljava/lang/String;Ljava/lang/String;IIIII)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
                     &[
                         JValue::Object(id.as_ref()),
                         JValue::Object(name.as_ref()),
@@ -1852,6 +1890,7 @@ impl PluginHost {
                         JValue::Int(block.y),
                         JValue::Int(block.z),
                         JValue::Int(i32::from(face)),
+                        JValue::Object(material.as_ref()),
                     ],
                 )?
                 .z()?;
@@ -1865,6 +1904,7 @@ impl PluginHost {
         id: uuid::Uuid,
         name: &str,
         block: BlockPosition,
+        material: &str,
     ) -> Result<bool, Error> {
         if !self.listens_for(BLOCK_BREAK_EVENT) {
             return Ok(true);
@@ -1872,17 +1912,19 @@ impl PluginHost {
         Ok(self.jvm.with_env(|env| {
             let id = env.new_string(id.to_string())?;
             let name = env.new_string(name)?;
+            let material = env.new_string(material)?;
             let allowed = env
                 .call_static_method(
                     BOOTSTRAP,
                     "fireBlockBreak",
-                    "(Ljava/lang/String;Ljava/lang/String;III)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
                     &[
                         JValue::Object(id.as_ref()),
                         JValue::Object(name.as_ref()),
                         JValue::Int(block.x),
                         JValue::Int(block.y),
                         JValue::Int(block.z),
+                        JValue::Object(material.as_ref()),
                     ],
                 )?
                 .z()?;
@@ -1897,6 +1939,8 @@ impl PluginHost {
         name: &str,
         block: BlockPosition,
         face: u8,
+        placed: &str,
+        replaced: &str,
     ) -> Result<bool, Error> {
         if !self.listens_for(BLOCK_PLACE_EVENT) {
             return Ok(true);
@@ -1904,11 +1948,13 @@ impl PluginHost {
         Ok(self.jvm.with_env(|env| {
             let id = env.new_string(id.to_string())?;
             let name = env.new_string(name)?;
+            let placed = env.new_string(placed)?;
+            let replaced = env.new_string(replaced)?;
             let allowed = env
                 .call_static_method(
                     BOOTSTRAP,
                     "fireBlockPlace",
-                    "(Ljava/lang/String;Ljava/lang/String;IIII)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
                     &[
                         JValue::Object(id.as_ref()),
                         JValue::Object(name.as_ref()),
@@ -1916,6 +1962,8 @@ impl PluginHost {
                         JValue::Int(block.y),
                         JValue::Int(block.z),
                         JValue::Int(i32::from(face)),
+                        JValue::Object(placed.as_ref()),
+                        JValue::Object(replaced.as_ref()),
                     ],
                 )?
                 .z()?;
@@ -2026,16 +2074,18 @@ impl ServerHooks for PluginHost {
         action: InteractAction,
         block: BlockPosition,
         face: u8,
+        material: &str,
     ) -> Result<bool, Error> {
-        self.fire_player_interact(id, name, action, block, face)
+        self.fire_player_interact(id, name, action, block, face, material)
     }
     fn block_broken(
         &self,
         id: uuid::Uuid,
         name: &str,
         block: BlockPosition,
+        material: &str,
     ) -> Result<bool, Error> {
-        self.fire_block_break(id, name, block)
+        self.fire_block_break(id, name, block, material)
     }
     fn block_placed(
         &self,
@@ -2043,8 +2093,10 @@ impl ServerHooks for PluginHost {
         name: &str,
         block: BlockPosition,
         face: u8,
+        placed: &str,
+        replaced: &str,
     ) -> Result<bool, Error> {
-        self.fire_block_place(id, name, block, face)
+        self.fire_block_place(id, name, block, face, placed, replaced)
     }
     fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error> {
         self.fire_player_command(id, name, message)

@@ -559,6 +559,12 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     });
     wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
     wait_for_prefix(&events, "break 0 64 0", &stdout, &stderr);
+    wait_for_line(
+        &events,
+        "break-type minecraft:grass_block world",
+        &stdout,
+        &stderr,
+    );
     assert_eq!(
         wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
         0,

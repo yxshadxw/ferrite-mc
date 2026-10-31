@@ -11,6 +11,7 @@ mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod commands_world;
 mod container;
 mod crafting;
 mod drops;
@@ -46,7 +47,7 @@ use self::{
     region::{Command, Mailbox, Player, Region, Signal, TickContext},
 };
 use ferrite_admin::AdminLists;
-use ferrite_net::game::{self, GameMessage, Outbound, ServerboundPlay};
+use ferrite_net::game::{self, GameMessage, Outbound, OutboundSender, ServerboundPlay};
 use ferrite_protocol::{Encode, VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, Regionizer, Scheduler};
 use std::{
@@ -63,6 +64,15 @@ pub struct Operator {
     pub uuid: Uuid,
     pub level: u8,
 }
+/// What a failed plugin event (for example a JVM exception) means for the action it guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginEventPolicy {
+    /// Bukkit-compatible (the default): the action proceeds as if nothing was cancelled.
+    #[default]
+    Allow,
+    /// Treat the failure like a cancellation: undo the action and resend block/teleport state.
+    Deny,
+}
 #[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
@@ -70,6 +80,8 @@ pub struct WorldSettings {
     pub ops: Vec<Operator>,
     /// Plugin event and command hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
+    /// What a failed plugin event means for the action it guards.
+    pub plugin_event_errors: PluginEventPolicy,
     /// Vanilla `ops.json`/`whitelist.json`/ban lists, when the server has a data directory.
     pub admin: Option<Arc<AdminLists>>,
     /// Whether the whitelist starts enabled.
@@ -90,6 +102,7 @@ impl Default for WorldSettings {
             max_players: 20,
             ops: Vec::new(),
             plugins: None,
+            plugin_event_errors: PluginEventPolicy::Allow,
             admin: None,
             whitelist: false,
         }
@@ -253,7 +266,7 @@ fn apply_game_rule(
     };
     Ok(format!("{name} = {}", result.text()))
 }
-fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
+fn emit<P: ferrite_protocol::Packet>(tx: &OutboundSender, p: &P) {
     let _ = tx.send(game::packet(p));
 }
 fn plugin_command_line(name: &str, args: &[String]) -> String {
@@ -295,7 +308,7 @@ fn json_text(json: &str) -> String {
     }
     if out.is_empty() { json.to_owned() } else { out }
 }
-fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
+fn chat(tx: &OutboundSender, text: &str) {
     emit(
         tx,
         &SystemChat {
@@ -389,8 +402,7 @@ async fn run(
             }
         },
     );
-    let mut mailboxes: HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)> =
-        HashMap::new();
+    let mut mailboxes: HashMap<Uuid, (u64, Mailbox, OutboundSender)> = HashMap::new();
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
     let mut names: HashMap<Uuid, String> = HashMap::new();
@@ -474,7 +486,7 @@ async fn run(
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
            if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), state: command_state.clone(), actions }, registry) {
-               let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
+               let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet.into()));
            }
            emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
@@ -483,7 +495,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -512,7 +524,7 @@ async fn run(
               scheduler.schedule_global(move |g|g.apply_chat_update(uuid,&last_seen));
               let _ = event_tx.send(GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(ServerboundChatCommand{command})});
           }},
-          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, _mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
+          GameMessage::Input{session,uuid,packet:ServerboundPlay::ChatCommand(command)}=>{let command = command.command; if let Some((_, mailbox, outbound)) = mailboxes.get(&uuid).filter(|m| m.0 == session) {
               let message = format!("/{}", command.trim_start_matches('/'));
               if let (Some(plugins), Some(name)) = (&settings.plugins, names.get(&uuid)) {
                   match plugins.player_command(uuid, name, &message) {
@@ -566,6 +578,7 @@ async fn run(
                       }
                   },
                   commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules, source.as_ref(), &command_speed, &name, value.as_deref()) { Ok(message) => chat(outbound, &message), Err(error) => chat(outbound, &error) },
+                  commands::Action::World(command) => { mailbox.lock().unwrap().push_back(Command::World(command)); },
                   commands::Action::Clear { targets, item, max_count } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Clear { target, target_name, item, max_count, feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Give { targets, item, count, item_name } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Experience { operation, targets, amount, unit } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Experience { target, target_name, operation, amount, unit, feedback: Some(outbound.clone()) }); } } },
@@ -688,7 +701,7 @@ fn hand_off(
 }
 /// Where command feedback goes: a player's chat, or the console log.
 struct Reply<'a> {
-    outbound: Option<&'a mpsc::UnboundedSender<Outbound>>,
+    outbound: Option<&'a OutboundSender>,
 }
 
 impl Reply<'_> {
@@ -715,7 +728,7 @@ struct CommandRuntime<'a> {
     admin: &'a mut Option<Arc<AdminLists>>,
     whitelist: &'a mut bool,
     saving: &'a mut bool,
-    mailboxes: &'a HashMap<Uuid, (u64, Mailbox, mpsc::UnboundedSender<Outbound>)>,
+    mailboxes: &'a HashMap<Uuid, (u64, Mailbox, OutboundSender)>,
     positions: &'a Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     profiler: &'a Arc<profile::Profiler>,
     source: &'a Option<Arc<anvil::AnvilChunkSource>>,
@@ -848,7 +861,8 @@ impl CommandRuntime<'_> {
             | Action::Clear { .. }
             | Action::Give { .. }
             | Action::Experience { .. }
-            | Action::GameRule(..) => false,
+            | Action::GameRule(..)
+            | Action::World(_) => false,
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {

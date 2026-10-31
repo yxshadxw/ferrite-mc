@@ -9,7 +9,7 @@ use ferrite_command::{
     arguments::{Coordinates, EntityTarget, GameMode, SelectorKind, WorldCoordinate},
     literal,
 };
-use ferrite_net::game::Outbound;
+use ferrite_net::game::OutboundSender;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -339,6 +339,7 @@ pub enum Action {
         name: String,
         args: Vec<String>,
     },
+    World(super::commands_world::WorldCommand),
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
@@ -376,7 +377,7 @@ pub struct ResolvedPlayer {
 #[derive(Debug, Clone)]
 pub struct OnlinePlayer {
     pub name: String,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -1627,6 +1628,12 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
                 literal::<Source>("stop").executes(|ctx| send(ctx.source(), Action::ProfileStop)),
             ),
     );
+    tree.register(
+        literal::<Source>("stop")
+            .requires(|source| source.permission >= 4 && source.uuid.is_none())
+            .executes(|ctx| send(ctx.source(), Action::Stop)),
+    );
+    super::commands_world::register(&mut tree);
     tree
 }
 
@@ -2265,7 +2272,7 @@ mod tests {
             (bob, "Bob", [100.0, 64.0, 0.0]),
             (carol, "Carol", [10.0, 64.0, 0.0]),
         ] {
-            let (outbound, _) = tokio::sync::mpsc::unbounded_channel();
+            let (outbound, _) = OutboundSender::channel(1 << 20);
             online.insert(
                 uuid,
                 OnlinePlayer {

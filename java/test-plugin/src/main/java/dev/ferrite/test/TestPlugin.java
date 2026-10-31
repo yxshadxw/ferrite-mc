@@ -29,6 +29,7 @@ public final class TestPlugin extends JavaPlugin implements Listener {
     @EventHandler public void onBreak(org.bukkit.event.block.BlockBreakEvent event) {
         var block = event.getBlock();
         appendEvent("break " + block.getX() + " " + block.getY() + " " + block.getZ());
+        appendEvent("break-type " + block.getType().getKey() + " " + block.getWorld().getName());
         if (block.getX() == 1) { appendEvent("break-cancel " + block.getX() + " " + block.getY() + " " + block.getZ()); event.setCancelled(true); }
     }
     @EventHandler public void onCommand(org.bukkit.event.player.PlayerCommandPreprocessEvent event) {
