@@ -1760,6 +1760,106 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     server.abort();
 }
 
+/// A placed sand block finds no support and becomes a `FallingBlockEntity`; the tracking bot
+/// sees the block removal, the entity and the block placed where it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placed_sand_falls_and_lands_for_tracking_bot() {
+    use ferrite_protocol::{
+        packets::play::{AddEntity, BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    // A stone block to click, a floor three blocks below the free spot, air in between.
+    source.set_block(0, 64, 0, block("stone")).unwrap();
+    for y in 61..=64 {
+        source.set_block(1, y, 0, block("air")).unwrap();
+    }
+    source.set_block(1, 60, 0, block("stone")).unwrap();
+    let world = World::start_with(Some(source.clone()), [3, 65, 0]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "SandTester").await;
+    bot.until(46).await;
+    let sand_item = ferrite_data::registries::id("minecraft:item", "minecraft:sand").unwrap();
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: sand_item,
+        },
+    })
+    .await;
+    // Look west and down at the east face of the stone block at (0, 64, 0).
+    bot.send(&MoveRotation {
+        yaw: 90.0,
+        pitch: 35.3,
+        flags: 1,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(5),
+        cursor_x: 0.5,
+        cursor_y: 0.5,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+    let sand = block("sand");
+    let falling_type = i32::from(ferrite_entity::falling::falling_type());
+    let mut saw_falling = false;
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            match id {
+                AddEntity::ID => {
+                    let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+                    if add.entity_type.0 == falling_type {
+                        saw_falling = true;
+                    }
+                }
+                BlockUpdate::ID => {
+                    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                    if BlockPos::unpack(update.location) == BlockPos::new(1, 61, 0)
+                        && update.block_state.0 == sand as i32
+                    {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(landed.is_ok(), "sand never landed for the tracking bot");
+    assert_eq!(source.block(1, 61, 0), Some(sand));
+    assert!(saw_falling, "the bot never saw the falling block entity");
+}
+
 /// Vanilla `Level.markAndNotifyBlock` at work: breaking the block under a torch breaks the
 /// torch in the same region tick, and the tracking bot sees both block updates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

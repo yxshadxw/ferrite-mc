@@ -107,6 +107,25 @@ struct TickBlocks<'a> {
     source: Option<&'a super::anvil::AnvilChunkSource>,
     seen: std::cell::RefCell<HashMap<(i32, i32, i32), Option<u16>>>,
 }
+/// Physics reads through the tick's memoized block getter; placements write through the
+/// region's fluid world, so tracking players get the `block_update`.
+struct FallingAdapter<'a> {
+    read: &'a TickBlocks<'a>,
+    world: super::fluid::RegionFluidWorld<'a>,
+}
+
+impl BlockGetter for FallingAdapter<'_> {
+    fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        self.read.block_state(x, y, z)
+    }
+}
+
+impl ferrite_entity::falling::FallingWorld for FallingAdapter<'_> {
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u16) {
+        ferrite_fluid::FluidWorld::set_block(&mut self.world, x, y, z, u32::from(state));
+    }
+}
+
 impl BlockGetter for TickBlocks<'_> {
     fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let source = self.source?;
@@ -170,6 +189,7 @@ pub struct Region {
     fluid_ticks: ferrite_fluid::FluidTicks,
     random_ticks: super::random_tick::RandomTicks,
     updates: super::neighbors::Updates,
+    gravity: super::gravity::Gravity,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -185,6 +205,7 @@ impl RegionData for Region {
         for (chunk, count) in other.held_chunks {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
+        self.gravity.merge(other.gravity);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -206,6 +227,9 @@ impl RegionData for Region {
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
             random_ticks: super::random_tick::RandomTicks::default(),
             updates: super::neighbors::Updates::default(),
+            gravity: self.gravity.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -1324,6 +1348,81 @@ impl Region {
             self.entities.insert(record);
         }
     }
+
+    /// Vanilla `FallingBlock.onPlace`/`neighborChanged`: schedules a free gravity block. The
+    /// changed block and its six neighbors are the blocks vanilla notifies.
+    fn schedule_gravity(&mut self, source: &super::anvil::AnvilChunkSource, changed: &[[i32; 3]]) {
+        for &pos in changed {
+            for (dx, dy, dz) in [
+                (0, 0, 0),
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let target = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                let chunk = ChunkPos(target[0].div_euclid(16), target[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) = source
+                    .block(target[0], target[1], target[2])
+                    .and_then(|s| u16::try_from(s).ok())
+                else {
+                    continue;
+                };
+                if !super::gravity::is_gravity(state) {
+                    continue;
+                }
+                let below = source
+                    .block(target[0], target[1] - 1, target[2])
+                    .and_then(|s| u16::try_from(s).ok());
+                if super::gravity::is_free(below) {
+                    self.gravity.schedule(target);
+                }
+            }
+        }
+    }
+
+    /// Runs due gravity checks, then the neighbor updates of the blocks they removed.
+    fn tick_gravity(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let removed =
+            self.gravity
+                .tick(source, &self.held_chunks, &ctx.tracking, &mut self.entities);
+        if removed.is_empty() {
+            return;
+        }
+        for pos in &removed {
+            self.updates.block_changed(*pos);
+        }
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+
+    /// Ticks the falling block entities against this region's blocks.
+    fn tick_falling(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        let mut adapter = FallingAdapter {
+            read: &blocks,
+            world,
+        };
+        ferrite_entity::falling::tick_falling_blocks(&mut self.entities, &mut adapter, -64, 320);
+    }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
@@ -1453,13 +1552,18 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
-        self.tick_block_updates(ctx);
+        let changed = self.tick_block_updates(ctx);
+        if let Some(source) = ctx.source.as_deref() {
+            self.schedule_gravity(source, &changed);
+        }
+        self.tick_gravity(ctx);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
+        self.tick_falling(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
         }
