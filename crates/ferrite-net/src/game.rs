@@ -13,6 +13,8 @@ use uuid::Uuid;
 pub enum ServerboundPlay {
     PlayerAction(PlayerAction),
     UseItemOn(UseItemOn),
+    PlayerCommand(ServerboundPlayerCommand),
+    SignUpdate(SignUpdate),
     SetHeldItem(SetHeldItem),
     CreativeSlot(CreativeSlot<ferrite_item::ItemStack>),
     ContainerClick(ContainerClick<ferrite_item::HashedSlot>),
@@ -35,8 +37,6 @@ pub enum ServerboundPlay {
     ClientCommand(ferrite_protocol::packets::play::ServerboundClientCommand),
     /// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating, throwing, ...).
     UseItem(Box<ferrite_protocol::packets::play::ServerboundUseItem>),
-    /// Vanilla `ServerboundPlayerCommandPacket`: sprint/sneak/... state changes.
-    PlayerCommand(ferrite_protocol::packets::play::ServerboundPlayerCommand),
 }
 #[derive(Debug)]
 pub enum GameMessage {
@@ -270,6 +270,10 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
             ServerboundContainerClose::decode(&mut b)?.window.0,
         )),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
+        42 => Some(ServerboundPlay::PlayerCommand(
+            ServerboundPlayerCommand::decode(&mut b)?,
+        )),
+        62 => Some(ServerboundPlay::SignUpdate(SignUpdate::decode(&mut b)?)),
         54 => Some(ServerboundPlay::SetHeldItem(SetHeldItem::decode(&mut b)?)),
         57 => Some(ServerboundPlay::CreativeSlot(CreativeSlot::decode(&mut b)?)),
         66 => Some(ServerboundPlay::UseItemOn(UseItemOn::decode(&mut b)?)),
@@ -278,9 +282,6 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         ))),
         12 => Some(ServerboundPlay::ClientCommand(
             ferrite_protocol::packets::play::ServerboundClientCommand::decode(&mut b)?,
-        )),
-        42 => Some(ServerboundPlay::PlayerCommand(
-            ferrite_protocol::packets::play::ServerboundPlayerCommand::decode(&mut b)?,
         )),
         44 => {
             PlayerLoaded::decode(&mut b)?;
