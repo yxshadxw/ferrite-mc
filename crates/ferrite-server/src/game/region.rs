@@ -6,7 +6,7 @@ use ferrite_entity::{
     BlockGetter, EntityRecord, EntityStore, Rng, item,
     tracker::{self, Viewer, ViewerKey},
 };
-use ferrite_net::game::{Outbound, ServerboundPlay, packet};
+use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
 use ferrite_plugin::InteractAction;
 use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
@@ -26,9 +26,10 @@ pub enum Command {
         yaw: Option<f32>,
         pitch: Option<f32>,
     },
+    World(super::commands_world::WorldCommand),
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
-pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
+pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, OutboundSender)>>>;
 pub enum Signal {
     Transfer {
         from: ChunkPos,
@@ -114,7 +115,7 @@ pub struct Player {
     pub ground: bool,
     pub chunk: ChunkPos,
     pub mailbox: Mailbox,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
     pub gamemode: i32,
@@ -321,7 +322,7 @@ impl Player {
         send(self, &ChunkBatchStart);
         let count = chunks.len();
         for (x, z, packet) in chunks {
-            let _ = self.outbound.send(Outbound::Packet(packet));
+            let _ = self.outbound.send(Outbound::Packet(packet.into()));
             self.loaded.insert((x, z));
             if let Some((loaded, _)) = tracking.get_mut(&self.uuid) {
                 loaded.insert((x, z));
@@ -420,21 +421,25 @@ impl Player {
             );
         }
     }
-    fn change_block(&self, location: i64, expected: u32, state: u32) -> bool {
+    /// Applies a block change and tells every player tracking the chunk. `expected` keeps the
+    /// compare-and-set used by player interaction; commands pass `None`.
+    pub(crate) fn change_block(&self, location: i64, expected: Option<u32>, state: u32) -> bool {
         let pos = ferrite_protocol::types::BlockPos::unpack(location);
         let tracking = self.tracking.lock().unwrap();
         if self.source.as_ref().is_some_and(|source| {
             source
-                .compare_set_block(pos.x, pos.y, pos.z, Some(expected), state)
+                .compare_set_block(pos.x, pos.y, pos.z, expected, state)
                 .is_ok()
         }) {
             let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+            // One encoding, shared by every observer.
+            let update = packet(&BlockUpdate {
+                location,
+                block_state: VarInt(state as i32),
+            });
             for (loaded, outbound) in tracking.values() {
                 if loaded.contains(&chunk) {
-                    let _ = outbound.send(packet(&BlockUpdate {
-                        location,
-                        block_state: VarInt(state as i32),
-                    }));
+                    let _ = outbound.send(update.clone());
                 }
             }
             let _ = self.signals.send(Signal::FluidChange {
@@ -450,7 +455,7 @@ impl Player {
     /// Breaks a block (to air); an inventory block drops its contents (vanilla
     /// `Containers.dropContentsOnDestroy`).
     fn break_block(&mut self, location: i64, state: u32) -> bool {
-        if !self.change_block(location, state, 0) {
+        if !self.change_block(location, Some(state), 0) {
             return false;
         }
         if let Some(source) = &self.source {
@@ -558,7 +563,7 @@ impl Player {
         }) {
             return;
         }
-        let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
+        let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
@@ -653,6 +658,10 @@ impl Player {
                         self.teleport();
                         changed = true;
                     }
+                    continue;
+                }
+                Command::World(command) => {
+                    super::commands_world::run(self, command);
                     continue;
                 }
                 Command::Input(msg) => msg,
@@ -913,15 +922,15 @@ fn deliver(
     (uuid, session): ViewerKey,
     bytes: &[u8],
 ) {
-    let packet = Outbound::Packet(bytes.to_vec());
+    let packet = Outbound::Packet(bytes.to_vec().into());
     match players.get(&uuid) {
         Some(p) if p.session == session => {
-            let _ = p.outbound.send(packet);
+            let _ = p.outbound.send(packet.clone());
         }
         Some(_) => {}
         None => {
             if let Some((_, outbound)) = ctx.tracking.lock().unwrap().get(&uuid) {
-                let _ = outbound.send(packet);
+                let _ = outbound.send(packet.clone());
             }
         }
     }
