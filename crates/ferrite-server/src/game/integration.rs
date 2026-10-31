@@ -1617,6 +1617,117 @@ async fn tracker_spawns_and_removes_entities_by_range() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summoned_cow_is_tracked_falls_dies_and_drops_loot() {
+    use ferrite_protocol::packets::play::{
+        AddEntity, EntityMove, EntityMoveRotation, EntityTeleport, MetaValue, RemoveEntities,
+        SetEntityData,
+    };
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Rancher").await;
+    bot.until(46).await;
+    world
+        .console_command("/summon minecraft:cow 8.5 100.5 8.5".into())
+        .await
+        .unwrap();
+    let cow_type = i32::from(ferrite_entity::mob::MobKind::Cow.entity_type());
+    let cow = loop {
+        let body = entity_packet(&mut bot, AddEntity::ID, -1).await;
+        let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+        if add.entity_type.0 == cow_type {
+            // Spawned at 100.5; gravity may already have moved it a little this tick.
+            assert!((add.y - 100.5).abs() < 1.0, "spawned at {}", add.y);
+            break add.id.0;
+        }
+    };
+    // The tracker follows it down: a delta move with a downward delta, or a full sync below
+    // the spawn height once the fall outgrows the delta range.
+    let mut moved = false;
+    while !moved {
+        let (id, body) = tokio::time::timeout(std::time::Duration::from_secs(20), bot.next_play())
+            .await
+            .expect("cow movement packet");
+        match id {
+            EntityMove::ID => {
+                let packet = EntityMove::decode(&mut body.as_slice()).unwrap();
+                moved = packet.id.0 == cow && packet.dy < 0;
+            }
+            EntityMoveRotation::ID => {
+                let packet = EntityMoveRotation::decode(&mut body.as_slice()).unwrap();
+                moved = packet.id.0 == cow && packet.dy < 0;
+            }
+            EntityTeleport::ID => {
+                let packet = EntityTeleport::decode(&mut body.as_slice()).unwrap();
+                moved = packet.id.0 == cow && packet.y < 99.5;
+            }
+            _ => {}
+        }
+    }
+    // It lands and dies; the loot dropped by the entity loot table is tracked too.
+    let item_type = i32::from(
+        ferrite_data::entity_props::by_name("minecraft:item")
+            .unwrap()
+            .id,
+    );
+    let beef = ferrite_data::registries::id("minecraft:item", "minecraft:beef").unwrap();
+    let leather = ferrite_data::registries::id("minecraft:item", "minecraft:leather").unwrap();
+    let mut cow_removed = false;
+    let mut loot_items: Vec<(i32, i32)> = Vec::new();
+    let mut pending: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !cow_removed || loot_items.is_empty() {
+            let (id, body) = bot.next_play().await;
+            match id {
+                AddEntity::ID => {
+                    let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+                    if add.entity_type.0 == item_type {
+                        pending.insert(add.id.0);
+                    }
+                }
+                SetEntityData::ID => {
+                    let data = SetEntityData::decode(&mut body.as_slice()).unwrap();
+                    let stack = data.values.iter().find_map(|value| match &value.value {
+                        MetaValue::ItemStack(stack) => Some(*stack),
+                        _ => None,
+                    });
+                    if pending.contains(&data.id.0)
+                        && let Some(stack) = stack
+                    {
+                        loot_items.push((data.id.0, stack.item_id));
+                    }
+                }
+                RemoveEntities::ID => {
+                    let removed = RemoveEntities::decode(&mut body.as_slice()).unwrap();
+                    cow_removed |= removed.ids.contains(&VarInt(cow));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("cow death and loot packets");
+    assert!(
+        loot_items
+            .iter()
+            .all(|(_, item)| *item == beef || *item == leather),
+        "unexpected loot: {loot_items:?}"
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     use ferrite_protocol::{
         packets::play::{

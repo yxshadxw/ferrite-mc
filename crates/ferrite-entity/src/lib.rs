@@ -16,6 +16,7 @@
 //! section leaves its store by value ([`EntityStore::take_crossing`]) to be handed to the new
 //! owner through that region's task queue.
 
+pub mod ai;
 mod id;
 mod index;
 pub mod item;

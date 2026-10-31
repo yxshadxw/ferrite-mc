@@ -84,6 +84,16 @@ impl MobKind {
         entity_props::by_name(name).and_then(|props| Self::from_entity_type(props.id))
     }
 
+    /// English display name, as used by `/summon` feedback.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Chicken => "Chicken",
+            Self::Cow => "Cow",
+            Self::Pig => "Pig",
+            Self::Sheep => "Sheep",
+        }
+    }
+
     /// Vanilla `Animal.removeWhenFarAway` is false: passive animals persist.
     pub fn despawns_when_far(self) -> bool {
         false
@@ -103,6 +113,8 @@ pub struct MobState {
     pub fall_distance: f32,
     /// Vanilla `removeWhenFarAway`; animals keep this false.
     pub despawns: bool,
+    /// Whether the death loot was already rolled and spawned.
+    pub loot_dropped: bool,
 }
 
 impl MobState {
@@ -115,6 +127,7 @@ impl MobState {
             no_action_time: 0,
             fall_distance: 0.0,
             despawns: kind.despawns_when_far(),
+            loot_dropped: false,
         }
     }
 

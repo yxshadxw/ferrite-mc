@@ -9,6 +9,7 @@ use ferrite_command::{
     arguments::{Coordinates, EntityTarget, GameMode, SelectorKind, WorldCoordinate},
     literal,
 };
+use ferrite_entity::mob::MobKind;
 use ferrite_net::game::OutboundSender;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -333,6 +334,11 @@ pub enum Action {
     },
     Tps,
     Mspt,
+    /// `/summon`: create a mob at an absolute position.
+    Summon {
+        kind: MobKind,
+        pos: [f64; 3],
+    },
     ProfileStart,
     ProfileStop,
     Plugin {
@@ -684,6 +690,36 @@ fn kill_builder() -> ferrite_command::NodeBuilder<Source> {
                 )
             }),
         )
+}
+
+fn summon_builder() -> ferrite_command::NodeBuilder<Source> {
+    literal::<Source>("summon")
+        .requires(|source| source.permission >= 2)
+        .restricted(true)
+        .then(
+            argument("entity", ArgumentType::ResourceLocation)
+                .executes(|ctx| summon_action(ctx, false))
+                .then(argument("pos", ArgumentType::Vec3).executes(|ctx| summon_action(ctx, true))),
+        )
+}
+
+fn summon_action(ctx: &CommandContext<Source>, with_pos: bool) -> Result<i32, CommandError> {
+    let name = ctx
+        .string("entity")
+        .ok_or_else(|| CommandError::failed("missing entity argument 'entity'"))?;
+    let kind = MobKind::from_name(name).ok_or_else(|| {
+        if ferrite_data::entity_props::by_name(name).is_some() {
+            CommandError::failed(format!("Unable to summon entity {name}"))
+        } else {
+            CommandError::failed(format!("Invalid entity {name}"))
+        }
+    })?;
+    let pos = if with_pos {
+        coordinates(ctx, "pos")?.resolve(ctx.source().origin, ctx.source().yaw, ctx.source().pitch)
+    } else {
+        ctx.source().origin
+    };
+    send(ctx.source(), Action::Summon { kind, pos })
 }
 
 fn admin_targets_command(
@@ -1381,6 +1417,8 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
 
     // ---- entity effects ----
     tree.register(kill_builder());
+    tree.register(summon_builder());
+    tree.register(summon_builder());
 
     // ---- administration ----
     tree.register(admin_targets_command("op", |targets| Action::Op {
@@ -2785,6 +2823,35 @@ mod tests {
         assert!(matches!(received.try_recv().unwrap(), Action::ProfileStart));
         tree.execute("profile stop", operator).unwrap();
         assert!(matches!(received.try_recv().unwrap(), Action::ProfileStop));
+    }
+
+    #[test]
+    fn summon_parses_the_vanilla_entity_and_position_arguments() {
+        assert_eq!(
+            only("summon minecraft:cow", 2),
+            Action::Summon {
+                kind: MobKind::Cow,
+                pos: [0.0, 64.0, 0.0],
+            }
+        );
+        assert_eq!(
+            only("summon pig 10 64.5 -3", 2),
+            Action::Summon {
+                kind: MobKind::Pig,
+                pos: [10.5, 64.5, -2.5],
+            }
+        );
+        assert_eq!(
+            only("summon sheep ~ ~2 ~", 2),
+            Action::Summon {
+                kind: MobKind::Sheep,
+                pos: [0.0, 66.0, 0.0],
+            }
+        );
+        // A vanilla entity this server cannot simulate yet, and an unknown id.
+        assert!(run("summon minecraft:zombie", 2).0.is_err());
+        assert!(run("summon not_a_thing", 2).0.is_err());
+        assert!(run("summon minecraft:cow", 1).0.is_err());
     }
 
     #[test]

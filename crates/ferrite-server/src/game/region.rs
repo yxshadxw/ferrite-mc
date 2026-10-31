@@ -5,7 +5,8 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, item,
+    BlockGetter, EntityRecord, EntityStore, Rng, ai, item,
+    mob::{self, MobKind},
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
@@ -1269,6 +1270,61 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
+    /// Creates a mob at an absolute position (`/summon`).
+    pub fn summon(&mut self, kind: MobKind, pos: [f64; 3]) -> bool {
+        if !pos
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= 30_000_000.0)
+        {
+            return false;
+        }
+        let record = mob::new_mob(
+            kind,
+            ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+            &mut self.rng,
+        );
+        self.entities.insert(record);
+        true
+    }
+    /// Ticks the modelled mobs: movement, fall damage, despawn and death loot.
+    fn tick_mobs(&mut self, blocks: &impl BlockGetter) {
+        let players: Vec<_> = self
+            .players
+            .values()
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        ai::tick(&mut self.entities, blocks, &players, &mut self.rng);
+        // Mobs that died this tick drop their entity loot table once (vanilla
+        // `LivingEntity.dropFromLootTable`). The entity itself stays in the store until the
+        // tracker has sent `remove_entities` and `sweep_removed` drops the record.
+        let dead: Vec<_> = self
+            .entities
+            .keys()
+            .iter()
+            .filter_map(|&key| {
+                let data = self.entities.data(key)?;
+                let mob = data.mob?;
+                if !mob.is_dead() || mob.loot_dropped {
+                    return None;
+                }
+                Some((key, mob.kind, self.entities.pos(key)?))
+            })
+            .collect();
+        for (key, kind, pos) in dead {
+            if let Some(mob) = mob::state_mut(&mut self.entities, key) {
+                mob.loot_dropped = true;
+            }
+            for stack in super::drops::mob_drops(kind, &mut self.rng) {
+                let block = [
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ];
+                let record = item::pop_resource(block, stack, &mut self.rng);
+                self.entities.insert(record);
+            }
+        }
+    }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
@@ -1403,6 +1459,7 @@ impl Region {
             seen: Default::default(),
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
+        self.tick_mobs(&blocks);
         self.pick_up_items(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
