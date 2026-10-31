@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-struct Bot {
+pub(super) struct Bot {
     stream: TcpStream,
     encoder: FrameEncoder,
     decoder: FrameDecoder,
@@ -27,7 +27,7 @@ struct Bot {
     chunks_per_tick: f32,
 }
 impl Bot {
-    async fn send<P: Packet>(&mut self, p: &P) {
+    pub(super) async fn send<P: Packet>(&mut self, p: &P) {
         let mut body = Vec::new();
         encode_packet(p, &mut body);
         let mut wire = Vec::new();
@@ -97,7 +97,7 @@ impl Bot {
         }
         (id, rest)
     }
-    async fn until(&mut self, id: i32) -> Vec<u8> {
+    pub(super) async fn until(&mut self, id: i32) -> Vec<u8> {
         loop {
             let (got, body) = self.next_play().await;
             if got == id {
@@ -164,7 +164,7 @@ impl Bot {
         b
     }
     /// Joins and waits until the server positions the player in play state.
-    async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+    pub(super) async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
         Self::join_with_rate(addr, name, 64.0).await
     }
     /// Joins with a specific chunk-batch rate, so a test can keep the per-connection queue
@@ -1445,6 +1445,8 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         signals: tx,
         tracking: Default::default(),
         source: None,
+        dimension: super::Dimension::Overworld,
+        raining: false,
         rules: Default::default(),
         spawn: [0.0, 65.0, 0.0],
     };

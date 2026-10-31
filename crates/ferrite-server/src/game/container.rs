@@ -300,6 +300,10 @@ impl Player {
     /// `BarrelBlock`). Using them opens the menu instead of placing the held item; returns
     /// whether the block was used.
     pub fn use_block(&mut self, location: i64) -> bool {
+        // Doors, buttons, beds, signs, buckets and cauldrons first; menus follow.
+        if super::blocks::use_block(self, location) {
+            return true;
+        }
         let pos = ferrite_protocol::types::BlockPos::unpack(location);
         let Some(source) = self.source.clone() else {
             return false;
