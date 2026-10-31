@@ -3471,7 +3471,13 @@ mod tests {
             }
         );
         // A vanilla entity this server cannot simulate yet, and an unknown id.
-        assert!(run("summon minecraft:villager", 2).0.is_err());
+        assert_eq!(
+            only("summon minecraft:villager", 2),
+            Action::Summon {
+                kind: MobKind::Villager,
+                pos: [0.0, 64.0, 0.0],
+            }
+        );
         assert!(run("summon not_a_thing", 2).0.is_err());
         assert!(run("summon minecraft:cow", 1).0.is_err());
     }

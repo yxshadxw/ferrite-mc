@@ -37,6 +37,7 @@ pub mod spawn;
 mod store;
 pub mod tnt;
 pub mod tracker;
+pub mod villager;
 
 pub use id::{EntityKey, allocate_id, random_uuid};
 pub use index::{Cell, QUERY_MARGIN, SectionIndex};

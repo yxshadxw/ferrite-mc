@@ -36,6 +36,7 @@ pub enum MobKind {
     Spider,
     Creeper,
     Enderman,
+    Villager,
 }
 
 impl MobKind {
@@ -50,7 +51,7 @@ impl MobKind {
         Self::Enderman,
     ];
     /// Every modelled kind.
-    pub const ALL_MOBS: [Self; 9] = [
+    pub const ALL_MOBS: [Self; 10] = [
         Self::Chicken,
         Self::Cow,
         Self::Pig,
@@ -60,6 +61,7 @@ impl MobKind {
         Self::Spider,
         Self::Creeper,
         Self::Enderman,
+        Self::Villager,
     ];
 
     /// Vanilla entity type id, e.g. `"minecraft:cow"`.
@@ -74,6 +76,7 @@ impl MobKind {
             Self::Spider => "minecraft:spider",
             Self::Creeper => "minecraft:creeper",
             Self::Enderman => "minecraft:enderman",
+            Self::Villager => "minecraft:villager",
         }
     }
 
@@ -147,6 +150,8 @@ impl MobKind {
             Self::Spider => "minecraft:entities/spider",
             Self::Creeper => "minecraft:entities/creeper",
             Self::Enderman => "minecraft:entities/enderman",
+            // Villagers drop their held items only, which this server does not model.
+            Self::Villager => "",
         }
     }
 
@@ -174,6 +179,7 @@ impl MobKind {
             Self::Spider => "Spider",
             Self::Creeper => "Creeper",
             Self::Enderman => "Enderman",
+            Self::Villager => "Villager",
         }
     }
 
@@ -279,6 +285,14 @@ pub fn new_mob(kind: MobKind, pos: Vec3, rng: &mut Rng) -> EntityRecord {
     );
     data.yaw = rng.next_f32() * 360.0;
     data.mob = Some(MobState::new(kind));
+    if kind == MobKind::Villager {
+        let state = crate::villager::VillagerState::new(
+            crate::villager::VillagerType::Plains,
+            [pos.x, pos.y, pos.z],
+        );
+        crate::villager::define_metadata(&mut data.metadata, &state);
+        data.villager = Some(state);
+    }
     EntityRecord {
         pos,
         vel: Vec3::ZERO,
@@ -512,7 +526,10 @@ mod tests {
         }
         assert_eq!(MobKind::Cow.max_health(), 10.0);
         assert_eq!(MobKind::Chicken.max_health(), 4.0);
-        assert_eq!(MobKind::from_name("villager"), None);
+        assert_eq!(MobKind::from_name("villager"), Some(MobKind::Villager));
+        assert_eq!(MobKind::Villager.max_health(), 20.0);
+        // Vanilla files villagers under `MobCategory.MISC`, not `CREATURE`.
+        assert_eq!(MobKind::Villager.props().category, "misc");
     }
 
     #[test]

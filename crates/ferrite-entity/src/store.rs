@@ -24,6 +24,7 @@ use crate::item::ItemState;
 use crate::metadata::Metadata;
 use crate::mob::MobState;
 use crate::tracker::TrackerState;
+use crate::villager::VillagerState;
 use ferrite_math::{AABB, Vec3};
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
@@ -89,6 +90,8 @@ pub struct EntityData {
     pub mob: Option<MobState>,
     /// Experience-orb state, for `minecraft:experience_orb`.
     pub orb: Option<OrbState>,
+    /// Trade and profession state, for `minecraft:villager`.
+    pub villager: Option<VillagerState>,
     /// Active mob effects (`LivingEntity.activeEffects`), one per effect id.
     pub effects: ActiveEffects,
     /// Block state carried by a falling block (vanilla `FallingBlockEntity.blockState`).
@@ -122,6 +125,7 @@ impl EntityData {
             arrow: None,
             mob: None,
             orb: None,
+            villager: None,
             effects: ActiveEffects::default(),
             block_state: None,
             fuse: None,

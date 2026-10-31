@@ -82,6 +82,22 @@ fn main() {
         &out_dir.join("entity_props.rs"),
         &gen_entity_props(&entity_types),
     );
+    let trades = data.join("villager_trade");
+    let trade_sets = data.join("trade_set");
+    for path in [&trades, &trade_sets, &tags.join("villager_trade")] {
+        if !path.exists() {
+            missing(path);
+        }
+    }
+    write_file(
+        &out_dir.join("villager_trades.rs"),
+        &gen_villager_trades(
+            &registries,
+            &trades,
+            &trade_sets,
+            &tags.join("villager_trade"),
+        ),
+    );
 }
 
 /// Reports missing vanilla data, telling the user how to produce it.
@@ -1491,4 +1507,281 @@ fn float_literal(value: f64) -> String {
     } else {
         format!("{value:?}")
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// villager trades
+// ---------------------------------------------------------------------------------------------
+
+/// Item protocol ids from the `minecraft:item` registry report.
+fn item_ids(registries: &Path) -> BTreeMap<String, u16> {
+    let report = read_json(registries);
+    report
+        .get("minecraft:item")
+        .and_then(|registry| registry.get("entries"))
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{}: no minecraft:item registry", registries.display()))
+        .iter()
+        .map(|(name, value)| {
+            let id = value
+                .get("protocol_id")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| panic!("item {name} has no protocol id"));
+            (
+                name.clone(),
+                u16::try_from(id).unwrap_or_else(|_| panic!("item {name} id {id} is not a u16")),
+            )
+        })
+        .collect()
+}
+
+/// An item and a count from a trade's `wants`/`gives` object.
+fn trade_cost(
+    value: &serde_json::Value,
+    items: &BTreeMap<String, u16>,
+    context: &str,
+) -> (u16, i32) {
+    let name = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{context}: cost without an id"));
+    let count = value
+        .get("count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1)
+        .max(1) as i32;
+    let item = *items
+        .get(name)
+        .unwrap_or_else(|| panic!("{context}: unknown item {name}"));
+    (item, count)
+}
+
+/// The `*.json` files of a directory, sorted by path.
+fn json_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// One generated trade definition.
+struct TradeOut {
+    name: String,
+    wants: u16,
+    wants_count: i32,
+    gives: u16,
+    gives_count: i32,
+    second_wants: Option<(u16, i32)>,
+    max_uses: i32,
+    xp: i32,
+    price_multiplier: f32,
+}
+
+/// One generated trade-set entry: a profession level's pool and how many offers it draws.
+struct SetOut {
+    profession: String,
+    level: u8,
+    amount: usize,
+    trades: Vec<String>,
+}
+
+/// Compiles `villager_trade/**`, `trade_set/**` and the `villager_trade` tags into static tables.
+///
+/// Offers that need a `merchant_predicate` (a villager variant the offer depends on) are
+/// skipped; trades that attach modifiers or enchantments to their result keep their base item,
+/// because the item component model cannot apply those modifiers yet.
+fn gen_villager_trades(
+    registries: &Path,
+    trades_root: &Path,
+    sets_root: &Path,
+    tags_root: &Path,
+) -> String {
+    let item_table = item_ids(registries);
+    let mut defs = Vec::new();
+    let mut professions: Vec<String> = fs::read_dir(trades_root)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", trades_root.display()))
+        .filter_map(|entry| {
+            let path = entry.expect("directory entry").path();
+            path.is_dir()
+                .then(|| path.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .filter(|name| name != "wandering_trader")
+        .collect();
+    professions.sort();
+    for profession in &professions {
+        for level_dir in json_files_dirs(&trades_root.join(profession)) {
+            let Some(level) = level_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            for file in json_files(&level_dir) {
+                let stem = file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_else(|| panic!("{}: no file name", file.display()));
+                let json = read_json(&file);
+                let context = format!("{profession}/{level}/{stem}");
+                if json.get("merchant_predicate").is_some() {
+                    continue;
+                }
+                let (wants, wants_count) = trade_cost(&json["wants"], &item_table, &context);
+                let (gives, gives_count) = trade_cost(&json["gives"], &item_table, &context);
+                let second_wants = json
+                    .get("additional_wants")
+                    .map(|wanted| trade_cost(wanted, &item_table, &context));
+                let max_uses = json
+                    .get("max_uses")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(12) as i32;
+                let xp = json
+                    .get("xp")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0) as i32;
+                let price_multiplier = json
+                    .get("reputation_discount")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.05) as f32;
+                defs.push(TradeOut {
+                    name: format!("minecraft:{profession}/{level}/{stem}"),
+                    wants,
+                    wants_count,
+                    gives,
+                    gives_count,
+                    second_wants,
+                    max_uses,
+                    xp,
+                    price_multiplier,
+                });
+            }
+        }
+    }
+    defs.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut sets = Vec::new();
+    for profession in &professions {
+        let tag_dir = tags_root.join(profession);
+        if !tag_dir.is_dir() {
+            continue;
+        }
+        for file in json_files(&tag_dir) {
+            let Some(level) = file
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.strip_prefix("level_"))
+                .and_then(|level| level.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            let Some(values) = read_json(&file)
+                .get("values")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+            else {
+                continue;
+            };
+            let amount = read_json(
+                &sets_root
+                    .join(profession)
+                    .join(format!("level_{level}.json")),
+            )
+            .get("amount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(2) as usize;
+            let mut trades: Vec<String> = values
+                .into_iter()
+                .filter(|name| {
+                    defs.binary_search_by(|def| def.name.as_str().cmp(name))
+                        .is_ok()
+                })
+                .collect();
+            trades.sort();
+            trades.dedup();
+            if trades.is_empty() {
+                continue;
+            }
+            sets.push(SetOut {
+                profession: format!("minecraft:{profession}"),
+                level,
+                amount,
+                trades,
+            });
+        }
+    }
+    sets.sort_by(|left, right| {
+        (left.profession.as_str(), left.level).cmp(&(right.profession.as_str(), right.level))
+    });
+
+    let mut out = header("data/minecraft/villager_trade + trade_set + tags/villager_trade");
+    out.push_str("/// The trade definitions, sorted by name for binary search.\n");
+    out.push_str("static TRADES: &[TradeDef] = &[\n");
+    for def in &defs {
+        let second = match def.second_wants {
+            Some((item, count)) => format!("Some(({item}, {count}))"),
+            None => "None".into(),
+        };
+        writeln!(
+            out,
+            "    TradeDef {{ name: {}, wants: {}, wants_count: {}, gives: {}, gives_count: {}, \
+             second_wants: {}, max_uses: {}, xp: {}, price_multiplier: {} }},",
+            literal(&def.name),
+            def.wants,
+            def.wants_count,
+            def.gives,
+            def.gives_count,
+            second,
+            def.max_uses,
+            def.xp,
+            def.price_multiplier
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push_str("];\n\n");
+
+    out.push_str("/// The profession level pools, sorted by profession and level.\n");
+    out.push_str("static TRADE_SETS: &[TradeSet] = &[\n");
+    for set in &sets {
+        writeln!(
+            out,
+            "    TradeSet {{ profession: {}, level: {}, amount: {}, trades: &[",
+            literal(&set.profession),
+            set.level,
+            set.amount
+        )
+        .expect("writing to a String cannot fail");
+        items(
+            &mut out,
+            "        ",
+            &strings(&set.trades.iter().map(String::as_str).collect::<Vec<_>>()),
+        );
+        out.push_str("\n    ] },\n");
+    }
+    out.push_str("];\n");
+    out
+}
+
+/// Subdirectories of a directory sorted by name.
+fn json_files_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    let path = entry.expect("directory entry").path();
+                    path.is_dir().then_some(path)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
 }
