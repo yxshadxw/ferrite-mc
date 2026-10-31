@@ -19,6 +19,36 @@ use crate::suggestion::SuggestionsBuilder;
 pub use coords::{Coordinates, WorldCoordinate};
 pub use entity::{EntityTarget, ScoreHolder, SelectorKind, SelectorOption};
 
+/// An entity anchor argument (`feet` or `eyes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntityAnchor {
+    Feet,
+    Eyes,
+}
+
+impl EntityAnchor {
+    pub const ALL: [EntityAnchor; 2] = [Self::Feet, Self::Eyes];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Feet => "feet",
+            Self::Eyes => "eyes",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|anchor| anchor.name() == name)
+    }
+
+    /// Eye height above the entity's feet for a player.
+    pub fn offset(self) -> f64 {
+        match self {
+            Self::Feet => 0.0,
+            Self::Eyes => 1.62,
+        }
+    }
+}
+
 /// `brigadier:string` modes (the wire enum value is the discriminant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StringKind {
@@ -99,6 +129,7 @@ pub enum ArgumentType {
     Message,
     ResourceLocation,
     Rotation,
+    EntityAnchor,
     Dimension,
     Gamemode,
     Time {
@@ -135,6 +166,7 @@ pub enum ArgumentValue {
     Vec2([WorldCoordinate; 2]),
     ColumnPos([WorldCoordinate; 2]),
     Rotation([WorldCoordinate; 2]),
+    EntityAnchor(EntityAnchor),
     BlockState(BlockStateValue),
     /// Raw component source (JSON/SNBT), not interpreted.
     Component(String),
@@ -221,6 +253,13 @@ impl ArgumentValue {
     pub fn as_gamemode(&self) -> Option<GameMode> {
         match self {
             Self::Gamemode(g) => Some(*g),
+            _ => None,
+        }
+    }
+
+    pub fn as_entity_anchor(&self) -> Option<EntityAnchor> {
+        match self {
+            Self::EntityAnchor(anchor) => Some(*anchor),
             _ => None,
         }
     }
@@ -387,6 +426,7 @@ impl ArgumentType {
             Self::Message => "minecraft:message",
             Self::ResourceLocation => "minecraft:resource_location",
             Self::Rotation => "minecraft:rotation",
+            Self::EntityAnchor => "minecraft:entity_anchor",
             Self::Dimension => "minecraft:dimension",
             Self::Gamemode => "minecraft:gamemode",
             Self::Time { .. } => "minecraft:time",
@@ -464,6 +504,13 @@ impl ArgumentType {
             Self::Vec2 => ArgumentValue::Vec2(coords::parse_pair(reader, false, true)?),
             Self::ColumnPos => ArgumentValue::ColumnPos(coords::parse_pair(reader, true, false)?),
             Self::Rotation => ArgumentValue::Rotation(coords::parse_pair(reader, false, false)?),
+            Self::EntityAnchor => {
+                let name = reader.read_unquoted_string().to_owned();
+                ArgumentValue::EntityAnchor(
+                    EntityAnchor::from_name(&name)
+                        .ok_or_else(|| minecraft::anchor_invalid(reader, &name))?,
+                )
+            }
             Self::BlockState => ArgumentValue::BlockState(parse_block_state(reader)?),
             Self::Component => ArgumentValue::Component(scan::read_token(reader)?),
             Self::Message => ArgumentValue::Message(reader.read_rest().to_owned()),
@@ -531,6 +578,7 @@ impl ArgumentType {
             Self::Vec2 => &["0 0", "~ ~", "0.1 -0.5", "~1 ~-2"],
             Self::ColumnPos => &["0 0", "~ ~", "~1 ~-2"],
             Self::Rotation => &["0 0", "~ ~", "~-5 ~5"],
+            Self::EntityAnchor => &["feet", "eyes"],
             Self::BlockState => &["stone", "minecraft:stone", "stone[foo=bar]", "foo{bar=baz}"],
             Self::Component => &["\"hello world\"", "\"\"", "{text:\"hello world\"}"],
             Self::Message => &["Hello world!", "foo", "@e", "Hello @p :)"],
@@ -562,6 +610,11 @@ impl ArgumentType {
             Self::Gamemode => {
                 for mode in GameMode::ALL {
                     builder.suggest_matching(mode.name());
+                }
+            }
+            Self::EntityAnchor => {
+                for anchor in EntityAnchor::ALL {
+                    builder.suggest_matching(anchor.name());
                 }
             }
             Self::Entity { .. } | Self::GameProfile | Self::ScoreHolder { .. }
@@ -700,6 +753,7 @@ impl ArgumentType {
             "minecraft:message" => Self::Message,
             "minecraft:resource_location" => Self::ResourceLocation,
             "minecraft:rotation" => Self::Rotation,
+            "minecraft:entity_anchor" => Self::EntityAnchor,
             "minecraft:dimension" => Self::Dimension,
             "minecraft:gamemode" => Self::Gamemode,
             other => {
@@ -855,6 +909,13 @@ mod tests {
             parse(&ArgumentType::Gamemode, "god").unwrap_err().message(),
             "Unknown game mode: god"
         );
+        assert_eq!(
+            parse(&ArgumentType::EntityAnchor, "eyes").unwrap(),
+            ArgumentValue::EntityAnchor(EntityAnchor::Eyes)
+        );
+        let anchor = parse(&ArgumentType::EntityAnchor, "head").unwrap_err();
+        assert_eq!(anchor.translation_key(), "argument.anchor.invalid");
+        assert_eq!(anchor.message(), "Invalid entity anchor position head");
         assert_eq!(
             parse(&ArgumentType::Dimension, "the_nether").unwrap(),
             ArgumentValue::ResourceLocation("minecraft:the_nether".into())

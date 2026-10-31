@@ -85,6 +85,39 @@ public final class Bootstrap {
         }
         return result;
     }
+    /** Fires Bukkit's {@code PlayerMoveEvent}; false means a listener cancelled the move. */
+    public static boolean firePlayerMove(String id, String name, double fromX, double fromY, double fromZ, float fromYaw, float fromPitch, double toX, double toY, double toZ, float toYaw, float toPitch) {
+        var event = new org.bukkit.event.player.PlayerMoveEvent(ensurePlayer(id, name), new org.bukkit.Location(null, fromX, fromY, fromZ, fromYaw, fromPitch), new org.bukkit.Location(null, toX, toY, toZ, toYaw, toPitch));
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
+    /** Fires Bukkit's {@code PlayerInteractEvent} for a block click; false means cancelled. */
+    public static boolean firePlayerInteract(String id, String name, int action, int x, int y, int z, int face) {
+        var event = new org.bukkit.event.player.PlayerInteractEvent(ensurePlayer(id, name), action == 0 ? org.bukkit.event.block.Action.LEFT_CLICK_BLOCK : org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK, null, FerriteEventObjects.block(x, y, z), FerriteEventObjects.face(face), org.bukkit.inventory.EquipmentSlot.HAND);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled() && event.useInteractedBlock() != org.bukkit.event.Event.Result.DENY;
+    }
+    /** Fires Bukkit's {@code BlockBreakEvent}; false means a listener cancelled the break. */
+    public static boolean fireBlockBreak(String id, String name, int x, int y, int z) {
+        var event = new org.bukkit.event.block.BlockBreakEvent(FerriteEventObjects.block(x, y, z), ensurePlayer(id, name));
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
+    /** Fires Bukkit's {@code BlockPlaceEvent}; false means a listener cancelled the placement. */
+    public static boolean fireBlockPlace(String id, String name, int x, int y, int z, int face) {
+        var block = FerriteEventObjects.block(x, y, z);
+        var blockFace = FerriteEventObjects.face(face);
+        var against = FerriteEventObjects.block(x - blockFace.getModX(), y - blockFace.getModY(), z - blockFace.getModZ());
+        var event = new org.bukkit.event.block.BlockPlaceEvent(block, FerriteEventObjects.state(block), against, null, ensurePlayer(id, name), true, org.bukkit.inventory.EquipmentSlot.HAND);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled() && event.canBuild();
+    }
+    /** Fires Bukkit's {@code PlayerCommandPreprocessEvent}; false means a listener cancelled it. */
+    public static boolean firePlayerCommand(String id, String name, String message) {
+        var event = new org.bukkit.event.player.PlayerCommandPreprocessEvent(ensurePlayer(id, name), message);
+        synchronized (LEGACY_LOCK) { server.plugins.callEvent(event); }
+        return !event.isCancelled();
+    }
     /** Lines of {@code name\taliases\tpermission\tusage} for every enabled plugin command. */
     public static String pluginCommands() {
         StringBuilder out = new StringBuilder();

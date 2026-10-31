@@ -7,6 +7,7 @@ use ferrite_entity::{
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, ServerboundPlay, packet};
+use ferrite_plugin::InteractAction;
 use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, RegionData, SectionPos};
@@ -20,7 +21,11 @@ pub enum Command {
     Input(ServerboundPlay),
     Leave,
     SetMode(i32),
-    Teleport([f64; 3]),
+    Teleport {
+        pos: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
@@ -97,6 +102,9 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    pub name: String,
+    /// Plugin event hooks; `None` when the server runs without plugins.
+    pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -498,6 +506,21 @@ impl Player {
             };
             state
         };
+        if !self.plugin_allows(|plugins| {
+            plugins.block_placed(
+                self.uuid,
+                &self.name,
+                ferrite_plugin::BlockPosition {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                },
+                u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+            )
+        }) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         let positions = self.positions.lock().unwrap();
         let offset = ferrite_math::Vec3::new(target.x as f64, target.y as f64, target.z as f64);
         if positions.iter().any(|(uuid, pos)| {
@@ -536,6 +559,23 @@ impl Player {
             }
         }
     }
+    /// Runs an event hook; a missing bridge or a failed call allows the action.
+    fn plugin_allows(
+        &self,
+        event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
+    ) -> bool {
+        let Some(plugins) = &self.plugins else {
+            return true;
+        };
+        match event(plugins.as_ref()) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::warn!(%error, "plugin event failed");
+                true
+            }
+        }
+    }
+
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
@@ -586,9 +626,15 @@ impl Player {
                     );
                     continue;
                 }
-                Command::Teleport(pos) => {
+                Command::Teleport { pos, yaw, pitch } => {
                     if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
                         self.pos = pos;
+                        if let Some(yaw) = yaw {
+                            self.yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch {
+                            self.pitch = pitch;
+                        }
                         self.teleport();
                         changed = true;
                     }
@@ -610,26 +656,49 @@ impl Player {
                     let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
                     match p.status.0 {
                         0 if self.hit(pos).is_some() => {
-                            let state = self
-                                .source
-                                .as_ref()
-                                .and_then(|s| s.block(pos.x, pos.y, pos.z));
-                            if let Some(state) = state {
-                                if self.gamemode == 1 {
-                                    self.change_block(p.location, state, 0);
-                                } else if self.gamemode == 0 {
-                                    // Zero hardness breaks on the first hit (vanilla: destroy
-                                    // progress >= 1 on START), so no finish action follows.
-                                    let instant = u16::try_from(state).is_ok_and(|s| {
-                                        usize::from(s) < ferrite_data::blocks::STATE_COUNT
-                                            && ferrite_data::block_props::get(s).hardness == 0.0
-                                    });
-                                    if instant {
-                                        if self.change_block(p.location, state, 0) {
-                                            self.broken.push((pos, state));
+                            let clicked = ferrite_plugin::BlockPosition {
+                                x: pos.x,
+                                y: pos.y,
+                                z: pos.z,
+                            };
+                            let allowed = self.plugin_allows(|plugins| {
+                                plugins.player_interacted(
+                                    self.uuid,
+                                    &self.name,
+                                    InteractAction::LeftClickBlock,
+                                    clicked,
+                                    u8::try_from(p.face.clamp(0, 5)).unwrap_or(0),
+                                )
+                            });
+                            if allowed {
+                                let state = self
+                                    .source
+                                    .as_ref()
+                                    .and_then(|s| s.block(pos.x, pos.y, pos.z));
+                                if let Some(state) = state {
+                                    if self.gamemode == 1 {
+                                        if self.plugin_allows(|plugins| {
+                                            plugins.block_broken(self.uuid, &self.name, clicked)
+                                        }) {
+                                            self.change_block(p.location, state, 0);
                                         }
-                                    } else {
-                                        self.breaking = Some((p.location, state, 0));
+                                    } else if self.gamemode == 0 {
+                                        // Zero hardness breaks on the first hit (vanilla: destroy
+                                        // progress >= 1 on START), so no finish action follows.
+                                        let instant = u16::try_from(state).is_ok_and(|s| {
+                                            usize::from(s) < ferrite_data::blocks::STATE_COUNT
+                                                && ferrite_data::block_props::get(s).hardness == 0.0
+                                        });
+                                        if instant {
+                                            if self.plugin_allows(|plugins| {
+                                                plugins.block_broken(self.uuid, &self.name, clicked)
+                                            }) && self.change_block(p.location, state, 0)
+                                            {
+                                                self.broken.push((pos, state));
+                                            }
+                                        } else {
+                                            self.breaking = Some((p.location, state, 0));
+                                        }
                                     }
                                 }
                             }
@@ -643,6 +712,17 @@ impl Player {
                                     .ok()
                                     .and_then(super::interaction::break_ticks)
                                     .is_some_and(|ticks| elapsed >= ticks)
+                                && self.plugin_allows(|plugins| {
+                                    plugins.block_broken(
+                                        self.uuid,
+                                        &self.name,
+                                        ferrite_plugin::BlockPosition {
+                                            x: pos.x,
+                                            y: pos.y,
+                                            z: pos.z,
+                                        },
+                                    )
+                                })
                                 && self.change_block(location, state, 0)
                             {
                                 self.broken.push((pos, state));
@@ -660,11 +740,28 @@ impl Player {
                 }
                 ServerboundPlay::UseItemOn(p) => {
                     let clicked = ferrite_protocol::types::BlockPos::unpack(p.location);
-                    let used = (0..=1).contains(&p.hand.0)
-                        && self.hit(clicked).is_some()
-                        && self.use_crafting_table(p.location);
-                    if !used {
-                        self.place(&p);
+                    let allowed = self.plugin_allows(|plugins| {
+                        plugins.player_interacted(
+                            self.uuid,
+                            &self.name,
+                            InteractAction::RightClickBlock,
+                            ferrite_plugin::BlockPosition {
+                                x: clicked.x,
+                                y: clicked.y,
+                                z: clicked.z,
+                            },
+                            u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+                        )
+                    });
+                    if allowed {
+                        let used = (0..=1).contains(&p.hand.0)
+                            && self.hit(clicked).is_some()
+                            && self.use_crafting_table(p.location);
+                        if !used {
+                            self.place(&p);
+                        }
+                    } else {
+                        self.send_block_snapshot(p.location);
                     }
                     self.send_block_snapshot(p.location);
                     if let Some(face) = usize::try_from(p.face.0)
@@ -711,6 +808,23 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) {
+                            // Bukkit fires `PlayerMoveEvent` only when the position changes.
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: self.yaw,
+                                to_pitch: self.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.ground = p.flags & 1 != 0;
                             changed = true;
@@ -723,6 +837,22 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) && p.yaw.is_finite() && p.pitch.is_finite() {
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: p.yaw,
+                                to_pitch: p.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.yaw = p.yaw;
                             self.pitch = p.pitch;

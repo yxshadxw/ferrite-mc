@@ -65,7 +65,7 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
         let key = key.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(Wire::new(stream), config, key).await {
+            if let Err(error) = handle_connection(Wire::new(stream), config, key, peer.ip()).await {
                 tracing::info!(%peer, %error, "connection closed");
             }
         });
@@ -105,6 +105,7 @@ async fn handle_connection(
     mut stream: Wire,
     config: ServerConfig,
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
+    peer: std::net::IpAddr,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::default();
     let packet = read_packet(&mut stream, &mut decoder).await?;
@@ -126,7 +127,7 @@ async fn handle_connection(
         } else {
             None
         };
-        return offline_login(stream, decoder, config, key, legacy).await;
+        return offline_login(stream, decoder, config, key, legacy, peer).await;
     }
     let packet = read_packet(&mut stream, &mut decoder).await?;
     let mut body = packet.as_slice();
@@ -163,6 +164,7 @@ async fn offline_login(
     config: ServerConfig,
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
     legacy: Option<forwarding::LegacyForwarding>,
+    peer: std::net::IpAddr,
 ) -> Result<()> {
     use ferrite_protocol::packets::login::{LoginStart, LoginSuccess, SetCompression};
 
@@ -194,7 +196,8 @@ async fn offline_login(
                 uuid,
                 name,
                 properties,
-                address: None,
+                // No proxy: the peer address is the player's address.
+                address: Some(peer),
                 chat_visibility: 0,
             }
         }
@@ -520,6 +523,7 @@ async fn play(
         uuid,
         name: profile.name,
         properties: profile.properties,
+        address: profile.address,
         dimension_type,
         biome,
         view_distance: config.view_distance.clamp(2, 32),

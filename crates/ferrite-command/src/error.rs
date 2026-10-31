@@ -311,6 +311,7 @@ pub mod minecraft {
         gamemode_invalid => "argument.gamemode.invalid", "Unknown game mode: {}";
         option_valueless => "argument.entity.options.valueless", "Expected value for option '{}'";
         option_unknown => "argument.entity.options.unknown", "Unknown option '{}'";
+        anchor_invalid => "argument.anchor.invalid", "Invalid entity anchor position {}";
     }
 
     pub fn time_too_low(reader: &StringReader, found: i32, min: i32) -> CommandSyntaxError {
