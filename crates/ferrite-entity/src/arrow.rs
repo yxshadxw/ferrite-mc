@@ -135,8 +135,12 @@ pub fn tick_arrows(
         let Some(bbox) = store.bbox(key) else {
             continue;
         };
-        if arrow.age > OWNER_GRACE
-            && let Some((uuid, _)) = players.iter().find(|(_, box_)| box_.intersects(bbox))
+        // Vanilla `AbstractArrow.onHitEntity` ignores only its shooter, and only during the
+        // first [`OWNER_GRACE`] ticks; every other player in the flight path is hit at once.
+        let owner_grace = arrow.age <= OWNER_GRACE;
+        if let Some((uuid, _)) = players
+            .iter()
+            .find(|(uuid, box_)| box_.intersects(bbox) && !(owner_grace && arrow.owner == Some(*uuid)))
         {
             hits.push(PlayerHit {
                 uuid: *uuid,
@@ -169,6 +173,15 @@ mod tests {
 
     fn spawn_arrow(store: &mut EntityStore, pos: Vec3, vel: Vec3) -> EntityKey {
         store.insert(new_arrow(pos, vel, 4.0, None, &mut Rng::new(1)))
+    }
+
+    fn spawn_arrow_from(
+        store: &mut EntityStore,
+        pos: Vec3,
+        vel: Vec3,
+        owner: Uuid,
+    ) -> EntityKey {
+        store.insert(new_arrow(pos, vel, 4.0, Some(owner), &mut Rng::new(1)))
     }
 
     #[test]
@@ -215,24 +228,53 @@ mod tests {
     }
 
     #[test]
-    fn arrows_report_player_hits_after_the_owner_grace() {
+    fn arrows_hit_a_player_who_is_not_the_shooter_at_once() {
         let world = TestWorld::flat(64);
         let mut store = EntityStore::default();
-        let uuid = Uuid::from_u128(7);
+        let shooter = Uuid::from_u128(1);
+        let target = Uuid::from_u128(2);
+        let key = spawn_arrow_from(
+            &mut store,
+            Vec3::new(0.5, 68.0, 0.5),
+            Vec3::new(0.0, 0.0, 2.0),
+            shooter,
+        );
+        // The box starts behind the arrow and covers its first step, so the grace must not
+        // apply to a player who is not the shooter.
+        let box_ = AABB::new(0.2, 66.0, 1.0, 0.8, 70.0, 40.0);
+        assert_eq!(
+            tick_arrows(&mut store, &world, &[(target, box_)]),
+            [PlayerHit {
+                uuid: target,
+                damage: 4.0
+            }]
+        );
+        assert!(store.flags(key).unwrap().has(Flags::REMOVED));
+    }
+
+    #[test]
+    fn arrows_ignore_their_shooter_for_the_grace() {
+        let world = TestWorld::flat(64);
+        let mut store = EntityStore::default();
+        let shooter = Uuid::from_u128(7);
         // The box spans the arrow's whole flight, so the owner grace is what delays the hit.
         let box_ = AABB::new(0.2, 64.0, 0.2, 0.8, 70.0, 40.0);
-        spawn_arrow(
+        let key = spawn_arrow_from(
             &mut store,
             Vec3::new(0.5, 68.0, 0.5),
             Vec3::new(0.0, 0.0, 0.2),
+            shooter,
         );
-        let mut hits = Vec::new();
-        for _ in 0..40 {
-            hits.extend(tick_arrows(&mut store, &world, &[(uuid, box_)]));
-            if !hits.is_empty() {
-                break;
-            }
+        for _ in 0..OWNER_GRACE {
+            assert!(tick_arrows(&mut store, &world, &[(shooter, box_)]).is_empty());
+            assert!(!store.flags(key).unwrap().has(Flags::REMOVED));
         }
-        assert_eq!(hits, [PlayerHit { uuid, damage: 4.0 }]);
+        assert_eq!(
+            tick_arrows(&mut store, &world, &[(shooter, box_)]),
+            [PlayerHit {
+                uuid: shooter,
+                damage: 4.0
+            }]
+        );
     }
 }

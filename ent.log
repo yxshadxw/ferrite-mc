@@ -1,0 +1,91 @@
+   Compiling ferrite-entity v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-entity)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.94s
+     Running unittests src\lib.rs (target\debug\deps\ferrite_entity-22f7eaeb0bcc4fb2.exe)
+
+running 77 tests
+test ai::tests::a_hurt_cow_flees_from_its_attacker ... ok
+test ai::tests::despawn_rules_run_every_tick ... ok
+test ai::tests::a_creeper_swells_next_to_a_player_and_explodes ... ok
+test ai::tests::a_nearby_player_is_looked_at ... ok
+test arrow::tests::an_arrow_hurts_a_mob_it_passes_through ... ok
+test ai::tests::a_long_fall_kills_a_cow ... ok
+test arrow::tests::arrows_fall_with_gravity_and_stick_in_blocks ... ok
+test combat::tests::a_raised_shield_faces_the_attacker ... ok
+test ai::tests::wander_walks_along_the_chosen_yaw ... ok
+test effect::tests::effect_ids_match_the_registry_report ... ok
+test combat::tests::criticals_and_sweeps_follow_the_vanilla_conditions ... ok
+test ai::tests::a_short_drop_hurts_but_does_not_kill ... ok
+test combat::tests::reach_facing_and_look_vectors_match_the_client_conventions ... ok
+test ai::tests::a_zombie_reaches_and_hits_its_target ... ok
+test combat::tests::swords_beat_fists_and_faster_weapons_charge_faster ... ok
+test ai::tests::snakes_and_spiders_shoot_and_bite ... ok
+test arrow::tests::arrows_ignore_their_shooter_for_the_grace ... ok
+test arrow::tests::arrows_hit_a_player_who_is_not_the_shooter_at_once ... ok
+test ai::tests::gravity_lands_a_mob_on_the_ground ... ok
+test combat::tests::arrows_scale_with_draw_and_criticals ... ok
+test effect::tests::instant_effects_apply_once_and_are_not_stored ... ok
+test combat::tests::attack_strength_scales_damage_from_a_fifth_to_full ... ok
+test effect::tests::speed_and_slowness_feed_the_movement_multiplier ... ok
+test effect::tests::regeneration_poison_and_wither_follow_vanilla_intervals ... ok
+test effect::tests::absorption_adds_and_removes_its_shield ... ok
+test effect::tests::hunger_saturation_and_infinite_durations ... ok
+test effect::tests::strength_weakness_health_boost_and_resistance_modify_attributes ... ok
+test effect::tests::stronger_and_longer_instances_win_and_clear_removes_everything ... ok
+test experience::tests::award_splits_into_vanilla_sizes ... ok
+test effect::tests::update_packet_flags_cover_ambient_particles_and_icon ... ok
+test experience::tests::pickup_awards_the_value_and_sends_take_item_entity ... ok
+test experience::tests::nearby_orbs_merge_counts_and_keep_the_oldest_age ... ok
+test experience::tests::orbs_expire_after_their_lifetime ... ok
+test falling::tests::an_entity_in_the_way_keeps_the_block_from_landing ... ok
+test index::tests::cell_packs_negative_coordinates ... ok
+test item::tests::falls_through_air_with_vanilla_gravity_and_drag ... ok
+test id::tests::ids_are_unique_and_increasing ... ok
+test falling::tests::falls_under_gravity_and_places_its_block_on_the_floor ... ok
+test item::tests::items_despawn_after_their_lifetime ... ok
+test item::tests::dropped_item_falls_and_comes_to_rest_on_the_ground ... ok
+test item::tests::pickup_respects_delay_range_and_fills_the_inventory ... ok
+test mob::tests::clocks_advance_and_state_survives_a_region_hand_off ... ok
+test metadata::tests::only_changed_values_are_packed ... ok
+test item::tests::stuck_items_are_pushed_out ... ok
+test item::tests::thrown_items_fly_where_the_player_looks ... ok
+test mob::tests::passive_mobs_persist_until_their_despawn_policy_allows_it ... ok
+test mob::tests::kinds_match_the_vanilla_entity_data ... ok
+test mob::tests::damage_respects_the_hurt_cooldown_and_knocks_back ... ok
+test physics::tests::boxes_and_fluids ... ok
+test mob::tests::fall_damage_starts_above_the_safe_distance ... ok
+test mob::tests::lethal_damage_removes_the_mob_and_reports_death ... ok
+test path::tests::a_flat_path_is_straight_and_bounded ... ok
+test path::tests::unloaded_columns_are_walls ... ok
+test potion::tests::empty_potion_contents_are_water_and_bad_shapes_are_ignored ... ok
+test potion::tests::every_registered_potion_has_a_definition ... ok
+test potion::tests::potion_effects_match_vanilla_durations ... ok
+test potion::tests::potion_contents_parse_ids_custom_effects_and_colors ... ok
+test item::tests::nearby_items_merge_and_keep_the_longer_delay ... ok
+test rng::tests::values_stay_in_range ... ok
+test spawn::tests::surface_finds_the_first_open_block ... ok
+test spawn::tests::spawns_grass_animals_in_daylight_within_the_cap ... ok
+test store::tests::crossing_a_region_section_hands_the_entity_out ... ok
+test store::tests::moving_entities_updates_sections_and_queries ... ok
+test store::tests::removed_flag_is_swept ... ok
+test store::tests::removed_keys_never_resolve_again ... ok
+test spawn::tests::the_creature_mob_cap_stops_spawning ... ok
+test store::tests::split_and_merge_follow_chunks ... ok
+test tracker::tests::absent_viewers_get_a_grace_period_and_removal_reaches_all ... ok
+test tracker::tests::mobs_are_tracked_moved_teleported_and_removed ... ok
+test tnt::tests::fuse_ends_after_eighty_ticks_and_the_entity_is_removed ... ok
+test tracker::tests::movement_uses_deltas_then_full_sync ... ok
+test tracker::tests::pairs_by_range_and_loaded_chunk ... ok
+test spawn::tests::darkness_stone_and_an_absent_player_never_spawn ... ok
+test path::tests::a_wall_forces_a_detour ... ok
+test spawn::tests::monsters_spawn_on_dark_floors_up_to_the_monster_cap ... ok
+test ai::tests::endermen_blink_to_walkable_ground ... ok
+test path::tests::a_step_up_and_a_drop_are_walkable_but_a_wall_is_not ... ok
+
+test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests ferrite_entity
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

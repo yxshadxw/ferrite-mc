@@ -3086,8 +3086,15 @@ mod tests {
                 pos: [0.0, 66.0, 0.0],
             }
         );
+        assert_eq!(
+            only("summon minecraft:zombie 2.5 65 0.5", 2),
+            Action::Summon {
+                kind: MobKind::Zombie,
+                pos: [2.5, 65.0, 0.5],
+            }
+        );
         // A vanilla entity this server cannot simulate yet, and an unknown id.
-        assert!(run("summon minecraft:zombie", 2).0.is_err());
+        assert!(run("summon minecraft:villager", 2).0.is_err());
         assert!(run("summon not_a_thing", 2).0.is_err());
         assert!(run("summon minecraft:cow", 1).0.is_err());
     }

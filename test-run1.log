@@ -1,0 +1,1427 @@
+warning: output filename collision at C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\target\debug\examples\throughput.exe
+  |
+  = note: the example target `throughput` in package `ferrite-region v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-region)` has the same output filename as the example target `throughput` in package `ferrite-light v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-light)`
+  = note: this may become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/6313>
+  = help: consider changing their names to be unique or compiling them separately
+warning: output filename collision at C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\target\debug\examples\throughput.pdb
+  |
+  = note: the example target `throughput` in package `ferrite-region v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-region)` has the same output filename as the example target `throughput` in package `ferrite-light v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-light)`
+  = note: this may become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/6313>
+  = help: consider changing their names to be unique or compiling them separately
+   Compiling rand_core v0.10.1
+   Compiling simd-adler32 v0.3.10
+   Compiling serde_core v1.0.229
+   Compiling windows-sys v0.61.2
+   Compiling regex-syntax v0.8.11
+   Compiling ppv-lite86 v0.2.21
+   Compiling winapi v0.3.9
+   Compiling zerocopy v0.8.63
+   Compiling getrandom v0.4.3
+   Compiling miniz_oxide v0.9.1
+   Compiling either v1.19.0
+   Compiling clap_lex v1.1.1
+   Compiling anstyle v1.0.14
+   Compiling cast v0.3.0
+   Compiling ciborium-io v0.2.2
+   Compiling ferrite-translate v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-translate)
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling alloca v0.4.0
+   Compiling bumpalo v3.20.3
+   Compiling uuid v1.29.0
+   Compiling clap_builder v4.6.7
+   Compiling itertools v0.13.0
+   Compiling zopfli v0.8.4
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling wait-timeout v0.2.1
+   Compiling rand_chacha v0.3.1
+   Compiling cpufeatures v0.3.1
+   Compiling flate2 v1.1.10
+   Compiling bit-vec v0.10.1
+   Compiling rand v0.10.3
+   Compiling chacha20 v0.10.2
+   Compiling rand_xorshift v0.5.0
+   Compiling rand v0.8.8
+   Compiling bit-set v0.11.1
+   Compiling core_detect v1.0.0
+   Compiling zip v4.6.1
+   Compiling zip v2.6.1
+   Compiling unarray v0.1.4
+   Compiling derive_more v2.1.1
+   Compiling itertools v0.10.5
+   Compiling regex-automata v0.4.18
+   Compiling tempfile v3.27.0
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling phf_generator v0.11.3
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling libloading v0.7.4
+   Compiling phf_codegen v0.11.3
+   Compiling winapi-util v0.1.11
+   Compiling unicode_names2_generator v1.3.0
+   Compiling same-file v1.0.6
+   Compiling serde_norway v0.9.42
+   Compiling tokio v1.54.1
+   Compiling jni v0.21.1
+   Compiling walkdir v2.5.0
+   Compiling clap v4.6.7
+   Compiling ferrite-data v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-data)
+   Compiling tinytemplate v1.2.1
+   Compiling serde_urlencoded v0.7.1
+   Compiling half v2.7.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling criterion-plot v0.8.2
+   Compiling ciborium-ll v0.2.2
+   Compiling ferrite-plugin-meta v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-plugin-meta)
+   Compiling ciborium v0.2.2
+   Compiling page_size v0.6.0
+   Compiling regex v1.13.1
+   Compiling matchers v0.2.0
+   Compiling ferrite-admin v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-admin)
+   Compiling ferrite-recipe v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-recipe)
+   Compiling num-bigint-dig v0.8.6
+   Compiling tracing-subscriber v0.3.23
+   Compiling criterion v0.8.2
+   Compiling ferrite-jvm v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-jvm)
+   Compiling ferrite-loot v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-loot)
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling ferrite-profiler v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-profiler)
+   Compiling rusty-fork v0.3.1
+   Compiling unicode_names2 v1.3.0
+   Compiling ferrite-fluid v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-fluid)
+   Compiling rsa v0.9.10
+   Compiling ferrite-plugin v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-plugin)
+   Compiling toml_edit v0.22.27
+   Compiling proptest v1.12.0
+   Compiling crossterm_winapi v0.9.1
+   Compiling ferrite-light v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-light)
+   Compiling criterion-plot v0.5.0
+   Compiling is-terminal v0.4.17
+   Compiling ferrite-config v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-config)
+   Compiling crossterm v0.29.0
+   Compiling criterion v0.5.1
+   Compiling ferrite-console v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-console)
+   Compiling toml v0.8.23
+   Compiling hyper v1.12.0
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.6
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.21
+   Compiling ferrite-nbt v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-nbt)
+   Compiling hyper-rustls v0.27.10
+   Compiling ferrite-protocol v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-protocol)
+   Compiling ferrite-world v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-world)
+   Compiling ferrite-text v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-text)
+   Compiling reqwest v0.12.28
+   Compiling ferrite-worldgen v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-worldgen)
+   Compiling ferrite-command v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-command)
+   Compiling ferrite-item v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-item)
+   Compiling ferrite-noise v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-noise)
+   Compiling ferrite-math v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-math)
+   Compiling ferrite-region v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-region)
+   Compiling ferrite-inventory v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-inventory)
+   Compiling ferrite-net v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-net)
+   Compiling ferrite-entity v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-entity)
+   Compiling ferrite-server v0.1.0 (C:\Users\taegy\orca\workspaces\ferrite-mc-ref\oc5\crates\ferrite-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.45s
+     Running unittests src\lib.rs (target\debug\deps\ferrite_admin-584d28d63b0ff19e.exe)
+
+running 6 tests
+test timestamp::tests::from_str_uses_the_same_parser ... ok
+test timestamp::tests::colon_offsets_are_normalized ... ok
+test timestamp::tests::invalid_timestamps_are_rejected ... ok
+test timestamp::tests::negative_and_utc_offsets_round_trip ... ok
+test timestamp::tests::positive_offset_round_trips ... ok
+test timestamp::tests::ordering_compares_instants ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\behavior.rs (target\debug\deps\behavior-3b90a9156a6479e6.exe)
+
+running 10 tests
+test forever_bans_never_expire ... ok
+test ops_upsert_and_remove ... ok
+test usercache_names_ignore_case_and_replace ... ok
+test whitelist_names_ignore_case ... ok
+test ip_bans_honor_expiry_and_case ... ok
+test player_bans_honor_expiry ... ok
+test dirty_tracking_writes_only_changed_files ... ok
+test usercache_expires_after_eight_weeks ... ok
+test atomic_save_ignores_leftover_temp_files ... ok
+test concurrent_readers_and_writer ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\reference.rs (target\debug\deps\reference-88bece835f025f7f.exe)
+
+running 4 tests
+test usercache_is_compact_with_multiple_entries ... ok
+test loaded_vanilla_files_parse_and_stay_unchanged ... ok
+test new_lists_serialize_exactly_like_vanilla ... ok
+test dirty_mutations_round_trip_to_identical_bytes ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_command-6b1ee1417b14d412.exe)
+
+running 31 tests
+test arguments::entity::tests::score_holders ... ok
+test arguments::coords::tests::pairs ... ok
+test arguments::coords::tests::block_pos_forms ... ok
+test arguments::coords::tests::vec3_centers_integers ... ok
+test arguments::coords::tests::coordinates_resolve_against_position_and_rotation ... ok
+test arguments::entity::tests::names_uuids_selectors ... ok
+test arguments::entity::tests::selector_errors ... ok
+test arguments::scan::tests::tokens_keep_groups_together ... ok
+test arguments::tests::block_state_shape ... ok
+test arguments::tests::float_and_double_ranges_format_like_java ... ok
+test arguments::tests::minecraft_simple_types ... ok
+test arguments::tests::opaque_and_component_tokens ... ok
+test arguments::tests::properties_encoding ... ok
+test error::tests::context_truncates_to_ten_chars ... ok
+test error::tests::position_counts_utf16 ... ok
+test reader::tests::booleans ... ok
+test arguments::scan::tests::identifiers ... ok
+test arguments::tests::integer_range_errors ... ok
+test arguments::tests::string_kinds ... ok
+test reader::tests::numbers ... ok
+test error::tests::java_number_formatting ... ok
+test reader::tests::multibyte_cursor ... ok
+test reader::tests::invalid_escape_points_at_escaped_char ... ok
+test reader::tests::quoted_strings_and_escapes ... ok
+test suggestion::tests::apply_replaces_range ... ok
+test reader::tests::unquoted_and_expect ... ok
+test suggestion::tests::skips_exact_match_and_sorts_ignoring_case ... ok
+test vanilla::tests::rejects_bad_redirect ... ok
+test reader::tests::unclosed_and_unstarted_quotes ... ok
+test vanilla::tests::loads_sample ... ok
+test suggestion::tests::merge_expands_to_common_range ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\dispatcher.rs (target\debug\deps\dispatcher-ca3f90b31c961a4b.exe)
+
+running 14 tests
+test fork_tolerates_failing_branches ... ok
+test literal_argument_chain ... ok
+test unknown_and_incomplete_commands ... ok
+test int_range_errors_surface_through_dispatcher ... ok
+test smart_usage ... ok
+test merging_registrations ... ok
+test redirect_to_root_and_fork ... ok
+test selectors_require_the_configured_permission ... ok
+test permission_filtering ... ok
+test quoted_escapes_and_greedy_strings ... ok
+test ambiguity_between_argument_types ... ok
+test suggester_kind_is_kept ... ok
+test literal_preferred_over_argument_and_ambiguities ... ok
+test suggestions_at_cursor ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\gamerule.rs (target\debug\deps\gamerule-88995b191a7be7fe.exe)
+
+running 4 tests
+test reads_the_pre_26_3_level_dat_compound ... ok
+test validates_types_bounds_aliases_and_nbt_roundtrip ... ok
+test matches_the_vanilla_game_rule_registry ... ok
+test matches_the_vanilla_command_tree ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\vanilla.rs (target\debug\deps\vanilla-fcc43e81843989c4.exe)
+
+running 5 tests
+test redirect_to_hidden_node_is_dropped ... ok
+test plugin_trees_with_unknown_parsers_still_serialize ... ok
+test registry_order_matches_report ... ok
+test vanilla_tree_parses_real_commands ... ok
+test vanilla_tree_loads_serializes_and_round_trips ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_config-3108580968b085a7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\paper_config.rs (target\debug\deps\paper_config-1837f53dd54600ac.exe)
+
+running 14 tests
+test bukkit_and_spigot_defaults_reemit_equivalent ... ok
+test paper_defaults_reemit_equivalent ... ok
+test bad_overrides_are_rejected ... ok
+test sample_paper_global_reemits_equivalent_and_keeps_unknown_keys ... ok
+test config_version_migration_hoists_legacy_key ... ok
+test world_render_includes_comments ... ok
+test environment_overrides_apply ... ok
+test sample_paper_global_parses ... ok
+test world_defaults_and_per_world_fallback ... ok
+test cli_overrides_apply_everywhere ... ok
+test broken_world_file_falls_back_and_reports ... ok
+test unknown_paper_keys_survive_rewrite ... ok
+test newer_config_version_is_not_rewritten ... ok
+test save_defaults_writes_every_file_and_reloads ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\server_properties.rs (target\debug\deps\server_properties-0ba68301fe105e2e.exe)
+
+running 4 tests
+test properties_escaping_round_trips ... ok
+test real_vanilla_server_properties_loads ... ok
+test defaults_are_complete_and_round_trip ... ok
+test unknown_keys_survive_rewrite ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_console-e4751e8cac396899.exe)
+
+running 20 tests
+test color::tests::unknown_obfuscated_and_trailing_codes_are_dropped ... ok
+test color::tests::stripping_removes_codes_only ... ok
+test color::tests::colors_and_formatting_become_ansi ... ok
+test editor::tests::submit_trims_and_clears ... ok
+test editor::tests::tab_requests_completion ... ok
+test editor::tests::history_navigation_keeps_draft ... ok
+test editor::tests::shutdown_keys ... ok
+test editor::tests::ctrl_w_deletes_previous_word ... ok
+test editor::tests::unicode_cursor_moves_by_character ... ok
+test editor::tests::edit_keys ... ok
+test history::tests::record_dedupes_and_caps ... ok
+test editor::tests::inserts_and_moves ... ok
+test log::tests::archive_names_follow_vanilla_pattern ... ok
+test log::tests::formats_paper_style_lines ... ok
+test editor::tests::completion_replaces_word_and_extends_prefix ... ok
+test history::tests::missing_file_loads_empty ... ok
+test history::tests::reload_keeps_newest_entries_within_limit ... ok
+test log::tests::opening_archives_previous_latest_log ... ok
+test history::tests::persists_and_reloads ... ok
+test log::tests::writes_plain_lines_and_rotates_gzip ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_data-f96569b3b49920ba.exe)
+
+running 8 tests
+test tests::air_is_state_zero ... ok
+test tests::multi_property_state_round_trips ... ok
+test tests::data_driven_registries ... ok
+test tests::packet_ids ... ok
+test tests::stone_state_matches_its_default ... ok
+test tests::unknown_lookups_are_none ... ok
+test tests::built_in_registries ... ok
+test tests::every_state_round_trips ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\block_props.rs (target\debug\deps\block_props-c114cce4c4a07167.exe)
+
+running 11 tests
+test air_is_air ... ok
+test block_info_matches_the_block_table ... ok
+test bottom_slab_has_a_half_height_collision_box ... ok
+test glass_is_transparent_but_still_blocks_motion ... ok
+test light_sources ... ok
+test oak_leaves_are_excluded_from_the_no_leaves_heightmap ... ok
+test stone_is_opaque_and_blocks_motion ... ok
+test water_is_a_full_fluid_without_ocean_floor ... ok
+test slab_face_shapes_follow_vanilla ... ok
+test flowing_fluid_retains_its_vanilla_id ... ok
+test every_state_has_consistent_shapes ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\entity_props.rs (target\debug\deps\entity_props-fc974f61ebde0fbb.exe)
+
+running 9 tests
+test cow_speed_is_point_two ... ok
+test attachments_are_single_points ... ok
+test ender_dragon_is_summonable ... ok
+test unknown_entity_types_are_none ... ok
+test item_frame_tracking_range ... ok
+test zombie_has_twenty_health ... ok
+test creeper_is_a_monster ... ok
+test player_dimensions ... ok
+test entity_type_count ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\tags.rs (target\debug\deps\tags-5e387d22d686a807.exe)
+
+running 7 tests
+test built_in_tag_totals ... ok
+test every_registry_has_a_tag ... ok
+test item_planks_contains_oak_planks ... ok
+test logs_contain_oak_log ... ok
+test pickaxe_contains_stone ... ok
+test unknown_tags_and_registries_are_none ... ok
+test tables_are_sorted_and_namespaced ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_entity-559292b24d1eec48.exe)
+
+running 76 tests
+test combat::tests::a_raised_shield_faces_the_attacker ... ok
+test ai::tests::a_nearby_player_is_looked_at ... ok
+test combat::tests::arrows_scale_with_draw_and_criticals ... ok
+test combat::tests::attack_strength_scales_damage_from_a_fifth_to_full ... ok
+test ai::tests::despawn_rules_run_every_tick ... ok
+test arrow::tests::arrows_fall_with_gravity_and_stick_in_blocks ... ok
+test arrow::tests::an_arrow_hurts_a_mob_it_passes_through ... ok
+test arrow::tests::arrows_report_player_hits_after_the_owner_grace ... ok
+test ai::tests::snakes_and_spiders_shoot_and_bite ... ok
+test combat::tests::criticals_and_sweeps_follow_the_vanilla_conditions ... ok
+test combat::tests::reach_facing_and_look_vectors_match_the_client_conventions ... ok
+test ai::tests::a_hurt_cow_flees_from_its_attacker ... ok
+test ai::tests::wander_walks_along_the_chosen_yaw ... ok
+test effect::tests::absorption_adds_and_removes_its_shield ... ok
+test ai::tests::gravity_lands_a_mob_on_the_ground ... ok
+test ai::tests::a_long_fall_kills_a_cow ... ok
+test ai::tests::a_creeper_swells_next_to_a_player_and_explodes ... ok
+test effect::tests::hunger_saturation_and_infinite_durations ... ok
+test effect::tests::effect_ids_match_the_registry_report ... ok
+test effect::tests::instant_effects_apply_once_and_are_not_stored ... ok
+test effect::tests::regeneration_poison_and_wither_follow_vanilla_intervals ... ok
+test effect::tests::speed_and_slowness_feed_the_movement_multiplier ... ok
+test effect::tests::strength_weakness_health_boost_and_resistance_modify_attributes ... ok
+test effect::tests::stronger_and_longer_instances_win_and_clear_removes_everything ... ok
+test effect::tests::update_packet_flags_cover_ambient_particles_and_icon ... ok
+test experience::tests::award_splits_into_vanilla_sizes ... ok
+test ai::tests::a_short_drop_hurts_but_does_not_kill ... ok
+test combat::tests::swords_beat_fists_and_faster_weapons_charge_faster ... ok
+test experience::tests::orbs_expire_after_their_lifetime ... ok
+test experience::tests::nearby_orbs_merge_counts_and_keep_the_oldest_age ... ok
+test experience::tests::pickup_awards_the_value_and_sends_take_item_entity ... ok
+test id::tests::ids_are_unique_and_increasing ... ok
+test falling::tests::falls_under_gravity_and_places_its_block_on_the_floor ... ok
+test index::tests::cell_packs_negative_coordinates ... ok
+test falling::tests::an_entity_in_the_way_keeps_the_block_from_landing ... ok
+test item::tests::falls_through_air_with_vanilla_gravity_and_drag ... ok
+test item::tests::items_despawn_after_their_lifetime ... ok
+test ai::tests::a_zombie_reaches_and_hits_its_target ... ok
+test item::tests::pickup_respects_delay_range_and_fills_the_inventory ... ok
+test item::tests::dropped_item_falls_and_comes_to_rest_on_the_ground ... ok
+test item::tests::thrown_items_fly_where_the_player_looks ... ok
+test item::tests::stuck_items_are_pushed_out ... ok
+test metadata::tests::only_changed_values_are_packed ... ok
+test mob::tests::clocks_advance_and_state_survives_a_region_hand_off ... ok
+test mob::tests::damage_respects_the_hurt_cooldown_and_knocks_back ... ok
+test mob::tests::fall_damage_starts_above_the_safe_distance ... ok
+test mob::tests::lethal_damage_removes_the_mob_and_reports_death ... ok
+test mob::tests::passive_mobs_persist_until_their_despawn_policy_allows_it ... ok
+test mob::tests::kinds_match_the_vanilla_entity_data ... ok
+test path::tests::a_flat_path_is_straight_and_bounded ... ok
+test physics::tests::boxes_and_fluids ... ok
+test item::tests::nearby_items_merge_and_keep_the_longer_delay ... ok
+test path::tests::unloaded_columns_are_walls ... ok
+test potion::tests::every_registered_potion_has_a_definition ... ok
+test potion::tests::empty_potion_contents_are_water_and_bad_shapes_are_ignored ... ok
+test potion::tests::potion_effects_match_vanilla_durations ... ok
+test potion::tests::potion_contents_parse_ids_custom_effects_and_colors ... ok
+test rng::tests::values_stay_in_range ... ok
+test spawn::tests::surface_finds_the_first_open_block ... ok
+test store::tests::crossing_a_region_section_hands_the_entity_out ... ok
+test store::tests::moving_entities_updates_sections_and_queries ... ok
+test store::tests::removed_flag_is_swept ... ok
+test store::tests::removed_keys_never_resolve_again ... ok
+test spawn::tests::spawns_grass_animals_in_daylight_within_the_cap ... ok
+test spawn::tests::the_creature_mob_cap_stops_spawning ... ok
+test store::tests::split_and_merge_follow_chunks ... ok
+test tracker::tests::absent_viewers_get_a_grace_period_and_removal_reaches_all ... ok
+test tracker::tests::mobs_are_tracked_moved_teleported_and_removed ... ok
+test tracker::tests::movement_uses_deltas_then_full_sync ... ok
+test tracker::tests::pairs_by_range_and_loaded_chunk ... ok
+test tnt::tests::fuse_ends_after_eighty_ticks_and_the_entity_is_removed ... ok
+test spawn::tests::darkness_stone_and_an_absent_player_never_spawn ... ok
+test path::tests::a_wall_forces_a_detour ... ok
+test spawn::tests::monsters_spawn_on_dark_floors_up_to_the_monster_cap ... ok
+test path::tests::a_step_up_and_a_drop_are_walkable_but_a_wall_is_not ... ok
+test ai::tests::endermen_blink_to_walkable_ground ... ok
+
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_fluid-3d1e0f76d655896a.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\interactions.rs (target\debug\deps\interactions-292af0ed94bdc1fe.exe)
+
+running 7 tests
+test lava_over_soul_soil_next_to_blue_ice_makes_basalt ... ok
+test neighbor_change_reacts_immediately_without_waiting_for_tick ... ok
+test lava_next_to_water_solidifies_by_source_status ... ok
+test downward_lava_entering_water_makes_stone ... ok
+test water_bucket_preserves_waterloggable_blocks ... ok
+test scheduled_lava_respects_conversion_rule ... ok
+test flowing_water_does_not_fill_slab_but_source_water_does ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\new_liquid.rs (target\debug\deps\new_liquid-9f345f60f4276d3b.exe)
+
+running 9 tests
+test block_helpers_respect_solid_and_waterloggable_states ... ok
+test collision_faces_combine_across_shared_boundary ... ok
+test two_sources_form_water_source_only_with_support ... ok
+test lava_source_creation_obeys_conversion_rule ... ok
+test fluid_above_produces_falling_state ... ok
+test source_conversion_precedes_water_above_and_solid_walls_block_flow ... ok
+test strongest_neighbor_loses_dimension_dependent_amount ... ok
+test world_can_supply_contextual_collision_shapes ... ok
+test door_stairs_and_fence_collision_faces_are_directional ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\spread.rs (target\debug\deps\spread-b1bf2cb7b7486dd9.exe)
+
+running 10 tests
+test duplicate_scheduling_keeps_first_due_time ... ok
+test moving_pending_ticks_preserves_remaining_delay ... ok
+test three_neighboring_sources_allow_sideways_spread_while_falling ... ok
+test scheduled_work_waits_until_due_and_duplicate_positions_are_safe ... ok
+test slope_search_can_look_through_existing_flowing_fluid ... ok
+test advance_processes_one_relative_tick ... ok
+test slope_search_prefers_a_hole ... ok
+test lava_on_flat_floor_spreads_three_blocks ... ok
+test water_source_spreads_seven_block_diamond_on_flat_floor ... ok
+test water_over_ledge_creates_falling_column ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests\state.rs (target\debug\deps\state-426cf2da5c753505.exe)
+
+running 4 tests
+test water_and_lava_tick_delays_depend_on_dimension ... ok
+test waterlogged_slab_and_air_have_expected_fluid ... ok
+test falling_amounts_encode_legacy_levels_and_unknown_ids_are_empty ... ok
+test vanilla_block_levels_decode_and_encode_as_fluid_states ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_inventory-7a30be4e1a445274.exe)
+
+running 39 tests
+test tests::click_input_ids_round_trip ... ok
+test tests::double_click_collects_partial_stacks_first ... ok
+test tests::correct_predictions_send_nothing ... ok
+test tests::crafting_leaves_remainders_in_the_grid ... ok
+test tests::crafting_result_is_sent_after_a_grid_click ... ok
+test tests::clone_needs_infinite_materials_and_an_empty_cursor ... ok
+test tests::crafting_table_quick_moves_into_the_grid_first ... ok
+test tests::closing_returns_the_grid_and_cursor_to_the_inventory ... ok
+test tests::double_click_backwards_with_button_one ... ok
+test tests::cursed_armor_stays_on_outside_creative ... ok
+test tests::drag_is_cancelled_by_other_clicks_and_never_reaches_the_result ... ok
+test tests::inventory_add_fills_matching_stacks_then_free_slots_in_vanilla_order ... ok
+test tests::inventory_menu_maps_vanilla_slots ... ok
+test tests::left_drag_splits_evenly_and_keeps_the_remainder ... ok
+test tests::left_drag_tops_up_existing_stacks ... ok
+test tests::armor_slots_take_only_matching_equipment_one_at_a_time ... ok
+test tests::middle_drag_fills_stacks_only_in_creative ... ok
+test tests::pickup_left_takes_and_places_the_whole_stack ... ok
+test tests::pickup_merges_up_to_the_stack_limit_and_swaps_other_items ... ok
+test tests::pickup_right_takes_half_rounded_up_and_places_one ... ok
+test tests::pickup_outside_drops_the_cursor ... ok
+test tests::chest_quick_move_goes_to_the_inventory_end_first ... ok
+test tests::right_drag_places_one_per_slot ... ok
+test tests::quick_move_between_hotbar_and_main_inventory ... ok
+test tests::quick_move_fills_matching_stacks_before_empty_slots ... ok
+test tests::quick_move_from_offhand_and_full_inventory ... ok
+test tests::throw_and_swap_from_the_result_slot_craft ... ok
+test tests::swap_with_hotbar_and_offhand ... ok
+test tests::single_slot_drag_is_a_plain_click ... ok
+test tests::two_by_two_crafting_takes_one_craft_per_click ... ok
+test tests::result_does_not_stack_past_the_cursor_limit ... ok
+test tests::quick_move_equips_armor_and_unequips_to_the_inventory ... ok
+test tests::stale_state_ids_resync_everything ... ok
+test tests::throw_one_or_the_whole_stack ... ok
+test tests::shift_click_result_crafts_everything_into_the_hotbar_end_first ... ok
+test tests::transfer_state_keeps_the_inventory_view ... ok
+test tests::unstackable_items_take_one_slot_each ... ok
+test tests::shift_click_result_drops_the_part_that_does_not_fit ... ok
+test tests::wrong_predictions_are_corrected_slot_by_slot ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_item-370e4c8806b7ad5a.exe)
+
+running 38 tests
+test component::tests::component_type_lookup_accepts_both_spellings ... ok
+test component::tests::patch_rejects_a_mismatched_component_id ... ok
+test component::tests::patch_unset_restores_the_default ... ok
+test stack::tests::item_names_and_defaults_come_from_the_generated_tables ... ok
+test component::tests::patch_encodes_added_and_removed_components ... ok
+test component::tests::values_of_another_shape_stay_opaque ... ok
+test defaults::tests::lookups_accept_both_spellings ... ok
+test component::tests::typed_components_round_trip ... ok
+test defaults::tests::default_components_are_typed_where_expected ... ok
+test component::tests::patch_rejects_unknown_component_names ... ok
+test stack::tests::nbt_omits_an_empty_patch_and_defaults_the_count ... ok
+test stack::tests::default_components_decode_to_typed_values ... ok
+test stack::tests::nbt_round_trip_keeps_removed_components_and_custom_data ... ok
+test stack::tests::potion_contents_components_decode_and_round_trip ... ok
+test defaults::tests::air_is_item_zero ... ok
+test stack::tests::effective_components_read_defaults_and_patches ... ok
+test stack::tests::max_stack_size_can_be_overridden_or_removed ... ok
+test stack::tests::merging_stops_at_the_stack_limit ... ok
+test stack::tests::nbt_rejects_invalid_stacks ... ok
+test stack::tests::splitting_moves_up_to_the_requested_count ... ok
+test stack::tests::stacking_requires_the_same_item_and_components ... ok
+test wire::tests::empty_slot_structure ... ok
+test wire::tests::every_variant_id_is_a_single_varint ... ok
+test wire::tests::full_diamond_sword_round_trips ... ok
+test wire::tests::hashed_slot_round_trips_and_keeps_opaque_hashes ... ok
+test wire::tests::hand_written_component_vectors ... ok
+test wire::tests::malformed_slots_are_errors_not_panics ... ok
+test wire::tests::nested_templates_inside_bundle_and_container_round_trip ... ok
+test wire::tests::opaque_components_cannot_be_encoded ... ok
+test wire::tests::optional_hashed_slot_matches_the_wire_form ... ok
+test wire::tests::protocol_traits_round_trip ... ok
+test wire::tests::every_component_type_round_trips_through_a_slot ... ok
+test wire::tests::potion_contents_round_trip ... ok
+test wire::tests::truncated_payloads_never_panic ... ok
+test wire::tests::typed_attribute_modifiers_and_tool_round_trip ... ok
+test wire::tests::typed_components_decode_from_their_network_payloads ... ok
+test wire::tests::random_bytes_never_panic ... ok
+test defaults::tests::every_item_has_an_id_and_defaults ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests\java_vectors.rs (target\debug\deps\java_vectors-9051079b422673be.exe)
+
+running 1 test
+test real_server_slots_decode_and_re_encode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.25s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_jvm-3f9da84d1b0f0149.exe)
+
+running 4 tests
+test discovery::tests::parses_feature_versions ... ok
+test discovery::tests::rejects_a_directory_without_a_release_file ... ok
+test discovery::tests::rejects_an_older_release_file ... ok
+test discovery::tests::accepts_a_supported_release_file ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\jvm.rs (target\debug\deps\jvm-758de7a62c93b40e.exe)
+
+running 4 tests
+test a_second_jvm_is_rejected ... ok
+test discovers_a_java_25_installation ... ok
+test java_exception_becomes_a_rust_error_with_stack_trace ... ok
+test rust_native_is_called_from_java ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_light-d9a1ab1779145c34.exe)
+
+running 1 test
+test properties::tests::complementary_slab_faces_close_but_matching_faces_do_not ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\light.rs (target\debug\deps\light-443a0df9f6d7c5fc.exe)
+
+running 13 tests
+test documented_vanilla_properties ... ok
+test calibrated_sensors_vault_and_empty_lichen_have_stateful_emission ... ok
+test common_state_dependent_light_properties ... ok
+test stair_faces_follow_half_facing_and_corner_shape ... ok
+test storage_compaction_and_unloaded_edges ... ok
+test torch_crosses_chunk_boundary ... ok
+test torch_propagates_and_removal_clears ... ok
+test emitting_source_does_not_bypass_target_full_face ... ok
+test attenuated_sky_fades_below_a_wide_water_layer ... ok
+test sky_water_overhang_and_column_change ... ok
+test incremental_matches_relight_with_competing_sources_and_obstacles ... ok
+test skylight_incremental_matches_relight_after_column_changes ... ok
+test incremental_changes_match_rebuild_over_mixed_sequence ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+
+     Running tests\vanilla.rs (target\debug\deps\vanilla-924a3fe2e8849a9a.exe)
+
+running 1 test
+test compare_fixture_light_when_available has been running for over 60 seconds
+test compare_fixture_light_when_available ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 112.59s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_loot-252a0aa79ad4b319.exe)
+
+running 12 tests
+test function::tests::ore_drops_with_fortune_scales_the_base ... ok
+test function::tests::ore_drops_without_fortune_keeps_the_base ... ok
+test function::tests::opaque_functions_pass_the_stack_through ... ok
+test function::tests::uniform_bonus_stays_within_the_multiplier ... ok
+test number::tests::bare_numbers_are_constants ... ok
+test number::tests::ranges_clamp_either_bound ... ok
+test number::tests::binomial_counts_trials ... ok
+test number::tests::uniform_stays_in_range ... ok
+test tags::tests::cycles_do_not_loop_forever ... ok
+test tags::tests::duplicates_are_removed ... ok
+test tags::tests::missing_nested_tags_are_skipped ... ok
+test tags::tests::nested_tags_are_resolved ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\vanilla.rs (target\debug\deps\vanilla-cb517aadc96552cc.exe)
+
+running 5 tests
+test stone_drops_cobblestone ... ok
+test every_vanilla_table_parses ... ok
+test chest_table_rolls_items_within_its_rolls_range ... ok
+test diamond_ore_with_fortune_three_yields_one_to_four ... ok
+test oak_leaves_sapling_chance_and_shears ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.03s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_math-a7d8d4dc0d47836c.exe)
+
+running 18 tests
+test aabb::tests::clip_reports_entry_face ... ok
+test aabb::tests::inflate_deflate_and_move ... ok
+test aabb::tests::intersects_contains_and_union ... ok
+test direction::tests::opposites_and_axes ... ok
+test direction::tests::steps_match_faces ... ok
+test shape::tests::world_boxes_are_offset_by_block_position ... ok
+test mth::tests::lerp_and_clamp ... ok
+test pos::tests::chunks_floor_negative_coordinates ... ok
+test mth::tests::wrap_degrees_uses_half_open_range ... ok
+test pos::tests::negative_section_conversions_floor ... ok
+test pos::tests::offsets_and_directions ... ok
+test pos::tests::containing_floors_negative_coordinates ... ok
+test shape::tests::step_up_can_be_disabled ... ok
+test mth::tests::floor_handles_negatives ... ok
+test vec3::tests::dot_and_cross ... ok
+test vec3::tests::length_and_normalize ... ok
+test view::tests::cardinal_directions ... ok
+test view::tests::round_trips ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\vanilla_cases.rs (target\debug\deps\vanilla_cases-d13707597c7ebbb4.exe)
+
+running 10 tests
+test block_raycast_hits_correct_face ... ok
+test step_up_onto_slab_works ... ok
+test walking_into_wall_stops_at_face ... ok
+test negative_coordinates_floor_for_sections_and_chunks ... ok
+test stepping_onto_full_block_does_not_work ... ok
+test sub_epsilon_gap_is_treated_as_touching ... ok
+test falling_onto_ground_stops_at_y ... ok
+test block_raycast_through_gap_misses ... ok
+test block_raycast_hits_top_face_from_above ... ok
+test yaw_pitch_and_look_vectors_round_trip ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_nbt-fa52ccf1b66b637f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\binary.rs (target\debug\deps\binary-805338a289502147.exe)
+
+running 9 tests
+test reject_invalid_utf8_and_lengths ... ok
+test binary_roundtrip_named_and_network ... ok
+test modern_snbt_literals ... ok
+test malformed_input_does_not_panic ... ok
+test snbt_operations_named_escapes_and_invalid_numbers ... ok
+test snbt_surrogate_pairs ... ok
+test compression_and_all_types_roundtrip ... ok
+test snbt_roundtrip ... ok
+test rejects_large_list_even_when_input_is_long_enough ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\serde_contract.rs (target\debug\deps\serde_contract-d192149def2c1891.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\snbt_grammar.rs (target\debug\deps\snbt_grammar-d5b77b937d60e2d6.exe)
+
+running 14 tests
+test accepts_booleans_strings_and_operations ... ok
+test accepts_arrays_lists_and_compounds ... ok
+test rejects_malformed_strings_and_structures ... ok
+test rejects_malformed_numbers ... ok
+test empty_typed_lists_collapse_to_empty_end_list ... ok
+test accepts_floats_and_non_finite_values ... ok
+test heterogeneous_lists_use_vanilla_wrappers_and_roundtrip ... ok
+test formats_every_tag_variant ... ok
+test accepts_integers_and_suffixes ... ok
+test errors_report_position_and_reason ... ok
+test excessive_nesting_is_rejected_without_stack_overflow ... ok
+test property_roundtrip_random_tags ... ok
+test arbitrary_bytes_never_panic ... ok
+test arbitrary_grammar_characters_never_panic ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_net-a349e29c36cfa42b.exe)
+
+running 37 tests
+test cfb8::tests::aes_ni_matches_fips197 ... ok
+test cfb8::tests::nist_cfb8_vector ... ok
+test chunk_tests::chunk_contains_platform_and_correct_heightmap ... ok
+test forwarding::tests::legacy_host_without_properties_is_accepted ... ok
+test forwarding::tests::velocity_payload_tampering_is_rejected ... ok
+test forwarding::tests::legacy_host_with_invalid_address_is_rejected ... ok
+test forwarding::tests::velocity_version_one_payload_is_accepted ... ok
+test forwarding::tests::velocity_payload_with_valid_hmac_is_accepted ... ok
+test game::interaction_tests::routes_interaction_packets ... ok
+test forwarding::tests::legacy_host_split_reads_address_uuid_and_properties ... ok
+test game::interaction_tests::routes_signed_chat_and_acknowledgements ... ok
+test game_channel_tests::play_input_decodes_to_typed_event ... ok
+test forwarding::tests::legacy_host_without_forwarding_data_is_none ... ok
+test forwarding::tests::velocity_payload_with_wrong_secret_is_rejected ... ok
+test game::queue_tests::queue_rejects_when_byte_budget_is_exhausted ... ok
+test game::interaction_tests::routes_survival_input_packets ... ok
+test encryption_tests::minecraft_digest_vectors ... ok
+test registry::tests::synchronized_registries_match_vanilla_26_3 ... ok
+test registry::tests::resolves_nested_and_optional_tags_and_rejects_cycles ... ok
+test tests::status_state_scopes_leave_to_the_session ... ok
+test tests::status_json_reports_sample_favicon_and_secure_chat ... ok
+test validation_tests::rejects_unrepresentable_compression_threshold ... ok
+test tests::oversized_handshake_frame_is_rejected ... ok
+test login_test::velocity_forwarding_replaces_the_login_profile ... ok
+test login_test::native_only_rejects_older_protocols ... ok
+test login_test::offline_login_compresses_and_sends_profile ... ok
+test login_test::older_protocol_is_translated_when_all_versions_are_supported ... ok
+test wire::tests::split_halves_encrypt_and_decrypt_a_batch ... ok
+test keepalive_tests::configuration_wait_sends_keepalive ... ok
+test encryption_tests::encrypted_login_roundtrip ... ok
+test login_test::status_advertises_the_older_protocol ... ok
+test tests::status_ping_over_tcp ... ok
+test cfb8::tests::matches_reference_over_random_inputs ... ok
+test tests::silent_client_is_disconnected_by_the_read_timeout ... ok
+test wire::tests::encrypted_stream_roundtrips_under_backpressure ... ok
+test registry_tests::vanilla_registries_and_tags_are_resolved ... ok
+test configuration_test::configuration_sends_known_pack_and_registries ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+
+     Running tests\status.rs (target\debug\deps\status-d7e64dff4fb2e41c.exe)
+
+running 1 test
+test status_and_ping_over_tcp_report_vanilla_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_noise-c1a3e12b4c9d6cb4.exe)
+
+running 8 tests
+test math::tests::log_matches_java_strictmath ... ok
+test random::tests::seed_upgrade_is_deterministic ... ok
+test noise::tests::gradient_table_matches_vanilla ... ok
+test random::tests::md5_matches_rfc_1321_vectors ... ok
+test noise::tests::wrap_is_identity_inside_window ... ok
+test tests::java_string_hash_matches_known_values ... ok
+test tests::block_seed_matches_vanilla_values ... ok
+test noise::tests::wrap_folds_large_coordinates ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\reference.rs (target\debug\deps\reference-c5007743d29655f9.exe)
+
+running 1 test
+test reference_samples_are_bitwise_identical ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.09s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_plugin-e29acd6f25a9132c.exe)
+
+running 2 tests
+test scheduling::tests::entity_task_waits_until_due ... ok
+test scheduling::tests::region_task_retains_coordinates_and_waits_for_due_tick ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\compat\main.rs (target\debug\deps\compat-162109df27042b79.exe)
+
+running 2 tests
+test compat_probe ... ok
+test compatibility_report ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\integration.rs (target\debug\deps\integration-7f021eef43276c0f.exe)
+
+running 1 test
+10월 31, 2026 8:29:53 오후 org.bukkit.Bukkit setServer
+정보: This server is running Ferrite version 0.1.0 (Implementing API version 26.3)
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: FerriteTest enabled
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: server name Ferrite
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: initial ip ban true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: FerriteTest settings Integration MOTD 42 25570 8 true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: dependency visible
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onTest
+정보: FerriteTest event
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface SURVIVAL false true true true 29999984 10 10 0 -1 -1 true false false 0
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-motd Integration MOTD
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-folder true true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-api ip=[] hardcore=false logips=true secure=false transfers=false hide=false force-default=false container=true level=true update=update/update warnings=DEFAULT paused=false ticking=true global=true chained=1000000 enabled=[vanilla] disabled=[] pack=true serverpack=true pack-required=false bosses=false boss=true remove-boss=false throttle=-1 registry=true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-itemfactory meta=true air=true applicable=true not-applicable=false copied=true leather=10511680 egg=true name=block.minecraft.stone
+10월 31, 2026 8:29:53 오후 dev.ferrite.server.FerriteServer lambda$createConsoleSender$0
+정보: pong
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-common dispatched=true online=0 worlds=0 plugins=3 self-enabled=true player=true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: FerriteTest enabled
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: server name Ferrite
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: initial ip ban true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: FerriteTest settings Integration MOTD 42 25570 8 true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onTest
+정보: FerriteTest event
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface SURVIVAL false true true true 29999984 10 10 0 -1 -1 true false false 0
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-motd Integration MOTD
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-folder true true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-api ip=[] hardcore=false logips=true secure=false transfers=false hide=false force-default=false container=true level=true update=update/update warnings=DEFAULT paused=false ticking=true global=true chained=1000000 enabled=[vanilla] disabled=[] pack=true serverpack=true pack-required=false bosses=false boss=true remove-boss=false throttle=-1 registry=true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-itemfactory meta=true air=true applicable=true not-applicable=false copied=true leather=10511680 egg=true name=block.minecraft.stone
+10월 31, 2026 8:29:53 오후 dev.ferrite.server.FerriteServer lambda$createConsoleSender$0
+정보: pong
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onEnable
+정보: surface-common dispatched=true online=0 worlds=0 plugins=3 self-enabled=true player=true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$2
+정보: offline snapshot true
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$2
+정보: player snapshot 16.0 14 CREATIVE
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$2
+정보: world snapshot probe_world STONE
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$2
+정보: surface-query 0 0 true false true 0
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$2
+정보: surface-query 0 0 true false true 0
+10월 31, 2026 8:29:53 오후 dev.ferrite.server.FerriteServer lambda$createConsoleSender$0
+정보: hello hello
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$8
+정보: FerriteTest global
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$9
+정보: FerriteTest tick
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$7
+정보: FerriteTest entity
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$7
+정보: FerriteTest entity
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest owned
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest range owned
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest region
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest owned
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest range owned
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin lambda$onEnable$5
+정보: FerriteTest region
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onDisable
+정보: FerriteTest disabled
+10월 31, 2026 8:29:53 오후 dev.ferrite.test.TestPlugin onDisable
+정보: FerriteTest disabled
+test plugin_lifecycle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.49s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_plugin_meta-d5d6291b27e30cbe.exe)
+
+running 25 tests
+test descriptor::tests::invalid_load_is_rejected ... ok
+test descriptor::tests::parses_minimal_descriptor ... ok
+test descriptor::tests::unquoted_scalars_are_coerced ... ok
+test descriptor::tests::invalid_name_characters_are_rejected ... ok
+test descriptor::tests::author_and_authors_are_merged_author_first ... ok
+test descriptor::tests::paper_dependency_with_invalid_load_is_rejected ... ok
+test descriptor::tests::plugin_yml_ignores_paper_sections ... ok
+test descriptor::tests::paper_descriptor_parses_dependencies_and_defaults ... ok
+test order::tests::missing_hard_dependency_is_reported_with_every_name ... ok
+test descriptor::tests::permissions_default_to_op_and_reject_unknown_defaults ... ok
+test order::tests::cycle_members_are_skipped_and_reported_with_paper_message ... ok
+test descriptor::tests::commands_keep_description_usage_aliases_and_permission ... ok
+test order::tests::duplicate_names_keep_the_first_entry ... ok
+test order::tests::dependent_of_skipped_plugin_fails_too ... ok
+test order::tests::equal_plugins_are_ordered_alphabetically ... ok
+test descriptor::tests::malformed_yaml_is_a_metadata_error ... ok
+test order::tests::loadbefore_orders_plugin_before_target_and_overrides_depend ... ok
+test order::tests::provides_aliases_satisfy_dependencies_case_insensitively ... ok
+test descriptor::tests::missing_required_fields_are_typed_errors ... ok
+test order::tests::scc_finds_nested_cycles ... ok
+test descriptor::tests::name_spaces_are_normalized_like_bukkit ... ok
+test order::tests::self_dependency_is_ignored ... ok
+test order::tests::soft_dependency_orders_when_present_and_is_optional_when_absent ... ok
+test order::tests::startup_and_postworld_are_split_but_still_ordered ... ok
+test order::tests::threading_mode_follows_folia_support ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\jars.rs (target\debug\deps\jars-2da1959c80041a6a.exe)
+
+running 11 tests
+test missing_hard_dependency_fails_plugin_and_its_dependents ... ok
+test startup_plugins_are_split_from_postworld_plugins ... ok
+test soft_dependency_orders_but_does_not_require_presence ... ok
+test folia_supported_selects_region_aware_threading ... ok
+test basic_plugin_yml_is_parsed_from_a_jar ... ok
+test invalid_descriptors_are_reported_per_jar ... ok
+test duplicate_names_keep_the_first_plugin ... ok
+test cycles_are_reported_paper_style_and_skipped ... ok
+test loadbefore_orders_plugin_before_target ... ok
+test provides_aliases_satisfy_hard_dependencies ... ok
+test paper_plugin_yml_is_parsed_and_takes_precedence ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_profiler-1d140d88c614a8fb.exe)
+
+running 33 tests
+test stats::tests::empty_samples_are_all_zero ... ok
+test paper::tests::plain_tps_line_matches_paper ... ok
+test paper::tests::colored_mspt_line_colors_by_tick_budget ... ok
+test paper::tests::colored_tps_line_colors_each_value ... ok
+test stats::tests::single_sample_is_every_percentile ... ok
+test paper::tests::mspt_lines_cover_both_windows ... ok
+test paper::tests::region_tps_line_shows_the_short_windows ... ok
+test paper::tests::plain_mspt_line_lists_every_metric ... ok
+test stats::tests::percentile_of_one_hundred_values ... ok
+test stats::tests::percentile_of_two_hundred_values ... ok
+test paper::tests::plain_tps_line_uses_one_decimal ... ok
+test stats::tests::percentile_uses_nearest_rank ... ok
+test tick::tests::regional_recording_leaves_the_global_window_alone ... ok
+test timings::tests::display_prints_the_tree ... ok
+test sampler::tests::stop_is_idempotent_and_safe_before_any_sample ... ok
+test tick::tests::reset_region_clears_only_that_slot ... ok
+test tick::tests::per_region_windows_are_isolated ... ok
+test timings::tests::reset_starts_a_fresh_period ... ok
+test timings::tests::same_name_nested_twice_creates_a_child ... ok
+test timings::tests::records_scopes_concurrently_from_eight_threads ... ok
+test timings::tests::scopes_are_attributed_to_the_bound_region ... ok
+test tick::tests::concurrent_recording_from_eight_threads ... ok
+test tick::tests::mspt_windows_pick_the_right_ticks ... ok
+test tick::tests::empty_monitor_reports_full_tps_and_no_mspt ... ok
+test tick::tests::tps_follows_tick_duration ... ok
+test tick::tests::tps_windows_use_their_own_tick_ranges ... ok
+test tick::tests::tps_is_capped_at_twenty ... ok
+test tick::tests::tps_accounts_for_lag_spikes ... ok
+test timings::tests::per_region_counters_are_isolated ... ok
+test timings::tests::scope_percentages_of_tick_use_the_reference ... ok
+test timings::tests::report_builds_a_tree_sorted_by_total_time ... ok
+test sampler::tests::exports_plain_text_and_json ... ok
+test sampler::tests::samples_are_attributed_to_the_scope_the_thread_is_in ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_protocol-d366fe9e23893776.exe)
+
+running 41 tests
+test codec::tests::bool_decode_rejects_non_boolean ... ok
+test codec::tests::decode_partial_every_prefix_of_five_byte_varint ... ok
+test codec::tests::decode_string_rejects_negative_and_oversized_lengths ... ok
+test codec::tests::partial_varint ... ok
+test codec::tests::varint_decode_fast_path_consumes_exactly_one_or_two_bytes ... ok
+test codec::tests::strings_options_arrays_uuids ... ok
+test codec::tests::varint_known_values ... ok
+test frame::tests::empty_body_compresses_as_the_uncompressed_marker ... ok
+test codec::tests::varlong_max_len_and_overlong ... ok
+test codec::tests::vec_decode_huge_length_short_input_is_eof ... ok
+test frame::tests::compressed_data_len_above_max_rejected ... ok
+test frame::tests::corrupt_zlib_payload_errors ... ok
+test frame::tests::frame_len_above_max_rejected ... ok
+test frame::tests::compressed_declared_length_mismatch_rejected ... ok
+test codec::tests::varlong_known_values ... ok
+test packets::configuration_tests::configuration_packets_roundtrip ... ok
+test frame::tests::truncated_zlib_payload_errors ... ok
+test packets::login_tests::login_packet_roundtrips ... ok
+test packets::multiplayer_tests::multiplayer_packet_roundtrips ... ok
+test packets::multiplayer_tests::player_info_marks_players_listed ... ok
+test packets::play::chat_tests::chat_type_uses_holder_id_plus_one ... ok
+test packets::play::chat_tests::chat_packets_roundtrip ... ok
+test packets::play::chat_tests::last_seen_bitset_is_three_bytes ... ok
+test packets::play::chat_tests::rejects_oversized_profile_key ... ok
+test packets::play::command_feedback_tests::boss_bar_and_team_packets_roundtrip ... ok
+test packets::play::command_feedback_tests::effect_and_title_packets_roundtrip ... ok
+test packets::play::command_feedback_tests::scoreboard_packets_roundtrip ... ok
+test packets::play::command_feedback_tests::sound_and_particle_packets_roundtrip ... ok
+test packets::play::command_feedback_tests::world_border_packets_roundtrip ... ok
+test packets::play::interaction_tests::container_packets_roundtrip ... ok
+test packets::play::interaction_tests::entity_packets_roundtrip ... ok
+test packets::play::interaction_tests::interaction_packets_roundtrip ... ok
+test packets::play::sign_packet_tests::player_command_sign_update_and_editor_roundtrip ... ok
+test packets::status::tests::status_packets_roundtrip_and_ids ... ok
+test types::tests::block_pos_packs ... ok
+test packets::play_tests::play_packet_roundtrips ... ok
+test types::tests::lp_vec3_matches_vanilla_quantization ... ok
+test frame::tests::incompressible_payload_roundtrips ... ok
+test frame::tests::flate2_frames_decode_with_backend ... ok
+test frame::tests::backend_frames_decode_with_flate2 ... ok
+test frame::tests::frames_roundtrip ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_recipe-7dc4fba8542c0a30.exe)
+
+running 5 tests
+test tags::tests::object_entries_parse_required_flag ... ok
+test tags::tests::missing_required_tags_are_errors ... ok
+test tags::tests::cycles_are_errors ... ok
+test tags::tests::optional_missing_tags_are_skipped ... ok
+test tags::tests::nested_tags_are_resolved ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\vanilla.rs (target\debug\deps\vanilla-537335c4d51f4647.exe)
+
+running 9 tests
+test smelting_raw_iron ... ok
+test sticks_from_two_planks_anywhere_in_a_3x3 ... ok
+test stonecutting_stone_options ... ok
+test crafting_table_in_a_2x2 ... ok
+test planks_from_a_log ... ok
+test grids_that_match_nothing_return_none ... ok
+test flint_and_steel_is_shapeless ... ok
+test mirrored_shaped_recipes_match ... ok
+test every_vanilla_recipe_type_has_the_expected_count ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.44s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_region-7a5e8241fef0d606.exe)
+
+running 3 tests
+test merges_report_tick_offset_and_splits_inherit_tick ... ok
+test tests::split_and_merge_preserve_overdue_deadlines ... ok
+test tests::local_connectivity_check_matches_full_search ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+
+     Running tests\catchup.rs (target\debug\deps\catchup-428a7d7baba68d0a.exe)
+
+running 1 test
+test overloaded_region_does_not_burst_after_load_is_removed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+
+     Running tests\mutations.rs (target\debug\deps\mutations-8b43271e50780702.exe)
+
+running 12 tests
+test concurrent_stress_large ... ignored, long-running concurrent stress test
+test dead_section_is_retired_after_its_tick ... ok
+test removal_of_ticking_chunk_updates_holder_count_immediately ... ok
+test bridge_absorbs_idle_neighbor_while_other_region_ticks ... ok
+test ticking_region_retains_existing_empty_sections_and_new_halo_is_transient ... ok
+test pending_merge_chain_across_three_regions_applies_in_order ... ok
+test added_section_beside_ticking_region_is_transient_until_merge ... ok
+test transient_bridge_waits_for_both_ticking_regions ... ok
+test mutations_near_ticking_region_do_not_delay_idle_region ... ok
+test merge_of_ticking_and_idle_region_applies_right_after_the_tick ... ok
+test concurrent_stress_small ... ok
+test concurrent_halo_mutations_preserve_region_invariants ... ok
+
+test result: ok. 11 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.89s
+
+     Running tests\properties.rs (target\debug\deps\properties-64ebe2778cf393ba.exe)
+
+running 2 tests
+test tasks_survive_bridge_merge_and_split ... ok
+test every_held_chunk_has_one_owner ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+
+     Running tests\regionizer.rs (target\debug\deps\regionizer-094903cae21d0310.exe)
+
+running 15 tests
+test stress_mutations_and_queued_tasks ... ignored, long-running concurrent stress test
+test split_partitions_data_and_sections_use_floor_division ... ok
+test bridge_merges_and_removal_splits ... ok
+test merged_region_handle_becomes_dead ... ok
+test region_stats_count_live_empty_and_dead_sections ... ok
+test recalculation_retains_empty_sections_near_remaining_chunks ... ok
+test configured_empty_sections_reserve_the_merge_radius ... ok
+test default_regionizer_reserves_empty_sections_within_merge_radius ... ok
+test holder_counts_and_global_queue_are_preserved ... ok
+test tasks_parked_in_new_empty_sections_follow_owner ... ok
+test tasks_run_on_the_region_that_owns_the_target ... ok
+test mutations_wait_for_inflight_tick_and_tasks_follow_merge ... ok
+test bridge_task_queued_during_tick_survives_deferred_merge ... ok
+test ticking_region_does_not_block_distant_regions_or_chunk_add ... ok
+test queued_tasks_follow_chunk_ownership_and_shutdown_returns_data ... ok
+
+test result: ok. 14 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src\lib.rs (target\debug\deps\ferrite_server-31302afa62684d2a.exe)
+
+running 224 tests
+test game::blocks::tests::props_round_trip_and_preserve_the_other_values ... ok
+test game::chat::tests::last_seen_checksum_matches_vanilla_algorithm ... ok
+test game::chunk::tests::flat_generator_builds_bedrock_dirt_and_grass ... ok
+test game::chat::tests::tracker_tracks_pending_then_acknowledged_entries ... ok
+test game::commands::tests::advance_time_only_stops_the_clock ... ok
+test game::chat::tests::tracker_rejects_acknowledging_empty_slots_and_bad_checksums ... ok
+test game::commands::tests::clear_and_give_resolve_targets_items_and_counts ... ok
+test game::commands::tests::defaultgamemode_updates_state_and_requires_an_argument ... ok
+test game::commands::tests::entity_and_profile_resolution_use_online_then_cache ... ok
+test game::commands::tests::difficulty_queries_sets_and_rejects_the_same_value ... ok
+test game::commands::tests::entity_selectors_require_permission_level_two ... ok
+test game::commands::tests::command_permission_levels_match_vanilla ... ok
+test game::commands::tests::ban_ip_requires_admin_and_accepts_a_reason ... ok
+test game::commands::tests::ban_requires_admin_and_defaults_the_reason ... ok
+test game::commands::tests::gamemode_sets_self_and_reports_missing_target ... ok
+test game::commands::tests::banlist_requires_admin_and_lists_both_kinds ... ok
+test game::commands::tests::list_formats_players_and_rejects_unknown_subcommands ... ok
+test game::commands::tests::me_broadcasts_as_emote_and_requires_an_action ... ok
+test game::commands::tests::kill_requires_gamemaster ... ok
+test game::commands::tests::kick_requires_admin_and_defaults_the_reason ... ok
+test game::commands::tests::plugin_commands_register_aliases_and_forward_arguments ... ok
+test game::commands::tests::msg_tell_and_w_message_players ... ok
+test game::commands::tests::op_and_deop_require_admin ... ok
+test game::commands::tests::gamerule_commands_use_vanilla_names_types_and_bounds ... ok
+test game::commands::tests::say_broadcasts_with_announcement_chat_type_and_checks_permission ... ok
+test game::commands::tests::pardon_commands_require_admin ... ok
+test game::commands::tests::seed_reports_world_seed_and_requires_permission ... ok
+test game::commands::tests::save_on_and_off_require_owner ... ok
+test game::commands::tests::save_all_requires_owner_and_accepts_flush ... ok
+test game::commands::tests::time_sets_adds_queries_and_rejects_negative_ticks ... ok
+test game::commands::tests::tps_mspt_and_profile_use_the_profiler_and_require_permission ... ok
+test game::commands::tests::stop_requires_owner ... ok
+test game::commands::tests::weather_sets_duration_and_rejects_zero ... ok
+test game::commands::tests::summon_parses_the_vanilla_entity_and_position_arguments ... FAILED
+test game::commands::tests::xp_resolves_operations_units_and_permissions ... ok
+test game::commands_data::tests::block_operations_are_emitted_as_actions ... ok
+test game::commands_data::tests::entity_data_reads_the_player_view ... ok
+test game::commands_data::tests::storage_round_trips_through_get_merge_modify_and_remove ... ok
+test game::commands_exec::tests::as_and_at_fork_over_players ... ok
+test game::commands_exec::tests::conditions_gate_the_run ... ok
+test game::commands_exec::tests::run_reaches_the_inner_command ... ok
+test game::commands_exec::tests::modifiers_rewrite_the_source ... ok
+test game::commands_exec::tests::store_writes_the_inner_result ... ok
+test game::commands::tests::entity_selectors_require_gamemaster ... ok
+test game::commands::tests::tp_and_teleport_accept_vanilla_forms ... ok
+test game::commands_extras::tests::effect_gives_and_clears ... ok
+test game::commands_extras::tests::particle_sends_position_delta_and_count ... ok
+test game::commands_extras::tests::enchant_applies_to_targets ... ok
+test game::commands_extras::tests::playsound_resolves_the_sound_and_category ... ok
+test game::commands_extras::tests::setworldspawn_updates_state_and_broadcasts ... ok
+test game::commands::tests::whitelist_requires_admin ... ok
+test game::commands_extras::tests::spawnpoint_updates_player_state ... ok
+test game::commands_extras::tests::tellraw_sends_the_component_text ... ok
+test game::commands_meta::tests::scoreboard_objectives_and_players ... ok
+test game::commands_meta::tests::bossbar_creates_updates_and_lists ... ok
+test game::commands_extras::tests::stopsound_sends_source_and_sound_filters ... ok
+test game::commands_world::tests::block_state_errors_name_the_offending_part ... ok
+test game::commands_world::tests::clone_replaces_and_masks_air ... ok
+test game::commands_meta::tests::tags_add_list_and_remove ... ok
+test game::commands_world::tests::fill_replaces_keeps_hollows_and_outlines ... ok
+test game::commands_world::tests::fill_respects_filters_and_the_volume_limit ... ok
+test game::commands_world::tests::setblock_replaces_and_keeps_only_air ... ok
+test game::commands_meta::tests::teams_add_join_and_modify ... ok
+test game::commands_extras::tests::worldborder_sets_centers_and_queries ... ok
+test game::commands_world::tests::dispatcher_parses_world_commands_and_permissions ... ok
+test game::commands_extras::tests::title_subcommands_send_components_and_times ... ok
+test game::explosion::tests::exposure_shrinks_behind_a_wall_and_knockback_follows_the_ray ... ok
+test game::explosion::tests::blast_destroys_stone_but_obsidian_resists ... ok
+test game::feedback::tests::renders_vanilla_feedback ... ok
+test game::fire::tests::fire_ages_burns_planks_and_rain_extinguishes ... ok
+test game::fire::tests::flammability_comes_from_the_generated_tags ... ok
+test game::fire::tests::scheduled_fire_reschedules_itself ... ok
+test game::fire::tests::soul_fire_needs_soul_soil_and_fire_needs_support ... ok
+test game::fixture_spawn_comes_from_level_dat ... ok
+test game::explosion::tests::a_stronger_blast_reaches_further ... ok
+test game::drops::tests::cows_drop_leather_and_beef ... ok
+test game::drops::tests::blocks_drop_their_loot_with_the_right_tool ... ok
+test game::functions::tests::function_command_unknown_function_errors ... ok
+test game::functions::tests::function_command_substitutes_macros_and_return_stops_the_function ... ok
+test game::chat::tests::packet_roundtrip_covers_chat_session_update ... ok
+test game::functions::tests::parser_skips_comments_and_blank_lines_and_joins_continuations ... ok
+test game::functions::tests::macros_substitute_compound_arguments ... ok
+test game::chat::tests::expired_profile_key_is_reported ... ok
+test game::global::tests::visibility_and_chat_follow_positions ... ok
+test game::global::tests::tick_records_global_and_tracking_scopes_when_timings_are_attached ... ok
+test game::gravity::tests::gravity_blocks_are_the_vanilla_falling_blocks ... ok
+test game::crafting::tests::crafts_planks_sticks_and_tables_in_both_grids ... ok
+test game::chat::tests::chain_rejects_out_of_order_times_and_unsigned_secure_messages ... ok
+test game::chat::tests::signed_chat_validates_the_acknowledged_last_seen_chain ... ok
+test game::chat::tests::signed_chain_advances_and_rejects_tampering ... ok
+test game::functions::tests::loader_reads_datapack_functions_and_tags ... ok
+test game::gravity::tests::unsupported_sand_becomes_a_falling_entity_after_two_ticks ... ok
+test game::anvil::tests::two_players_share_one_encoded_packet ... ok
+test game::block_container::tests::chests_pair_up_with_the_right_half_first ... ok
+test game::anvil::tests::block_change_invalidates_only_the_edited_chunk ... ok
+test game::anvil::tests::light_change_invalidates_the_cached_packet ... ok
+test game::fluid::tests::missing_and_unowned_chunks_are_solid_and_not_loaded ... ok
+test game::block_container::tests::items_round_trip_through_the_block_entity_and_spill_on_break ... ok
+test game::fluid::tests::fluid_tick_never_loads_unheld_neighbor ... ok
+test game::integration::admin_commands_persist_to_the_lists ... ok
+test game::integration::console_stop_is_dispatched ... ok
+test game::integration::banned_player_is_disconnected_before_play ... ok
+test game::explosion::tests::fixture_world_blast_uses_vanilla_resistance_and_loot ... ok
+test game::integration::breaking_support_drops_torch_for_tracking_bot ... ok
+test game::integration::commands_packet_decodes_and_filters_permissions ... ok
+test game::block_tests::nether_bed_explodes_for_tracking_bot ... ok
+test game::integration::duplicate_login_kicks_old_session_and_keeps_new_session ... ok
+test game::integration::effect_and_title_commands_reach_the_client ... ok
+test game::anvil_tests::fixture_chunk_encodes_stored_lighting ... ok
+test game::gamerules_persist_across_world_restart ... ok
+test game::integration::creative_slot_updates_player_inventory ... ok
+test game::integration::creative_break_broadcasts_to_tracking_player ... ok
+test game::integration::block_placement_uses_items_in_survival_only ... ok
+test game::integration::clear_give_and_xp_commands_act_on_a_bot_session ... ok
+test game::integration::ip_banned_player_is_disconnected_before_play ... ok
+test game::integration::message_command_reaches_target_and_sender ... ok
+test game::integration::entities_follow_region_merges_splits_and_hand_offs ... ok
+test game::integration::chest_contents_are_shared_saved_and_spilled_when_broken ... ok
+test game::integration::kill_command_shows_the_death_screen_even_in_creative ... ok
+test game::block_tests::sign_and_bucket_interactions_reach_tracking_bot ... ok
+test game::integration::operator_stop_shuts_the_world_down ... ok
+test game::integration::operator_teleport_command_moves_player ... ok
+test game::integration::interaction_reach_and_placement ... ok
+test game::integration::milk_bucket_clears_effects_with_bot ... ok
+test game::integration::offline_chat_broadcasts_unsigned_player_chat_to_others ... ok
+test game::integration::crossing_region_boundary_keeps_chat_and_movement_routed ... ok
+test game::integration::profile_start_and_stop_collect_tick_scopes ... ok
+test game::integration::resistance_reduces_fall_damage_with_bot ... ok
+test game::integration::player_data_is_scoped_to_one_world ... ok
+test game::integration::setblock_command_updates_block_for_tracking_player ... ok
+test game::integration::effect_command_expires_and_sends_remove ... ok
+test game::integration::survival_death_drops_experience_that_is_picked_up_after_respawn ... ok
+test game::integration::crafting_planks_and_sticks_in_the_grid_and_on_a_table ... ok
+test game::integration::placed_sand_falls_and_lands_for_tracking_bot ... ok
+test game::integration::a_creeper_blast_damages_blocks_for_a_bot ... ok
+test game::integration::survival_kill_death_screen_and_keep_inventory_respawn ... ok
+test game::integration::survival_void_damage_kills_and_sends_the_death_screen ... ok
+test game::block_tests::fire_door_lever_and_button_reach_tracking_bot ... ok
+test game::integration::survival_fall_damage_and_natural_regeneration_with_bot ... ok
+test game::integration::survival_inventory_clicks_drops_and_hotbar_swaps ... ok
+test game::integration::totem_of_undying_prevents_death_with_bot ... ok
+test game::interaction::tests::stairs_half_facing_and_waterlogging ... ok
+test game::interaction::tests::tool_less_stone_and_log_axis ... ok
+test game::integration::tps_and_mspt_commands_report_live_tick_statistics ... ok
+test game::interaction::tests::torch_on_a_side_face_becomes_the_matching_wall_torch ... ok
+test game::interaction::tests::wall_button_gets_the_clicked_face_and_facing ... ok
+test game::memory_chunk_block_mutation_is_visible ... ok
+test game::nbt_path::tests::merge_remove_and_list_edits ... ok
+test game::nbt_path::tests::paths_resolve_and_write ... ok
+test game::neighbors::tests::flowers_need_dirt_or_farmland_but_doors_and_rails_need_any_sturdy_face ... ok
+test game::neighbors::tests::region_border_changes_are_ignored ... ok
+test game::neighbors::tests::standing_and_wall_torches_need_their_support ... ok
+test game::neighbors::tests::unsupported_blocks_break_with_their_state_and_cascade ... ok
+test game::operator_permissions_require_the_configured_uuid ... ok
+test game::playerdata::tests::missing_or_corrupt_data_is_none ... ok
+test game::playerdata::tests::older_saves_and_bad_slots_are_converted_or_ignored ... ok
+test game::playerdata::tests::round_trips_position_mode_and_inventory ... ok
+test game::profile::tests::mspt_lines_cover_both_windows ... ok
+test game::profile::tests::profile_session_reports_the_slowest_scopes ... ok
+test game::profile::tests::profile_start_and_stop_are_exclusive ... ok
+test game::profile::tests::region_slots_are_stable_and_reset_after_wrapping ... ok
+test game::profile::tests::tps_does_not_list_regions_without_ticks ... ok
+test game::integration::tracker_spawns_and_removes_entities_by_range ... ok
+test game::profile::tests::tps_hides_regions_that_stopped_ticking ... ok
+test game::profile::tests::tps_lines_cover_the_global_tick_and_active_regions ... ok
+test game::random_tick::tests::grass_decays_under_opaque_block_and_spreads_only_in_light ... ok
+test game::random_tick::tests::leaves_decay_only_when_nonpersistent_and_distance_seven ... ok
+test game::random_tick::tests::non_ticking_sections_do_not_sample_and_ticking_sections_use_one_draw_per_pick ... ok
+test game::redstone::tests::buttons_release_after_their_press_lengths ... ok
+test game::redstone::tests::comparator_output_freezes_while_locked_and_resumes_after_unlock ... ok
+test game::redstone::tests::comparator_compares_subtracts_and_reports_analog_strength ... ok
+test game::redstone::tests::lever_drives_door_gate_rail_note_block_and_tnt ... ok
+test game::redstone::tests::lever_powers_wire_and_lamp_and_turning_it_off_clears_the_wire ... ok
+test game::redstone::tests::observer_emits_a_two_tick_pulse_when_the_block_in_front_changes ... ok
+test game::integration::potion_drinking_applies_vanilla_effects_with_bot ... ok
+test game::redstone::tests::pressure_plate_tracks_players_and_daylight_detector_tracks_brightness ... ok
+test game::redstone::tests::redstone_block_powers_an_adjacent_wire ... ok
+test game::redstone::tests::repeater_holds_its_state_while_locked ... ok
+test game::redstone::tests::repeater_waits_delay_times_two_ticks_before_switching ... ok
+test game::redstone::tests::split_and_merge_keep_scheduled_ticks_with_their_sections ... ok
+test game::redstone::tests::strong_power_reaches_wire_and_lamp_through_stone ... ok
+test game::redstone::tests::torch_burns_out_after_repeated_toggles_and_recovers ... ok
+test game::redstone::tests::torch_inverts_the_block_it_is_attached_to ... ok
+test game::redstone::tests::wire_connects_up_to_a_raised_wire_and_side_to_components ... ok
+test game::region::chunk_holders_follow_region_merge_and_split ... ok
+test game::region::event_policy_tests::a_missing_plugin_bridge_always_allows_the_action ... ok
+test game::integration::two_bots_move_stream_chat_and_disconnect ... ok
+test game::redstone::tests::wire_power_decays_one_per_block ... ok
+test game::region::event_policy_tests::block_materials_come_from_the_state_table ... ok
+test game::region::event_policy_tests::failed_plugin_events_follow_the_configured_policy ... ok
+test game::region::fluid_ownership_tests::fluid_ticks_survive_merge_and_split ... ok
+test game::survival::tests::absorption_absorbs_before_health_and_invulnerability_blocks_repeats ... ok
+test game::region::tests::experience_curve_matches_vanilla_levels ... ok
+test game::region::tests::window_is_sorted_and_unloads_outside ... ok
+test game::region::tests::tick_records_a_region_scope_when_timings_are_attached ... ok
+test game::survival::tests::fall_damage_is_ceil_of_fall_distance_minus_three ... ok
+test game::survival::tests::food_eat_matches_vanilla_saturation_by_modifier ... ok
+test game::survival::tests::health_reaches_zero_once_and_heals_clamp_at_max ... ok
+test game::survival::tests::natural_regeneration_uses_the_ten_and_eighty_tick_timers ... ok
+test game::survival::tests::creative_ignores_hazards_but_not_void_and_spectators_take_nothing ... ok
+test game::survival::tests::sprinting_and_jumping_add_exhaustion ... ok
+test game::survival::tests::exhaustion_eats_saturation_then_food ... ok
+test game::survival::tests::starvation_fires_after_eighty_ticks_and_respects_normal_health_floor ... ok
+test game::survival::tests::sync_tracks_health_food_and_saturation_bits ... ok
+test game::survival::tests::water_fire_lava_and_void_follow_vanilla_timings ... ok
+test game::tests::movement_validation_rejects_large_and_nonfinite_moves ... ok
+test plugins::tests::only_jar_files_count_as_plugins ... ok
+test game::integration::summoned_cow_is_tracked_falls_dies_and_drops_loot ... ok
+test game::integration::slow_reader_is_disconnected_without_stalling_ticks ... ok
+test game::integration::survival_break_requires_elapsed_ticks ... ok
+test game::integration::survival_break_drops_an_item_that_falls_and_is_picked_up ... ok
+test game::integration::tnt_explodes_and_drops_blocks_for_tracking_bot ... ok
+test game::integration::grass_spread_reaches_tracking_bot_on_fixture_world ... ok
+test game::integration::a_zombie_reaches_and_damages_a_bot has been running for over 60 seconds
+test game::integration::bot_break_is_saved_on_shutdown has been running for over 60 seconds
+test game::integration::gamerule_zero_stops_grass_spread_for_bot ... ok
+test game::integration::bot_break_is_saved_on_shutdown ... ok
+test game::integration::redstone_lever_lights_lamp_for_bot_on_fixture_world ... ok
+test game::integration::fixture_world_streams_disk_chunk ... ok
+test game::integration::water_bucket_spread_reaches_tracking_bot_on_fixture_world ... ok
+test game::integration::redstone_torch_inverter_for_bot_on_fixture_world ... ok
+test game::integration::redstone_repeater_delay_for_bot_on_fixture_world ... ok
+test game::integration::survival_eating_uses_food_component_after_use_duration ... ok
+test game::modified_chunk_is_written_on_flush ... ok
+test game::terrain::tests::generates_overworld_terrain_with_surface_and_biomes ... ok
