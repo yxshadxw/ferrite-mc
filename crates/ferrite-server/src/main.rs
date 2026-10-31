@@ -229,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             status: Default::default(),
             read_timeout: ferrite_net::DEFAULT_READ_TIMEOUT,
             game: Some(world.sender.clone()),
+            ..Default::default()
         },
     ));
     let (console_tx, mut console_rx) = tokio::sync::mpsc::unbounded_channel();

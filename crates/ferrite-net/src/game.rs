@@ -2,7 +2,11 @@ use ferrite_protocol::{
     Decode, DecodeError, Packet, VarInt, encode_packet,
     packets::{login::Property, play::*},
 };
-use tokio::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 /// Messages decoded from a play connection, with no world state in the transport.
 #[derive(Debug, Clone)]
@@ -49,7 +53,7 @@ pub enum GameMessage {
         /// Client chat visibility: 0 = shown, 1 = commands only, 2 = hidden.
         chat_visibility: u8,
         max_players: u32,
-        outbound: mpsc::UnboundedSender<Outbound>,
+        outbound: OutboundSender,
     },
     Input {
         session: u64,
@@ -68,15 +72,161 @@ pub enum GameMessage {
         complete: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
-#[derive(Debug)]
+/// A packet is already encoded (or `Arc`-shared when one encoding goes to many players);
+/// compression and encryption happen later, in the connection's writer task.
+#[derive(Debug, Clone)]
 pub enum Outbound {
-    Packet(Vec<u8>),
+    Packet(Arc<[u8]>),
     Disconnect(String),
 }
 pub fn packet<P: Packet>(p: &P) -> Outbound {
     let mut bytes = Vec::new();
     encode_packet(p, &mut bytes);
-    Outbound::Packet(bytes)
+    Outbound::Packet(bytes.into())
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// The connection's byte budget is exhausted; the client is being disconnected.
+    Full,
+    /// The writer task has already stopped.
+    Closed,
+}
+/// Bytes-based budget shared by the game side (producer) and the writer task (consumer).
+#[derive(Debug)]
+struct Budget {
+    limit: usize,
+    bytes: AtomicUsize,
+    overflow: AtomicBool,
+    overflow_tx: watch::Sender<bool>,
+}
+impl Budget {
+    fn mark_overflow(&self) {
+        if !self.overflow.swap(true, Ordering::AcqRel) {
+            let _ = self.overflow_tx.send(true);
+        }
+    }
+    fn release(&self, size: usize) {
+        self.bytes.fetch_sub(size, Ordering::AcqRel);
+    }
+    fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::Acquire)
+    }
+}
+/// Per-connection outbound queue. `send` never blocks: ticks push bytes and move on, and a
+/// client that stops reading gets its queue capped instead of growing without bound.
+#[derive(Debug, Clone)]
+pub struct OutboundSender {
+    tx: mpsc::UnboundedSender<Outbound>,
+    budget: Arc<Budget>,
+}
+/// Receiving end owned by the connection's writer task.
+#[derive(Debug)]
+pub struct OutboundReceiver {
+    rx: mpsc::UnboundedReceiver<Outbound>,
+    budget: Arc<Budget>,
+    overflow: watch::Receiver<bool>,
+}
+impl OutboundSender {
+    /// `limit` is the maximum number of still-uncompressed packet bytes queued for this
+    /// connection.
+    pub fn channel(limit: usize) -> (Self, OutboundReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (overflow_tx, overflow) = watch::channel(false);
+        let budget = Arc::new(Budget {
+            limit,
+            bytes: AtomicUsize::new(0),
+            overflow: AtomicBool::new(false),
+            overflow_tx,
+        });
+        (
+            Self {
+                tx,
+                budget: budget.clone(),
+            },
+            OutboundReceiver {
+                rx,
+                budget,
+                overflow,
+            },
+        )
+    }
+    /// Queue a packet without blocking. A full queue latches the connection into the
+    /// "Timed out" path and drops this packet.
+    pub fn send(&self, msg: Outbound) -> Result<(), SendError> {
+        if self.budget.overflowed() {
+            return Err(SendError::Closed);
+        }
+        let size = match &msg {
+            Outbound::Packet(body) => body.len(),
+            Outbound::Disconnect(_) => 0,
+        };
+        let previous = self.budget.bytes.fetch_add(size, Ordering::AcqRel);
+        if previous + size > self.budget.limit {
+            self.budget.bytes.fetch_sub(size, Ordering::AcqRel);
+            self.budget.mark_overflow();
+            return Err(SendError::Full);
+        }
+        if self.tx.send(msg).is_err() {
+            self.budget.bytes.fetch_sub(size, Ordering::AcqRel);
+            return Err(SendError::Closed);
+        }
+        Ok(())
+    }
+    pub fn is_overflowed(&self) -> bool {
+        self.budget.overflowed()
+    }
+}
+/// One step of the writer task: a queued packet, a latched overflow, or a closed queue.
+#[derive(Debug)]
+pub enum Incoming {
+    Message(Outbound),
+    Overflow,
+    Closed,
+}
+impl OutboundReceiver {
+    pub async fn recv(&mut self) -> Option<Outbound> {
+        let msg = self.rx.recv().await?;
+        self.release(&msg);
+        Some(msg)
+    }
+    pub fn try_recv(&mut self) -> Option<Outbound> {
+        let msg = self.rx.try_recv().ok()?;
+        self.release(&msg);
+        Some(msg)
+    }
+    fn release(&self, msg: &Outbound) {
+        if let Outbound::Packet(body) = msg {
+            self.budget.release(body.len());
+        }
+    }
+    /// Wait for the next packet. Cancel-safe: used directly inside the writer's `select!`.
+    /// A latched overflow wakes `next` even when packets are still queued, so the writer can
+    /// drop the backlog and deliver the disconnect promptly.
+    pub async fn next(&mut self) -> Incoming {
+        if self.budget.overflowed() {
+            return Incoming::Overflow;
+        }
+        tokio::select! {
+            msg = self.rx.recv() => match msg {
+                Some(msg) => {
+                    self.release(&msg);
+                    Incoming::Message(msg)
+                }
+                // All senders are gone and the queue is empty.
+                None => Incoming::Closed,
+            },
+            _ = self.overflow.changed() => Incoming::Overflow,
+        }
+    }
+    pub fn overflowed(&self) -> bool {
+        self.budget.overflowed()
+    }
+    /// Drop every queued packet and refund its budget. Used once the connection is closing.
+    pub fn discard(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.release(&msg);
+        }
+    }
 }
 pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> {
     let mut b = data;
@@ -125,6 +275,28 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
     })
 }
 
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queue_rejects_when_byte_budget_is_exhausted() {
+        let (tx, mut rx) = OutboundSender::channel(8);
+        let packet = || Outbound::Packet(Arc::from([0u8; 4].as_slice()));
+        tx.send(packet()).unwrap();
+        tx.send(packet()).unwrap();
+        assert_eq!(tx.send(packet()).unwrap_err(), SendError::Full);
+        assert!(rx.overflowed());
+        let incoming = tokio::time::timeout(std::time::Duration::from_secs(1), rx.next())
+            .await
+            .expect("overflow must wake the writer");
+        assert!(matches!(incoming, Incoming::Overflow));
+        // Overflow is latched: the connection is being torn down, so later packets are dropped.
+        assert_eq!(tx.send(packet()).unwrap_err(), SendError::Closed);
+        let first = rx.recv().await.unwrap();
+        assert!(matches!(first, Outbound::Packet(_)));
+        rx.discard();
+    }
+}
 #[cfg(test)]
 mod interaction_tests {
     use super::*;

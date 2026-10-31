@@ -1,13 +1,14 @@
 use super::{
     PluginEventPolicy,
     chunk::{ChunkSource, FlatGenerator},
+    commands::{XpOperation, XpUnit},
     valid_move,
 };
 use ferrite_entity::{
     BlockGetter, EntityRecord, EntityStore, Rng, item,
     tracker::{self, Viewer, ViewerKey},
 };
-use ferrite_net::game::{Outbound, ServerboundPlay, packet};
+use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
 use ferrite_plugin::InteractAction;
 use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
@@ -27,9 +28,33 @@ pub enum Command {
         yaw: Option<f32>,
         pitch: Option<f32>,
     },
+    World(super::commands_world::WorldCommand),
+    Clear {
+        target: Uuid,
+        target_name: String,
+        item: Option<u16>,
+        max_count: Option<i32>,
+        feedback: Option<OutboundSender>,
+    },
+    Give {
+        target: Uuid,
+        target_name: String,
+        item: u16,
+        count: i32,
+        item_name: String,
+        feedback: Option<OutboundSender>,
+    },
+    Experience {
+        target: Uuid,
+        target_name: String,
+        operation: XpOperation,
+        amount: i32,
+        unit: XpUnit,
+        feedback: Option<OutboundSender>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
-pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
+pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, OutboundSender)>>>;
 pub enum Signal {
     Transfer {
         from: ChunkPos,
@@ -117,10 +142,13 @@ pub struct Player {
     pub ground: bool,
     pub chunk: ChunkPos,
     pub mailbox: Mailbox,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
     pub gamemode: i32,
+    pub experience_level: i32,
+    pub experience_progress: f32,
+    pub experience_total: i32,
     pub inventory: ferrite_inventory::PlayerInventory,
     pub menus: super::container::Containers,
     pub breaking: Option<(i64, u32, u32)>,
@@ -259,6 +287,34 @@ fn event_allows(
         }
     }
 }
+/// Vanilla's total experience required to reach `level`.
+fn total_for_level(level: i32) -> i64 {
+    let level = i64::from(level.max(0));
+    if level <= 16 {
+        level * level + 6 * level
+    } else if level <= 31 {
+        (2.5 * level as f64 * level as f64 - 40.5 * level as f64 + 360.0) as i64
+    } else {
+        (4.5 * level as f64 * level as f64 - 162.5 * level as f64 + 2220.0) as i64
+    }
+}
+
+/// Level and bar progress for a total amount of experience.
+fn level_and_progress(total: i32) -> (i32, f32) {
+    let total = i64::from(total.max(0));
+    let mut level = 0;
+    while level < 21_863 && total >= total_for_level(level + 1) {
+        level += 1;
+    }
+    let base = total_for_level(level);
+    let next = total_for_level(level + 1);
+    let progress = if next > base {
+        ((total - base) as f32 / (next - base) as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (level, progress)
+}
 impl Player {
     pub fn refresh_chunks(&mut self) {
         send(
@@ -350,7 +406,7 @@ impl Player {
         send(self, &ChunkBatchStart);
         let count = chunks.len();
         for (x, z, packet) in chunks {
-            let _ = self.outbound.send(Outbound::Packet(packet));
+            let _ = self.outbound.send(Outbound::Packet(packet.into()));
             self.loaded.insert((x, z));
             if let Some((loaded, _)) = tracking.get_mut(&self.uuid) {
                 loaded.insert((x, z));
@@ -449,21 +505,25 @@ impl Player {
             );
         }
     }
-    fn change_block(&self, location: i64, expected: u32, state: u32) -> bool {
+    /// Applies a block change and tells every player tracking the chunk. `expected` keeps the
+    /// compare-and-set used by player interaction; commands pass `None`.
+    pub(crate) fn change_block(&self, location: i64, expected: Option<u32>, state: u32) -> bool {
         let pos = ferrite_protocol::types::BlockPos::unpack(location);
         let tracking = self.tracking.lock().unwrap();
         if self.source.as_ref().is_some_and(|source| {
             source
-                .compare_set_block(pos.x, pos.y, pos.z, Some(expected), state)
+                .compare_set_block(pos.x, pos.y, pos.z, expected, state)
                 .is_ok()
         }) {
             let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+            // One encoding, shared by every observer.
+            let update = packet(&BlockUpdate {
+                location,
+                block_state: VarInt(state as i32),
+            });
             for (loaded, outbound) in tracking.values() {
                 if loaded.contains(&chunk) {
-                    let _ = outbound.send(packet(&BlockUpdate {
-                        location,
-                        block_state: VarInt(state as i32),
-                    }));
+                    let _ = outbound.send(update.clone());
                 }
             }
             let _ = self.signals.send(Signal::FluidChange {
@@ -479,7 +539,7 @@ impl Player {
     /// Breaks a block (to air); an inventory block drops its contents (vanilla
     /// `Containers.dropContentsOnDestroy`).
     fn break_block(&mut self, location: i64, state: u32) -> bool {
-        if !self.change_block(location, state, 0) {
+        if !self.change_block(location, Some(state), 0) {
             return false;
         }
         if let Some(source) = &self.source {
@@ -589,7 +649,7 @@ impl Player {
         }) {
             return;
         }
-        let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
+        let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
@@ -615,6 +675,171 @@ impl Player {
         event_allows(self.plugins.as_deref(), self.plugin_event_errors, event)
     }
 
+    fn feedback(&self, feedback: Option<&OutboundSender>, text: String) {
+        match feedback {
+            Some(tx) => {
+                let _ = tx.send(packet(&SystemChat {
+                    content: ferrite_protocol::types::PlainText(text),
+                    overlay: false,
+                }));
+            }
+            None => tracing::info!("{text}"),
+        }
+    }
+    /// `/clear`: removes up to `max_count` matching items (all when `None`).
+    fn clear_items(
+        &mut self,
+        item: Option<u16>,
+        max_count: Option<i32>,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        let matches = |stack: &ferrite_item::ItemStack| {
+            !stack.is_empty() && item.is_none_or(|id| stack.item == id)
+        };
+        if max_count == Some(0) {
+            let found: i32 = (0..ferrite_inventory::SIZE)
+                .map(|slot| self.inventory.get(slot))
+                .filter(|stack| matches(stack))
+                .map(|stack| stack.count)
+                .sum();
+            let text = if found == 0 {
+                format!("No items were found on player {target_name}")
+            } else {
+                format!("Found {found} matching item(s) on player {target_name}")
+            };
+            self.feedback(feedback, text);
+            return;
+        }
+        let limit = max_count.unwrap_or(i32::MAX);
+        let mut removed = 0;
+        for slot in 0..ferrite_inventory::SIZE {
+            if removed >= limit {
+                break;
+            }
+            if !matches(self.inventory.get(slot)) {
+                continue;
+            }
+            let take = self.inventory.get(slot).count.min(limit - removed);
+            removed += self.inventory.remove(slot, take).count;
+        }
+        if removed == 0 {
+            self.feedback(
+                feedback,
+                format!("No items were found on player {target_name}"),
+            );
+            return;
+        }
+        self.sync_containers();
+        self.feedback(
+            feedback,
+            format!("Removed {removed} items from {target_name}"),
+        );
+    }
+    /// `/give`: places the stack back in the inventory, dropping what does not fit.
+    fn give_items(
+        &mut self,
+        item: u16,
+        count: i32,
+        item_name: &str,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        let leftover = self
+            .inventory
+            .place_back(ferrite_item::ItemStack::with_count(item, count));
+        let given = count - leftover.as_ref().map_or(0, |stack| stack.count);
+        if let Some(leftover) = leftover {
+            self.menus.thrown.push(leftover);
+        }
+        if given > 0 {
+            self.sync_containers();
+        }
+        self.feedback(
+            feedback,
+            format!("Gave {given} {item_name} to {target_name}"),
+        );
+    }
+    fn set_experience_total(&mut self, total: i64) {
+        let total = total.clamp(0, i64::from(i32::MAX)) as i32;
+        let (level, progress) = level_and_progress(total);
+        self.experience_total = total;
+        self.experience_level = level;
+        self.experience_progress = progress;
+    }
+    fn set_experience_level(&mut self, level: i32) {
+        let level = level.clamp(0, 21_863);
+        self.experience_level = level;
+        self.experience_progress = 0.0;
+        self.experience_total = total_for_level(level).min(i64::from(i32::MAX)) as i32;
+    }
+    /// `/xp`: add, set or query experience points/levels.
+    fn apply_experience(
+        &mut self,
+        operation: XpOperation,
+        amount: i32,
+        unit: XpUnit,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        if operation == XpOperation::Query {
+            let text = match unit {
+                XpUnit::Points => {
+                    format!("{target_name} has {} experience", self.experience_total)
+                }
+                XpUnit::Levels => format!(
+                    "{target_name} has {} experience levels",
+                    self.experience_level
+                ),
+            };
+            self.feedback(feedback, text);
+            return;
+        }
+        match (operation, unit) {
+            (XpOperation::Add, XpUnit::Points) => {
+                self.set_experience_total(i64::from(self.experience_total) + i64::from(amount));
+            }
+            (XpOperation::Add, XpUnit::Levels) => {
+                self.set_experience_level(self.experience_level.saturating_add(amount));
+            }
+            (XpOperation::Set, XpUnit::Points) => self.set_experience_total(i64::from(amount)),
+            (XpOperation::Set, XpUnit::Levels) => self.set_experience_level(amount),
+            (XpOperation::Query, _) => unreachable!(),
+        }
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+        let text = match operation {
+            XpOperation::Add if amount < 0 => match unit {
+                XpUnit::Points => format!(
+                    "Took {} experience from {target_name}",
+                    amount.unsigned_abs()
+                ),
+                XpUnit::Levels => {
+                    format!("Took {} levels from {target_name}", amount.unsigned_abs())
+                }
+            },
+            XpOperation::Add => match unit {
+                XpUnit::Points => format!("Gave {amount} experience to {target_name}"),
+                XpUnit::Levels => format!("Gave {amount} levels to {target_name}"),
+            },
+            XpOperation::Set => match unit {
+                XpUnit::Points => {
+                    format!("Set {target_name}'s experience to {amount}")
+                }
+                XpUnit::Levels => {
+                    format!("Set {target_name}'s experience level to {amount}")
+                }
+            },
+            XpOperation::Query => unreachable!(),
+        };
+        self.feedback(feedback, text);
+    }
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
@@ -676,6 +901,54 @@ impl Player {
                         }
                         self.teleport();
                         changed = true;
+                    }
+                    continue;
+                }
+                Command::World(command) => {
+                    super::commands_world::run(self, command);
+                    continue;
+                }
+                Command::Clear {
+                    target,
+                    target_name,
+                    item,
+                    max_count,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.clear_items(item, max_count, &target_name, feedback.as_ref());
+                    }
+                    continue;
+                }
+                Command::Give {
+                    target,
+                    target_name,
+                    item,
+                    count,
+                    item_name,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.give_items(item, count, &item_name, &target_name, feedback.as_ref());
+                    }
+                    continue;
+                }
+                Command::Experience {
+                    target,
+                    target_name,
+                    operation,
+                    amount,
+                    unit,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.apply_experience(
+                            operation,
+                            amount,
+                            unit,
+                            &target_name,
+                            feedback.as_ref(),
+                        );
                     }
                     continue;
                 }
@@ -952,15 +1225,15 @@ fn deliver(
     (uuid, session): ViewerKey,
     bytes: &[u8],
 ) {
-    let packet = Outbound::Packet(bytes.to_vec());
+    let packet = Outbound::Packet(bytes.to_vec().into());
     match players.get(&uuid) {
         Some(p) if p.session == session => {
-            let _ = p.outbound.send(packet);
+            let _ = p.outbound.send(packet.clone());
         }
         Some(_) => {}
         None => {
             if let Some((_, outbound)) = ctx.tracking.lock().unwrap().get(&uuid) {
-                let _ = outbound.send(packet);
+                let _ = outbound.send(packet.clone());
             }
         }
     }
@@ -1148,6 +1421,20 @@ impl Region {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn experience_curve_matches_vanilla_levels() {
+        assert_eq!(total_for_level(0), 0);
+        assert_eq!(total_for_level(1), 7);
+        assert_eq!(total_for_level(16), 352);
+        assert_eq!(total_for_level(17), 394);
+        assert_eq!(total_for_level(30), 1395);
+        assert_eq!(total_for_level(31), 1507);
+        assert_eq!(total_for_level(32), 1628);
+        assert_eq!(level_and_progress(394), (17, 0.0));
+        assert_eq!(level_and_progress(7), (1, 0.0));
+        assert!((level_and_progress(15).1 - 8.0 / 9.0).abs() < 1e-6);
+    }
+
     #[test]
     fn tick_records_a_region_scope_when_timings_are_attached() {
         let mut region = Region::default();

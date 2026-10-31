@@ -118,6 +118,12 @@ impl Player {
         emit(self, vec![full]);
     }
 
+    /// Broadcasts the current menu's changed slots (vanilla `broadcastChanges`).
+    pub fn sync_containers(&mut self) {
+        let out = self.menus.current().broadcast_changes(&self.inventory);
+        emit(self, out);
+    }
+
     /// Once per tick, like `ServerPlayer.tick`: `containerMenu.broadcastChanges()`, then the
     /// open menu closes if it is no longer valid.
     pub fn tick_containers(&mut self) {
