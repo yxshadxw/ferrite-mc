@@ -16,6 +16,26 @@ pub struct SeededNoise {
 }
 
 impl SeededNoise {
+    pub(crate) fn named_random(&self, name: &str) -> Box<dyn RandomSource> {
+        self.factory.from_hash_of(name)
+    }
+    pub(crate) fn positional_random(
+        &self,
+        name: Option<&str>,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Box<dyn RandomSource> {
+        if let Some(name) = name {
+            self.factory
+                .from_hash_of(name)
+                .fork_positional()
+                .at(x, y, z)
+        } else {
+            self.factory.at(x, y, z)
+        }
+    }
+
     pub fn new(data: &WorldgenData, seed: i64) -> Self {
         let mut source = XoroshiroRandomSource::new(seed);
         let factory = source.fork_positional();
