@@ -8,7 +8,7 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, ai,
+    BlockGetter, EntityRecord, EntityStore, Flags, Rng, ai, arrow, combat,
     effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
     experience, item,
     mob::{self, MobKind},
@@ -146,6 +146,8 @@ pub struct TickContext {
     pub rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
     /// World spawn, where a player without a bed respawns (`ServerPlayer.respawn`).
     pub spawn: [f64; 3],
+    /// Command-visible entity snapshot this region publishes at the end of each tick.
+    pub command_entities: Arc<Mutex<super::entity_index::EntityIndex>>,
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
 pub(super) struct TickBlocks<'a> {
@@ -273,6 +275,20 @@ pub struct Player {
     pub flat: bool,
     /// Set by `client_command` action 0 (`perform respawn`); the region performs it.
     pub respawn_requested: bool,
+    /// Network ids of entities this player attacked this tick.
+    pub attacks: Vec<i32>,
+    /// Ticks since the last swing, vanilla `attackStrengthTicker`.
+    pub attack_ticks: i32,
+    /// Whether a shield is raised (vanilla `LivingEntity.isBlocking`).
+    pub blocking: bool,
+    /// Ticks the shield stays disabled after an axe hit.
+    pub shield_disabled: i32,
+    /// Ticks a drawn bow has been held.
+    pub bow_charge: i32,
+    /// Whether the player is drawing a bow.
+    pub using_bow: bool,
+    /// The bow was released this tick; the region fires the arrow.
+    pub bow_released: bool,
 }
 #[derive(Default)]
 pub struct Region {
@@ -292,6 +308,8 @@ pub struct Region {
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
     rng: Rng,
+    /// UUIDs this region last published into `TickContext::command_entities`.
+    published_entities: HashSet<Uuid>,
 }
 impl RegionData for Region {
     fn merge(&mut self, mut other: Self) {
@@ -307,6 +325,7 @@ impl RegionData for Region {
         self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
+        self.published_entities.extend(other.published_entities);
         self.generator.merge(other.generator);
     }
     fn split(&mut self, sections: &HashSet<SectionPos>) -> Self {
@@ -341,6 +360,7 @@ impl RegionData for Region {
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
+            published_entities: HashSet::new(),
         };
         let moving: Vec<_> = self
             .held_chunks
@@ -708,6 +728,15 @@ impl Player {
         if let Some(source) = &self.source {
             for stack in super::block_container::take_contents(source, pos, state) {
                 self.menus.spilled.push((pos, stack));
+            }
+            let name = u16::try_from(state)
+                .ok()
+                .and_then(ferrite_data::blocks::state)
+                .map(|(name, _)| name);
+            if name.and_then(super::furnace::kind).is_some() {
+                for stack in super::furnace::take_contents(source, pos) {
+                    self.menus.spilled.push((pos, stack));
+                }
             }
         }
         true
@@ -1087,6 +1116,42 @@ impl Player {
         self.experience_level = level;
         self.experience_progress = progress;
     }
+    /// Adds experience points, as taking a furnace result or a grindstone output does (vanilla
+    /// `Player.giveExperiencePoints`). Fractional points are rounded down, like vanilla's
+    /// `Mth.floor` of the accumulated recipe experience.
+    pub fn add_experience(&mut self, points: f32) {
+        let points = points.floor();
+        if !points.is_finite() || points <= 0.0 {
+            return;
+        }
+        self.set_experience_total(i64::from(self.experience_total) + points as i64);
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+    }
+
+    /// Spends experience levels, as taking an anvil result does (vanilla
+    /// `Player.giveExperienceLevels(-cost)`).
+    pub fn spend_levels(&mut self, levels: i32) {
+        if levels <= 0 {
+            return;
+        }
+        self.set_experience_level(self.experience_level.saturating_sub(levels));
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+    }
+
     fn set_experience_level(&mut self, level: i32) {
         let level = level.clamp(0, 21_863);
         self.experience_level = level;
@@ -1457,6 +1522,19 @@ impl Player {
         if self.use_potion(slot) {
             return;
         }
+        // Vanilla `LivingEntity.startUsingItem`: a shield raises, a bow starts drawing.
+        match stack.name() {
+            Some("minecraft:shield") if self.shield_disabled == 0 => {
+                self.blocking = true;
+                return;
+            }
+            Some("minecraft:bow") => {
+                self.using_bow = true;
+                self.bow_charge = 0;
+                return;
+            }
+            _ => {}
+        }
         let Some(ferrite_item::Component::Food(food)) =
             stack.effective_component(ferrite_item::component_ids::FOOD)
         else {
@@ -1554,6 +1632,29 @@ impl Player {
         );
         self.survival.eating = None;
         self.sync_health();
+    }
+
+    /// Vanilla `LivingEntity.isDamageSourceBlocked`: a raised shield facing the attacker
+    /// stops the hit. The caller applies the shield's knockback and cooldown.
+    pub(crate) fn blocks_damage_from(&self, source: [f64; 3]) -> bool {
+        if !self.blocking || self.shield_disabled > 0 {
+            return false;
+        }
+        combat::shield_blocks(
+            self.yaw,
+            ferrite_math::Vec3::new(self.pos[0], self.pos[1], self.pos[2]),
+            ferrite_math::Vec3::new(source[0], source[1], source[2]),
+        )
+    }
+
+    /// `LivingEntity.releaseUsingItem`: a drawn bow fires and a raised shield drops.
+    fn release_use(&mut self) {
+        if self.using_bow {
+            self.bow_released = true;
+            self.using_bow = false;
+        }
+        self.blocking = false;
+        self.survival.eating = None;
     }
 
     /// Vanilla `ServerPlayer.respawn`: a fresh survival state at the world spawn. The client
@@ -1659,6 +1760,11 @@ impl Player {
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
+        }
+        self.attack_ticks = self.attack_ticks.saturating_add(1).min(40);
+        self.shield_disabled = self.shield_disabled.saturating_sub(1);
+        if self.using_bow && !self.survival.dead {
+            self.bow_charge = self.bow_charge.saturating_add(1).min(20);
         }
         let mut commands: VecDeque<_> = self.mailbox.lock().unwrap().drain(..).collect();
         let start = self.pos;
@@ -1851,14 +1957,24 @@ impl Player {
                 Command::Input(msg) => msg,
             };
             match msg {
-                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3 | 4 | 6) => {
+                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3..=6) => {
                     match p.status.0 {
                         3 => self.drop_selected(true),
                         4 => self.drop_selected(false),
+                        5 => self.release_use(),
                         _ => self.swap_hands(),
                     }
                 }
+                ServerboundPlay::Attack(p) => self.attacks.push(p.entity_id.0),
+                ServerboundPlay::Interact(p) => {
+                    // The secondary action is a right-click; an attack is the primary hand.
+                    if !p.using_secondary_action && p.hand.0 == 0 {
+                        self.attacks.push(p.entity_id.0);
+                    }
+                }
                 ServerboundPlay::ContainerClick(p) => self.handle_container_click(p),
+                ServerboundPlay::ContainerButtonClick(p) => self.handle_container_button(p),
+                ServerboundPlay::RenameItem(p) => self.rename_item(p.name),
                 ServerboundPlay::ContainerClose(_) => self.close_container(),
                 ServerboundPlay::PlayerAction(p) => {
                     let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
@@ -2033,6 +2149,9 @@ impl Player {
                 ServerboundPlay::SetHeldItem(p) => {
                     // Vanilla `handleSetCarriedItem` ignores slots outside the hotbar.
                     if (0..=8).contains(&p.slot) {
+                        self.using_bow = false;
+                        self.bow_charge = 0;
+                        self.blocking = false;
                         self.inventory.selected = p.slot as usize;
                     }
                 }
@@ -2209,14 +2328,60 @@ impl Region {
     }
     /// Ticks the modelled mobs: goals, movement, fall damage, despawn, natural spawning and
     /// death loot.
-    fn tick_mobs(&mut self, blocks: &TickBlocks<'_>) {
-        let players: Vec<_> = self
+    fn tick_mobs(&mut self, ctx: &TickContext, blocks: &TickBlocks<'_>) {
+        let positions: Vec<_> = self
             .players
             .values()
             .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
             .collect();
-        ai::tick(&mut self.entities, blocks, &players, &mut self.rng);
-        for record in spawn::natural_spawn(&self.entities, blocks, &players, &mut self.rng, 1) {
+        let targets: Vec<_> = self
+            .players
+            .values()
+            .map(|p| ai::Target {
+                uuid: p.uuid,
+                pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+            })
+            .collect();
+        for event in ai::tick_with(&mut self.entities, blocks, &targets, &mut self.rng) {
+            match event {
+                ai::MobEvent::Melee {
+                    player,
+                    damage,
+                    from,
+                    attacker,
+                } => self.damage_player(player, damage, DamageKind::Mob, from, Some(attacker)),
+                ai::MobEvent::Arrow {
+                    from,
+                    direction,
+                    damage,
+                } => {
+                    let speed = arrow::SPEED;
+                    let vel = ferrite_math::Vec3::new(
+                        direction.x * speed,
+                        direction.y * speed,
+                        direction.z * speed,
+                    );
+                    let record = arrow::new_arrow(from, vel, damage, None, &mut self.rng);
+                    self.entities.insert(record);
+                }
+                ai::MobEvent::Explode { center, power } => {
+                    self.explode([center.x, center.y, center.z], power, ctx);
+                    if let Some(source) = ctx.source.as_deref() {
+                        let mut broken = Vec::new();
+                        self.apply_neighbor_updates(source, ctx, &mut broken);
+                        for (pos, state) in broken {
+                            self.spawn_block_drops(pos, state);
+                        }
+                    }
+                }
+            }
+        }
+        for record in spawn::natural_spawn(&self.entities, blocks, &positions, &mut self.rng, 1) {
+            self.entities.insert(record);
+        }
+        for record in
+            spawn::natural_spawn_monsters(&self.entities, blocks, &positions, &mut self.rng, 1)
+        {
             self.entities.insert(record);
         }
         // Mobs that died this tick drop their entity loot table once (vanilla
@@ -2250,6 +2415,233 @@ impl Region {
             }
         }
     }
+    /// Resolves this tick's `serverbound_attack` swings: reach, weapon damage and attack
+    /// strength, critical hits, sweeping, knockback and the hurt animation. A drawn bow that
+    /// was released this tick fires its arrow first.
+    fn resolve_attacks(&mut self, ctx: &TickContext) {
+        struct Pending {
+            uuid: Uuid,
+            attacks: Vec<i32>,
+            ticks: i32,
+            bow: Option<(f32, f32, f32)>,
+        }
+        let mut pending = Vec::new();
+        for (&uuid, p) in self.players.iter_mut() {
+            let attacks = std::mem::take(&mut p.attacks);
+            let released = std::mem::take(&mut p.bow_released);
+            if attacks.is_empty() && !released {
+                continue;
+            }
+            let bow = released.then(|| {
+                let charge = (p.bow_charge as f32 / 20.0).clamp(0.0, 1.0);
+                (charge, p.yaw, p.pitch)
+            });
+            // Every swing resets the attack-strength ticker, even when nothing is hit.
+            let ticks = p.attack_ticks;
+            p.attack_ticks = 0;
+            pending.push(Pending {
+                uuid,
+                attacks,
+                ticks,
+                bow,
+            });
+        }
+        for Pending {
+            uuid,
+            attacks,
+            ticks,
+            bow,
+        } in pending
+        {
+            if let Some((charge, yaw, pitch)) = bow
+                && charge >= 0.1
+            {
+                self.fire_bow(uuid, charge, yaw, pitch);
+            }
+            if attacks.is_empty() {
+                continue;
+            }
+            let Some(p) = self.players.get(&uuid) else {
+                continue;
+            };
+            if p.survival.dead || p.gamemode == 3 {
+                continue;
+            }
+            let stack = p.inventory.selected_item().clone();
+            let stats = combat::weapon_stats(&stack);
+            let strength = combat::attack_strength(ticks, stats.attack_speed);
+            let sword = combat::is_sword(&stack);
+            let mut damage = stats.attack_damage * combat::damage_scale(strength);
+            let critical =
+                combat::can_critical(p.ground, p.survival.fall_distance, p.survival.sprinting);
+            if critical {
+                damage *= combat::CRITICAL_MULTIPLIER;
+            }
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let eye = combat::eye_position(feet);
+            let look = combat::look_vector(p.yaw, p.pitch);
+            let range = if p.gamemode == 1 {
+                combat::CREATIVE_ENTITY_RANGE
+            } else {
+                combat::ENTITY_RANGE
+            };
+            let mut hurt_keys = Vec::new();
+            for id in attacks {
+                let Some(key) = self.entities.key_of(id) else {
+                    continue;
+                };
+                let (Some(bbox), Some(target)) = (self.entities.bbox(key), self.entities.pos(key))
+                else {
+                    continue;
+                };
+                if !combat::within_reach(eye, bbox, range) || !combat::facing(eye, look, target) {
+                    continue;
+                }
+                let Some(hurt) = mob::hurt(&mut self.entities, key, damage as f32, Some(feet))
+                else {
+                    continue;
+                };
+                mob::retaliate(&mut self.entities, key, uuid);
+                hurt_keys.push((key, critical));
+                // Sweeping: a sword at full charge on the ground hits everything around the
+                // target for 1.0 (`Player.attack`'s `sweepAttack`).
+                if matches!(hurt, mob::Hurt::Survived { .. } | mob::Hurt::Died)
+                    && combat::can_sweep(sword, strength, p.ground, p.survival.sprinting)
+                {
+                    for other in self.entities.query_vec(bbox.inflate(1.0, 0.25, 1.0)) {
+                        if other == key || !mob::is_mob(&self.entities, other) {
+                            continue;
+                        }
+                        mob::hurt(&mut self.entities, other, combat::SWEEP_DAMAGE, Some(feet));
+                    }
+                }
+            }
+            for (key, critical) in hurt_keys {
+                let Some(data) = self.entities.data(key) else {
+                    continue;
+                };
+                let id = VarInt(data.id);
+                let yaw = data.yaw;
+                let players = &self.players;
+                tracker::broadcast(
+                    &self.entities,
+                    key,
+                    &HurtAnimation { id, yaw },
+                    &mut |viewer, bytes| deliver(players, ctx, viewer, bytes),
+                );
+                if critical {
+                    tracker::broadcast(
+                        &self.entities,
+                        key,
+                        &Animate { id, action: 4 },
+                        &mut |viewer, bytes| deliver(players, ctx, viewer, bytes),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fires an arrow from a released bow (vanilla `BowItem.releaseUsing`): speed and damage
+    /// scale with the draw, and a full draw is critical.
+    fn fire_bow(&mut self, uuid: Uuid, charge: f32, yaw: f32, pitch: f32) {
+        let Some(p) = self.players.get(&uuid) else {
+            return;
+        };
+        let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+        let eye = combat::eye_position(feet);
+        let direction = combat::look_vector(yaw, pitch);
+        let speed = f64::from(charge) * arrow::SPEED;
+        let vel = ferrite_math::Vec3::new(
+            direction.x * speed,
+            direction.y * speed,
+            direction.z * speed,
+        );
+        let start = ferrite_math::Vec3::new(
+            eye.x + direction.x * 0.3,
+            eye.y + direction.y * 0.3 - 0.1,
+            eye.z + direction.z * 0.3,
+        );
+        let damage = combat::arrow_damage(charge, charge >= 1.0);
+        let record = arrow::new_arrow(start, vel, damage, Some(uuid), &mut self.rng);
+        self.entities.insert(record);
+    }
+
+    /// Applies damage to a player of this region, honouring a raised shield (vanilla
+    /// `LivingEntity.hurt` after `isDamageSourceBlocked`).
+    fn damage_player(
+        &mut self,
+        uuid: Uuid,
+        amount: f32,
+        kind: DamageKind,
+        from: ferrite_math::Vec3,
+        attacker: Option<ferrite_entity::EntityKey>,
+    ) {
+        let Some(p) = self.players.get_mut(&uuid) else {
+            return;
+        };
+        if p.blocks_damage_from([from.x, from.y, from.z]) {
+            // A blocked hit costs no health: the shield is disabled for its cooldown and the
+            // attacker is knocked back (`LivingEntity.blockUsingShield`).
+            p.shield_disabled = 5;
+            if let Some(attacker) = attacker {
+                let source = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                mob::knockback(&mut self.entities, attacker, source);
+            }
+            return;
+        }
+        if p.hurt(kind, amount) {
+            // Vanilla `Mob.doHurtTarget` knocks the hurt player away from the attacker.
+            let dx = p.pos[0] - from.x;
+            let dz = p.pos[2] - from.z;
+            let length = (dx * dx + dz * dz).sqrt().max(1.0e-4);
+            let y = if p.ground { 0.4 } else { 0.0 };
+            send(
+                p,
+                &SetEntityMotion {
+                    id: VarInt(p.entity),
+                    velocity: ferrite_protocol::types::LpVec3([
+                        dx / length * 0.4,
+                        y,
+                        dz / length * 0.4,
+                    ]),
+                },
+            );
+        }
+    }
+
+    /// Advances arrow flight and applies arrow hits to the players of this region.
+    fn tick_arrows(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let players: Vec<(Uuid, ferrite_math::AABB)> = self
+            .players
+            .values()
+            .map(|p| {
+                (
+                    p.uuid,
+                    ferrite_math::AABB::new(
+                        p.pos[0] - 0.3,
+                        p.pos[1],
+                        p.pos[2] - 0.3,
+                        p.pos[0] + 0.3,
+                        p.pos[1] + 1.8,
+                        p.pos[2] + 0.3,
+                    ),
+                )
+            })
+            .collect();
+        for hit in arrow::tick_arrows(&mut self.entities, &blocks, &players) {
+            if let Some(p) = self.players.get_mut(&hit.uuid) {
+                p.hurt(DamageKind::Arrow, hit.damage);
+            }
+        }
+    }
+
     /// Runs the neighbor updates of this tick's block changes (vanilla
     /// `Level.markAndNotifyBlock` -> `Block.updateNeighbourShapes`). Unsupported blocks break
     /// here; their loot drops as item entities through the normal loot tables.
@@ -2858,7 +3250,9 @@ impl Region {
             seen: Default::default(),
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
-        self.tick_mobs(&blocks);
+        self.resolve_attacks(ctx);
+        self.tick_arrows(ctx);
+        self.tick_mobs(ctx, &blocks);
         let alive: Vec<ferrite_math::Vec3> = self
             .players
             .values()
@@ -2882,6 +3276,59 @@ impl Region {
                 entity: Box::new(entity),
             });
         }
+        self.publish_command_entities(&ctx.command_entities);
+    }
+
+    /// Publishes this region's entities for command selectors. Folia keeps the store region
+    /// local; commands read the snapshot and route mutations back to this region.
+    fn publish_command_entities(&mut self, index: &Arc<Mutex<super::entity_index::EntityIndex>>) {
+        index
+            .lock()
+            .unwrap()
+            .sync(&mut self.published_entities, &self.entities);
+    }
+
+    /// Marks one entity for removal (`/kill`). The tracker still sends the remove packet and
+    /// the normal sweep drops it on this tick or the next.
+    pub fn kill_entity(&mut self, uuid: Uuid) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::REMOVED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
+    }
+
+    /// Moves one entity (`/tp`). When the destination left this region section, the normal
+    /// `take_crossing` pass hands it to the owning region by value on the next tick.
+    pub fn teleport_entity(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) -> bool {
+        let key = self.entities.keys().iter().copied().find(|key| {
+            self.entities
+                .data(*key)
+                .is_some_and(|data| data.uuid == uuid)
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        self.entities
+            .set_pos(key, ferrite_math::Vec3::new(pos[0], pos[1], pos[2]));
+        if let Some(data) = self.entities.data_mut(key) {
+            data.yaw = yaw;
+            data.pitch = pitch;
+            data.head_yaw = yaw;
+        }
+        if let Some(flags) = self.entities.flags_mut(key) {
+            flags.set(Flags::TELEPORTED, true);
+            flags.set(Flags::NEEDS_SYNC, true);
+        }
+        true
     }
 }
 #[cfg(test)]
@@ -2916,6 +3363,7 @@ mod tests {
             raining: false,
             rules: Default::default(),
             spawn: [0.0, 65.0, 0.0],
+            command_entities: Default::default(),
         });
 
         let report = timings.report_all(50.0);
@@ -2923,6 +3371,36 @@ mod tests {
             report.rows.iter().any(|row| row.path == "region-tick"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn kill_and_teleport_apply_to_region_entities_and_hand_off() {
+        use ferrite_entity::{EntityData, EntityRecord, allocate_id, random_uuid};
+        use ferrite_math::Vec3;
+        let mut region = Region::default();
+        let record = |x: f64| EntityRecord {
+            pos: Vec3::new(x, 64.0, 0.5),
+            vel: Vec3::ZERO,
+            flags: Flags::default(),
+            data: EntityData::new(allocate_id(), random_uuid(), 71, 0.25, 0.25),
+        };
+
+        let key = region.entities.insert(record(1.5));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.kill_entity(uuid));
+        assert!(region.entities.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(region.entities.sweep_removed().len(), 1);
+
+        // Teleporting across the default region section hands the record to the owner of the
+        // destination chunk on the next crossing pass.
+        let key = region.entities.insert(record(250.0));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.teleport_entity(uuid, [300.5, 64.0, 0.5], 90.0, 10.0));
+        assert_eq!(region.entities.data(key).unwrap().yaw, 90.0);
+        assert!(region.entities.flags(key).unwrap().has(Flags::TELEPORTED));
+        let out = region.entities.take_crossing();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk(), (18, 0));
     }
 
     #[test]

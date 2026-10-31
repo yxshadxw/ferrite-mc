@@ -73,6 +73,45 @@ impl<S> CommandDispatcher<S> {
         self.nodes.len()
     }
 
+    /// The root's literal children, in registration order (`/help` lists these).
+    pub fn root_literals(&self) -> Vec<(&str, NodeId)> {
+        self.node(ROOT)
+            .children()
+            .iter()
+            .filter_map(|id| match self.node(*id).kind() {
+                NodeKind::Literal(name) => Some((name.as_str(), *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The first full usage string below `id`, e.g. `tp <targets> <location>`.
+    pub fn first_usage(&self, id: NodeId) -> Option<String> {
+        fn walk<S>(
+            dispatcher: &CommandDispatcher<S>,
+            id: NodeId,
+            path: &mut Vec<String>,
+            result: &mut Option<String>,
+        ) {
+            if result.is_some() {
+                return;
+            }
+            let node = dispatcher.node(id);
+            if node.is_executable() {
+                *result = Some(path.join(" "));
+                return;
+            }
+            for child in node.children() {
+                path.push(dispatcher.node(*child).usage_text());
+                walk(dispatcher, *child, path, result);
+                path.pop();
+            }
+        }
+        let mut result = None;
+        walk(self, id, &mut Vec::new(), &mut result);
+        result
+    }
+
     /// Adds a top-level command, merging with an existing one of the same name.
     pub fn register(&mut self, builder: NodeBuilder<S>) -> NodeId {
         self.add_child(ROOT, builder)

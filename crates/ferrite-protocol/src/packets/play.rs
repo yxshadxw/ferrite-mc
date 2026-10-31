@@ -386,6 +386,14 @@ packet!(UseItemOn,66,Serverbound,{hand:VarInt,location:i64,face:VarInt,cursor_x:
 packet!(BlockUpdate,8,Clientbound,{location:i64,block_state:VarInt});
 packet!(AcknowledgeBlockChange,4,Clientbound,{sequence:VarInt});
 packet!(SetHeldItem,54,Serverbound,{slot:i16});
+// Vanilla `ServerboundAttackPacket`: left-click on an entity, by network id.
+packet!(ServerboundAttack,1,Serverbound,{entity_id:VarInt});
+// Vanilla `ServerboundInteractPacket`: use or attack an entity at a point in its box.
+packet!(ServerboundInteract,26,Serverbound,{entity_id:VarInt,hand:VarInt,x:f64,y:f64,z:f64,using_secondary_action:bool});
+// Vanilla `ClientboundHurtAnimationPacket`: `yaw` is the hurt direction in degrees.
+packet!(HurtAnimation,43,Clientbound,{id:VarInt,yaw:f32});
+// Vanilla `ClientboundAnimatePacket`: 4 = critical hit, 5 = magic critical hit.
+packet!(Animate,2,Clientbound,{id:VarInt,action:u8});
 
 /// Packets carrying item stacks are generic over the stack type: this crate cannot depend on
 /// `ferrite-item`, whose full `ItemStack` (and `HashedSlot`) implement `Encode`/`Decode` behind
@@ -419,6 +427,13 @@ packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
 packet!(ClientboundContainerClose,17,Clientbound,{window:VarInt});
 packet!(SetHeldSlot,107,Clientbound,{slot:VarInt});
 packet!(OpenScreen,60,Clientbound,{window:VarInt,menu:VarInt,title:crate::types::Translatable});
+// Vanilla `ClientboundContainerSetDataPacket`: one menu property (furnace lit/progress, anvil
+// cost, enchanting costs and seed, stonecutter selection).
+packet!(ContainerSetData,19,Clientbound,{window:VarInt,id:i16,value:i16});
+// Vanilla `ServerboundContainerButtonClickPacket`: enchant choice, stonecutter recipe, ...
+packet!(ContainerButtonClick,17,Serverbound,{window:VarInt,button:VarInt});
+// Vanilla `ServerboundRenameItemPacket` (anvil): the name field is capped at 50 by the server.
+packet!(RenameItem,49,Serverbound,{name:String});
 
 /// Vanilla `ServerboundContainerClickPacket.MAX_SLOT_COUNT`.
 pub const CONTAINER_CLICK_MAX_SLOTS: usize = 128;
@@ -1131,6 +1146,18 @@ mod interaction_tests {
             menu: VarInt(12),
             title: crate::types::Translatable("container.crafting".into()),
         });
+        roundtrip(ContainerSetData {
+            window: VarInt(1),
+            id: 4,
+            value: 200,
+        });
+        roundtrip(ContainerButtonClick {
+            window: VarInt(1),
+            button: VarInt(7),
+        });
+        roundtrip(RenameItem {
+            name: "Excalibur".into(),
+        });
         // More than 128 changed slots is rejected like vanilla.
         let mut bytes = Vec::new();
         ContainerClick::<ItemStack> {
@@ -1176,6 +1203,25 @@ mod interaction_tests {
             sequence: VarInt(3),
         });
         roundtrip(SetHeldItem { slot: 2 });
+        roundtrip(ServerboundAttack {
+            entity_id: VarInt(9),
+        });
+        roundtrip(ServerboundInteract {
+            entity_id: VarInt(9),
+            hand: VarInt(0),
+            x: 0.25,
+            y: 1.5,
+            z: -0.5,
+            using_secondary_action: true,
+        });
+        roundtrip(HurtAnimation {
+            id: VarInt(9),
+            yaw: 45.0,
+        });
+        roundtrip(Animate {
+            id: VarInt(9),
+            action: 4,
+        });
         roundtrip(CreativeSlot {
             slot: 36,
             item: ItemStack {

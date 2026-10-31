@@ -15,6 +15,7 @@
 //! follow the regionizer, and [`EntityStore::take_crossing`] removes entities that walked into
 //! another region section so the caller can hand them to the owner of their new chunk.
 
+use crate::arrow::ArrowState;
 use crate::effect::ActiveEffects;
 use crate::experience::OrbState;
 use crate::id::EntityKey;
@@ -24,7 +25,7 @@ use crate::metadata::Metadata;
 use crate::mob::MobState;
 use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
 /// Chunk shift of a region section, matching `ferrite_region::Regionizer::default()`.
@@ -82,6 +83,8 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Arrow state, for `minecraft:arrow`.
+    pub arrow: Option<ArrowState>,
     /// Living state, for the modelled mobs.
     pub mob: Option<MobState>,
     /// Experience-orb state, for `minecraft:experience_orb`.
@@ -92,6 +95,8 @@ pub struct EntityData {
     pub block_state: Option<u16>,
     /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
     pub fuse: Option<i32>,
+    /// Scoreboard tags (`/tag`), which entity selectors match with `tag=`.
+    pub tags: BTreeSet<String>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -114,11 +119,13 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            arrow: None,
             mob: None,
             orb: None,
             effects: ActiveEffects::default(),
             block_state: None,
             fuse: None,
+            tags: BTreeSet::new(),
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }

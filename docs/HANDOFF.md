@@ -1,3 +1,5 @@
+> **Coordinator:** how to run the orchestration (start workers, merge, push) is in
+> [`docs/handoff/coordinator-guide.md`](handoff/coordinator-guide.md).
 > **Newest:** the Day 6 end state (what is on main, snapshot branches, unstarted tasks, how to resume) is in
 > [`docs/handoff/day6-session-record.md`](handoff/day6-session-record.md).
 
@@ -294,3 +296,81 @@ the compat report on the WIP branches lists what real plugins still need). Workt
 - The rest of the `Server` stubs and NMS-typed CraftBukkit methods (`CraftItemStack.asNMSCopy`,
   `CraftWorld#getHandle`, `CraftMagicNumbers`) remain; client-facing tab completion still goes
   through the Rust dispatcher, not plugin `TabCompleter`s.
+
+---
+
+# Day 7 (2026-11-01) — OC4 takeover: plugin region scheduler
+
+Branch `yxshadxw/oc4` on top of `c0c2835`. Finishes the Day 6 `wip/day6-oc4` bridge work that was
+left half-done when the opencode session hit its quota.
+
+## On the branch
+- `Bootstrap.startServer()` creates the Bukkit server without enabling plugins; the host publishes
+  the main world and then calls `Bootstrap.enablePlugins`, so `onEnable` already sees
+  `getWorlds()`.
+- Every accepted movement refreshes the Bukkit player snapshot
+  (`ServerHooks::update_player_location` -> `Bootstrap.updatePlayerLocation`), and
+  `registerPlayer` updates the existing `FerritePlayer` instead of replacing it, so plugin-held
+  `Player` references stay valid.
+- Paper's region scheduler is live: `PluginHost::take_region_tasks` returns due tasks to the game
+  loop, which schedules each on the region owning its chunk. Bukkit's sync scheduler and Paper's
+  global scheduler run on the global tick; `runTaskAsynchronously`,
+  `runTaskLaterAsynchronously` and `runTaskTimerAsynchronously` run on the async scheduler.
+- The typical fixture schedules through `RegionScheduler#run`, `runTask`, `runTaskLater`,
+  `runTaskTimer`, `runTaskAsynchronously`, `runTaskLaterAsynchronously` and
+  `runTaskTimerAsynchronously`, and asserts `/typical where` after a move plus `/typical give`
+  through `Native.playerInventory`.
+
+## Checks
+Final run on the merged tree (`origin/main` at `ac58ab3`, merge `2e5aeeb`):
+- `cargo test --workspace --no-fail-fast`: **1012 passed, 1 failed, 2 ignored** across 105 test
+  binaries. The one failure is `game::integration::chest_contents_are_shared_saved_and_spilled_when_broken`,
+  which times out its 20 s pickup deadline only under full-suite load; it passes alone (1/1, 23 s).
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`: clean.
+- `cargo test -p ferrite-server --test plugin_lifecycle`: 2/2 (129 s), also covered by the merge
+  run above.
+- Load-sensitive runs on this machine also aborted the `ferrite-worldgen` Java harness
+  (`carver::tests::mask_matches_26_3_java_harness`, 1/1 alone in 134.6 s) and once failed
+  `java_differential` with `STATUS_DLL_INIT_FAILED`; both pass alone and in an unloaded full run.
+
+## Startup note
+On this machine a debug server spends about 80 s loading the vanilla registry and 60 s preloading
+1,763 recipes before it accepts logins, so the lifecycle test allows 300 s for the first response
+(all plugin assertions keep their 60 s deadlines). If startup regresses further, profile
+`RuntimeRegistry::load` and `crafting::preload` instead of raising the deadline again.
+
+## Day 7 orchestration record (2026-11-01)
+
+`origin/main` = `bf2f8fd`. The whole workspace suite is green (105 test binaries, all passed) and
+`clippy -D warnings` / `fmt --check` are clean; that run was made on the oc8 branch tree, which is
+identical to `main` apart from `README.md`.
+
+Merged this session:
+
+| Merge | Content |
+|---|---|
+| `b8ef576` | oc7 containers: furnace/blast furnace/smoker smelting, anvil repair/rename/cost, enchanting, grindstone, stonecutter, smithing, loom |
+| `ac58ab3` | oc5 hostile mobs (zombie, skeleton, spider, creeper, enderman) with goals and block-grid pathfinding, arrows, player combat (crits, sweep, knockback, shield), monster spawning |
+| `d082d3c` | oc4 plugin bridge: plugin region tasks routed through the region scheduler, world/player snapshots, `Native.playerInventory` |
+| `e94a34c` | oc8 commands: `locate`, `datapack`, `help`, `schedule`, `trigger`, `reload`, entity selectors from the region stores, selector options |
+| `bf2f8fd` | oc8 follow-up: `@e[type=#tag]` resolves through the entity type tags and rejects unknown tags/types |
+
+Two test fixes were needed on the way: `commands_packet_decodes_and_filters_permissions` now
+decodes every parser property and suggestion type (the new `/help` word argument broke the old
+decoder), and the oc5 merge kept both the `RenameItem` and `Attack`/`Interact` packet arms.
+
+`README.md` was rewritten (`d88dc52`) around a done / in-progress / missing status table so the
+state of the project can be read at a glance.
+
+### Still open
+
+- **Worldgen throughput (oc6) is not done.** The worker reported `worker_done` with outcome
+  `failed`: `yxshadxw/oc6` at `6e28734` only adds the benchmark scaffolding (`rayon` in the
+  workspace dependencies, genbench framing); there is no density cache and no parallel chunk pool.
+  `cargo test -p ferrite-worldgen` passed 60/60 on that branch. Next: merge `main`, implement the
+  cache reuse plus a bounded chunk worker pool with byte-identical output, and measure
+  `crates/ferrite-worldgen/examples/genbench.rs` against the 69-chunks-in-30-s baseline before
+  starting tree features. The oc6 terminal is wedged on a 6,334-character input overlay and does
+  not accept new prompts, so it needs a fresh session.
+- **Pistons** (`task_94b5018a1e91`) and **plugin API breadth** (`task_0c86a661ea7c`) are created
+  but not started; the oc7 and oc4 sessions went idle, and oc4 hit its quota.

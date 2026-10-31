@@ -19,6 +19,10 @@ pub enum ServerboundPlay {
     CreativeSlot(CreativeSlot<ferrite_item::ItemStack>),
     ContainerClick(ContainerClick<ferrite_item::HashedSlot>),
     ContainerClose(i32),
+    /// Vanilla `ServerboundContainerButtonClickPacket` (enchant choice, stonecutter recipe).
+    ContainerButtonClick(ContainerButtonClick),
+    /// Vanilla `ServerboundRenameItemPacket` (anvil).
+    RenameItem(RenameItem),
     Position(MovePosition),
     PositionRotation(MovePositionRotation),
     Rotation(MoveRotation),
@@ -37,6 +41,10 @@ pub enum ServerboundPlay {
     ClientCommand(ferrite_protocol::packets::play::ServerboundClientCommand),
     /// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating, throwing, ...).
     UseItem(Box<ferrite_protocol::packets::play::ServerboundUseItem>),
+    /// Vanilla `ServerboundAttackPacket`: left-click on an entity.
+    Attack(ferrite_protocol::packets::play::ServerboundAttack),
+    /// Vanilla `ServerboundInteractPacket`: use or attack an entity at a point in its box.
+    Interact(ferrite_protocol::packets::play::ServerboundInteract),
 }
 #[derive(Debug)]
 pub enum GameMessage {
@@ -266,9 +274,19 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         18 => Some(ServerboundPlay::ContainerClick(ContainerClick::decode(
             &mut b,
         )?)),
+        17 => Some(ServerboundPlay::ContainerButtonClick(
+            ContainerButtonClick::decode(&mut b)?,
+        )),
         19 => Some(ServerboundPlay::ContainerClose(
             ServerboundContainerClose::decode(&mut b)?.window.0,
         )),
+        1 => Some(ServerboundPlay::Attack(
+            ferrite_protocol::packets::play::ServerboundAttack::decode(&mut b)?,
+        )),
+        26 => Some(ServerboundPlay::Interact(
+            ferrite_protocol::packets::play::ServerboundInteract::decode(&mut b)?,
+        )),
+        49 => Some(ServerboundPlay::RenameItem(RenameItem::decode(&mut b)?)),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
         42 => Some(ServerboundPlay::PlayerCommand(
             ServerboundPlayerCommand::decode(&mut b)?,

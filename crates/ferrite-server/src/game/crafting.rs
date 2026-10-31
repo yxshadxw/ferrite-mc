@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ferrite_inventory::{Crafter, NoCrafting};
+use ferrite_inventory::{CookingOutput, Crafter, FurnaceKind, NoCrafting};
 use ferrite_item::ItemStack;
-use ferrite_recipe::RecipeBook;
+use ferrite_recipe::{CookingKind, RecipeBook, RecipeKind};
 
 /// Vanilla `CraftingMenu.slotChangedCraftingGrid`: the grid's result from the recipe book.
 ///
@@ -13,6 +13,29 @@ use ferrite_recipe::RecipeBook;
 /// fixed result in `ferrite-recipe` and craft nothing. No 26.3 crafting result carries a
 /// component patch, so a result is its item and count.
 struct RecipeCrafter(RecipeBook);
+
+impl RecipeCrafter {
+    /// Vanilla `RecipeManager.getRecipeFor(RecipeType, input)` for one furnace family, with the
+    /// 26.3 recipe's result, cooking time and experience.
+    fn cooking(&self, kind: FurnaceKind, input: &ItemStack) -> Option<CookingOutput> {
+        let cooking_kind = match kind {
+            FurnaceKind::Furnace => CookingKind::Smelting,
+            FurnaceKind::BlastFurnace => CookingKind::Blasting,
+            FurnaceKind::Smoker => CookingKind::Smoking,
+        };
+        let recipe = self.0.match_cooking(cooking_kind, input.name()?)?;
+        let RecipeKind::Cooking(cooking) = &recipe.kind else {
+            return None;
+        };
+        let result = ItemStack::from_name(&cooking.result.item)?
+            .copy_with_count(i32::try_from(cooking.result.count).ok()?);
+        Some(CookingOutput {
+            result,
+            cook_time: i32::try_from(cooking.cooking_time).ok()?,
+            experience: cooking.experience,
+        })
+    }
+}
 
 impl Crafter for RecipeCrafter {
     fn craft(&self, grid: &[ItemStack], width: usize) -> ItemStack {
@@ -31,6 +54,111 @@ impl Crafter for RecipeCrafter {
                 Some(ItemStack::from_name(&result.item)?.copy_with_count(count))
             })
             .unwrap_or_default()
+    }
+
+    fn cook(&self, kind: FurnaceKind, input: &ItemStack) -> Option<CookingOutput> {
+        self.cooking(kind, input)
+    }
+
+    fn burn_time(&self, item: &ItemStack) -> i32 {
+        item.name().map_or(0, fuel_burn_time)
+    }
+
+    fn stonecutting(&self, input: &ItemStack) -> Vec<ItemStack> {
+        let Some(name) = input.name() else {
+            return Vec::new();
+        };
+        self.0
+            .stonecutting_options(name)
+            .into_iter()
+            .filter_map(|recipe| recipe.result())
+            .filter_map(|result| {
+                let count = i32::try_from(result.count).ok()?;
+                ItemStack::from_name(&result.item).map(|stack| stack.copy_with_count(count))
+            })
+            .collect()
+    }
+
+    fn smithing(
+        &self,
+        template: &ItemStack,
+        base: &ItemStack,
+        addition: &ItemStack,
+    ) -> Option<ItemStack> {
+        let (Some(template), Some(base), Some(addition)) =
+            (template.name(), base.name(), addition.name())
+        else {
+            return None;
+        };
+        let tags = self.0.tags();
+        for recipe in self.0.recipes() {
+            let RecipeKind::SmithingTransform(transform) = &recipe.kind else {
+                continue;
+            };
+            if !transform.template.matches(template, tags)
+                || !transform.base.matches(base, tags)
+                || !transform.addition.matches(addition, tags)
+            {
+                continue;
+            }
+            let count = i32::try_from(transform.result.count).ok()?;
+            return ItemStack::from_name(&transform.result.item)
+                .map(|stack| stack.copy_with_count(count));
+        }
+        None
+    }
+}
+
+/// Vanilla `FuelValues.burnDuration` for the 26.3 fuels this server knows (the generated data
+/// pack does not ship the `furnace_fuel` values, so the common fuels are listed here; anything
+/// absent is not a fuel).
+fn fuel_burn_time(name: &str) -> i32 {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    match name {
+        "coal" | "charcoal" => 1600,
+        "coal_block" => 16000,
+        "lava_bucket" => 20000,
+        "blaze_rod" => 2400,
+        "dried_kelp_block" => 4000,
+        "magma_cream" => 800,
+        "bamboo" | "stick" | "bowl" => 100,
+        "sapling" => 100,
+        _ if name.ends_with("_sapling") => 100,
+        _ if name.ends_with("_planks")
+            || name.ends_with("_log")
+            || name.ends_with("_wood")
+            || name.ends_with("_fence")
+            || name.ends_with("_fence_gate")
+            || name.ends_with("_stairs")
+            || name == "crafting_table"
+            || name == "chest"
+            || name == "trapped_chest"
+            || name == "bookshelf"
+            || name == "ladder"
+            || name == "note_block"
+            || name == "jukebox"
+            || name == "cartography_table"
+            || name == "fletching_table"
+            || name == "smithing_table"
+            || name == "loom"
+            || name == "barrel" =>
+        {
+            300
+        }
+        _ if name.ends_with("_slab") => 150,
+        _ if name.ends_with("_wool") => 100,
+        _ if name.ends_with("_carpet") => 67,
+        _ if name.ends_with("_door") => 200,
+        _ if name.ends_with("_boat") || name.ends_with("_sign") => 200,
+        _ if name.ends_with("_wooden_sword")
+            || name.ends_with("_wooden_pickaxe")
+            || name.ends_with("_wooden_axe")
+            || name.ends_with("_wooden_shovel")
+            || name.ends_with("_wooden_hoe") =>
+        {
+            200
+        }
+        _ => 0,
     }
 }
 

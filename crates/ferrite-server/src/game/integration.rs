@@ -1164,9 +1164,61 @@ async fn commands_packet_decodes_and_filters_permissions() {
         let mut parser = None;
         if flags & 3 == 2 {
             let id = VarInt::decode(&mut input).unwrap().0;
-            if Some(id) == registry.id("minecraft:entity") {
-                // minecraft:entity properties: single/players-only flags.
+            let mut number_bits = || {
+                let bits = u8::decode(&mut input).unwrap();
+                (bits & 1 != 0, bits & 2 != 0)
+            };
+            if Some(id) == registry.id("minecraft:entity")
+                || Some(id) == registry.id("minecraft:score_holder")
+            {
+                // minecraft:entity / score_holder properties: single / multiple flags.
                 let _ = u8::decode(&mut input).unwrap();
+            } else if Some(id) == registry.id("brigadier:string")
+                || Some(id) == registry.id("minecraft:time")
+            {
+                let _ = VarInt::decode(&mut input).unwrap();
+            } else if Some(id) == registry.id("brigadier:float") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = f32::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = f32::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:double") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = f64::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = f64::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:integer") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = VarInt::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = VarInt::decode(&mut input).unwrap();
+                }
+            } else if Some(id) == registry.id("brigadier:long") {
+                let (min, max) = number_bits();
+                if min {
+                    let _ = i64::decode(&mut input).unwrap();
+                }
+                if max {
+                    let _ = i64::decode(&mut input).unwrap();
+                }
+            } else if ferrite_command::arguments::RegistryParser::ALL
+                .iter()
+                .any(|kind| registry.id(kind.id()) == Some(id))
+            {
+                // Registry parsers send the target registry identifier.
+                let _ = String::decode(&mut input).unwrap();
+            }
+            if flags & 0x10 != 0 {
+                // Suggestion type follows the parser properties.
+                let _ = VarInt::decode(&mut input).unwrap();
             }
             parser = Some(id);
         }
@@ -1449,6 +1501,7 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         raining: false,
         rules: Default::default(),
         spawn: [0.0, 65.0, 0.0],
+        command_entities: Default::default(),
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),
@@ -1743,6 +1796,156 @@ async fn summoned_cow_is_tracked_falls_dies_and_drops_loot() {
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zombie_reaches_and_damages_a_bot() {
+    use ferrite_protocol::packets::play::SetHealth;
+    // Only damage in survival counts, and `/gamemode` needs operator rights.
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Prey"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Prey").await;
+    bot.until(46).await;
+    // Creative ignores monster attacks, so the bot has to survive in survival mode.
+    set_mode(&mut bot, "survival", 0).await;
+    world
+        .console_command("/summon minecraft:zombie 2.5 65 0.5".into())
+        .await
+        .unwrap();
+    let damaged = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            if id == SetHealth::ID {
+                let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+                if health.health < 20.0 {
+                    return health.health;
+                }
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(damaged.is_ok(), "the zombie never reached and hit the bot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skeleton_arrow_damages_a_bot() {
+    use ferrite_protocol::packets::play::SetHealth;
+    // Only damage in survival counts, and `/gamemode` needs operator rights.
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Volley"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Volley").await;
+    bot.until(46).await;
+    set_mode(&mut bot, "survival", 0).await;
+    // Six blocks away: inside the bow range, far enough not to back off.
+    world
+        .console_command("/summon minecraft:skeleton 6.5 65 0.5".into())
+        .await
+        .unwrap();
+    let damaged = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            if id == SetHealth::ID {
+                let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+                if health.health < 20.0 {
+                    return health.health;
+                }
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    let health = damaged.expect("the skeleton never shot the bot");
+    // One non-critical skeleton arrow does exactly the base two damage.
+    assert!((health - 18.0).abs() < 1e-3, "one arrow: {health}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_creeper_blast_damages_blocks_for_a_bot() {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Boom").await;
+    bot.until(46).await;
+    world
+        .console_command("/summon minecraft:creeper 2.5 65 0.5".into())
+        .await
+        .unwrap();
+    let blast = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            if id == BlockUpdate::ID {
+                let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                let pos = BlockPos::unpack(update.location);
+                if update.block_state.0 == 0 && pos.x.abs() <= 8 && pos.z.abs() <= 8 && pos.y <= 65
+                {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(
+        blast.is_ok(),
+        "the creeper never destroyed blocks near the bot"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3866,4 +4069,431 @@ async fn survival_death_drops_experience_that_is_picked_up_after_respawn() {
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
+}
+
+/// Vanilla `AbstractFurnaceMenu`/`AbstractFurnaceBlockEntity`: a fixture-world furnace smelts raw
+/// gold into a gold ingot, streams the lit state and cook progress as container data, and awards
+/// the recipe's experience when the result is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn furnace_smelts_and_awards_experience_on_fixture_world() {
+    use ferrite_inventory::{FurnaceKind, FurnaceState};
+    use ferrite_protocol::{
+        packets::play::{
+            ContainerClick, ContainerContent, ContainerSetData, ContainerSlot, MoveRotation,
+            OpenScreen, SetCursorItem, SetExperience, UseItemOn,
+        },
+        types::BlockPos,
+    };
+
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
+    let temp = std::env::temp_dir().join(format!("ferrite-furnace-{}", uuid::Uuid::new_v4()));
+    let dir = temp.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.clone(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let air = u32::from(ferrite_data::blocks::default_state("air").unwrap());
+    for y in 65..=67 {
+        for x in 0..=2 {
+            for z in 0..=2 {
+                source.set_block(x, y, z, air).unwrap();
+            }
+        }
+    }
+    let furnace_state = u32::from(
+        ferrite_data::blocks::state_id("furnace", &[("facing", "north"), ("lit", "false")])
+            .unwrap(),
+    );
+    source.set_block(0, 64, 0, furnace_state).unwrap();
+    // Seed a nearly finished raw-gold smelt (vanilla: 200 ticks, 1.0 experience).
+    let mut data = super::furnace::FurnaceData {
+        items: vec![ferrite_item::ItemStack::empty(); super::furnace::SLOTS],
+        state: FurnaceState {
+            cook: 199,
+            cook_total: 200,
+            burn: 400,
+            burn_total: 1600,
+            pending_experience: 0.0,
+        },
+    };
+    data.items[0] = ferrite_item::ItemStack::from_name("raw_gold").unwrap();
+    data.items[1] = ferrite_item::ItemStack::from_name("coal").unwrap();
+    super::furnace::store(&source, [0, 64, 0], FurnaceKind::Furnace, &data);
+
+    let world = World::start_with(Some(source.clone()), [0, 65, 0]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Smelter").await;
+    bot.until(46).await;
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+
+    let gold = ferrite_data::registries::id("minecraft:item", "minecraft:gold_ingot").unwrap();
+    let mut window = -1;
+    let mut state = 0;
+    let mut have_content = false;
+    let mut saw_lit = false;
+    let mut saw_total = false;
+    let mut result = (0, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            match id {
+                OpenScreen::ID => {
+                    window = OpenScreen::decode(&mut body.as_slice()).unwrap().window.0;
+                }
+                ContainerContent::<ferrite_item::ItemStack>::ID => {
+                    let packet =
+                        ContainerContent::<ferrite_item::ItemStack>::decode(&mut body.as_slice())
+                            .unwrap();
+                    state = packet.state.0;
+                    have_content = true;
+                    result = (i32::from(packet.slots[2].item), packet.slots[2].count);
+                }
+                ContainerSlot::<ferrite_item::ItemStack>::ID => {
+                    let packet =
+                        ContainerSlot::<ferrite_item::ItemStack>::decode(&mut body.as_slice())
+                            .unwrap();
+                    state = packet.state.0;
+                    if packet.slot == 2 {
+                        result = (i32::from(packet.item.item), packet.item.count);
+                    }
+                }
+                ContainerSetData::ID => {
+                    let data = ContainerSetData::decode(&mut body.as_slice()).unwrap();
+                    saw_lit |= data.id == 0 && data.value == 1;
+                    saw_total |= data.id == 2 && data.value == 200;
+                }
+                _ => {}
+            }
+            if have_content && saw_lit && saw_total && result.0 == gold && result.1 > 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("furnace opens and finishes the seeded smelt");
+    assert!(window > 0, "the furnace menu opened");
+    assert_eq!(result, (gold, 1));
+
+    // Take the result: the cursor receives the ingot and the recipe's experience is awarded.
+    bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+        window: VarInt(window),
+        state: VarInt(state),
+        slot: 2,
+        button: 0,
+        input: VarInt(0),
+        changed: vec![],
+        carried: None,
+    })
+    .await;
+    let mut carried = None;
+    let mut experience = None;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while carried.is_none() || experience.is_none() {
+            let (id, body) = bot.next_play().await;
+            if id == SetCursorItem::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    SetCursorItem::<ferrite_item::ItemStack>::decode(&mut body.as_slice()).unwrap();
+                carried = Some((i32::from(packet.item.item), packet.item.count));
+            }
+            if id == SetExperience::ID {
+                experience = Some(SetExperience::decode(&mut body.as_slice()).unwrap().total.0);
+            }
+            if id == ContainerSlot::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    ContainerSlot::<ferrite_item::ItemStack>::decode(&mut body.as_slice()).unwrap();
+                state = packet.state.0;
+            }
+        }
+    })
+    .await
+    .expect("taking the furnace result syncs the cursor and experience");
+    assert_eq!(carried, Some((gold, 1)));
+    assert!(experience.is_some_and(|total| total >= 1), "{experience:?}");
+
+    // Put the ingot into the hotbar slot (menu slot 30) and see it in the slot update.
+    bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+        window: VarInt(window),
+        state: VarInt(state),
+        slot: 30,
+        button: 0,
+        input: VarInt(0),
+        changed: vec![],
+        carried: None,
+    })
+    .await;
+    let mut placed = false;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !placed {
+            let (id, body) = bot.next_play().await;
+            if id == ContainerSlot::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    ContainerSlot::<ferrite_item::ItemStack>::decode(&mut body.as_slice()).unwrap();
+                if packet.slot == 30 {
+                    placed = i32::from(packet.item.item) == gold && packet.item.count == 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the smelted ingot reaches the hotbar");
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    let temp_root = std::env::temp_dir().canonicalize().unwrap();
+    let resolved = temp.canonicalize().unwrap();
+    assert_eq!(resolved.parent(), Some(temp_root.as_path()));
+    std::fs::remove_dir_all(resolved).unwrap();
+}
+
+/// Vanilla `AnvilMenu`: two damaged iron swords combine into a fully repaired one, the result is
+/// shown in slot 2, and taking it spends the two experience levels and consumes both inputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anvil_repairs_two_damaged_swords_on_fixture_world() {
+    use ferrite_protocol::{
+        packets::play::{
+            ContainerClick, ContainerContent, ContainerSlot, CreativeSlot, MoveRotation,
+            OpenScreen, SetCursorItem, SetExperience, UseItemOn,
+        },
+        types::BlockPos,
+    };
+
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
+    let temp = std::env::temp_dir().join(format!("ferrite-anvil-{}", uuid::Uuid::new_v4()));
+    let dir = temp.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.clone(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let air = u32::from(ferrite_data::blocks::default_state("air").unwrap());
+    for y in 65..=67 {
+        for x in 0..=2 {
+            for z in 0..=2 {
+                source.set_block(x, y, z, air).unwrap();
+            }
+        }
+    }
+    let anvil = u32::from(ferrite_data::blocks::state_id("anvil", &[("facing", "north")]).unwrap());
+    source.set_block(0, 64, 0, anvil).unwrap();
+
+    let world = World::start_configured(
+        Some(source),
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Anvil"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Anvil").await;
+    bot.until(46).await;
+    bot.raw(7, "xp set @s 10 levels").await;
+    let mut level = 0;
+    while level != 10 {
+        let body = bot.until(SetExperience::ID).await;
+        level = SetExperience::decode(&mut body.as_slice()).unwrap().level.0;
+    }
+
+    for slot in [36, 37] {
+        let mut sword = ferrite_item::ItemStack::from_name("iron_sword").unwrap();
+        sword.components.insert(
+            ferrite_item::component_ids::DAMAGE,
+            ferrite_item::Component::Damage(100),
+        );
+        bot.send(&CreativeSlot { slot, item: sword }).await;
+    }
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+
+    let mut window = -1;
+    let mut state = 0;
+    let mut have_content = false;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !(window > 0 && have_content) {
+            let (id, body) = bot.next_play().await;
+            match id {
+                OpenScreen::ID => {
+                    window = OpenScreen::decode(&mut body.as_slice()).unwrap().window.0;
+                }
+                ContainerContent::<ferrite_item::ItemStack>::ID => {
+                    state =
+                        ContainerContent::<ferrite_item::ItemStack>::decode(&mut body.as_slice())
+                            .unwrap()
+                            .state
+                            .0;
+                    have_content = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the anvil menu opens");
+
+    // Move both swords from the hotbar (menu slots 30/31) into the anvil inputs (0/1).
+    for (from, to) in [(30, 0), (31, 1)] {
+        for slot in [from, to] {
+            bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+                window: VarInt(window),
+                state: VarInt(state),
+                slot,
+                button: 0,
+                input: VarInt(0),
+                changed: vec![],
+                carried: None,
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    let mut repaired = None;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while repaired.is_none() {
+            let (id, body) = bot.next_play().await;
+            if id == ContainerSlot::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    ContainerSlot::<ferrite_item::ItemStack>::decode(&mut body.as_slice()).unwrap();
+                state = packet.state.0;
+                if packet.slot == 2 && packet.item.count > 0 {
+                    repaired = Some(packet.item);
+                }
+            }
+            if id == ContainerContent::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    ContainerContent::<ferrite_item::ItemStack>::decode(&mut body.as_slice())
+                        .unwrap();
+                state = packet.state.0;
+                if packet.slots[2].count > 0 {
+                    repaired = Some(packet.slots[2].clone());
+                }
+            }
+        }
+    })
+    .await
+    .expect("the anvil shows the repaired result");
+    assert_eq!(repaired.unwrap().damage(), 0);
+
+    bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+        window: VarInt(window),
+        state: VarInt(state),
+        slot: 2,
+        button: 0,
+        input: VarInt(0),
+        changed: vec![],
+        carried: None,
+    })
+    .await;
+    let mut carried = None;
+    let mut spent = None;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while carried.is_none() || spent.is_none() {
+            let (id, body) = bot.next_play().await;
+            if id == SetCursorItem::<ferrite_item::ItemStack>::ID {
+                let packet =
+                    SetCursorItem::<ferrite_item::ItemStack>::decode(&mut body.as_slice()).unwrap();
+                if packet.item.count > 0 {
+                    carried = Some(packet.item);
+                }
+            }
+            if id == SetExperience::ID {
+                spent = Some(SetExperience::decode(&mut body.as_slice()).unwrap().level.0);
+            }
+        }
+    })
+    .await
+    .expect("taking the anvil result syncs the cursor and level");
+    assert_eq!(carried.unwrap().damage(), 0);
+    assert_eq!(spent, Some(8), "the repair costs two levels");
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    let temp_root = std::env::temp_dir().canonicalize().unwrap();
+    let resolved = temp.canonicalize().unwrap();
+    assert_eq!(resolved.parent(), Some(temp_root.as_path()));
+    std::fs::remove_dir_all(resolved).unwrap();
 }

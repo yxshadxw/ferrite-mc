@@ -2,7 +2,8 @@ use ferrite_item::{Component, Enchantments, HashedSlot, ItemStack, component_ids
 
 use crate::{
     ClickInput::{self, *},
-    Clicker, Crafter, Menu, NoCrafting, PlayerInventory, SLOT_OUTSIDE, Sync,
+    Clicker, CookingOutput, Crafter, FurnaceKind, Menu, NoCrafting, PlayerInventory, SLOT_OUTSIDE,
+    Sync,
 };
 
 fn item(name: &str, count: i32) -> ItemStack {
@@ -75,6 +76,243 @@ impl Fixture {
         }
         self.click(SLOT_OUTSIDE, (kind << 2) | 2, QuickCraft);
     }
+}
+
+/// Raw gold smelts into a gold ingot (200 ticks, 1 experience); coal burns for 1600 ticks.
+struct FurnaceCrafter;
+
+impl Crafter for FurnaceCrafter {
+    fn craft(&self, _: &[ItemStack], _: usize) -> ItemStack {
+        empty()
+    }
+
+    fn cook(&self, kind: FurnaceKind, input: &ItemStack) -> Option<CookingOutput> {
+        (kind == FurnaceKind::Furnace && input.name() == Some("minecraft:raw_gold")).then(|| {
+            CookingOutput {
+                result: item("gold_ingot", 1),
+                cook_time: 200,
+                experience: 1.0,
+            }
+        })
+    }
+
+    fn burn_time(&self, item: &ItemStack) -> i32 {
+        if item.name() == Some("minecraft:coal") {
+            1600
+        } else {
+            0
+        }
+    }
+}
+
+#[test]
+fn furnace_menu_cooks_consumes_fuel_and_syncs_container_data() {
+    let mut f = Fixture::new(Menu::furnace(7, FurnaceKind::Furnace));
+    f.menu
+        .set_slot(&mut f.inv, &FurnaceCrafter, 0, item("raw_gold", 1));
+    f.menu
+        .set_slot(&mut f.inv, &FurnaceCrafter, 1, item("coal", 2));
+    assert_eq!(f.menu.len(), 39);
+    assert_eq!(
+        f.menu.kind(),
+        crate::MenuKind::Furnace(FurnaceKind::Furnace)
+    );
+    assert_eq!(f.menu.kind().menu_type(), Some("minecraft:furnace".into()));
+
+    // The first tick lights the furnace, consumes one fuel and starts cooking.
+    f.menu.tick(&FurnaceCrafter);
+    assert_eq!(f.menu.data_value(0), 1);
+    assert_eq!((f.menu.data_value(1), f.menu.data_value(2)), (1, 200));
+    assert_eq!((f.menu.data_value(3), f.menu.data_value(4)), (1600, 1600));
+    assert_eq!(f.slot(1), item("coal", 1));
+    // The first broadcast sends every data slot once, then only changes.
+    let first = f.menu.broadcast_changes(&f.inv);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|sync| matches!(sync, Sync::Data { .. }))
+            .count(),
+        5
+    );
+    assert!(
+        !f.menu
+            .broadcast_changes(&f.inv)
+            .iter()
+            .any(|sync| matches!(sync, Sync::Data { .. }))
+    );
+
+    for _ in 1..200 {
+        f.menu.tick(&FurnaceCrafter);
+    }
+    assert_eq!(f.slot(0), empty());
+    assert_eq!(f.slot(2), item("gold_ingot", 1));
+    assert_eq!(f.menu.data_value(0), 1);
+    assert_eq!(f.menu.data_value(1), 0);
+    assert_eq!(f.menu.furnace_state().unwrap().pending_experience, 1.0);
+
+    // Taking the output awards the experience and leaves the fuel alone.
+    let mut p = Clicker::new(&mut f.inv, false, &FurnaceCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert_eq!(p.xp, 1.0);
+    assert_eq!(p.drops, Vec::<ItemStack>::new());
+    assert_eq!(f.menu.carried(), &item("gold_ingot", 1));
+    assert_eq!(f.slot(2), empty());
+    assert_eq!(f.menu.furnace_state().unwrap().pending_experience, 0.0);
+}
+
+#[test]
+fn anvil_repairs_renames_and_charges_levels() {
+    let mut f = Fixture::new(Menu::anvil(9));
+    let mut first = item("iron_sword", 1);
+    first
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(100));
+    let mut second = first.copy_with_count(1);
+    second
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(100));
+    assert_eq!(first.max_damage(), Some(250));
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, first.clone());
+    assert_eq!(f.menu.anvil_cost(), 0);
+    assert_eq!(f.slot(2), empty());
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 1, second.clone());
+    // Two half-damaged swords plus the 5% combine bonus fully repair the result for 2 levels.
+    assert_eq!(f.menu.anvil_cost(), 2);
+    assert_eq!(f.slot(2).damage(), 0);
+    assert_eq!(f.slot(2).name(), Some("minecraft:iron_sword"));
+
+    let mut p = Clicker::new(&mut f.inv, false, &TestCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert_eq!(p.levels, 2);
+    assert_eq!(f.menu.carried().damage(), 0);
+    assert_eq!((f.slot(0), f.slot(1)), (empty(), empty()));
+    assert_eq!(f.menu.anvil_cost(), 0);
+
+    // A rename alone costs one level and writes the custom name component.
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, first);
+    f.menu.rename("Excalibur".into());
+    assert_eq!(f.menu.anvil_cost(), 1);
+    assert!(matches!(
+        f.menu
+            .result()
+            .effective_component(component_ids::CUSTOM_NAME),
+        Some(Component::Opaque(ferrite_nbt::Tag::String(name))) if name == "Excalibur"
+    ));
+    // A repair material repairs a quarter of the durability per item.
+    let mut damaged = item("iron_sword", 1);
+    damaged
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(200));
+    f.menu.rename(String::new());
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, damaged);
+    f.menu
+        .set_slot(&mut f.inv, &TestCrafter, 1, item("iron_ingot", 2));
+    assert_eq!(f.slot(2).damage(), 200 - 2 * (250 / 4));
+    assert_eq!(f.menu.anvil_cost(), 2);
+}
+
+/// Station recipes for the non-furnace crafting stations.
+struct StationCrafter;
+
+impl Crafter for StationCrafter {
+    fn craft(&self, _: &[ItemStack], _: usize) -> ItemStack {
+        empty()
+    }
+
+    fn stonecutting(&self, input: &ItemStack) -> Vec<ItemStack> {
+        if input.name() == Some("minecraft:stone") {
+            vec![item("stone_slab", 2)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn smithing(
+        &self,
+        template: &ItemStack,
+        base: &ItemStack,
+        addition: &ItemStack,
+    ) -> Option<ItemStack> {
+        (template.name() == Some("minecraft:netherite_upgrade_smithing_template")
+            && base.name() == Some("minecraft:diamond_sword")
+            && addition.name() == Some("minecraft:netherite_ingot"))
+        .then(|| item("netherite_sword", 1))
+    }
+}
+
+#[test]
+fn stonecutter_grindstone_enchanting_smithing_and_loom_work() {
+    let mut f = Fixture::new(Menu::stonecutter(3));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("stone", 3));
+    assert_eq!(f.menu.kind(), crate::MenuKind::Stonecutter);
+    assert_eq!(f.slot(1), item("stone_slab", 2));
+    let mut p = Clicker::new(&mut f.inv, false, &StationCrafter);
+    f.menu.clicked(&mut p, 1, 0, Pickup);
+    assert_eq!(f.menu.carried(), &item("stone_slab", 2));
+    assert_eq!(f.slot(0), item("stone", 2));
+
+    // A grindstone strips enchantments and combines the durability of two copies.
+    let mut f = Fixture::new(Menu::grindstone(4));
+    let mut left = item("iron_sword", 1);
+    left.components
+        .insert(component_ids::DAMAGE, Component::Damage(50));
+    let mut enchantments = Enchantments::new();
+    enchantments.set("minecraft:sharpness", 2);
+    left.components.insert(
+        component_ids::ENCHANTMENTS,
+        Component::Enchantments(enchantments),
+    );
+    f.menu.set_slot(&mut f.inv, &StationCrafter, 0, left);
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("iron_sword", 1));
+    assert_eq!(f.slot(2).damage(), 0);
+    assert!(
+        f.slot(2)
+            .effective_component(component_ids::ENCHANTMENTS)
+            .is_none()
+    );
+    let mut p = Clicker::new(&mut f.inv, false, &StationCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert!(p.xp >= 2.0);
+    assert_eq!(f.slot(0), empty());
+
+    // Enchanting costs one lapis and one level per choice.
+    let mut f = Fixture::new(Menu::enchanting(5));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("diamond_sword", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("lapis_lazuli", 3));
+    assert_eq!(f.menu.enchant_cost(1), 2);
+    assert_eq!(f.menu.button_click(1), Some(2));
+    assert_eq!(f.menu.data_value(0), 1);
+    match f.slot(0).effective_component(component_ids::ENCHANTMENTS) {
+        Some(Component::Enchantments(enchantments)) => {
+            assert_eq!(enchantments.level("minecraft:sharpness"), Some(2))
+        }
+        other => panic!("no enchantments: {other:?}"),
+    }
+    assert_eq!(f.slot(1), item("lapis_lazuli", 1));
+
+    let mut f = Fixture::new(Menu::smithing(6));
+    f.menu.set_slot(
+        &mut f.inv,
+        &StationCrafter,
+        0,
+        item("netherite_upgrade_smithing_template", 1),
+    );
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("diamond_sword", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 2, item("netherite_ingot", 1));
+    assert_eq!(f.slot(3), item("netherite_sword", 1));
+
+    let mut f = Fixture::new(Menu::loom(7));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("white_banner", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("red_dye", 1));
+    assert_eq!(f.slot(3).name(), Some("minecraft:red_banner"));
 }
 
 #[test]
