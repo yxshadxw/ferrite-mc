@@ -3,6 +3,8 @@ pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
 #[cfg(test)]
 mod block_tests;
 mod blocks;
+#[cfg(test)]
+mod persistence_tests;
 mod terrain;
 pub use terrain::{Generated, StageTimings, TerrainKind, VanillaTerrain};
 pub mod playerdata;
@@ -22,6 +24,7 @@ pub fn new_anvil_source_with(
 pub fn new_memory_source(terrain: Option<Arc<VanillaTerrain>>) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new_memory_with_terrain(terrain)
 }
+pub mod beacon;
 mod block_container;
 mod chat;
 mod chunk;
@@ -37,6 +40,7 @@ mod crafting;
 mod dispenser;
 mod drops;
 mod entity_index;
+mod entity_save;
 pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
 mod explosion;
 mod feedback;
@@ -518,6 +522,7 @@ async fn run(
     let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
     initial_state.entities = command_entities;
     let world_path = source.as_ref().and_then(|source| source.path());
+    let entity_world = world_path.map(std::path::Path::to_path_buf);
     let disabled_packs = world_path.map(functions::read_disabled).unwrap_or_default();
     initial_state.functions = Arc::new(functions::FunctionStore::load_with_disabled(
         world_path,
@@ -786,7 +791,7 @@ async fn run(
               }}
               let _ = complete.send(result.map(|_| stop));
           },
-          GameMessage::Shutdown{complete}=>{let _=stop_tx.send(true);let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let _stopped = scheduler.shutdown();let result = if let Some(source) = &source { source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")) } else { Ok(()) }; let _=complete.send(result);break;}
+          GameMessage::Shutdown{complete}=>{let _=stop_tx.send(true);let (ack_tx,ack_rx)=oneshot::channel();scheduler.schedule_global(move |g|{g.shutdown();let _=ack_tx.send(());});let _=ack_rx.await;let mut stopped = scheduler.shutdown();let entity_result = match &entity_world { Some(dir) => entity_save::save_regions(dir, &mut stopped.regions).map_err(|error| format!("failed to save entities during shutdown: {error:#}")), None => Ok(()) };let result = match (entity_result, &source) { (Err(error), _) => Err(error), (Ok(()), Some(source)) => source.flush_all().await.map_err(|error| format!("failed to save world chunks during shutdown: {error:#}")), (Ok(()), None) => Ok(()) }; let _=complete.send(result);break;}
          }},
          _=autosave.tick(), if saving_enabled => {
              if let Some(source) = &source && let Err(error) = source.flush_all().await {
@@ -794,7 +799,8 @@ async fn run(
              }
          },
          signal=signals.recv()=>{let Some(signal)=signal else {break}; match signal {
-          Signal::Hold{chunk,add}=>if add{*holds.entry(chunk).or_default() += 1;scheduler.add_chunk(chunk);scheduler.schedule_at_chunk(chunk,move |r|r.hold_chunk(chunk));}else{release_hold(&scheduler, &mut holds, &signal_tx, chunk);},
+          Signal::Hold{chunk,add}=>if add{let first={let count=holds.entry(chunk).or_default();*count += 1;*count == 1};scheduler.add_chunk(chunk);let dir=entity_world.clone();scheduler.schedule_at_chunk(chunk,move |r|{r.hold_chunk(chunk);if first && let Some(dir)=dir{r.add_entities(entity_save::load(&dir, (chunk.0, chunk.1)));}});}else{release_hold(&scheduler, &mut holds, &signal_tx, chunk);},
+          Signal::SaveEntities{chunk,entities}=>{if let Some(dir)=&entity_world && let Err(error)=entity_save::save(dir, (chunk.0, chunk.1), &entities){tracing::error!(%error, chunk=?chunk, "failed to save chunk entities");}},
           Signal::FinishRelease{chunk,flush}=>{scheduler.remove_chunk(chunk);if flush && let Some(source)=source.clone(){tokio::spawn(async move {if let Err(error)=source.flush_chunk(chunk.0,chunk.1).await{tracing::error!(%error,"failed to save unloaded chunk");}});}},
           Signal::FluidChange{x,y,z}=>{
             for (dx,dy,dz) in [(0,0,0),(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)] {
@@ -947,6 +953,10 @@ fn defer_release(
     let signals = signals.clone();
     scheduler.schedule_at_chunk(chunk, move |region| {
         region.release_chunk(chunk);
+        // Entities leave the store before the chunk data is flushed, so a reload reads exactly
+        // what was held when the last viewer left.
+        let entities = region.take_chunk_entities(chunk);
+        let _ = signals.send(Signal::SaveEntities { chunk, entities });
         let _ = signals.send(Signal::FinishRelease { chunk, flush });
     });
 }

@@ -213,19 +213,27 @@ pub fn chunk_from_nbt(
     }
     if let Some(Tag::List(List::Compound(entities))) = root.get("block_entities") {
         for entity in entities {
-            let x = ints(entity, "x")?;
-            let y = ints(entity, "y")?;
-            let z = ints(entity, "z")?;
-            let name = string(
-                entity
-                    .get("id")
-                    .ok_or(ChunkNbtError::Invalid("block entity id"))?,
-            )?;
-            let type_id = registry
-                .entity_id(name)
-                .ok_or_else(|| ChunkNbtError::Unknown(name.into()))?;
+            // A broken block entity must not take the whole chunk down with it: skip it and keep
+            // loading the rest, like vanilla's erroring block-entity codec.
+            let (Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))) =
+                (entity.get("x"), entity.get("y"), entity.get("z"))
+            else {
+                tracing::warn!("skipping a block entity without integer x/y/z coordinates");
+                continue;
+            };
+            let name = match entity.get("id") {
+                Some(Tag::String(name)) => name,
+                _ => {
+                    tracing::warn!(x, y, z, "skipping a block entity without an id");
+                    continue;
+                }
+            };
+            let Some(type_id) = registry.entity_id(name) else {
+                tracing::warn!(id = %name, "skipping a block entity of an unknown type");
+                continue;
+            };
             chunk.block_entities.insert(
-                (x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8),
+                (x.rem_euclid(16) as u8, *y, z.rem_euclid(16) as u8),
                 BlockEntity {
                     type_id,
                     data: entity.clone(),
@@ -405,19 +413,18 @@ pub fn chunk_to_nbt(
     let entities = chunk
         .block_entities
         .iter()
-        .map(|(&(x, y, z), entity)| {
+        .filter_map(|(&(x, y, z), entity)| {
+            // Vanilla's block-entity codec drops a type it cannot write instead of failing the
+            // whole chunk; the rest of the chunk must still be saved.
+            let Some(name) = registry.entity_name(entity.type_id) else {
+                tracing::warn!(
+                    type_id = entity.type_id,
+                    "not saving a block entity of an unknown type"
+                );
+                return None;
+            };
             let mut c = entity.data.clone();
-            c.insert(
-                "id".into(),
-                Tag::String(
-                    registry
-                        .entity_name(entity.type_id)
-                        .ok_or_else(|| {
-                            ChunkNbtError::Unknown(format!("block entity {}", entity.type_id))
-                        })?
-                        .into(),
-                ),
-            );
+            c.insert("id".into(), Tag::String(name.into()));
             let cx = match root.get("xPos") {
                 Some(Tag::Int(n)) => *n,
                 _ => 0,
@@ -429,9 +436,9 @@ pub fn chunk_to_nbt(
             c.insert("x".into(), Tag::Int(cx * 16 + i32::from(x)));
             c.insert("y".into(), Tag::Int(y));
             c.insert("z".into(), Tag::Int(cz * 16 + i32::from(z)));
-            Ok(c)
+            Some(c)
         })
-        .collect::<Result<Vec<_>, ChunkNbtError>>()?;
+        .collect::<Vec<_>>();
     root.insert("block_entities".into(), Tag::List(List::Compound(entities)));
     Ok(Tag::Compound(root))
 }

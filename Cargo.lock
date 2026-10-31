@@ -927,6 +927,7 @@ dependencies = [
  "lz4_flex",
  "serde_json",
  "thiserror 2.0.21",
+ "tracing",
  "xxhash-rust",
  "zip 2.6.1",
 ]
