@@ -1746,6 +1746,91 @@ async fn summoned_cow_is_tracked_falls_dies_and_drops_loot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zombie_reaches_and_damages_a_bot() {
+    use ferrite_protocol::packets::play::SetHealth;
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Prey").await;
+    bot.until(46).await;
+    // Creative ignores monster attacks, so the bot has to survive in survival mode.
+    set_mode(&mut bot, "survival", 0).await;
+    world
+        .console_command("/summon minecraft:zombie 2.5 65 0.5".into())
+        .await
+        .unwrap();
+    let damaged = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            if id == SetHealth::ID {
+                let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+                if health.health < 20.0 {
+                    return health.health;
+                }
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(damaged.is_ok(), "the zombie never reached and hit the bot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_creeper_blast_damages_blocks_for_a_bot() {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 4,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Boom").await;
+    bot.until(46).await;
+    world
+        .console_command("/summon minecraft:creeper 2.5 65 0.5".into())
+        .await
+        .unwrap();
+    let blast = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (id, body) = bot.next_play().await;
+            if id == BlockUpdate::ID {
+                let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                let pos = BlockPos::unpack(update.location);
+                if update.block_state.0 == 0 && pos.x.abs() <= 8 && pos.z.abs() <= 8 && pos.y <= 65
+                {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(
+        blast.is_ok(),
+        "the creeper never destroyed blocks near the bot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     use ferrite_protocol::{
         packets::play::{

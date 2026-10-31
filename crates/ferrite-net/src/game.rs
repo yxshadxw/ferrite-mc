@@ -37,6 +37,10 @@ pub enum ServerboundPlay {
     ClientCommand(ferrite_protocol::packets::play::ServerboundClientCommand),
     /// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating, throwing, ...).
     UseItem(Box<ferrite_protocol::packets::play::ServerboundUseItem>),
+    /// Vanilla `ServerboundAttackPacket`: left-click on an entity.
+    Attack(ferrite_protocol::packets::play::ServerboundAttack),
+    /// Vanilla `ServerboundInteractPacket`: use or attack an entity at a point in its box.
+    Interact(ferrite_protocol::packets::play::ServerboundInteract),
 }
 #[derive(Debug)]
 pub enum GameMessage {
@@ -268,6 +272,12 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         )?)),
         19 => Some(ServerboundPlay::ContainerClose(
             ServerboundContainerClose::decode(&mut b)?.window.0,
+        )),
+        1 => Some(ServerboundPlay::Attack(
+            ferrite_protocol::packets::play::ServerboundAttack::decode(&mut b)?,
+        )),
+        26 => Some(ServerboundPlay::Interact(
+            ferrite_protocol::packets::play::ServerboundInteract::decode(&mut b)?,
         )),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
         42 => Some(ServerboundPlay::PlayerCommand(
