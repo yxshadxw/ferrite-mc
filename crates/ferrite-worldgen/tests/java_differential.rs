@@ -201,3 +201,161 @@ fn matches_vanilla_overworld_multi_noise_source_on_20k_samples() {
          ({rtree_differences} cases where vanilla's hinted R-tree picked a different tied biome)"
     );
 }
+
+#[test]
+fn density_router_matches_vanilla() {
+    let root = project_root();
+    let home = java_home().expect("Java 25 required for density differential");
+    let (separator, dependencies) = classpath(&root).expect("vanilla jar and libraries required");
+    let output_dir = java_output_dir();
+    let classes = output_dir.join("density-classes");
+    fs::create_dir_all(&classes).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/java/DensityRouterDump.java");
+    let javac = home
+        .join("bin")
+        .join(if cfg!(windows) { "javac.exe" } else { "javac" });
+    let java = home
+        .join("bin")
+        .join(if cfg!(windows) { "java.exe" } else { "java" });
+    let compile = Command::new(javac)
+        .args(["-encoding", "UTF-8", "-cp"])
+        .arg(&dependencies)
+        .arg("-d")
+        .arg(&classes)
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "javac: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let dump = output_dir.join("density_router.tsv");
+    let cp = format!("{}{}{}", classes.display(), separator, dependencies);
+    let run = Command::new(java)
+        .current_dir(&output_dir)
+        .arg("-cp")
+        .arg(cp)
+        .arg("DensityRouterDump")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "Java: {}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let data = WorldgenData::load(generated_root()).unwrap();
+    let settings = data
+        .noise_settings
+        .get(&"minecraft:overworld".parse().unwrap())
+        .unwrap();
+    let router = settings.noise_router.resolve_references(&data).unwrap();
+    let functions = [
+        &router.final_density,
+        &router.continents,
+        &router.erosion,
+        &router.depth,
+        &router.ridges,
+        &router.temperature,
+        &router.vegetation,
+        &router.chunk_surface_level,
+    ];
+    let seeded = ferrite_worldgen::SeededNoise::new(&data, 123456789);
+    let mut max_error = 0.0_f64;
+    let contents = fs::read_to_string(dump).unwrap();
+    let mut count = 0;
+    for line in contents.lines() {
+        let values: Vec<f64> = line.split('\t').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(values.len(), 11);
+        let ctx = seeded.at(values[0] as i32, values[1] as i32, values[2] as i32);
+        for (i, function) in functions.iter().enumerate() {
+            let got = function.compute(&ctx);
+            let expected = values[i + 3];
+            let error = (got - expected).abs();
+            max_error = max_error.max(error);
+            assert!(
+                error <= 1e-9,
+                "point {:?}, field {i}: Rust {got}, Java {expected}, error {error}",
+                &values[..3]
+            );
+        }
+        count += 1;
+    }
+    assert_eq!(count, 2000);
+    println!("density differential: {count} points, maximum error {max_error}");
+}
+
+#[test]
+fn surface_biome_matches_vanilla() {
+    use ferrite_worldgen::{NoiseChunkGenerator, SurfaceGenerator};
+    let root = project_root();
+    let home = java_home().expect("Java 25 required");
+    let (separator, dependencies) = classpath(&root).expect("vanilla jar and libraries required");
+    let output_dir = java_output_dir();
+    let classes = output_dir.join("surface-biome-classes");
+    fs::create_dir_all(&classes).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/java/SurfaceBiomeDump.java");
+    let executable = |name: &str| {
+        home.join("bin").join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        })
+    };
+    let compile = Command::new(executable("javac"))
+        .args(["-encoding", "UTF-8", "-cp"])
+        .arg(&dependencies)
+        .arg("-d")
+        .arg(&classes)
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "javac: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let dump = output_dir.join("surface_biomes.tsv");
+    let cp = format!("{}{}{}", classes.display(), separator, dependencies);
+    let run = Command::new(executable("java"))
+        .current_dir(&output_dir)
+        .arg("-cp")
+        .arg(cp)
+        .arg("SurfaceBiomeDump")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "java: {} {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let data = WorldgenData::load(generated_root()).unwrap();
+    let noise = NoiseChunkGenerator::new(&data, -540760265).unwrap();
+    let surface = SurfaceGenerator::new(&data, &noise, -540760265).unwrap();
+    let contents = fs::read_to_string(dump).unwrap();
+    let mut count = 0;
+    for line in contents.lines() {
+        let p: Vec<_> = line.split('\t').collect();
+        let x = p[0].parse().unwrap();
+        let y = p[1].parse().unwrap();
+        let z = p[2].parse().unwrap();
+        let expected_quart = (
+            p[4].parse().unwrap(),
+            p[5].parse().unwrap(),
+            p[6].parse().unwrap(),
+        );
+        assert_eq!(
+            surface.biome_quart_at(x, y, z),
+            expected_quart,
+            "quart for ({x}, {y}, {z})"
+        );
+        let actual = surface.biome_at(x, y, z).to_string();
+        assert_eq!(actual, p[3], "position ({x}, {y}, {z})");
+        count += 1;
+    }
+    assert_eq!(count, 2000);
+}

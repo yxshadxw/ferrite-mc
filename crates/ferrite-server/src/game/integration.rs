@@ -2692,3 +2692,53 @@ async fn clear_give_and_xp_commands_act_on_a_bot_session() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effect_and_title_commands_reach_the_client() {
+    use ferrite_protocol::packets::play::{
+        ClearTitles, RemoveMobEffect, SetTitleText, SetTitlesAnimation, UpdateMobEffect,
+    };
+
+    let (world, addr, server) = op_world(None, 1, &["Healer"]).await;
+    let mut bot = Bot::join(addr, "Healer").await;
+    bot.until(46).await;
+
+    let speed = ferrite_data::registries::id("minecraft:mob_effect", "minecraft:speed").unwrap();
+    bot.raw(7, "effect give @s speed 5 1").await;
+    let body = bot.until(UpdateMobEffect::ID).await;
+    let effect = UpdateMobEffect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(effect.effect.0, speed);
+    assert_eq!(effect.amplifier.0, 1);
+    assert_eq!(effect.duration.0, 100);
+    assert_eq!(effect.flags, 6);
+    bot.chat_containing("Applied effect Speed to Healer").await;
+
+    bot.raw(7, "effect clear @s speed").await;
+    let body = bot.until(RemoveMobEffect::ID).await;
+    let removed = RemoveMobEffect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(removed.effect.0, speed);
+    bot.chat_containing("Removed effect Speed from Healer")
+        .await;
+
+    bot.raw(7, "title @s times 10 70 20").await;
+    let body = bot.until(SetTitlesAnimation::ID).await;
+    let times = SetTitlesAnimation::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((times.fade_in, times.stay, times.fade_out), (10, 70, 20));
+    bot.chat_containing("Changed title display times for Healer")
+        .await;
+
+    bot.raw(7, "title @s title {\"text\":\"Hello\"}").await;
+    let body = bot.until(SetTitleText::ID).await;
+    let title = SetTitleText::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(title.text.0, "Hello");
+    bot.chat_containing("Showing new title for Healer").await;
+
+    bot.raw(7, "title @s clear").await;
+    let body = bot.until(ClearTitles::ID).await;
+    assert!(!ClearTitles::decode(&mut body.as_slice()).unwrap().reset);
+    bot.chat_containing("Cleared titles for Healer").await;
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

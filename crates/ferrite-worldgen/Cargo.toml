@@ -10,3 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ferrite-noise = { path = "../ferrite-noise" }
+ferrite-world = { path = "../ferrite-world" }
+sha2 = "0.10"
+
+[dev-dependencies]
+ferrite-nbt = { path = "../ferrite-nbt" }
