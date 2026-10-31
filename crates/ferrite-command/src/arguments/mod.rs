@@ -263,6 +263,16 @@ impl ArgumentValue {
             _ => None,
         }
     }
+
+    /// Whether this value is an entity selector (`@a`, `@e[...]`, `@s`, ...), which
+    /// vanilla gates behind the `commands/entity_selectors` permission.
+    pub fn has_selector(&self) -> bool {
+        match self {
+            Self::Entity(target) | Self::GameProfile(target) => target.is_selector(),
+            Self::ScoreHolder(holder) => holder.is_selector(),
+            _ => false,
+        }
+    }
 }
 
 /// `block_state` syntax: `id[key=value,...]{nbt}`.
