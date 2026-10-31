@@ -3,12 +3,13 @@ pub mod forwarding;
 mod wire;
 use anyhow::{Context, Result, bail, ensure};
 use ferrite_protocol::{
-    Decode, FrameDecoder, FrameEncoder, Packet, VarInt, encode_packet,
+    Decode, FrameDecoder, FrameEncoder, Packet, State, VarInt, encode_packet,
     packets::{
         handshake::{Intent, Intention},
         status::{PingRequest, PongResponse, StatusRequest, StatusResponse},
     },
 };
+use ferrite_translate::{HandshakeOutcome, RawPacket, Translator};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
@@ -106,6 +107,17 @@ fn status_json(config: &ServerConfig) -> String {
     response.to_string()
 }
 
+/// Which client protocol versions the listener accepts (`supported-versions` in
+/// `ferrite.toml`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SupportedVersions {
+    /// The core protocol plus every older version the translation chain reaches.
+    #[default]
+    All,
+    /// Only the core protocol; other clients get vanilla's "outdated" disconnect.
+    Native,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub motd: String,
@@ -117,6 +129,8 @@ pub struct ServerConfig {
     pub enforce_secure_profile: bool,
     pub compression_threshold: usize,
     pub view_distance: u8,
+    /// Which client protocol versions are accepted.
+    pub supported_versions: SupportedVersions,
     /// Maximum queued, still-uncompressed packet bytes per connection. Exceeding it
     /// disconnects the client as timed out instead of blocking or growing without bound.
     pub send_queue_bytes: usize,
@@ -142,6 +156,7 @@ impl Default for ServerConfig {
             enforce_secure_profile: true,
             compression_threshold: 256,
             view_distance: 10,
+            supported_versions: SupportedVersions::All,
             send_queue_bytes: 2 * 1024 * 1024,
             write_timeout: std::time::Duration::from_secs(30),
             forwarding: forwarding::Forwarding::None,
@@ -220,6 +235,26 @@ async fn send_packet<P: Packet, W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Encode and send a packet, translating it for the client when it is older than the core.
+async fn send_translated<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    encoder: &FrameEncoder,
+    translator: Option<&mut Translator>,
+    state: State,
+    packet: RawPacket,
+) -> Result<()> {
+    let packets = match translator {
+        Some(translator) => translator.clientbound(state, packet)?,
+        None => vec![packet],
+    };
+    for packet in packets {
+        let mut wire = Vec::new();
+        encoder.encode(&packet.to_frame(), &mut wire);
+        stream.write_all(&wire).await?;
+    }
+    Ok(())
+}
+
 async fn handle_connection(
     mut stream: Wire,
     config: ServerConfig,
@@ -228,11 +263,59 @@ async fn handle_connection(
 ) -> Result<()> {
     let mut decoder = FrameDecoder::default();
     let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
+    let handshake_packet = RawPacket::parse(&packet)?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != Intention::ID {
         bail!("expected handshake");
     }
     let handshake = Intention::decode(&mut body)?;
+    // A native client keeps the untranslated path; an older one gets a session that
+    // rewrites IDs and layouts in both directions.
+    let mut translator = match config.supported_versions {
+        SupportedVersions::Native => {
+            if handshake.intent != Intent::Status
+                && handshake.protocol_version != ferrite_protocol::PROTOCOL_VERSION
+            {
+                let unsupported = ferrite_translate::Unsupported {
+                    client_protocol: handshake.protocol_version,
+                };
+                let disconnect_encoder = FrameEncoder::default();
+                send_translated(
+                    &mut stream,
+                    &disconnect_encoder,
+                    None,
+                    State::Login,
+                    unsupported.login_disconnect(),
+                )
+                .await?;
+                return Ok(());
+            }
+            None
+        }
+        SupportedVersions::All => match Translator::from_handshake(&handshake_packet)? {
+            HandshakeOutcome::Supported { translator, .. } => {
+                (!translator.is_passthrough()).then_some(translator)
+            }
+            // A login from an unsupported client is rejected in the login state, exactly
+            // like vanilla's handshake listener. Status stays untranslated so the server
+            // list still shows the version mismatch.
+            HandshakeOutcome::Unsupported { unsupported, .. }
+                if handshake.intent != Intent::Status =>
+            {
+                let disconnect_encoder = FrameEncoder::default();
+                send_translated(
+                    &mut stream,
+                    &disconnect_encoder,
+                    None,
+                    State::Login,
+                    unsupported.login_disconnect(),
+                )
+                .await?;
+                return Ok(());
+            }
+            HandshakeOutcome::Unsupported { .. } => None,
+        },
+    };
     if handshake.intent != Intent::Status {
         // BungeeCord legacy forwarding is appended to the handshake host. Paper's
         // Spigot patch in ServerHandshakePacketListenerImpl parses it before the
@@ -246,7 +329,7 @@ async fn handle_connection(
         } else {
             None
         };
-        return offline_login(stream, decoder, config, key, legacy, peer).await;
+        return offline_login(stream, decoder, config, key, legacy, peer, translator).await;
     }
     let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
@@ -255,9 +338,16 @@ async fn handle_connection(
     }
     StatusRequest::decode(&mut body)?;
     let json = status_json(&config);
-    send_packet(&mut stream, &StatusResponse { json })
-        .await
-        .context("send status")?;
+    let status_encoder = FrameEncoder::default();
+    send_translated(
+        &mut stream,
+        &status_encoder,
+        translator.as_mut(),
+        State::Status,
+        RawPacket::of(&StatusResponse { json }),
+    )
+    .await
+    .context("send status")?;
     let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
     if VarInt::decode(&mut body)?.0 != PingRequest::ID {
@@ -280,6 +370,7 @@ async fn offline_login(
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
     legacy: Option<forwarding::LegacyForwarding>,
     peer: std::net::IpAddr,
+    mut translator: Option<Translator>,
 ) -> Result<()> {
     use ferrite_protocol::packets::login::{LoginStart, LoginSuccess, SetCompression};
 
@@ -353,20 +444,20 @@ async fn offline_login(
     decoder.set_compression(Some(config.compression_threshold));
     let mut encoder = FrameEncoder::default();
     encoder.set_compression(Some(config.compression_threshold), 6);
-    let mut body = Vec::new();
-    encode_packet(
-        &LoginSuccess {
+    send_translated(
+        &mut stream,
+        &encoder,
+        translator.as_mut(),
+        State::Login,
+        RawPacket::of(&LoginSuccess {
             uuid: profile.uuid,
             name: profile.name.clone(),
             properties: profile.properties.clone(),
             session_id: uuid::Uuid::new_v4(),
-        },
-        &mut body,
-    );
-    let mut wire = Vec::new();
-    encoder.encode(&body, &mut wire);
-    stream.write_all(&wire).await?;
-    configure(stream, decoder, encoder, config, profile).await
+        }),
+    )
+    .await?;
+    configure(stream, decoder, encoder, config, profile, translator).await
 }
 
 /// Ask Velocity for its modern-forwarding payload and verify the HMAC.
@@ -410,6 +501,7 @@ async fn query_velocity(
         .context("client did not answer the Velocity forwarding query")?;
     forwarding::parse_velocity_payload(secret.as_bytes(), &data.0)
 }
+#[cfg(test)]
 async fn send_compressed<P: Packet, W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
     encoder: &FrameEncoder,
@@ -437,6 +529,7 @@ async fn configure(
     encoder: FrameEncoder,
     config: ServerConfig,
     mut profile: Profile,
+    mut translator: Option<Translator>,
 ) -> Result<()> {
     use ferrite_protocol::{
         Encode, RestBytes,
@@ -455,13 +548,15 @@ async fn configure(
     }
     let mut brand = Vec::new();
     "Ferrite".encode(&mut brand);
-    send_compressed(
+    send_translated(
         &mut stream,
         &encoder,
-        &ClientboundCustomPayload {
+        translator.as_mut(),
+        State::Configuration,
+        RawPacket::of(&ClientboundCustomPayload {
             channel: "minecraft:brand".into(),
             data: RestBytes(brand),
-        },
+        }),
     )
     .await?;
     let pack = KnownPack {
@@ -469,12 +564,14 @@ async fn configure(
         id: "core".into(),
         version: ferrite_protocol::GAME_VERSION.into(),
     };
-    send_compressed(
+    send_translated(
         &mut stream,
         &encoder,
-        &ClientboundKnownPacks {
+        translator.as_mut(),
+        State::Configuration,
+        RawPacket::of(&ClientboundKnownPacks {
             packs: vec![pack.clone()],
-        },
+        }),
     )
     .await?;
     let mut timer = tokio::time::interval_at(
@@ -488,6 +585,7 @@ async fn configure(
             &encoder,
             &mut timer,
             Some(&mut profile),
+            translator.as_mut(),
         )
         .await?;
         let mut body = packet.as_slice();
@@ -504,18 +602,34 @@ async fn configure(
     }
     let vanilla = tokio::task::spawn_blocking(registry::load_vanilla).await??;
     for (name, entries) in &vanilla.registries {
-        send_compressed(
+        send_translated(
             &mut stream,
             &encoder,
-            &RegistryData {
+            translator.as_mut(),
+            State::Configuration,
+            RawPacket::of(&RegistryData {
                 registry: name.clone(),
                 entries: entries.clone(),
-            },
+            }),
         )
         .await?;
     }
-    send_compressed(&mut stream, &encoder, &vanilla.tags).await?;
-    send_compressed(&mut stream, &encoder, &FinishConfiguration).await?;
+    send_translated(
+        &mut stream,
+        &encoder,
+        translator.as_mut(),
+        State::Configuration,
+        RawPacket::of(&vanilla.tags),
+    )
+    .await?;
+    send_translated(
+        &mut stream,
+        &encoder,
+        translator.as_mut(),
+        State::Configuration,
+        RawPacket::of(&FinishConfiguration),
+    )
+    .await?;
     loop {
         let packet = read_config_packet(
             &mut stream,
@@ -523,6 +637,7 @@ async fn configure(
             &encoder,
             &mut timer,
             Some(&mut profile),
+            translator.as_mut(),
         )
         .await?;
         let mut body = packet.as_slice();
@@ -535,7 +650,10 @@ async fn configure(
             "enforce-secure-profile is ignored in offline mode: unsigned chat is accepted"
         );
     }
-    play(stream, decoder, encoder, config, profile, vanilla).await
+    play(
+        stream, decoder, encoder, config, profile, vanilla, translator,
+    )
+    .await
 }
 async fn read_config_packet(
     stream: &mut Wire,
@@ -543,15 +661,30 @@ async fn read_config_packet(
     encoder: &FrameEncoder,
     timer: &mut tokio::time::Interval,
     mut profile: Option<&mut Profile>,
+    mut translator: Option<&mut Translator>,
 ) -> Result<Vec<u8>> {
     use ferrite_protocol::packets::configuration::{
         ClientInformation, ClientboundKeepAlive, ServerboundCustomPayload, ServerboundKeepAlive,
     };
     loop {
         tokio::select! {
-            _=timer.tick()=>{send_compressed(stream,encoder,&ClientboundKeepAlive{id:1}).await?;}
-            packet=read_packet(stream,decoder)=>{let packet=packet?;let mut body=packet.as_slice();let id=VarInt::decode(&mut body)?.0;
-                match id {0=>{let info=ClientInformation::decode(&mut body)?;if let Some(profile)=profile.as_deref_mut(){profile.chat_visibility=match info.chat_mode.0{1=>1,2=>2,_=>0};}},2=>{ServerboundCustomPayload::decode(&mut body)?;},4=>{ServerboundKeepAlive::decode(&mut body)?;},_=>return Ok(packet)}
+            _=timer.tick()=>{send_translated(stream,encoder,None,State::Configuration,RawPacket::of(&ClientboundKeepAlive{id:1})).await?;}
+            packet=read_packet(stream,decoder)=>{
+                let frame=packet?;
+                let packets = if let Some(translator) = translator.as_deref_mut() {
+                    translator.serverbound(State::Configuration, RawPacket::parse(&frame)?)?
+                } else {
+                    vec![RawPacket::parse(&frame)?]
+                };
+                for packet in packets {
+                    let mut body = packet.body.as_slice();
+                    match packet.id {
+                        0 => { let info = ClientInformation::decode(&mut body)?; if let Some(profile)=profile.as_deref_mut(){profile.chat_visibility=match info.chat_mode.0{1=>1,2=>2,_=>0};} },
+                        2 => { ServerboundCustomPayload::decode(&mut body)?; },
+                        4 => { ServerboundKeepAlive::decode(&mut body)?; },
+                        _ => return Ok(packet.to_frame()),
+                    }
+                }
             }
         }
     }
@@ -615,6 +748,7 @@ async fn play(
     config: ServerConfig,
     profile: Profile,
     vanilla: registry::VanillaData,
+    translator: Option<Translator>,
 ) -> Result<()> {
     use game::GameMessage;
     tracing::info!(name = %profile.name, address = ?profile.address, "entering play");
@@ -660,7 +794,15 @@ async fn play(
     // write side and does compression, encryption and one write per batch, so a slow client
     // can never stall a tick.
     let (mut reader, writer) = stream.into_split();
-    let mut writer_task = tokio::spawn(write_loop(writer, encoder, queue, config.write_timeout));
+    let translator =
+        translator.map(|translator| std::sync::Arc::new(std::sync::Mutex::new(translator)));
+    let mut writer_task = tokio::spawn(write_loop(
+        writer,
+        encoder,
+        queue,
+        config.write_timeout,
+        translator.clone(),
+    ));
     let result = async {
         loop {
             tokio::select! {
@@ -672,9 +814,18 @@ async fn play(
                 }
                 frame = read_packet(&mut reader, &mut decoder) => {
                     let frame = frame?;
-                    if let Some(packet) = game::decode_play(&frame)? {
-                        game.send(GameMessage::Input { session, uuid, packet })
-                            .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                    let packets = match &translator {
+                        Some(translator) => translator
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .serverbound(State::Play, RawPacket::parse(&frame)?)?,
+                        None => vec![RawPacket::parse(&frame)?],
+                    };
+                    for packet in packets {
+                        if let Some(packet) = game::decode_play(&packet.to_frame())? {
+                            game.send(GameMessage::Input { session, uuid, packet })
+                                .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                        }
                     }
                 }
             }
@@ -691,13 +842,12 @@ async fn write_loop(
     encoder: FrameEncoder,
     mut queue: game::OutboundReceiver,
     write_timeout: std::time::Duration,
+    translator: Option<std::sync::Arc<std::sync::Mutex<Translator>>>,
 ) -> Result<()> {
     use ferrite_protocol::{
         packets::play::{PlayDisconnect, PlayKeepAlive},
         types::PlainText,
     };
-    let mut keepalive_body = Vec::new();
-    encode_packet(&PlayKeepAlive { id: 1 }, &mut keepalive_body);
     let mut keepalive = tokio::time::interval_at(
         tokio::time::Instant::now() + std::time::Duration::from_secs(10),
         std::time::Duration::from_secs(10),
@@ -708,7 +858,12 @@ async fn write_loop(
         let mut close = None;
         tokio::select! {
             biased;
-            _ = keepalive.tick() => encoder.encode(&keepalive_body, &mut batch),
+            _ = keepalive.tick() => queue_raw(
+                &mut batch,
+                &encoder,
+                &translator,
+                RawPacket::of(&PlayKeepAlive { id: 1 }),
+            ),
             incoming = queue.next() => match incoming {
                 game::Incoming::Overflow => {
                     queue.discard();
@@ -716,11 +871,11 @@ async fn write_loop(
                 }
                 game::Incoming::Closed => return Ok(()),
                 game::Incoming::Message(msg) => {
-                    queue_batch(&mut batch, &encoder, msg, &mut close);
+                    queue_batch(&mut batch, &encoder, &translator, msg, &mut close);
                     while close.is_none()
                         && let Some(msg) = queue.try_recv()
                     {
-                        queue_batch(&mut batch, &encoder, msg, &mut close);
+                        queue_batch(&mut batch, &encoder, &translator, msg, &mut close);
                     }
                 }
             }
@@ -732,14 +887,14 @@ async fn write_loop(
             close = Some("Timed out".to_string());
         }
         if let Some(reason) = close {
-            let mut body = Vec::new();
-            encode_packet(
-                &PlayDisconnect {
+            queue_raw(
+                &mut batch,
+                &encoder,
+                &translator,
+                RawPacket::of(&PlayDisconnect {
                     reason: PlainText(reason),
-                },
-                &mut body,
+                }),
             );
-            encoder.encode(&body, &mut batch);
             if !batch.is_empty() {
                 write_batch(&mut writer, &mut batch, write_timeout).await?;
             }
@@ -753,12 +908,50 @@ async fn write_loop(
 fn queue_batch(
     batch: &mut Vec<u8>,
     encoder: &FrameEncoder,
+    translator: &Option<std::sync::Arc<std::sync::Mutex<Translator>>>,
     msg: game::Outbound,
     close: &mut Option<String>,
 ) {
     match msg {
-        game::Outbound::Packet(body) => encoder.encode(&body, batch),
+        game::Outbound::Packet(body) => match RawPacket::parse(&body) {
+            Ok(packet) => queue_raw(batch, encoder, translator, packet),
+            Err(error) => {
+                tracing::error!(%error, "invalid core packet");
+                *close = Some("Internal error".into());
+            }
+        },
         game::Outbound::Disconnect(reason) => *close = Some(reason),
+    }
+}
+
+/// Encode one core packet into the client's protocol and append it to the batch. Native
+/// clients take the exact same path as before translation existed.
+fn queue_raw(
+    batch: &mut Vec<u8>,
+    encoder: &FrameEncoder,
+    translator: &Option<std::sync::Arc<std::sync::Mutex<Translator>>>,
+    packet: RawPacket,
+) {
+    match translator {
+        Some(translator) => {
+            let raw = packet.to_frame();
+            match translator
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clientbound(State::Play, packet)
+            {
+                Ok(packets) => {
+                    for packet in packets {
+                        encoder.encode(&packet.to_frame(), batch);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "packet translation failed");
+                    encoder.encode(&raw, batch);
+                }
+            }
+        }
+        None => encoder.encode(&packet.to_frame(), batch),
     }
 }
 async fn write_batch(
@@ -1259,6 +1452,166 @@ mod login_test {
         assert_eq!(profile.name, "Notch");
         server.abort();
     }
+
+    /// Send a handshake and a login start, then return the first reply frame.
+    async fn login_attempt(
+        addr: std::net::SocketAddr,
+        protocol: i32,
+    ) -> (TcpStream, FrameDecoder, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut wire = Vec::new();
+        for body in [
+            {
+                let mut b = Vec::new();
+                encode_packet(
+                    &Intention {
+                        protocol_version: protocol,
+                        server_address: "localhost".into(),
+                        server_port: addr.port(),
+                        intent: Intent::Login,
+                    },
+                    &mut b,
+                );
+                b
+            },
+            {
+                let mut b = Vec::new();
+                encode_packet(
+                    &LoginStart {
+                        name: "Steve".into(),
+                        uuid: uuid::Uuid::nil(),
+                    },
+                    &mut b,
+                );
+                b
+            },
+        ] {
+            FrameEncoder::default().encode(&body, &mut wire);
+        }
+        stream.write_all(&wire).await.unwrap();
+        let mut decoder = FrameDecoder::default();
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .expect("server did not answer the login attempt")
+        .unwrap();
+        (stream, decoder, packet)
+    }
+
+    #[tokio::test]
+    async fn native_only_rejects_older_protocols() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                supported_versions: SupportedVersions::Native,
+                ..Default::default()
+            },
+        ));
+        let (_stream, _decoder, packet) = login_attempt(addr, 776).await;
+        let mut body = packet.as_slice();
+        assert_eq!(
+            VarInt::decode(&mut body).unwrap().0,
+            0,
+            "expected the login-state disconnect"
+        );
+        let reason = String::decode(&mut body).unwrap();
+        assert!(
+            reason.contains("multiplayer.disconnect.outdated_client"),
+            "{reason}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn older_protocol_is_translated_when_all_versions_are_supported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                ..Default::default()
+            },
+        ));
+        // 26.2 (776): the login flow is reached instead of the "outdated client" disconnect.
+        let (mut stream, mut decoder, packet) = login_attempt(addr, 776).await;
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, SetCompression::ID);
+        decoder.set_compression(Some(256));
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, LoginSuccess::ID);
+        assert_eq!(LoginSuccess::decode(&mut body).unwrap().name, "Steve");
+
+        // A protocol outside the chain is rejected even though older versions are accepted.
+        let (_stream, _decoder, packet) = login_attempt(addr, 775).await;
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, 0);
+        let reason = String::decode(&mut body).unwrap();
+        assert!(
+            reason.contains("multiplayer.disconnect.outdated_client"),
+            "{reason}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn status_advertises_the_older_protocol() {
+        use ferrite_protocol::packets::status::{StatusRequest, StatusResponse};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, ServerConfig::default()));
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut wire = Vec::new();
+        for body in [
+            {
+                let mut b = Vec::new();
+                encode_packet(
+                    &Intention {
+                        protocol_version: 776,
+                        server_address: "localhost".into(),
+                        server_port: addr.port(),
+                        intent: Intent::Status,
+                    },
+                    &mut b,
+                );
+                b
+            },
+            {
+                let mut b = Vec::new();
+                encode_packet(&StatusRequest, &mut b);
+                b
+            },
+        ] {
+            FrameEncoder::default().encode(&body, &mut wire);
+        }
+        stream.write_all(&wire).await.unwrap();
+        let mut decoder = FrameDecoder::default();
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_packet(&mut stream, &mut decoder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut body = packet.as_slice();
+        assert_eq!(VarInt::decode(&mut body).unwrap().0, StatusResponse::ID);
+        let response: serde_json::Value =
+            serde_json::from_str(&StatusResponse::decode(&mut body).unwrap().json).unwrap();
+        assert_eq!(response["version"]["protocol"], 776);
+        server.abort();
+    }
 }
 
 #[cfg(test)]
@@ -1666,7 +2019,7 @@ mod keepalive_tests {
             let mut decoder = FrameDecoder::default();
             let encoder = FrameEncoder::default();
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(20));
-            read_config_packet(&mut wire, &mut decoder, &encoder, &mut timer, None)
+            read_config_packet(&mut wire, &mut decoder, &encoder, &mut timer, None, None)
                 .await
                 .unwrap()
         });
