@@ -19,6 +19,8 @@
 //! owner through that region's task queue.
 
 pub mod ai;
+pub mod arrow;
+pub mod combat;
 pub mod effect;
 pub mod experience;
 pub mod falling;
@@ -27,6 +29,7 @@ mod index;
 pub mod item;
 pub mod metadata;
 pub mod mob;
+pub mod path;
 pub mod physics;
 pub mod potion;
 mod rng;

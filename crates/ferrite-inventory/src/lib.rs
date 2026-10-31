@@ -20,7 +20,9 @@ pub use inventory::{
     CHEST, FEET, HEAD, HOTBAR, ITEMS, LEGS, OFFHAND, PlayerInventory, SIZE, equipment_slot,
 };
 pub use menu::{
-    ClickInput, Clicker, Crafter, Menu, MenuKind, NoCrafting, SLOT_OUTSIDE, Sync, craft_remainder,
+    ClickInput, Clicker, CookingOutput, Crafter, FURNACE_BURN_LEFT, FURNACE_BURN_TOTAL,
+    FURNACE_COOK_PROGRESS, FURNACE_COOK_TOTAL, FURNACE_DATA_SLOTS, FURNACE_LIT, FurnaceKind,
+    FurnaceState, Menu, MenuKind, NoCrafting, SLOT_OUTSIDE, Sync, craft_remainder,
 };
 
 #[cfg(test)]

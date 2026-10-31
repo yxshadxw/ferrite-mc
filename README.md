@@ -5,8 +5,10 @@
 > Bukkit/Spigot/Paper/Folia plugins, with multiple Minecraft versions supported later.
 > Target: Minecraft Java 26.3, protocol 777. Current status: **playable survival basics on
 > bot-verified worlds** — login/encryption, signed chat, server-list ping (players, favicon),
-> block break/place with drops, inventory/crafting/chests, item entities, survival (health,
-> hunger, death, XP), redstone, falling blocks and explosions, passive mobs, random ticks, fluids,
+> block break/place with drops, inventory/crafting/chests, furnace and anvil menus, item entities, survival (health,
+> hunger, death, XP), redstone, falling blocks and explosions, passive and hostile mobs
+> (zombie, skeleton, spider, creeper, enderman) with pathfinding, melee combat and arrows,
+> random ticks, fluids,
 > ~70 vanilla commands (including execute and data), plugin events, multi-version client
 > translation, a Folia-style regionizer and Starlight-style lighting (0 mismatches vs vanilla).
 > World generation (density functions, noise chunks, aquifers, surface rules, carvers) matches
@@ -45,6 +47,10 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   랜덤 틱(잔디 번짐·나뭇잎 소멸), 유체(물/용암)
 - **게임플레이** — 블록 캐기/설치와 드롭, 아이템 엔티티와 줍기, 인벤토리 클릭, 2x2/작업대
   크래프팅, 상자·통 메뉴, 게임룰 59종과 저장
+- **제작대·용광로** — 용광로·용해로·훈연기 제련(바닐라 연료 연소 시간, 조리 진행도, 켜짐/꺼짐
+  상태 동기화, 꺼낼 때 경험치), 모루 수리·이름 변경·레벨 비용(내구도 5% 보너스, 선행 작업
+  패널티, 40레벨 상한), 마법 부여대, 숫돌, 석재 절단기, 대장장이 작업대, 베틀 메뉴와
+  슬롯 검증
 - **생존** — 체력·피해(낙하/익사/용암/불/공허), 허기와 포화도, 음식 먹기, 사망·리스폰
   (`keepInventory` 반영), 경험치 오브와 사망 시 경험치 드롭
 - **블록 변화** — 이웃 업데이트와 `canSurvive` 규칙, 낙하 블록(모래·자갈·콘크리트 가루·모루),
@@ -52,8 +58,11 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   양동이(물·용암·가마솥)와 실크터치 드롭
 - **레드스톤** — 와이어 신호 감쇠, 레버·버튼·압력판·횃불(번아웃)·관찰자·반복기·비교기,
   램프·문·트랩도어·펜스 게이트·노트 블록 반응
-- **몹 (진행 중)** — 몹 프레임워크(체력·피해·넉백·전리품·디스폰), 수동 몹(돼지·소·양·닭)의
-  배회/주시 목표와 자연 스폰, `/summon`
+- **몹** — 몹 프레임워크(체력·피해·넉백·전리품·디스폰), 수동 몹(돼지·소·양·닭)의
+  배회/주시 목표와 자연 스폰, 적대 몹(좀비·스켈레톤·거미·크리퍼·엔더맨)의 목표 기반 AI와
+  블록 격자 길찾기, 몬스터 자연 스폰(밝기·몹 캡·디스폰), `/summon`
+- **전투** — 공격 패킷과 무기 공격 속도·공격력, 치명타(1.5배)와 휩쓸기, 넉백, 방패 방어,
+  화살 피해
 - **명령(약 70개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
   `give`, `clear`, `xp`, `effect`, `enchant`, `title`, `scoreboard`, `bossbar`, `team`,
   `worldborder`, `setblock`, `fill`, `clone`, `execute`(as/at/if/unless/store/run 등),
@@ -78,7 +87,7 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 아직 아닌 것(솔직하게):
 
 - **실제 클라이언트로 접속 테스트를 하지 않았습니다.**
-- 적대 몹 AI·전투, 화재(진행 중), 피스톤은 개발 중이거나 아직 없습니다.
+- 화재(진행 중), 피스톤은 개발 중이거나 아직 없습니다.
 - 플러그인 API는 Paper `Server`의 일부(약 120/206 메서드)와 최소 CraftBukkit shim만
   구현되어 있습니다. EssentialsX 같은 대형 플러그인의 모든 호출 경로는 아직 동작하지 않고,
   NMS 타입에 의존하는 메서드는 `UnsupportedOperationException`을 던집니다.
