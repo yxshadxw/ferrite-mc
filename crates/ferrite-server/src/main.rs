@@ -25,6 +25,27 @@ struct Config {
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
     plugin_bridge: Option<std::path::PathBuf>,
+    /// Plugin bridge settings from the `[plugins]` table.
+    plugins: PluginSettings,
+    /// Enforce `whitelist.json` for new connections.
+    whitelist: bool,
+}
+
+/// Plugin bridge settings from the `[plugins]` table.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct PluginSettings {
+    /// What a failed plugin event means for the action it guards.
+    on_event_error: EventErrorPolicy,
+}
+
+/// What a failed plugin event means for the action it guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EventErrorPolicy {
+    #[default]
+    Allow,
+    Deny,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +129,8 @@ impl Default for Config {
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
             plugin_bridge: None,
+            plugins: PluginSettings::default(),
+            whitelist: false,
         }
     }
 }
@@ -133,6 +156,8 @@ async fn main() -> anyhow::Result<()> {
             "online-mode is ignored when player forwarding is enabled; authenticate players on the proxy"
         );
     }
+    let admin =
+        std::sync::Arc::new(ferrite_admin::AdminLists::load(".").context("loading admin lists")?);
     if !config.online_mode && !ops.is_empty() {
         tracing::warn!(
             "operator UUIDs in offline mode must be offline-mode UUIDs; player names are not authenticated"
@@ -162,10 +187,17 @@ async fn main() -> anyhow::Result<()> {
             GameMode::Survival => 0,
             GameMode::Creative => 1,
         },
+        max_players: i32::try_from(config.max_players).unwrap_or(i32::MAX),
         ops,
         plugins: plugin_bridge
             .as_ref()
             .map(ferrite_server::plugins::PluginBridge::hooks),
+        plugin_event_errors: match config.plugins.on_event_error {
+            EventErrorPolicy::Allow => game::PluginEventPolicy::Allow,
+            EventErrorPolicy::Deny => game::PluginEventPolicy::Deny,
+        },
+        admin: Some(admin),
+        whitelist: config.whitelist,
     };
     game::playerdata::init(
         config
@@ -197,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
             status: Default::default(),
             read_timeout: ferrite_net::DEFAULT_READ_TIMEOUT,
             game: Some(world.sender.clone()),
+            ..Default::default()
         },
     ));
     let (console_tx, mut console_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -213,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    let mut stopped = world.stop_signal();
     let result = loop {
         tokio::select! {
             result = &mut server => break Some(result),
@@ -222,6 +256,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(false) => {},
                 Err(error) => tracing::warn!(%error, "console command failed"),
             },
+            _ = async {
+                loop {
+                    if *stopped.borrow() { break; }
+                    if stopped.changed().await.is_err() { break; }
+                }
+            } => break None,
         }
     };
     let world_result = world.shutdown().await;
@@ -360,6 +400,9 @@ mod tests {
             Some(std::path::Path::new("plugins"))
         );
         assert_eq!(defaults.plugin_bridge, None);
+        assert_eq!(defaults.plugins.on_event_error, EventErrorPolicy::Allow);
+        let denied: Config = toml::from_str("[plugins]\non-event-error = 'deny'").unwrap();
+        assert_eq!(denied.plugins.on_event_error, EventErrorPolicy::Deny);
         assert_eq!(
             defaults.server_icon.as_deref(),
             Some(std::path::Path::new("server-icon.png"))

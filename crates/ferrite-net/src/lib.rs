@@ -117,6 +117,11 @@ pub struct ServerConfig {
     pub enforce_secure_profile: bool,
     pub compression_threshold: usize,
     pub view_distance: u8,
+    /// Maximum queued, still-uncompressed packet bytes per connection. Exceeding it
+    /// disconnects the client as timed out instead of blocking or growing without bound.
+    pub send_queue_bytes: usize,
+    /// How long one writer batch may block before the connection is dropped.
+    pub write_timeout: std::time::Duration,
     pub forwarding: forwarding::Forwarding,
     /// `data:image/png;base64,...` shown in the server list, when a valid icon was loaded.
     pub favicon: Option<String>,
@@ -137,6 +142,8 @@ impl Default for ServerConfig {
             enforce_secure_profile: true,
             compression_threshold: 256,
             view_distance: 10,
+            send_queue_bytes: 2 * 1024 * 1024,
+            write_timeout: std::time::Duration::from_secs(30),
             forwarding: forwarding::Forwarding::None,
             favicon: None,
             status: Arc::new(StatusState::default()),
@@ -166,7 +173,7 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<()> {
         let key = key.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(Wire::new(stream), config, key).await {
+            if let Err(error) = handle_connection(Wire::new(stream), config, key, peer.ip()).await {
                 tracing::info!(%peer, %error, "connection closed");
             }
         });
@@ -217,6 +224,7 @@ async fn handle_connection(
     mut stream: Wire,
     config: ServerConfig,
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
+    peer: std::net::IpAddr,
 ) -> Result<()> {
     let mut decoder = FrameDecoder::default();
     let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
@@ -238,7 +246,7 @@ async fn handle_connection(
         } else {
             None
         };
-        return offline_login(stream, decoder, config, key, legacy).await;
+        return offline_login(stream, decoder, config, key, legacy, peer).await;
     }
     let packet = read_packet_timeout(&mut stream, &mut decoder, config.read_timeout).await?;
     let mut body = packet.as_slice();
@@ -271,6 +279,7 @@ async fn offline_login(
     config: ServerConfig,
     key: Option<std::sync::Arc<rsa::RsaPrivateKey>>,
     legacy: Option<forwarding::LegacyForwarding>,
+    peer: std::net::IpAddr,
 ) -> Result<()> {
     use ferrite_protocol::packets::login::{LoginStart, LoginSuccess, SetCompression};
 
@@ -303,7 +312,8 @@ async fn offline_login(
                 uuid,
                 name,
                 properties,
-                address: None,
+                // No proxy: the peer address is the player's address.
+                address: Some(peer),
                 chat_visibility: 0,
             }
         }
@@ -599,15 +609,14 @@ fn flat_chunk(x: i32, z: i32, biome: i32) -> ferrite_protocol::packets::play::Ch
     }
 }
 async fn play(
-    mut stream: Wire,
+    stream: Wire,
     mut decoder: FrameDecoder,
     encoder: FrameEncoder,
     config: ServerConfig,
     profile: Profile,
     vanilla: registry::VanillaData,
 ) -> Result<()> {
-    use ferrite_protocol::packets::play::{PlayDisconnect, PlayKeepAlive};
-    use game::{GameMessage, Outbound};
+    use game::GameMessage;
     tracing::info!(name = %profile.name, address = ?profile.address, "entering play");
     let game = config.game.context("game loop unavailable")?;
     let dimension_type = vanilla.registries["minecraft:dimension_type"]
@@ -627,12 +636,13 @@ async fn play(
     let uuid = profile.uuid;
     let status = config.status.clone();
     let status_name = profile.name.clone();
-    let (outbound, mut queue) = tokio::sync::mpsc::unbounded_channel();
+    let (outbound, queue) = game::OutboundSender::channel(config.send_queue_bytes);
     game.send(GameMessage::Joined {
         session,
         uuid,
         name: profile.name,
         properties: profile.properties,
+        address: profile.address,
         dimension_type,
         biome,
         view_distance: config.view_distance.clamp(2, 32),
@@ -642,23 +652,125 @@ async fn play(
         chat_type,
         chat_visibility: profile.chat_visibility,
         max_players: config.max_players,
-        outbound,
+        outbound: outbound.clone(),
     })
     .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
     status.join(session, status_name, uuid);
-    let result=async {
-        let mut tick=tokio::time::interval(std::time::Duration::from_millis(50));
-        let mut keepalive=tokio::time::interval_at(tokio::time::Instant::now()+std::time::Duration::from_secs(10),std::time::Duration::from_secs(10));
-        loop {tokio::select! {
-            _=tick.tick()=>{let mut batch=Vec::new();let mut close=false;while let Ok(msg)=queue.try_recv(){match msg {Outbound::Packet(body)=>{tracing::debug!(id=?ferrite_protocol::VarInt::decode_partial(&body).ok().flatten().map(|v| v.0),len=body.len(),"play packet out");encoder.encode(&body,&mut batch)},Outbound::Disconnect(reason)=>{let mut body=Vec::new();encode_packet(&PlayDisconnect {reason:ferrite_protocol::types::PlainText(reason)},&mut body);encoder.encode(&body,&mut batch);close=true;break;}}} if !batch.is_empty(){stream.write_all(&batch).await?;}
-                if close{return Ok(());}},
-            _=keepalive.tick()=>{send_compressed(&mut stream,&encoder,&PlayKeepAlive{id:1}).await?;},
-            frame=read_packet(&mut stream,&mut decoder)=>{let frame=frame?;if let Some(packet)=game::decode_play(&frame)?{game.send(GameMessage::Input {session,uuid,packet}).map_err(|_|anyhow::anyhow!("game loop stopped"))?;}}
-        }}
-    }.await;
+    // Ticks only push already-encoded bytes into the bounded queue. This task owns the socket
+    // write side and does compression, encryption and one write per batch, so a slow client
+    // can never stall a tick.
+    let (mut reader, writer) = stream.into_split();
+    let mut writer_task = tokio::spawn(write_loop(writer, encoder, queue, config.write_timeout));
+    let result = async {
+        loop {
+            tokio::select! {
+                finished = &mut writer_task => {
+                    return match finished {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!("writer task failed: {error}")),
+                    };
+                }
+                frame = read_packet(&mut reader, &mut decoder) => {
+                    let frame = frame?;
+                    if let Some(packet) = game::decode_play(&frame)? {
+                        game.send(GameMessage::Input { session, uuid, packet })
+                            .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    writer_task.abort();
     let _ = game.send(GameMessage::Left { session, uuid });
     status.leave(session);
     result
+}
+async fn write_loop(
+    mut writer: wire::WireWriter,
+    encoder: FrameEncoder,
+    mut queue: game::OutboundReceiver,
+    write_timeout: std::time::Duration,
+) -> Result<()> {
+    use ferrite_protocol::{
+        packets::play::{PlayDisconnect, PlayKeepAlive},
+        types::PlainText,
+    };
+    let mut keepalive_body = Vec::new();
+    encode_packet(&PlayKeepAlive { id: 1 }, &mut keepalive_body);
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(10),
+    );
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let mut batch = Vec::new();
+        let mut close = None;
+        tokio::select! {
+            biased;
+            _ = keepalive.tick() => encoder.encode(&keepalive_body, &mut batch),
+            incoming = queue.next() => match incoming {
+                game::Incoming::Overflow => {
+                    queue.discard();
+                    close = Some("Timed out".to_string());
+                }
+                game::Incoming::Closed => return Ok(()),
+                game::Incoming::Message(msg) => {
+                    queue_batch(&mut batch, &encoder, msg, &mut close);
+                    while close.is_none()
+                        && let Some(msg) = queue.try_recv()
+                    {
+                        queue_batch(&mut batch, &encoder, msg, &mut close);
+                    }
+                }
+            }
+        }
+        // Overflow can latch after the last `try_recv`; drop the rest of the backlog and send
+        // the disconnect instead of flushing packets the client is not reading.
+        if close.is_none() && queue.overflowed() {
+            queue.discard();
+            close = Some("Timed out".to_string());
+        }
+        if let Some(reason) = close {
+            let mut body = Vec::new();
+            encode_packet(
+                &PlayDisconnect {
+                    reason: PlainText(reason),
+                },
+                &mut body,
+            );
+            encoder.encode(&body, &mut batch);
+            if !batch.is_empty() {
+                write_batch(&mut writer, &mut batch, write_timeout).await?;
+            }
+            return Ok(());
+        }
+        if !batch.is_empty() {
+            write_batch(&mut writer, &mut batch, write_timeout).await?;
+        }
+    }
+}
+fn queue_batch(
+    batch: &mut Vec<u8>,
+    encoder: &FrameEncoder,
+    msg: game::Outbound,
+    close: &mut Option<String>,
+) {
+    match msg {
+        game::Outbound::Packet(body) => encoder.encode(&body, batch),
+        game::Outbound::Disconnect(reason) => *close = Some(reason),
+    }
+}
+async fn write_batch(
+    writer: &mut wire::WireWriter,
+    batch: &mut [u8],
+    write_timeout: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(write_timeout, writer.write_batch(batch)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => bail!("client timed out while writing"),
+    }
 }
 fn minecraft_digest(digest: &[u8]) -> String {
     num_bigint::BigInt::from_signed_bytes_be(digest).to_str_radix(16)
@@ -768,7 +880,8 @@ fn valid_username(name: &str) -> bool {
         && name.len() <= 16
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
-fn offline_uuid(name: &str) -> uuid::Uuid {
+/// The UUID an offline-mode server gives a player name (`OfflinePlayer:<name>`, MD5, version 3).
+pub fn offline_uuid(name: &str) -> uuid::Uuid {
     let digest = md5::compute(format!("OfflinePlayer:{name}"));
     let mut bytes = digest.0;
     bytes[6] = (bytes[6] & 0x0f) | 0x30;

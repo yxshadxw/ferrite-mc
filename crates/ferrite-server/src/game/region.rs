@@ -1,12 +1,15 @@
 use super::{
+    PluginEventPolicy,
     chunk::{ChunkSource, FlatGenerator},
+    commands::{XpOperation, XpUnit},
     valid_move,
 };
 use ferrite_entity::{
     BlockGetter, EntityRecord, EntityStore, Rng, item,
     tracker::{self, Viewer, ViewerKey},
 };
-use ferrite_net::game::{Outbound, ServerboundPlay, packet};
+use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
+use ferrite_plugin::InteractAction;
 use ferrite_profiler::Timings;
 use ferrite_protocol::{VarInt, packets::play::*};
 use ferrite_region::{ChunkPos, RegionData, SectionPos};
@@ -20,10 +23,38 @@ pub enum Command {
     Input(ServerboundPlay),
     Leave,
     SetMode(i32),
-    Teleport([f64; 3]),
+    Teleport {
+        pos: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    },
+    World(super::commands_world::WorldCommand),
+    Clear {
+        target: Uuid,
+        target_name: String,
+        item: Option<u16>,
+        max_count: Option<i32>,
+        feedback: Option<OutboundSender>,
+    },
+    Give {
+        target: Uuid,
+        target_name: String,
+        item: u16,
+        count: i32,
+        item_name: String,
+        feedback: Option<OutboundSender>,
+    },
+    Experience {
+        target: Uuid,
+        target_name: String,
+        operation: XpOperation,
+        amount: i32,
+        unit: XpUnit,
+        feedback: Option<OutboundSender>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
-pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
+pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, OutboundSender)>>>;
 pub enum Signal {
     Transfer {
         from: ChunkPos,
@@ -97,6 +128,11 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    pub name: String,
+    /// Plugin event hooks; `None` when the server runs without plugins.
+    pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
+    /// What a failed plugin event means for the action it guards.
+    pub plugin_event_errors: PluginEventPolicy,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -106,12 +142,15 @@ pub struct Player {
     pub ground: bool,
     pub chunk: ChunkPos,
     pub mailbox: Mailbox,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
     pub gamemode: i32,
-    pub inventory: [ItemStack; 46],
-    pub held_slot: u8,
+    pub experience_level: i32,
+    pub experience_progress: f32,
+    pub experience_total: i32,
+    pub inventory: ferrite_inventory::PlayerInventory,
+    pub menus: super::container::Containers,
     pub breaking: Option<(i64, u32, u32)>,
     pub view: i32,
     pub pending_teleport: Option<i32>,
@@ -219,8 +258,62 @@ fn chunk_window(
     });
     (forget, new)
 }
-fn send<P: ferrite_protocol::Packet>(p: &Player, msg: &P) {
+pub(super) fn send<P: ferrite_protocol::Packet>(p: &Player, msg: &P) {
     let _ = p.outbound.send(packet(msg));
+}
+/// Namespaced block id of a global state id, for Bukkit event materials.
+fn material_name(state: u32) -> &'static str {
+    u16::try_from(state)
+        .ok()
+        .and_then(ferrite_data::blocks::state)
+        .map_or("minecraft:air", |(name, _)| name)
+}
+/// Runs an event hook. A missing bridge allows the action; a failed call is
+/// decided by `plugin-event-errors` (Bukkit-compatible default: allow).
+fn event_allows(
+    plugins: Option<&dyn ferrite_plugin::ServerHooks>,
+    policy: PluginEventPolicy,
+    event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
+) -> bool {
+    let Some(plugins) = plugins else {
+        return true;
+    };
+    match event(plugins) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            let allow = policy == PluginEventPolicy::Allow;
+            tracing::warn!(%error, allow, "plugin event failed");
+            allow
+        }
+    }
+}
+/// Vanilla's total experience required to reach `level`.
+fn total_for_level(level: i32) -> i64 {
+    let level = i64::from(level.max(0));
+    if level <= 16 {
+        level * level + 6 * level
+    } else if level <= 31 {
+        (2.5 * level as f64 * level as f64 - 40.5 * level as f64 + 360.0) as i64
+    } else {
+        (4.5 * level as f64 * level as f64 - 162.5 * level as f64 + 2220.0) as i64
+    }
+}
+
+/// Level and bar progress for a total amount of experience.
+fn level_and_progress(total: i32) -> (i32, f32) {
+    let total = i64::from(total.max(0));
+    let mut level = 0;
+    while level < 21_863 && total >= total_for_level(level + 1) {
+        level += 1;
+    }
+    let base = total_for_level(level);
+    let next = total_for_level(level + 1);
+    let progress = if next > base {
+        ((total - base) as f32 / (next - base) as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (level, progress)
 }
 impl Player {
     pub fn refresh_chunks(&mut self) {
@@ -313,7 +406,7 @@ impl Player {
         send(self, &ChunkBatchStart);
         let count = chunks.len();
         for (x, z, packet) in chunks {
-            let _ = self.outbound.send(Outbound::Packet(packet));
+            let _ = self.outbound.send(Outbound::Packet(packet.into()));
             self.loaded.insert((x, z));
             if let Some((loaded, _)) = tracking.get_mut(&self.uuid) {
                 loaded.insert((x, z));
@@ -412,21 +505,25 @@ impl Player {
             );
         }
     }
-    fn change_block(&self, location: i64, expected: u32, state: u32) -> bool {
+    /// Applies a block change and tells every player tracking the chunk. `expected` keeps the
+    /// compare-and-set used by player interaction; commands pass `None`.
+    pub(crate) fn change_block(&self, location: i64, expected: Option<u32>, state: u32) -> bool {
         let pos = ferrite_protocol::types::BlockPos::unpack(location);
         let tracking = self.tracking.lock().unwrap();
         if self.source.as_ref().is_some_and(|source| {
             source
-                .compare_set_block(pos.x, pos.y, pos.z, Some(expected), state)
+                .compare_set_block(pos.x, pos.y, pos.z, expected, state)
                 .is_ok()
         }) {
             let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+            // One encoding, shared by every observer.
+            let update = packet(&BlockUpdate {
+                location,
+                block_state: VarInt(state as i32),
+            });
             for (loaded, outbound) in tracking.values() {
                 if loaded.contains(&chunk) {
-                    let _ = outbound.send(packet(&BlockUpdate {
-                        location,
-                        block_state: VarInt(state as i32),
-                    }));
+                    let _ = outbound.send(update.clone());
                 }
             }
             let _ = self.signals.send(Signal::FluidChange {
@@ -438,6 +535,21 @@ impl Player {
         } else {
             false
         }
+    }
+    /// Breaks a block (to air); an inventory block drops its contents (vanilla
+    /// `Containers.dropContentsOnDestroy`).
+    fn break_block(&mut self, location: i64, state: u32) -> bool {
+        if !self.change_block(location, Some(state), 0) {
+            return false;
+        }
+        if let Some(source) = &self.source {
+            let pos = ferrite_protocol::types::BlockPos::unpack(location);
+            let pos = [pos.x, pos.y, pos.z];
+            for stack in super::block_container::take_contents(source, pos, state) {
+                self.menus.spilled.push((pos, stack));
+            }
+        }
+        true
     }
     fn place(&mut self, p: &UseItemOn) {
         if !(self.gamemode == 0 || self.gamemode == 1)
@@ -481,31 +593,40 @@ impl Player {
         if !ferrite_data::block_props::get(old).replaceable {
             return;
         }
-        let slot = if p.hand.0 == 0 {
-            36 + self.held_slot as usize
-        } else {
-            45
-        };
-        let item = self.inventory[slot];
-        if item.count <= 0 {
+        let slot = self.hand_slot(p.hand.0);
+        let item = self.inventory.get(slot).clone();
+        if item.is_empty() {
             return;
         }
-        let water_bucket = ferrite_data::registries::id("minecraft:item", "minecraft:water_bucket")
-            == Some(item.item_id);
+        let item_id = i32::from(item.item);
+        let water_bucket = item.name() == Some("minecraft:water_bucket");
         let state = if water_bucket {
             ferrite_data::blocks::default_state("water").expect("vanilla water")
         } else {
-            let Some(state) = super::interaction::placement_state(
-                item.item_id,
-                p.face.0,
-                p.cursor_y,
-                self.yaw,
-                old,
-            ) else {
+            let Some(state) =
+                super::interaction::placement_state(item_id, p.face.0, p.cursor_y, self.yaw, old)
+            else {
                 return;
             };
             state
         };
+        if !self.plugin_allows(|plugins| {
+            plugins.block_placed(
+                self.uuid,
+                &self.name,
+                ferrite_plugin::BlockPosition {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                },
+                u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+                material_name(u32::from(state)),
+                material_name(u32::from(old)),
+            )
+        }) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         let positions = self.positions.lock().unwrap();
         let offset = ferrite_math::Vec3::new(target.x as f64, target.y as f64, target.z as f64);
         if positions.iter().any(|(uuid, pos)| {
@@ -528,31 +649,196 @@ impl Player {
         }) {
             return;
         }
-        let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
+        let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
+        // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
+        // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
             if water_bucket {
-                self.inventory[slot] = ItemStack {
-                    count: 1,
-                    item_id: ferrite_data::registries::id("minecraft:item", "minecraft:bucket")
-                        .expect("vanilla bucket"),
-                };
+                self.inventory.set(
+                    slot,
+                    ferrite_item::ItemStack::from_name("bucket").expect("vanilla bucket"),
+                );
             } else {
-                self.inventory[slot].count -= 1;
-                if self.inventory[slot].count == 0 {
-                    self.inventory[slot] = ItemStack::default();
-                }
+                self.inventory
+                    .set(slot, item.copy_with_count(item.count - 1));
             }
-            send(
-                self,
-                &ContainerSlot {
-                    window: VarInt(0),
-                    state: VarInt(0),
-                    slot: slot as i16,
-                    item: self.inventory[slot],
-                },
-            );
         }
+    }
+    /// Runs an event hook; a missing bridge or a failed call is decided by the
+    /// configured [`PluginEventPolicy`]. Callers cancel the action on `false`,
+    /// which resends the original block or teleport state.
+    fn plugin_allows(
+        &self,
+        event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
+    ) -> bool {
+        event_allows(self.plugins.as_deref(), self.plugin_event_errors, event)
+    }
+
+    fn feedback(&self, feedback: Option<&OutboundSender>, text: String) {
+        match feedback {
+            Some(tx) => {
+                let _ = tx.send(packet(&SystemChat {
+                    content: ferrite_protocol::types::PlainText(text),
+                    overlay: false,
+                }));
+            }
+            None => tracing::info!("{text}"),
+        }
+    }
+    /// `/clear`: removes up to `max_count` matching items (all when `None`).
+    fn clear_items(
+        &mut self,
+        item: Option<u16>,
+        max_count: Option<i32>,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        let matches = |stack: &ferrite_item::ItemStack| {
+            !stack.is_empty() && item.is_none_or(|id| stack.item == id)
+        };
+        if max_count == Some(0) {
+            let found: i32 = (0..ferrite_inventory::SIZE)
+                .map(|slot| self.inventory.get(slot))
+                .filter(|stack| matches(stack))
+                .map(|stack| stack.count)
+                .sum();
+            let text = if found == 0 {
+                format!("No items were found on player {target_name}")
+            } else {
+                format!("Found {found} matching item(s) on player {target_name}")
+            };
+            self.feedback(feedback, text);
+            return;
+        }
+        let limit = max_count.unwrap_or(i32::MAX);
+        let mut removed = 0;
+        for slot in 0..ferrite_inventory::SIZE {
+            if removed >= limit {
+                break;
+            }
+            if !matches(self.inventory.get(slot)) {
+                continue;
+            }
+            let take = self.inventory.get(slot).count.min(limit - removed);
+            removed += self.inventory.remove(slot, take).count;
+        }
+        if removed == 0 {
+            self.feedback(
+                feedback,
+                format!("No items were found on player {target_name}"),
+            );
+            return;
+        }
+        self.sync_containers();
+        self.feedback(
+            feedback,
+            format!("Removed {removed} items from {target_name}"),
+        );
+    }
+    /// `/give`: places the stack back in the inventory, dropping what does not fit.
+    fn give_items(
+        &mut self,
+        item: u16,
+        count: i32,
+        item_name: &str,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        let leftover = self
+            .inventory
+            .place_back(ferrite_item::ItemStack::with_count(item, count));
+        let given = count - leftover.as_ref().map_or(0, |stack| stack.count);
+        if let Some(leftover) = leftover {
+            self.menus.thrown.push(leftover);
+        }
+        if given > 0 {
+            self.sync_containers();
+        }
+        self.feedback(
+            feedback,
+            format!("Gave {given} {item_name} to {target_name}"),
+        );
+    }
+    fn set_experience_total(&mut self, total: i64) {
+        let total = total.clamp(0, i64::from(i32::MAX)) as i32;
+        let (level, progress) = level_and_progress(total);
+        self.experience_total = total;
+        self.experience_level = level;
+        self.experience_progress = progress;
+    }
+    fn set_experience_level(&mut self, level: i32) {
+        let level = level.clamp(0, 21_863);
+        self.experience_level = level;
+        self.experience_progress = 0.0;
+        self.experience_total = total_for_level(level).min(i64::from(i32::MAX)) as i32;
+    }
+    /// `/xp`: add, set or query experience points/levels.
+    fn apply_experience(
+        &mut self,
+        operation: XpOperation,
+        amount: i32,
+        unit: XpUnit,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        if operation == XpOperation::Query {
+            let text = match unit {
+                XpUnit::Points => {
+                    format!("{target_name} has {} experience", self.experience_total)
+                }
+                XpUnit::Levels => format!(
+                    "{target_name} has {} experience levels",
+                    self.experience_level
+                ),
+            };
+            self.feedback(feedback, text);
+            return;
+        }
+        match (operation, unit) {
+            (XpOperation::Add, XpUnit::Points) => {
+                self.set_experience_total(i64::from(self.experience_total) + i64::from(amount));
+            }
+            (XpOperation::Add, XpUnit::Levels) => {
+                self.set_experience_level(self.experience_level.saturating_add(amount));
+            }
+            (XpOperation::Set, XpUnit::Points) => self.set_experience_total(i64::from(amount)),
+            (XpOperation::Set, XpUnit::Levels) => self.set_experience_level(amount),
+            (XpOperation::Query, _) => unreachable!(),
+        }
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+        let text = match operation {
+            XpOperation::Add if amount < 0 => match unit {
+                XpUnit::Points => format!(
+                    "Took {} experience from {target_name}",
+                    amount.unsigned_abs()
+                ),
+                XpUnit::Levels => {
+                    format!("Took {} levels from {target_name}", amount.unsigned_abs())
+                }
+            },
+            XpOperation::Add => match unit {
+                XpUnit::Points => format!("Gave {amount} experience to {target_name}"),
+                XpUnit::Levels => format!("Gave {amount} levels to {target_name}"),
+            },
+            XpOperation::Set => match unit {
+                XpUnit::Points => {
+                    format!("Set {target_name}'s experience to {amount}")
+                }
+                XpUnit::Levels => {
+                    format!("Set {target_name}'s experience level to {amount}")
+                }
+            },
+            XpOperation::Query => unreachable!(),
+        };
+        self.feedback(feedback, text);
     }
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
@@ -580,6 +866,7 @@ impl Player {
             }
             let msg = match command {
                 Command::Leave => {
+                    self.close_container();
                     super::playerdata::save(
                         &self.uuid,
                         &super::playerdata::Saved::capture(
@@ -603,28 +890,115 @@ impl Player {
                     );
                     continue;
                 }
-                Command::Teleport(pos) => {
+                Command::Teleport { pos, yaw, pitch } => {
                     if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
                         self.pos = pos;
+                        if let Some(yaw) = yaw {
+                            self.yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch {
+                            self.pitch = pitch;
+                        }
                         self.teleport();
                         changed = true;
+                    }
+                    continue;
+                }
+                Command::World(command) => {
+                    super::commands_world::run(self, command);
+                    continue;
+                }
+                Command::Clear {
+                    target,
+                    target_name,
+                    item,
+                    max_count,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.clear_items(item, max_count, &target_name, feedback.as_ref());
+                    }
+                    continue;
+                }
+                Command::Give {
+                    target,
+                    target_name,
+                    item,
+                    count,
+                    item_name,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.give_items(item, count, &item_name, &target_name, feedback.as_ref());
+                    }
+                    continue;
+                }
+                Command::Experience {
+                    target,
+                    target_name,
+                    operation,
+                    amount,
+                    unit,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.apply_experience(
+                            operation,
+                            amount,
+                            unit,
+                            &target_name,
+                            feedback.as_ref(),
+                        );
                     }
                     continue;
                 }
                 Command::Input(msg) => msg,
             };
             match msg {
+                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3 | 4 | 6) => {
+                    match p.status.0 {
+                        3 => self.drop_selected(true),
+                        4 => self.drop_selected(false),
+                        _ => self.swap_hands(),
+                    }
+                }
+                ServerboundPlay::ContainerClick(p) => self.handle_container_click(p),
+                ServerboundPlay::ContainerClose(_) => self.close_container(),
                 ServerboundPlay::PlayerAction(p) => {
                     let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
                     match p.status.0 {
                         0 if self.hit(pos).is_some() => {
+                            let clicked = ferrite_plugin::BlockPosition {
+                                x: pos.x,
+                                y: pos.y,
+                                z: pos.z,
+                            };
                             let state = self
                                 .source
                                 .as_ref()
                                 .and_then(|s| s.block(pos.x, pos.y, pos.z));
-                            if let Some(state) = state {
+                            let allowed = self.plugin_allows(|plugins| {
+                                plugins.player_interacted(
+                                    self.uuid,
+                                    &self.name,
+                                    InteractAction::LeftClickBlock,
+                                    clicked,
+                                    u8::try_from(p.face.clamp(0, 5)).unwrap_or(0),
+                                    material_name(state.unwrap_or(0)),
+                                )
+                            });
+                            if allowed && let Some(state) = state {
                                 if self.gamemode == 1 {
-                                    self.change_block(p.location, state, 0);
+                                    if self.plugin_allows(|plugins| {
+                                        plugins.block_broken(
+                                            self.uuid,
+                                            &self.name,
+                                            clicked,
+                                            material_name(state),
+                                        )
+                                    }) {
+                                        self.break_block(p.location, state);
+                                    }
                                 } else if self.gamemode == 0 {
                                     // Zero hardness breaks on the first hit (vanilla: destroy
                                     // progress >= 1 on START), so no finish action follows.
@@ -633,7 +1007,15 @@ impl Player {
                                             && ferrite_data::block_props::get(s).hardness == 0.0
                                     });
                                     if instant {
-                                        if self.change_block(p.location, state, 0) {
+                                        if self.plugin_allows(|plugins| {
+                                            plugins.block_broken(
+                                                self.uuid,
+                                                &self.name,
+                                                clicked,
+                                                material_name(state),
+                                            )
+                                        }) && self.break_block(p.location, state)
+                                        {
                                             self.broken.push((pos, state));
                                         }
                                     } else {
@@ -651,7 +1033,19 @@ impl Player {
                                     .ok()
                                     .and_then(super::interaction::break_ticks)
                                     .is_some_and(|ticks| elapsed >= ticks)
-                                && self.change_block(location, state, 0)
+                                && self.plugin_allows(|plugins| {
+                                    plugins.block_broken(
+                                        self.uuid,
+                                        &self.name,
+                                        ferrite_plugin::BlockPosition {
+                                            x: pos.x,
+                                            y: pos.y,
+                                            z: pos.z,
+                                        },
+                                        material_name(state),
+                                    )
+                                })
+                                && self.break_block(location, state)
                             {
                                 self.broken.push((pos, state));
                             }
@@ -667,7 +1061,35 @@ impl Player {
                     );
                 }
                 ServerboundPlay::UseItemOn(p) => {
-                    self.place(&p);
+                    let clicked = ferrite_protocol::types::BlockPos::unpack(p.location);
+                    let state = self
+                        .source
+                        .as_ref()
+                        .and_then(|s| s.block(clicked.x, clicked.y, clicked.z));
+                    let allowed = self.plugin_allows(|plugins| {
+                        plugins.player_interacted(
+                            self.uuid,
+                            &self.name,
+                            InteractAction::RightClickBlock,
+                            ferrite_plugin::BlockPosition {
+                                x: clicked.x,
+                                y: clicked.y,
+                                z: clicked.z,
+                            },
+                            u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+                            material_name(state.unwrap_or(0)),
+                        )
+                    });
+                    if allowed {
+                        let used = (0..=1).contains(&p.hand.0)
+                            && self.hit(clicked).is_some()
+                            && self.use_block(p.location);
+                        if !used {
+                            self.place(&p);
+                        }
+                    } else {
+                        self.send_block_snapshot(p.location);
+                    }
                     self.send_block_snapshot(p.location);
                     if let Some(face) = usize::try_from(p.face.0)
                         .ok()
@@ -692,24 +1114,12 @@ impl Player {
                     );
                 }
                 ServerboundPlay::SetHeldItem(p) => {
+                    // Vanilla `handleSetCarriedItem` ignores slots outside the hotbar.
                     if (0..=8).contains(&p.slot) {
-                        self.held_slot = p.slot as u8;
+                        self.inventory.selected = p.slot as usize;
                     }
                 }
-                ServerboundPlay::CreativeSlot(p) => {
-                    if self.gamemode == 1 && (0..46).contains(&p.slot) {
-                        self.inventory[p.slot as usize] = p.item;
-                        send(
-                            self,
-                            &ContainerSlot {
-                                window: VarInt(0),
-                                state: VarInt(0),
-                                slot: p.slot,
-                                item: p.item,
-                            },
-                        );
-                    }
-                }
+                ServerboundPlay::CreativeSlot(p) => self.handle_creative_slot(p),
                 ServerboundPlay::Confirm(p) => {
                     if self.pending_teleport == Some(p.id.0) {
                         self.pending_teleport = None;
@@ -725,6 +1135,23 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) {
+                            // Bukkit fires `PlayerMoveEvent` only when the position changes.
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: self.yaw,
+                                to_pitch: self.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.ground = p.flags & 1 != 0;
                             changed = true;
@@ -737,6 +1164,22 @@ impl Player {
                     if self.pending_teleport.is_none() {
                         let to = [p.x, p.y, p.z];
                         if valid_move(start, to) && p.yaw.is_finite() && p.pitch.is_finite() {
+                            let movement = ferrite_plugin::PlayerMove {
+                                from: self.pos,
+                                to,
+                                from_yaw: self.yaw,
+                                from_pitch: self.pitch,
+                                to_yaw: p.yaw,
+                                to_pitch: p.pitch,
+                            };
+                            if to != self.pos
+                                && !self.plugin_allows(|plugins| {
+                                    plugins.player_moved(self.uuid, &self.name, &movement)
+                                })
+                            {
+                                self.teleport();
+                                continue;
+                            }
                             self.pos = to;
                             self.yaw = p.yaw;
                             self.pitch = p.pitch;
@@ -782,15 +1225,15 @@ fn deliver(
     (uuid, session): ViewerKey,
     bytes: &[u8],
 ) {
-    let packet = Outbound::Packet(bytes.to_vec());
+    let packet = Outbound::Packet(bytes.to_vec().into());
     match players.get(&uuid) {
         Some(p) if p.session == session => {
-            let _ = p.outbound.send(packet);
+            let _ = p.outbound.send(packet.clone());
         }
         Some(_) => {}
         None => {
             if let Some((_, outbound)) = ctx.tracking.lock().unwrap().get(&uuid) {
-                let _ = outbound.send(packet);
+                let _ = outbound.send(packet.clone());
             }
         }
     }
@@ -828,7 +1271,11 @@ impl Region {
     }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
-        let tool = p.inventory[36 + usize::from(p.held_slot.min(8))];
+        let held = p.inventory.selected_item();
+        let tool = ItemStack {
+            count: held.count.max(0),
+            item_id: i32::from(held.item),
+        };
         for (pos, state) in p.broken.drain(..) {
             let Ok(state) = u16::try_from(state) else {
                 continue;
@@ -842,7 +1289,6 @@ impl Region {
     /// Lets every non-spectator player pick up the items it touches.
     fn pick_up_items(&mut self, ctx: &TickContext) {
         let mut sent = Vec::new();
-        let mut slots = Vec::new();
         for p in self.players.values_mut() {
             if p.gamemode == 3 {
                 continue;
@@ -852,33 +1298,38 @@ impl Region {
                 entity_id: p.entity,
                 pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
                 inventory: &mut p.inventory,
-                selected: usize::from(p.held_slot),
                 infinite: p.gamemode == 1,
             };
-            let changed = item::pick_up(&mut self.entities, &mut picker, &mut |viewer, bytes| {
+            item::pick_up(&mut self.entities, &mut picker, &mut |viewer, bytes| {
                 sent.push((viewer, bytes.to_vec()))
             });
-            if !changed.is_empty() {
-                slots.push((p.uuid, changed));
-            }
         }
         // Like vanilla: the take animation first, the inventory sync at the end of the tick.
         for (viewer, bytes) in sent {
             deliver(&self.players, ctx, viewer, &bytes);
         }
-        for (uuid, changed) in slots {
-            let p = &self.players[&uuid];
-            for slot in changed {
-                send(
-                    p,
-                    &ContainerSlot {
-                        window: VarInt(0),
-                        state: VarInt(0),
-                        slot: slot as i16,
-                        item: p.inventory[slot],
-                    },
-                );
+    }
+    /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
+    /// entities in front of it. Item entities hold plain stacks for now, so components are not
+    /// carried over.
+    fn spawn_thrown(&mut self, p: &mut Player) {
+        for (block, stack) in p.menus.spilled.drain(..) {
+            let plain = ItemStack {
+                count: stack.count,
+                item_id: i32::from(stack.item),
+            };
+            for record in item::drop_from_container(block, plain, &mut self.rng) {
+                self.entities.insert(record);
             }
+        }
+        for stack in p.menus.thrown.drain(..) {
+            let plain = ItemStack {
+                count: stack.count,
+                item_id: i32::from(stack.item),
+            };
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let record = item::thrown_by_player(feet, 1.62, p.yaw, p.pitch, plain, &mut self.rng);
+            self.entities.insert(record);
         }
     }
     /// Runs the entity tracker against this region's players.
@@ -911,6 +1362,7 @@ impl Region {
                 }
                 None => p.update(),
             };
+            self.spawn_thrown(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -952,6 +1404,9 @@ impl Region {
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
+        for p in self.players.values_mut() {
+            p.tick_containers();
+        }
         self.track_entities(ctx);
         self.entities.sweep_removed();
         for entity in self.entities.take_crossing() {
@@ -966,6 +1421,20 @@ impl Region {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn experience_curve_matches_vanilla_levels() {
+        assert_eq!(total_for_level(0), 0);
+        assert_eq!(total_for_level(1), 7);
+        assert_eq!(total_for_level(16), 352);
+        assert_eq!(total_for_level(17), 394);
+        assert_eq!(total_for_level(30), 1395);
+        assert_eq!(total_for_level(31), 1507);
+        assert_eq!(total_for_level(32), 1628);
+        assert_eq!(level_and_progress(394), (17, 0.0));
+        assert_eq!(level_and_progress(7), (1, 0.0));
+        assert!((level_and_progress(15).1 - 8.0 / 9.0).abs() < 1e-6);
+    }
+
     #[test]
     fn tick_records_a_region_scope_when_timings_are_attached() {
         let mut region = Region::default();
@@ -1055,4 +1524,111 @@ fn chunk_holders_follow_region_merge_and_split() {
     assert_eq!(right.held_chunks.get(&ChunkPos(32, 0)), Some(&1));
     right.release_chunk(ChunkPos(32, 0));
     assert!(right.held_chunks.is_empty());
+}
+
+#[cfg(test)]
+mod event_policy_tests {
+    use super::*;
+    use ferrite_plugin::{BlockPosition, CommandSender, PluginCommand, PluginCommandResult};
+
+    /// A bridge whose every call fails, standing in for a broken JVM call.
+    struct Failing;
+    impl ferrite_plugin::ServerHooks for Failing {
+        fn player_joined(&self, _: Uuid, _: &str) -> Result<(), ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_left(&self, _: Uuid, _: &str) -> Result<(), ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn chat(&self, _: Uuid, _: &str, _: &str) -> Result<Option<String>, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_moved(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &ferrite_plugin::PlayerMove,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_interacted(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: InteractAction,
+            _: BlockPosition,
+            _: u8,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn block_broken(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: BlockPosition,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn block_placed(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: BlockPosition,
+            _: u8,
+            _: &str,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_command(&self, _: Uuid, _: &str, _: &str) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn plugin_commands(&self) -> Result<Vec<PluginCommand>, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn run_plugin_command(
+            &self,
+            _: CommandSender,
+            _: &str,
+        ) -> Result<PluginCommandResult, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+    }
+
+    fn decide(policy: PluginEventPolicy, result: Result<bool, ferrite_plugin::Error>) -> bool {
+        let failing: &dyn ferrite_plugin::ServerHooks = &Failing;
+        event_allows(Some(failing), policy, |_| result)
+    }
+
+    #[test]
+    fn failed_plugin_events_follow_the_configured_policy() {
+        assert!(decide(
+            PluginEventPolicy::Allow,
+            Err(ferrite_plugin::Error::InvalidTask)
+        ));
+        assert!(!decide(
+            PluginEventPolicy::Deny,
+            Err(ferrite_plugin::Error::InvalidTask)
+        ));
+        assert!(!decide(PluginEventPolicy::Allow, Ok(false)));
+        assert!(decide(PluginEventPolicy::Deny, Ok(true)));
+    }
+
+    #[test]
+    fn a_missing_plugin_bridge_always_allows_the_action() {
+        assert!(event_allows(None, PluginEventPolicy::Deny, |_| Err(
+            ferrite_plugin::Error::InvalidTask
+        )));
+    }
+
+    #[test]
+    fn block_materials_come_from_the_state_table() {
+        let stone = ferrite_data::blocks::default_state("stone").unwrap();
+        let grass = ferrite_data::blocks::default_state("grass_block").unwrap();
+        assert_eq!(material_name(u32::from(stone)), "minecraft:stone");
+        assert_eq!(material_name(u32::from(grass)), "minecraft:grass_block");
+        assert_eq!(material_name(u32::MAX), "minecraft:air");
+    }
 }

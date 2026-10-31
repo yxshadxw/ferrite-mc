@@ -1,5 +1,5 @@
 use super::chat::PlayerChatState;
-use ferrite_net::game::{Outbound, packet};
+use ferrite_net::game::{Outbound, OutboundSender, packet};
 use ferrite_profiler::Timings;
 use ferrite_protocol::{
     VarInt,
@@ -8,7 +8,6 @@ use ferrite_protocol::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 #[derive(Clone)]
 pub struct GlobalPlayer {
@@ -17,7 +16,7 @@ pub struct GlobalPlayer {
     pub name: String,
     pub properties: Vec<Property>,
     pub game_mode: i32,
-    pub outbound: UnboundedSender<Outbound>,
+    pub outbound: OutboundSender,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -35,7 +34,7 @@ impl GlobalPlayer {
         entity: i32,
         name: String,
         properties: Vec<Property>,
-        outbound: UnboundedSender<Outbound>,
+        outbound: OutboundSender,
         secure_chat: bool,
         chat_type: i32,
         chat_visibility: u8,
@@ -124,15 +123,15 @@ impl GlobalRegion {
         if let Some(player) = self.players.get_mut(&id) {
             player.game_mode = mode;
         }
-        let update = PlayerGameMode {
+        let update = packet(&PlayerGameMode {
             uuid: id,
             game_mode: VarInt(mode),
-        };
+        });
         for player in self.players.values() {
-            send(player, &update);
+            let _ = player.outbound.send(update.clone());
         }
     }
-    pub fn say(&self, message: &str) {
+    pub fn broadcast_text(&self, message: &str) {
         self.broadcast(message);
     }
     /// Registers or replaces a player's chat session and tells every client about it, so they
@@ -243,14 +242,13 @@ impl GlobalRegion {
         }
     }
     fn broadcast(&self, text: &str) {
+        // One encoding, shared by every recipient.
+        let message = packet(&SystemChat {
+            content: PlainText(text.into()),
+            overlay: false,
+        });
         for p in self.players.values() {
-            send(
-                p,
-                &SystemChat {
-                    content: PlainText(text.into()),
-                    overlay: false,
-                },
-            );
+            let _ = p.outbound.send(message.clone());
         }
     }
     pub fn leave(&mut self, id: Uuid) {
@@ -435,8 +433,8 @@ mod tests {
     #[test]
     fn visibility_and_chat_follow_positions() {
         let mut g = GlobalRegion::default();
-        let (a, mut ar) = tokio::sync::mpsc::unbounded_channel();
-        let (b, mut br) = tokio::sync::mpsc::unbounded_channel();
+        let (a, mut ar) = OutboundSender::channel(1 << 20);
+        let (b, mut br) = OutboundSender::channel(1 << 20);
         let pa = GlobalPlayer::new(
             uuid::Uuid::from_u128(1),
             1,
@@ -461,7 +459,7 @@ mod tests {
         g.join(pb);
         g.tick();
         assert!(
-            std::iter::from_fn(|| br.try_recv().ok())
+            std::iter::from_fn(|| br.try_recv())
                 .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==1))
         );
         g.chat(
@@ -475,12 +473,12 @@ mod tests {
             },
         );
         assert!(
-            std::iter::from_fn(|| br.try_recv().ok())
+            std::iter::from_fn(|| br.try_recv())
                 .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==66))
         );
         g.leave(uuid::Uuid::from_u128(1));
         assert!(
-            std::iter::from_fn(|| br.try_recv().ok())
+            std::iter::from_fn(|| br.try_recv())
                 .any(|p| matches!(p,Outbound::Packet(ref b) if b[0]==78))
         );
         let _ = &mut ar;

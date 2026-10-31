@@ -61,6 +61,7 @@ fn whitelist_names_ignore_case() -> Result<(), Box<dyn std::error::Error>> {
     assert!(lists.whitelist.contains_name("alice"));
     assert!(lists.whitelist.contains_name("ALICE"));
     assert!(!lists.whitelist.contains_name("Bob"));
+    assert_eq!(lists.whitelist.names(), ["Alice"]);
 
     lists.whitelist.add(uuid, "Alicia");
     assert!(!lists.whitelist.contains_name("Alice"));

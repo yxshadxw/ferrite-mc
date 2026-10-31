@@ -19,10 +19,12 @@ use ferrite_protocol::{
         handshake::{Intent, Intention},
         login::{LoginAcknowledged, LoginStart},
         play::{
-            ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, LastSeenUpdate,
-            PositionSync, ServerboundChat, SystemChat,
+            BlockUpdate, ChunkBatchReceived, ClientboundPlayerChat, ConfirmTeleport, CreativeSlot,
+            ItemStack, LastSeenUpdate, MovePosition, MoveRotation, PlayerAction, PositionSync,
+            ServerboundChat, SystemChat, UseItemOn,
         },
     },
+    types::BlockPos,
 };
 
 fn repo_root() -> PathBuf {
@@ -245,14 +247,11 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
-    /// Unsigned chat, the offline-mode path: no profile key and an empty last-seen update.
+    /// Sends an unsigned chat message (an offline-mode client's packet shape).
     fn chat(&mut self, text: &str) {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as i64);
         self.send(&ServerboundChat {
             message: text.into(),
-            timestamp,
+            timestamp: 1_700_000_000_000,
             salt: 0,
             signature: None,
             last_seen: LastSeenUpdate::new(0, &[], 0),
@@ -331,32 +330,88 @@ impl Bot {
         }
     }
 
+    fn move_to(&mut self, x: f64, y: f64, z: f64) {
+        self.send(&MovePosition { x, y, z, flags: 1 });
+    }
+
     fn collect_chats(&mut self, duration: Duration) -> Vec<String> {
         let deadline = Instant::now() + duration;
         let mut messages = Vec::new();
         while Instant::now() < deadline {
             if let Some((id, body)) = self.next_play()
-                && let Some(message) = chat_text(id, &body)
+                && let Some(text) = chat_text(id, &body)
             {
-                messages.push(message);
+                messages.push(text);
             }
         }
         messages
     }
 }
 
-/// Text of a chat packet: `player_chat` for player messages and `system_chat` for command output.
-fn chat_text(id: i32, body: &[u8]) -> Option<String> {
-    let mut body = body;
+/// Chat reaches the client as `player_chat` (signed) or `system_chat` (plain).
+fn chat_text(id: i32, mut body: &[u8]) -> Option<String> {
     match id {
-        ClientboundPlayerChat::ID => Some(
+        124 => Some(SystemChat::decode(&mut body).unwrap().content.0),
+        66 => Some(
             ClientboundPlayerChat::decode(&mut body)
                 .unwrap()
                 .body
                 .content,
         ),
-        SystemChat::ID => Some(SystemChat::decode(&mut body).unwrap().content.0),
         _ => None,
+    }
+}
+
+fn wait_for_prefix(
+    path: &Path,
+    prefix: &str,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(content) = fs::read_to_string(path)
+            && content.lines().any(|line| line.starts_with(prefix))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin never wrote a {prefix:?} line to {}:\n{}\n{}\n{}",
+            path.display(),
+            fs::read_to_string(path).unwrap_or_default(),
+            stdout.lock().unwrap(),
+            stderr.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_block_state(
+    bot: &mut Bot,
+    position: BlockPos,
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+    events: &Path,
+) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no block update for {:?}\nevents:\n{}\n{}\n{}",
+            position,
+            fs::read_to_string(events).unwrap_or_default(),
+            stdout.lock().unwrap(),
+            stderr.lock().unwrap()
+        );
+        if let Some((id, body)) = bot.next_play()
+            && id == BlockUpdate::ID
+        {
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            if BlockPos::unpack(update.location) == position {
+                return update.block_state.0;
+            }
+        }
     }
 }
 
@@ -456,7 +511,6 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     bot.chat("hello plugins");
     wait_for_line(&events, "chat hello plugins", &stdout, &stderr);
     wait_for_line(&events, "legacy-chat hello plugins", &stdout, &stderr);
-    // Signed chat carries the bare content plus the sender's chat type; the client renders the name.
     let broadcast = wait_for_chat(&mut bot, "hello plugins", &stdout, &stderr, &events);
     assert!(broadcast.contains("hello plugins"), "{broadcast}");
     bot.chat("cancel this");
@@ -471,6 +525,101 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     bot.raw(7, "testping");
     let pong = wait_for_chat(&mut bot, "pong", &stdout, &stderr, &events);
     assert_eq!(pong, "pong");
+    wait_for_prefix(&events, "command /testping", &stdout, &stderr);
+    bot.move_to(2.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 2 65 0", &stdout, &stderr);
+    bot.move_to(2.5, 100.0, 0.5);
+    wait_for_prefix(&events, "move-cancel Bot", &stdout, &stderr);
+    let rejected = PositionSync::decode(&mut bot.until(73).as_slice()).unwrap();
+    assert_eq!((rejected.x, rejected.y, rejected.z), (2.5, 65.0, 0.5));
+    bot.move_to(0.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 0 65 0", &stdout, &stderr);
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    });
+    bot.send(&PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(30),
+    });
+    wait_for_prefix(&events, "interact left 0 64 0", &stdout, &stderr);
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(31),
+    });
+    wait_for_prefix(&events, "interact right 0 63 0", &stdout, &stderr);
+    wait_for_prefix(&events, "break 0 64 0", &stdout, &stderr);
+    wait_for_line(
+        &events,
+        "break-type minecraft:grass_block world",
+        &stdout,
+        &stderr,
+    );
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
+        0,
+        "a creative break did not clear the block"
+    );
+    bot.move_to(1.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 1 65 0", &stdout, &stderr);
+    bot.send(&PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(1, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(32),
+    });
+    wait_for_prefix(&events, "break-cancel 1 64 0", &stdout, &stderr);
+    let grass = i32::from(ferrite_data::blocks::default_state("grass_block").unwrap());
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(1, 64, 0), &stdout, &stderr, &events),
+        grass,
+        "a cancelled break did not restore the block"
+    );
+    bot.move_to(0.5, 65.0, 0.5);
+    wait_for_prefix(&events, "move Bot 0 65 0", &stdout, &stderr);
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: ferrite_data::registries::id("minecraft:item", "minecraft:stone").unwrap(),
+        },
+    });
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(33),
+    });
+    wait_for_prefix(&events, "place-cancel 0 64 0", &stdout, &stderr);
+    assert_eq!(
+        wait_for_block_state(&mut bot, BlockPos::new(0, 64, 0), &stdout, &stderr, &events),
+        0,
+        "a cancelled placement was not rolled back on the client"
+    );
+    bot.raw(7, "testping nope");
+    wait_for_prefix(&events, "command /testping nope", &stdout, &stderr);
+    let after_command_cancel = bot.collect_chats(Duration::from_millis(1200));
+    assert!(
+        !after_command_cancel
+            .iter()
+            .any(|message| message.contains("pong")),
+        "a cancelled command still ran: {after_command_cancel:?}"
+    );
     drop(bot);
     wait_for_line(&events, "quit Bot", &stdout, &stderr);
 

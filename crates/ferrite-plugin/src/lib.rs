@@ -27,6 +27,12 @@ pub const PLAYER_JOIN_EVENT: &str = "org.bukkit.event.player.PlayerJoinEvent";
 pub const PLAYER_QUIT_EVENT: &str = "org.bukkit.event.player.PlayerQuitEvent";
 pub const ASYNC_CHAT_EVENT: &str = "io.papermc.paper.event.player.AsyncChatEvent";
 pub const ASYNC_PLAYER_CHAT_EVENT: &str = "org.bukkit.event.player.AsyncPlayerChatEvent";
+pub const PLAYER_MOVE_EVENT: &str = "org.bukkit.event.player.PlayerMoveEvent";
+pub const PLAYER_INTERACT_EVENT: &str = "org.bukkit.event.player.PlayerInteractEvent";
+pub const BLOCK_BREAK_EVENT: &str = "org.bukkit.event.block.BlockBreakEvent";
+pub const BLOCK_PLACE_EVENT: &str = "org.bukkit.event.block.BlockPlaceEvent";
+pub const PLAYER_COMMAND_PREPROCESS_EVENT: &str =
+    "org.bukkit.event.player.PlayerCommandPreprocessEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -46,6 +52,23 @@ pub struct BlockPosition {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+/// Which mouse button touched a block; Bukkit's `PlayerInteractEvent.Action`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum InteractAction {
+    LeftClickBlock = 0,
+    RightClickBlock = 1,
+}
+/// Where a player was and where a movement packet takes it; Bukkit's `PlayerMoveEvent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerMove {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+    pub from_yaw: f32,
+    pub from_pitch: f32,
+    pub to_yaw: f32,
+    pub to_pitch: f32,
 }
 #[derive(Clone, Debug)]
 pub struct BlockSnapshot {
@@ -297,6 +320,43 @@ pub trait ServerHooks: Send + Sync {
     ///
     /// Returns the message after listeners ran, or `None` when one cancelled chat.
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error>;
+    /// Fires Bukkit's `PlayerMoveEvent`; `false` means a listener cancelled the move.
+    fn player_moved(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `PlayerInteractEvent` for a block click; `false` means cancelled.
+    fn player_interacted(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
+        material: &str,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `BlockBreakEvent` before a block is removed; `false` means cancelled.
+    fn block_broken(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        material: &str,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `BlockPlaceEvent` before a block is placed; `false` means cancelled.
+    fn block_placed(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        face: u8,
+        placed: &str,
+        replaced: &str,
+    ) -> Result<bool, Error>;
+    /// Fires Bukkit's `PlayerCommandPreprocessEvent`; `false` means cancelled.
+    fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
     /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
@@ -795,6 +855,269 @@ extern "system" fn dispatch_back(mut env: JNIEnv, _: JClass, sender: JString, li
             )
         })
 }
+extern "system" fn player_move(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    from_x: f64,
+    from_y: f64,
+    from_z: f64,
+    from_yaw: f32,
+    from_pitch: f32,
+    to_x: f64,
+    to_y: f64,
+    to_z: f64,
+    to_yaw: f32,
+    to_pitch: f32,
+) -> u8 {
+    if [from_x, from_y, from_z, to_x, to_y, to_z]
+        .iter()
+        .any(|v| !v.is_finite())
+        || [from_yaw, from_pitch, to_yaw, to_pitch]
+            .iter()
+            .any(|v| !v.is_finite())
+    {
+        return 1;
+    }
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerMove",
+            "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Double(from_x),
+                JValue::Double(from_y),
+                JValue::Double(from_z),
+                JValue::Float(from_yaw),
+                JValue::Float(from_pitch),
+                JValue::Double(to_x),
+                JValue::Double(to_y),
+                JValue::Double(to_z),
+                JValue::Float(to_yaw),
+                JValue::Float(to_pitch),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
+extern "system" fn player_interact(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    action: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: i32,
+    material: JString,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let Ok(material) = env.get_string(&material) else {
+        return 1;
+    };
+    let material: String = material.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        let material = env.new_string(material).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerInteract",
+            "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Int(action),
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+                JValue::Int(face),
+                JValue::Object(material.as_ref()),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
+extern "system" fn block_break(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    x: i32,
+    y: i32,
+    z: i32,
+    material: JString,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let Ok(material) = env.get_string(&material) else {
+        return 1;
+    };
+    let material: String = material.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        let material = env.new_string(material).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "fireBlockBreak",
+            "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+                JValue::Object(material.as_ref()),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
+extern "system" fn block_place(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: i32,
+    placed: JString,
+    replaced: JString,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let Ok(placed) = env.get_string(&placed) else {
+        return 1;
+    };
+    let placed: String = placed.into();
+    let Ok(replaced) = env.get_string(&replaced) else {
+        return 1;
+    };
+    let replaced: String = replaced.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        let placed = env.new_string(placed).ok()?;
+        let replaced = env.new_string(replaced).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "fireBlockPlace",
+            "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Int(x),
+                JValue::Int(y),
+                JValue::Int(z),
+                JValue::Int(face),
+                JValue::Object(placed.as_ref()),
+                JValue::Object(replaced.as_ref()),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
+extern "system" fn player_command(
+    mut env: JNIEnv,
+    _: JClass,
+    player: JString,
+    name: JString,
+    message: JString,
+) -> u8 {
+    let Ok(player) = env.get_string(&player) else {
+        return 1;
+    };
+    let player: String = player.into();
+    let Ok(player) = uuid::Uuid::parse_str(&player) else {
+        return 1;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return 1;
+    };
+    let name: String = name.into();
+    let Ok(message) = env.get_string(&message) else {
+        return 1;
+    };
+    let message: String = message.into();
+    let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<bool> {
+        let player = env.new_string(player.to_string()).ok()?;
+        let name = env.new_string(name).ok()?;
+        let message = env.new_string(message).ok()?;
+        env.call_static_method(
+            BOOTSTRAP,
+            "firePlayerCommand",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+            &[
+                JValue::Object(player.as_ref()),
+                JValue::Object(name.as_ref()),
+                JValue::Object(message.as_ref()),
+            ],
+        )
+        .ok()?
+        .z()
+        .ok()
+    }));
+    u8::from(matches!(allowed, Ok(Some(true))))
+}
 extern "system" fn schedule_global(_: JNIEnv, _: JClass, id: i64, delay: i64) {
     REGION_QUEUE
         .get_or_init(Default::default)
@@ -985,6 +1308,31 @@ impl PluginHost {
                     "dispatchCommand",
                     "(Ljava/lang/String;Ljava/lang/String;)Z",
                     dispatch_back as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerMove",
+                    "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+                    player_move as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerInteract",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
+                    player_interact as *mut _,
+                ),
+                NativeMethod::new(
+                    "blockBreak",
+                    "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
+                    block_break as *mut _,
+                ),
+                NativeMethod::new(
+                    "blockPlace",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
+                    block_place as *mut _,
+                ),
+                NativeMethod::new(
+                    "playerCommand",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    player_command as *mut _,
                 ),
                 NativeMethod::new("scheduleGlobal", "(JJ)V", schedule_global as *mut _),
                 NativeMethod::new("currentTick", "()J", current_tick as *mut _),
@@ -1474,6 +1822,185 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Fires Bukkit's `PlayerMoveEvent`; no JNI call without a registered listener.
+    pub fn fire_player_move(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_MOVE_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerMove",
+                    "(Ljava/lang/String;Ljava/lang/String;DDDFFDDDFF)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Double(movement.from[0]),
+                        JValue::Double(movement.from[1]),
+                        JValue::Double(movement.from[2]),
+                        JValue::Float(movement.from_yaw),
+                        JValue::Float(movement.from_pitch),
+                        JValue::Double(movement.to[0]),
+                        JValue::Double(movement.to[1]),
+                        JValue::Double(movement.to[2]),
+                        JValue::Float(movement.to_yaw),
+                        JValue::Float(movement.to_pitch),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `PlayerInteractEvent`; no JNI call without a registered listener.
+    pub fn fire_player_interact(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
+        material: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_INTERACT_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let material = env.new_string(material)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerInteract",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIIILjava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(action as i32),
+                        JValue::Int(block.x),
+                        JValue::Int(block.y),
+                        JValue::Int(block.z),
+                        JValue::Int(i32::from(face)),
+                        JValue::Object(material.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `BlockBreakEvent`; no JNI call without a registered listener.
+    pub fn fire_block_break(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        material: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(BLOCK_BREAK_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let material = env.new_string(material)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireBlockBreak",
+                    "(Ljava/lang/String;Ljava/lang/String;IIILjava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(block.x),
+                        JValue::Int(block.y),
+                        JValue::Int(block.z),
+                        JValue::Object(material.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `BlockPlaceEvent`; no JNI call without a registered listener.
+    pub fn fire_block_place(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        face: u8,
+        placed: &str,
+        replaced: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(BLOCK_PLACE_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let placed = env.new_string(placed)?;
+            let replaced = env.new_string(replaced)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireBlockPlace",
+                    "(Ljava/lang/String;Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(block.x),
+                        JValue::Int(block.y),
+                        JValue::Int(block.z),
+                        JValue::Int(i32::from(face)),
+                        JValue::Object(placed.as_ref()),
+                        JValue::Object(replaced.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `PlayerCommandPreprocessEvent`; no JNI call without a registered listener.
+    pub fn fire_player_command(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        message: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(PLAYER_COMMAND_PREPROCESS_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let message = env.new_string(message)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerCommand",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Object(message.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
     /// Fires Paper's `AsyncChatEvent` and Bukkit's `AsyncPlayerChatEvent`.
     ///
     /// Returns the message after listeners ran, or `None` when a listener cancelled chat.
@@ -1531,6 +2058,48 @@ impl ServerHooks for PluginHost {
     }
     fn chat(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<Option<String>, Error> {
         self.fire_chat(id, name, message)
+    }
+    fn player_moved(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        movement: &PlayerMove,
+    ) -> Result<bool, Error> {
+        self.fire_player_move(id, name, movement)
+    }
+    fn player_interacted(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        action: InteractAction,
+        block: BlockPosition,
+        face: u8,
+        material: &str,
+    ) -> Result<bool, Error> {
+        self.fire_player_interact(id, name, action, block, face, material)
+    }
+    fn block_broken(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        material: &str,
+    ) -> Result<bool, Error> {
+        self.fire_block_break(id, name, block, material)
+    }
+    fn block_placed(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        block: BlockPosition,
+        face: u8,
+        placed: &str,
+        replaced: &str,
+    ) -> Result<bool, Error> {
+        self.fire_block_place(id, name, block, face, placed, replaced)
+    }
+    fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error> {
+        self.fire_player_command(id, name, message)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()

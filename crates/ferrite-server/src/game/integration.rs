@@ -23,6 +23,8 @@ struct Bot {
     encoder: FrameEncoder,
     decoder: FrameDecoder,
     commands: Option<Vec<u8>>,
+    /// Chunks per tick sent in automatic `ChunkBatchReceived` acknowledgements.
+    chunks_per_tick: f32,
 }
 impl Bot {
     async fn send<P: Packet>(&mut self, p: &P) {
@@ -87,7 +89,7 @@ impl Bot {
             }
             11 => {
                 self.send(&ChunkBatchReceived {
-                    chunks_per_tick: 64.0,
+                    chunks_per_tick: self.chunks_per_tick,
                 })
                 .await
             }
@@ -117,13 +119,15 @@ impl Bot {
         .await
         .expect("expected chat message")
     }
-    async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+    /// Completes login and configuration but stops before the play position packet.
+    async fn begin_join(addr: std::net::SocketAddr, name: &str) -> Self {
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut b = Self {
             stream,
             encoder: FrameEncoder::default(),
             decoder: FrameDecoder::default(),
             commands: None,
+            chunks_per_tick: 64.0,
         };
         b.send(&Intention {
             protocol_version: 777,
@@ -157,6 +161,17 @@ impl Bot {
             }
         }
         b.send(&AcknowledgeFinishConfiguration).await;
+        b
+    }
+    /// Joins and waits until the server positions the player in play state.
+    async fn join(addr: std::net::SocketAddr, name: &str) -> Self {
+        Self::join_with_rate(addr, name, 64.0).await
+    }
+    /// Joins with a specific chunk-batch rate, so a test can keep the per-connection queue
+    /// small without a normal reader overflowing it during the initial chunk burst.
+    async fn join_with_rate(addr: std::net::SocketAddr, name: &str, chunks_per_tick: f32) -> Self {
+        let mut b = Self::begin_join(addr, name).await;
+        b.chunks_per_tick = chunks_per_tick;
         b.until(73).await;
         b
     }
@@ -450,11 +465,13 @@ async fn operator_teleport_command_moves_player() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 1,
+            max_players: 20,
             ops: vec![super::Operator {
                 uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
                 level: 4,
             }],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -475,7 +492,21 @@ async fn operator_teleport_command_moves_player() {
     .await;
     let body = bot.until(73).await;
     let p = PositionSync::decode(&mut body.as_slice()).unwrap();
-    assert_eq!([p.x, p.y, p.z], [10.0, 70.0, 20.0]);
+    // Vec3 centers absolute integer x/z on the block center, like vanilla.
+    assert_eq!([p.x, p.y, p.z], [10.5, 70.0, 20.5]);
+
+    bot.raw(7, "tp @s ~ ~5 ~ rotation 90 10").await;
+    let body = bot.until(73).await;
+    let p = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert_eq!([p.x, p.y, p.z], [10.5, 75.0, 20.5]);
+    assert_eq!((p.yaw, p.pitch), (90.0, 10.0));
+
+    bot.raw(7, "tp @s 10 70 20 facing 10 70 30").await;
+    let body = bot.until(73).await;
+    let p = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert!((p.yaw - 0.0).abs() < 1e-4, "yaw {}", p.yaw);
+    assert!(p.pitch > 0.0, "looks down at the facing point: {}", p.pitch);
+
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
@@ -483,40 +514,31 @@ async fn operator_teleport_command_moves_player() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn creative_slot_updates_player_inventory() {
-    use ferrite_protocol::packets::play::{ContainerSlot, CreativeSlot, ItemStack};
-    let world = World::start();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve(
-        listener,
-        ServerConfig {
-            online_mode: false,
-            view_distance: 2,
-            game: Some(world.sender.clone()),
-            ..Default::default()
-        },
-    ));
-    let mut bot = Bot::join(addr, "Alice").await;
+    use ferrite_protocol::packets::play::{CreativeSlot, ItemStack};
+    let (world, addr, server) = op_world(None, 1, &[]).await;
+    let mut bot = join_with_inventory(addr, "Creator").await;
+    let stack = ItemStack {
+        count: 3,
+        item_id: 1,
+    };
     bot.send(&CreativeSlot {
         slot: 36,
-        item: ItemStack {
-            count: 3,
-            item_id: 1,
-        },
+        item: stack,
     })
     .await;
-    let body = tokio::time::timeout(std::time::Duration::from_secs(3), bot.until(20))
-        .await
-        .unwrap();
-    let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
-    assert_eq!(slot.slot, 36);
-    assert_eq!(
-        slot.item,
-        ItemStack {
-            count: 3,
-            item_id: 1
-        }
-    );
+    // The client already shows the stack, so (like vanilla) nothing is echoed; the server's
+    // full view has it.
+    assert_eq!(inventory_of(&mut bot).await[36], stack);
+    // Out-of-range slots and oversized stacks are ignored.
+    for (slot, count) in [(0, 1), (46, 1), (37, 65)] {
+        bot.send(&CreativeSlot {
+            slot,
+            item: ItemStack { count, item_id: 1 },
+        })
+        .await;
+    }
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots.iter().filter(|s| s.count > 0).count(), 1);
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
@@ -692,8 +714,10 @@ async fn survival_break_requires_elapsed_ticks() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 0,
+            max_players: 20,
             ops: vec![],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -762,6 +786,272 @@ async fn console_stop_is_dispatched() {
     assert!(world.console_command("/stop".into()).await.unwrap());
     assert!(world.console_command("unknown".into()).await.is_err());
     world.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_command_reaches_target_and_sender() {
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut alice = Bot::join(addr, "Alice").await;
+    let mut bob = Bot::join(addr, "Bob").await;
+    alice.until(46).await;
+    bob.until(46).await;
+
+    alice.raw(7, "msg Bob hello there").await;
+    assert_eq!(
+        bob.chat_containing("Alice whispers to you: hello there")
+            .await,
+        "Alice whispers to you: hello there"
+    );
+    assert_eq!(
+        alice
+            .chat_containing("You whisper to Bob: hello there")
+            .await,
+        "You whisper to Bob: hello there"
+    );
+
+    drop((alice, bob));
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_command_disconnects_the_target() {
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut alice = Bot::join(addr, "Alice").await;
+    let mut bob = Bot::join(addr, "Bob").await;
+    alice.until(46).await;
+    bob.until(46).await;
+
+    alice.raw(7, "kill Bob").await;
+    let body = bob.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(disconnect.reason.0, "You died!");
+    alice.chat_containing("Killed Bob").await;
+
+    drop((alice, bob));
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_stop_shuts_the_world_down() {
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.until(46).await;
+    bot.raw(7, "stop").await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), world.shutdown())
+        .await
+        .expect("world stops after /stop")
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn admin_commands_persist_to_the_lists() {
+    use ferrite_admin::AdminLists;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-admin-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    let alice = uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap();
+    let bob = uuid::Uuid::parse_str("22e0d6a0-1f4a-3a9e-8a2e-8f7a5d9d3b0e").unwrap();
+    lists.usercache.cache("Alice", alice);
+    lists.usercache.cache("Bob", bob);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists.clone()),
+            ..Default::default()
+        },
+    );
+    for command in [
+        "op Alice",
+        "op Ghost",
+        "deop Ghost",
+        "whitelist add Bob",
+        "whitelist remove Bob",
+        "whitelist add Bob",
+        "ban Bob griefing",
+        "banlist players",
+        "ban-ip 10.0.0.1",
+        "banlist ips",
+        "pardon-ip 10.0.0.1",
+        "pardon Bob",
+        "whitelist on",
+        "whitelist off",
+        "save-all",
+        "save-off",
+        "save-on",
+        "kick Ghost",
+        "deop Alice",
+        "whitelist reload",
+    ] {
+        world
+            .console_command(command.into())
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+    }
+
+    assert_eq!(lists.ops.level_of(alice), None);
+    assert_eq!(
+        lists.ops.level_of(super::commands::offline_uuid("Ghost")),
+        None
+    );
+    assert!(lists.bans.player_bans().is_empty());
+    assert!(!lists.bans.is_ip_banned("10.0.0.1"));
+    // The reload reads whitelist.json back; Bob was added before it.
+    let reloaded = AdminLists::load(&dir).unwrap();
+    assert!(reloaded.whitelist.contains(bob));
+    world.shutdown().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn banned_player_is_disconnected_before_play() {
+    use ferrite_admin::AdminLists;
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-ban-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    let alice = uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap();
+    lists.bans.ban(alice, "Alice", "griefing", "Server", None);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::begin_join(addr, "Alice").await;
+    let body = bot.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        disconnect.reason.0,
+        "You are banned from this server!\nReason: griefing"
+    );
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ip_banned_player_is_disconnected_before_play() {
+    use ferrite_admin::AdminLists;
+    use ferrite_protocol::packets::play::PlayDisconnect;
+
+    let dir = std::env::temp_dir().join(format!("ferrite-ban-ip-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lists = std::sync::Arc::new(AdminLists::load(&dir).unwrap());
+    lists.bans.ban_ip("127.0.0.1", "proxies", "Server", None);
+    lists.flush().unwrap();
+
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            admin: Some(lists),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::begin_join(addr, "Bob").await;
+    let body = bot.until(32).await;
+    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        disconnect.reason.0,
+        "Your IP address is banned from this server!\nReason: proxies"
+    );
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -838,18 +1128,82 @@ async fn commands_packet_decodes_and_filters_permissions() {
     let bot = Bot::join(addr, "Guest").await;
     let bytes = bot.commands.as_ref().expect("commands packet");
     let mut input = bytes.as_slice();
-    // The guest may only see the unrestricted root commands: tps and mspt.
-    assert_eq!(VarInt::decode(&mut input).unwrap().0, 3);
-    assert_eq!(u8::decode(&mut input).unwrap(), 0);
-    assert_eq!(
-        Vec::<VarInt>::decode(&mut input).unwrap(),
-        vec![VarInt(1), VarInt(2)]
-    );
-    for name in ["tps", "mspt"] {
-        assert_eq!(u8::decode(&mut input).unwrap() & 3, 1);
-        assert!(Vec::<VarInt>::decode(&mut input).unwrap().is_empty());
-        assert_eq!(String::decode(&mut input).unwrap(), name);
+    let node_count = VarInt::decode(&mut input).unwrap().0 as usize;
+    assert!(node_count >= 8, "guest tree has {node_count} nodes");
+    assert_eq!(u8::decode(&mut input).unwrap(), 0, "root flags");
+    let roots = Vec::<VarInt>::decode(&mut input).unwrap();
+    assert!(!roots.is_empty());
+    let registry = ferrite_command::ParserRegistry::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vanilla/26.3/generated/reports"),
+    )
+    .unwrap();
+    // The root node's flags and children were decoded above; the rest follow it.
+    let mut nodes = vec![(String::new(), 0, roots, None, None)];
+    for _ in 1..node_count {
+        let flags = u8::decode(&mut input).unwrap();
+        let children = Vec::<VarInt>::decode(&mut input).unwrap();
+        let redirect = if flags & 0x08 != 0 {
+            Some(VarInt::decode(&mut input).unwrap().0)
+        } else {
+            None
+        };
+        let name = String::decode(&mut input).unwrap();
+        let mut parser = None;
+        if flags & 3 == 2 {
+            let id = VarInt::decode(&mut input).unwrap().0;
+            if Some(id) == registry.id("minecraft:entity") {
+                // minecraft:entity properties: single/players-only flags.
+                let _ = u8::decode(&mut input).unwrap();
+            }
+            parser = Some(id);
+        }
+        nodes.push((name, flags & 3, children, redirect, parser));
     }
+
+    let named = |want: &str| nodes.iter().find(|node| node.0 == want);
+    for visible in [
+        "msg", "tell", "w", "tps", "mspt", "list", "me", "targets", "message", "uuids", "action",
+    ] {
+        assert!(named(visible).is_some(), "guest should see {visible}");
+    }
+    for hidden in [
+        "gamemode",
+        "defaultgamemode",
+        "difficulty",
+        "time",
+        "weather",
+        "seed",
+        "say",
+        "tp",
+        "teleport",
+        "kill",
+        "op",
+        "ban",
+        "kick",
+        "stop",
+        "save-all",
+        "whitelist",
+    ] {
+        assert!(named(hidden).is_none(), "guest should not see {hidden}");
+    }
+    let msg_index = nodes.iter().position(|node| node.0 == "msg").unwrap();
+    for redirect in ["tell", "w"] {
+        let node = named(redirect).unwrap();
+        assert_eq!(
+            node.3,
+            Some(msg_index as i32),
+            "{redirect} redirects to msg"
+        );
+    }
+    assert!(
+        nodes
+            .iter()
+            .filter(|node| node.2.is_empty() && node.1 == 1)
+            .count()
+            >= 4,
+        "root literal commands are leaves"
+    );
     assert_eq!(VarInt::decode(&mut input).unwrap().0, 0);
     assert!(input.is_empty());
     drop(bot);
@@ -1277,8 +1631,10 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
         [0, 65, 0],
         super::WorldSettings {
             gamemode: 0,
+            max_players: 20,
             ops: vec![],
             plugins: None,
+            ..Default::default()
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1377,8 +1733,8 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
     assert_eq!(take.amount.0, 1);
     let dirt = ferrite_data::registries::id("minecraft:item", "minecraft:dirt").unwrap();
     let slot = loop {
-        let body = entity_packet(&mut walker, ContainerSlot::ID, -1).await;
-        let slot = ContainerSlot::decode(&mut body.as_slice()).unwrap();
+        let body = entity_packet(&mut walker, ContainerSlot::<ItemStack>::ID, -1).await;
+        let slot = ContainerSlot::<ItemStack>::decode(&mut body.as_slice()).unwrap();
         if slot.slot == 36 {
             break slot;
         }
@@ -1475,4 +1831,785 @@ async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
         Some(std::env::temp_dir().canonicalize().unwrap().as_path())
     );
     std::fs::remove_dir_all(resolved).unwrap();
+}
+
+/// A world in `gamemode` whose named players are operators (for `/gamemode`), served on a
+/// local port.
+async fn op_world(
+    source: Option<std::sync::Arc<super::anvil::AnvilChunkSource>>,
+    gamemode: i32,
+    names: &[&str],
+) -> (
+    World,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let world = World::start_configured(
+        source,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode,
+            ops: names
+                .iter()
+                .map(|name| super::Operator {
+                    uuid: ferrite_net::offline_uuid(name),
+                    level: 4,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    (world, addr, server)
+}
+
+/// Joins and consumes the initial inventory contents.
+async fn join_with_inventory(addr: std::net::SocketAddr, name: &str) -> Bot {
+    let mut bot = Bot::join(addr, name).await;
+    bot.until(18).await;
+    bot
+}
+
+/// Sends a `container_click` with a stale state id, so the server answers with its whole view
+/// of the menu (vanilla `broadcastFullState`), and returns that view.
+async fn click_in(
+    bot: &mut Bot,
+    window: i32,
+    slot: i16,
+    button: i8,
+    input: ferrite_inventory::ClickInput,
+) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    use ferrite_protocol::packets::play::{ContainerClick, ContainerContent, ItemStack};
+    bot.send(&ContainerClick::<ferrite_item::HashedSlot> {
+        window: VarInt(window),
+        state: VarInt(-1),
+        slot,
+        button,
+        input: VarInt(input.id()),
+        changed: vec![],
+        carried: None,
+    })
+    .await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), bot.until(18))
+        .await
+        .expect("container contents");
+    let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(content.window.0, window);
+    content.slots
+}
+
+/// [`click_in`] on the inventory menu.
+async fn click(
+    bot: &mut Bot,
+    slot: i16,
+    button: i8,
+    input: ferrite_inventory::ClickInput,
+) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    click_in(bot, 0, slot, button, input).await
+}
+
+/// The server view of the inventory menu, without changing anything.
+async fn inventory_of(bot: &mut Bot) -> Vec<ferrite_protocol::packets::play::ItemStack> {
+    click(bot, -1, 0, ferrite_inventory::ClickInput::Pickup).await
+}
+
+fn plain(name: &str, count: i32) -> ferrite_protocol::packets::play::ItemStack {
+    ferrite_protocol::packets::play::ItemStack {
+        count,
+        item_id: ferrite_data::registries::id("minecraft:item", &format!("minecraft:{name}"))
+            .unwrap(),
+    }
+}
+
+/// Switches a bot to another game mode with `/gamemode` and waits for the change.
+async fn set_mode(bot: &mut Bot, mode: &str, id: u8) {
+    use ferrite_protocol::packets::play::GameEvent;
+    bot.raw(7, &format!("gamemode {mode}")).await;
+    loop {
+        let body = bot.until(GameEvent::ID).await;
+        let event = GameEvent::decode(&mut body.as_slice()).unwrap();
+        if event.event == 3 && event.value == f32::from(id) {
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_inventory_clicks_drops_and_hotbar_swaps() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::packets::play::{
+        AddEntity, CreativeSlot, ItemStack, PlayerAction, SetHeldItem,
+    };
+    let (world, addr, server) = op_world(None, 1, &["Sorter"]).await;
+    let mut bot = join_with_inventory(addr, "Sorter").await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("stone", 40),
+    })
+    .await;
+    bot.send(&CreativeSlot {
+        slot: 9,
+        item: plain("dirt", 10),
+    })
+    .await;
+    set_mode(&mut bot, "survival", 0).await;
+    let empty = ItemStack::default();
+    // Move a stack: pick it up, put it down elsewhere.
+    let slots = click(&mut bot, 36, 0, Pickup).await;
+    assert_eq!(slots[36], empty);
+    let slots = click(&mut bot, 20, 0, Pickup).await;
+    assert_eq!((slots[20], slots[36]), (plain("stone", 40), empty));
+    // Shift-click from the main inventory goes to the hotbar.
+    let slots = click(&mut bot, 20, 0, QuickMove).await;
+    assert_eq!((slots[20], slots[36]), (empty, plain("stone", 40)));
+    // Number key 3 swaps the hovered slot with hotbar slot 2.
+    let slots = click(&mut bot, 9, 2, Swap).await;
+    assert_eq!((slots[9], slots[38]), (empty, plain("dirt", 10)));
+    // Right-click takes half; a left click puts it down elsewhere.
+    click(&mut bot, 36, 1, Pickup).await;
+    let slots = click(&mut bot, 10, 0, Pickup).await;
+    assert_eq!(
+        (slots[36], slots[10]),
+        (plain("stone", 20), plain("stone", 20))
+    );
+    // Q drops one from the selected slot, Ctrl+Q the rest; both become item entities.
+    bot.send(&SetHeldItem { slot: 0 }).await;
+    for status in [4, 3] {
+        bot.send(&PlayerAction {
+            status: VarInt(status),
+            location: 0,
+            face: 0,
+            sequence: VarInt(0),
+        })
+        .await;
+    }
+    let item_type = i32::from(ferrite_data::entity_props::by_name("item").unwrap().id);
+    let mut spawned = 0;
+    while spawned < 2 {
+        let body = entity_packet(&mut bot, AddEntity::ID, -1).await;
+        if AddEntity::decode(&mut body.as_slice())
+            .unwrap()
+            .entity_type
+            .0
+            == item_type
+        {
+            spawned += 1;
+        }
+    }
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots[36], empty);
+    // Q over a slot of the inventory screen drops one item.
+    let slots = click(&mut bot, 10, 0, Throw).await;
+    assert_eq!(slots[10], plain("stone", 19));
+    // F swaps the main hand with the offhand.
+    bot.send(&SetHeldItem { slot: 2 }).await;
+    bot.send(&PlayerAction {
+        status: VarInt(6),
+        location: 0,
+        face: 0,
+        sequence: VarInt(0),
+    })
+    .await;
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!((slots[38], slots[45]), (empty, plain("dirt", 10)));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_placement_uses_items_in_survival_only() {
+    use ferrite_protocol::{
+        packets::play::{CreativeSlot, MoveRotation, PlayerAction, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &["Mason"]).await;
+    let mut bot = join_with_inventory(addr, "Mason").await;
+    bot.until(46).await;
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("stone", 2),
+    })
+    .await;
+    let stone = u32::from(ferrite_data::blocks::default_state("minecraft:stone").unwrap());
+    let break_block = |sequence: i32| PlayerAction {
+        status: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: 1,
+        sequence: VarInt(sequence),
+    };
+    let place = |sequence: i32| UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 63, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(sequence),
+    };
+    // Creative placement keeps the stack.
+    bot.send(&break_block(1)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    bot.send(&place(2)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(stone));
+    assert_eq!(inventory_of(&mut bot).await[36], plain("stone", 2));
+    // Break it again in creative, then place it in survival: one stone is used up.
+    bot.send(&break_block(3)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    set_mode(&mut bot, "survival", 0).await;
+    bot.send(&place(4)).await;
+    bot.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(stone));
+    assert_eq!(inventory_of(&mut bot).await[36], plain("stone", 1));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crafting_planks_and_sticks_in_the_grid_and_on_a_table() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::{
+        packets::play::{
+            ClientboundContainerClose, ContainerContent, CreativeSlot, ItemStack, MoveRotation,
+            OpenScreen, ServerboundContainerClose, UseItemOn,
+        },
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &["Joiner"]).await;
+    let mut bot = join_with_inventory(addr, "Joiner").await;
+    bot.until(46).await;
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: plain("oak_log", 3),
+    })
+    .await;
+    set_mode(&mut bot, "survival", 0).await;
+    let empty = ItemStack::default();
+
+    // 2x2 grid: one log shows four planks, a click takes one craft.
+    click(&mut bot, 36, 0, Pickup).await;
+    let slots = click(&mut bot, 1, 1, Pickup).await;
+    assert_eq!(
+        (slots[1], slots[0]),
+        (plain("oak_log", 1), plain("oak_planks", 4))
+    );
+    click(&mut bot, 36, 0, Pickup).await;
+    click(&mut bot, 0, 0, Pickup).await;
+    let slots = click(&mut bot, 9, 0, Pickup).await;
+    assert_eq!((slots[0], slots[1]), (empty, empty));
+    assert_eq!(
+        (slots[9], slots[36]),
+        (plain("oak_planks", 4), plain("oak_log", 2))
+    );
+    // Two planks stacked vertically make sticks; shift-click crafts into the hotbar end.
+    click(&mut bot, 9, 0, Pickup).await;
+    click(&mut bot, 1, 1, Pickup).await;
+    let slots = click(&mut bot, 3, 1, Pickup).await;
+    assert_eq!(slots[0], plain("stick", 4));
+    click(&mut bot, 9, 0, Pickup).await;
+    let slots = click(&mut bot, 0, 0, QuickMove).await;
+    assert_eq!((slots[44], slots[0]), (plain("stick", 4), empty));
+    assert_eq!(
+        (slots[1], slots[3], slots[9]),
+        (empty, empty, plain("oak_planks", 2))
+    );
+
+    // Crafting table: using it opens the 3x3 menu instead of placing the held logs.
+    let table = u32::from(ferrite_data::blocks::default_state("crafting_table").unwrap());
+    source.set_block(0, 64, 0, table).unwrap();
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    let use_table = UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    };
+    bot.send(&use_table).await;
+    let body = bot.until(OpenScreen::ID).await;
+    let screen = OpenScreen::decode(&mut body.as_slice()).unwrap();
+    let crafting = ferrite_data::registries::id("minecraft:menu", "minecraft:crafting").unwrap();
+    assert_eq!((screen.window.0, screen.menu.0), (1, crafting));
+    assert_eq!(screen.title.0, "container.crafting");
+    let body = bot.until(18).await;
+    let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(content.window.0, 1);
+    assert_eq!(content.slots.len(), 46);
+    assert_eq!(content.slots[37], plain("oak_log", 2));
+    assert_eq!(source.block(0, 65, 0), Some(0));
+    // Log in the centre, shift-click the result: the planks join the stack in the inventory.
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 5, 1, Pickup).await;
+    assert_eq!(slots[0], plain("oak_planks", 4));
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 0, 0, QuickMove).await;
+    assert_eq!(
+        (slots[0], slots[5], slots[10]),
+        (empty, empty, plain("oak_planks", 6))
+    );
+    // Sticks in the 3x3 grid, taken with a plain click.
+    click_in(&mut bot, 1, 10, 0, Pickup).await;
+    click_in(&mut bot, 1, 2, 1, Pickup).await;
+    let slots = click_in(&mut bot, 1, 5, 1, Pickup).await;
+    assert_eq!(slots[0], plain("stick", 4));
+    click_in(&mut bot, 1, 10, 0, Pickup).await;
+    click_in(&mut bot, 1, 0, 0, Pickup).await;
+    let slots = click_in(&mut bot, 1, 11, 0, Pickup).await;
+    assert_eq!(
+        (slots[11], slots[2], slots[5]),
+        (plain("stick", 4), empty, empty)
+    );
+    // Closing gives back what is left in the grid.
+    click_in(&mut bot, 1, 37, 0, Pickup).await;
+    click_in(&mut bot, 1, 1, 0, Pickup).await;
+    bot.send(&ServerboundContainerClose { window: VarInt(1) })
+        .await;
+    let slots = inventory_of(&mut bot).await;
+    assert_eq!(slots[36], plain("oak_log", 1));
+    assert_eq!(
+        (slots[9], slots[10]),
+        (plain("oak_planks", 4), plain("stick", 4))
+    );
+    assert_eq!(slots[44], plain("stick", 4));
+    // Walking away from an open table closes it (vanilla `stillValid`).
+    bot.send(&use_table).await;
+    let body = bot.until(OpenScreen::ID).await;
+    assert_eq!(
+        OpenScreen::decode(&mut body.as_slice()).unwrap().window.0,
+        2
+    );
+    bot.raw(7, "tp 30 65 0").await;
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        bot.until(ClientboundContainerClose::ID),
+    )
+    .await
+    .expect("container close");
+    let closed = ClientboundContainerClose::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(closed.window.0, 2);
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chest_contents_are_shared_saved_and_spilled_when_broken() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::{
+        packets::play::{
+            ContainerContent, ContainerSlot, CreativeSlot, ItemStack, MoveRotation, OpenScreen,
+            PlayerAction, ServerboundContainerClose, UseItemOn,
+        },
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &[]).await;
+    let mut keeper = join_with_inventory(addr, "Keeper").await;
+    keeper.until(46).await;
+    let chest = u32::from(ferrite_data::blocks::default_state("chest").unwrap());
+    source.set_block(0, 64, 0, chest).unwrap();
+    keeper
+        .send(&CreativeSlot {
+            slot: 36,
+            item: plain("stone", 40),
+        })
+        .await;
+    let open = |sequence: i32| UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 0.875,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(sequence),
+    };
+    let look_down = MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    };
+    let generic_9x3 =
+        ferrite_data::registries::id("minecraft:menu", "minecraft:generic_9x3").unwrap();
+    async fn opened(bot: &mut Bot) -> (OpenScreen, Vec<ItemStack>) {
+        let body = bot.until(OpenScreen::ID).await;
+        let screen = OpenScreen::decode(&mut body.as_slice()).unwrap();
+        let body = bot.until(18).await;
+        let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+        assert_eq!(content.window, screen.window);
+        (screen, content.slots)
+    }
+    keeper.send(&look_down).await;
+    keeper.send(&open(1)).await;
+    let (screen, slots) = opened(&mut keeper).await;
+    assert_eq!(
+        (screen.menu.0, screen.title.0.as_str()),
+        (generic_9x3, "container.chest")
+    );
+    assert_eq!(slots.len(), 27 + 36);
+    let window = screen.window.0;
+    // Into the chest: hotbar slot 0 is menu slot 54.
+    click_in(&mut keeper, window, 54, 0, Pickup).await;
+    let slots = click_in(&mut keeper, window, 0, 0, Pickup).await;
+    assert_eq!(
+        (slots[0], slots[54]),
+        (plain("stone", 40), ItemStack::default())
+    );
+    let entity = source.block_entity(0, 64, 0).expect("chest block entity");
+    assert!(matches!(
+        entity.data.get("Items"),
+        Some(ferrite_nbt::Tag::List(ferrite_nbt::List::Compound(items))) if items.len() == 1
+    ));
+    // A second player opening the same chest sees the stone.
+    let mut visitor = join_with_inventory(addr, "Visitor").await;
+    visitor.until(46).await;
+    visitor.send(&look_down).await;
+    visitor.send(&open(1)).await;
+    let (visitor_screen, slots) = opened(&mut visitor).await;
+    assert_eq!(slots[0], plain("stone", 40));
+    // The keeper splits the stack; the visitor is sent the change.
+    click_in(&mut keeper, window, 0, 1, Pickup).await;
+    click_in(&mut keeper, window, 1, 0, Pickup).await;
+    loop {
+        let body = visitor.until(ContainerSlot::<ItemStack>::ID).await;
+        let slot = ContainerSlot::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+        if slot.window == visitor_screen.window && slot.slot == 1 {
+            assert_eq!(slot.item, plain("stone", 20));
+            break;
+        }
+    }
+    keeper
+        .send(&ServerboundContainerClose {
+            window: VarInt(window),
+        })
+        .await;
+    // Breaking the chest spills its items and removes the block entity.
+    keeper
+        .send(&PlayerAction {
+            status: VarInt(0),
+            location: BlockPos::new(0, 64, 0).pack(),
+            face: 1,
+            sequence: VarInt(2),
+        })
+        .await;
+    keeper.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    assert!(source.block_entity(0, 64, 0).is_none());
+    // The chest is gone, so the visitor's screen closes (the inventory clicks below are only
+    // answered on window 0 once it has). Spilled items have no pickup delay, so the two players
+    // standing on the chest collect all 40 stone again.
+    let stone = plain("stone", 1).item_id;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut total = 0;
+        for bot in [&mut keeper, &mut visitor] {
+            total += inventory_of(bot)
+                .await
+                .iter()
+                .filter(|s| s.item_id == stone)
+                .map(|s| s.count)
+                .sum::<i32>();
+        }
+        if total == 40 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "picked up {total} stone"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    drop(keeper);
+    drop(visitor);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gamerule_zero_stops_grass_spread_for_bot() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.path().to_path_buf(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let y = (64..318)
+        .find(|y| source.brightness(8, y + 1, 8).unwrap_or(0) >= 9)
+        .unwrap();
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    for x in 7..=9 {
+        for z in 7..=9 {
+            source
+                .set_block(
+                    x,
+                    y,
+                    z,
+                    block(if (x, z) == (8, 8) {
+                        "dirt"
+                    } else {
+                        "grass_block"
+                    }),
+                )
+                .unwrap();
+            source.set_block(x, y + 1, z, block("air")).unwrap();
+        }
+    }
+    let world = World::start_configured(
+        Some(source.clone()),
+        [8, y + 1, 8],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    world.set_random_tick_speed(0);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Alice").await;
+    bot.until(46).await;
+    bot.raw(7, "gamerule random_tick_speed 0").await;
+    bot.chat_containing("random_tick_speed = 0").await;
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(source.block(8, y, 8), Some(block("dirt")));
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// `/setblock` writes through the shared block-change path, so another player tracking the
+/// chunk receives the ordinary `BlockUpdate`, and the source gets vanilla feedback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setblock_command_updates_block_for_tracking_player() {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let world = World::start_configured(
+        Some(source.clone()),
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 1,
+            ops: vec![super::Operator {
+                uuid: uuid::Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap(),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut builder = Bot::join(addr, "Alice").await;
+    let mut observer = Bot::join(addr, "Observer").await;
+    builder.until(46).await;
+    observer.until(46).await;
+    builder.raw(7, "setblock 10 64 0 minecraft:stone").await;
+    let body = tokio::time::timeout(std::time::Duration::from_secs(20), observer.until(8))
+        .await
+        .unwrap();
+    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(BlockPos::unpack(update.location), BlockPos::new(10, 64, 0));
+    let stone = ferrite_data::blocks::default_state("minecraft:stone").unwrap();
+    assert_eq!(update.block_state.0, i32::from(stone));
+    assert_eq!(source.block(10, 64, 0), Some(u32::from(stone)));
+    let feedback = builder.chat_containing("Changed the block").await;
+    assert!(feedback.contains("10, 64, 0"), "{feedback}");
+    drop(builder);
+    drop(observer);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// A bot that stops reading must be disconnected as timed out, and its blocked writer must not
+/// slow down the region ticks or the other players' connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_reader_is_disconnected_without_stalling_ticks() {
+    use ferrite_protocol::packets::play::{ClientboundPlayerChat, PlayDisconnect};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 24,
+            send_queue_bytes: 128 * 1024,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut slow = Bot::join_with_rate(addr, "Slow", 1.0).await;
+    let mut fast = Bot::join_with_rate(addr, "Fast", 1.0).await;
+    let before = world.tick_samples.lock().unwrap().len();
+    // One acknowledgement makes the next tick queue a full 64-chunk batch; the bot never reads
+    // it, so the per-connection queue fills while its writer is stuck on the socket. The ack is
+    // fully written before the server can drop the connection, so the disconnect is not lost
+    // to a reset.
+    slow.send(&ChunkBatchReceived {
+        chunks_per_tick: 64.0,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Other players are unaffected: their chat still arrives while the slow bot is blocked.
+    fast.chat("still moving").await;
+    let chat = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let body = fast.until(66).await;
+            let message = ClientboundPlayerChat::decode(&mut body.as_slice()).unwrap();
+            if message.body.content == "still moving" {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(chat.is_ok(), "chat stalled while a slow client was blocked");
+    // Let the slow bot read again; it must receive the timed-out disconnect.
+    let mut reason = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Ok((id, body)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), slow.next_play()).await
+        else {
+            break;
+        };
+        if id == PlayDisconnect::ID {
+            reason = Some(
+                PlayDisconnect::decode(&mut body.as_slice())
+                    .unwrap()
+                    .reason
+                    .0,
+            );
+            break;
+        }
+    }
+    assert_eq!(
+        reason.as_deref(),
+        Some("Timed out"),
+        "slow reader must be disconnected as timed out"
+    );
+    let samples = world.tick_samples.lock().unwrap().clone();
+    assert!(
+        samples.len() > before + 5,
+        "ticks stopped while a slow client was writing: {before} -> {}",
+        samples.len()
+    );
+    let worst = samples[before..].iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        worst < 250.0,
+        "a slow client stalled region ticks: worst {worst:.1} ms"
+    );
+    drop(fast);
+    drop(slow);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_give_and_xp_commands_act_on_a_bot_session() {
+    use ferrite_protocol::packets::play::SetExperience;
+    let (world, addr, server) = op_world(None, 1, &["Giver"]).await;
+    let mut bot = join_with_inventory(addr, "Giver").await;
+    let stone = ferrite_data::registries::id("minecraft:item", "minecraft:stone").unwrap();
+
+    // `/give` places the items in the live inventory and syncs the slots.
+    bot.raw(7, "give @s stone 5").await;
+    bot.chat_containing("Gave 5 Stone to Giver").await;
+    let slots = inventory_of(&mut bot).await;
+    assert!(
+        slots
+            .iter()
+            .any(|stack| stack.item_id == stone && stack.count == 5)
+    );
+
+    // `/clear` removes matching items again.
+    bot.raw(7, "clear @s minecraft:stone").await;
+    bot.chat_containing("Removed 5 items from Giver").await;
+    let slots = inventory_of(&mut bot).await;
+    assert!(
+        !slots
+            .iter()
+            .any(|stack| stack.item_id == stone && stack.count > 0)
+    );
+
+    // `/xp` set and add follow the vanilla curve and send `set_experience`.
+    bot.raw(7, "xp set @s 7 points").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (1, 7));
+    assert_eq!(xp.progress, 0.0);
+    bot.raw(7, "xp add @s 1 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!((xp.level.0, xp.total.0), (2, 16));
+    bot.raw(7, "xp query @s levels").await;
+    bot.chat_containing("Giver has 2 experience levels").await;
+
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
 }

@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ferrite_protocol::packets::play::ItemStack;
+use ferrite_inventory::PlayerInventory;
+use ferrite_item::ItemStack;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,8 +39,45 @@ pub struct Saved {
     pub yaw: f32,
     pub pitch: f32,
     pub gamemode: i32,
-    /// `(slot, item id, count)` for non-empty slots only.
+    /// `(inventory slot, network slot bytes as hex)` for non-empty slots, in vanilla `Inventory`
+    /// numbering. The network form keeps every component, including ones the NBT save format
+    /// cannot re-encode for the network.
+    #[serde(default)]
+    pub items: Vec<(u8, String)>,
+    /// The selected hotbar slot.
+    #[serde(default)]
+    pub selected: u8,
+    /// Older saves: `(window-0 menu slot, item id, count)` for non-empty slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inventory: Vec<(u8, i32, i32)>,
+}
+
+/// Window-0 menu slot to `Inventory` slot, for older saves.
+fn legacy_slot(menu_slot: u8) -> Option<usize> {
+    Some(match menu_slot {
+        5 => ferrite_inventory::HEAD,
+        6 => ferrite_inventory::CHEST,
+        7 => ferrite_inventory::LEGS,
+        8 => ferrite_inventory::FEET,
+        9..=35 => usize::from(menu_slot),
+        36..=44 => usize::from(menu_slot) - 36,
+        45 => ferrite_inventory::OFFHAND,
+        _ => return None,
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 impl Saved {
@@ -48,32 +86,51 @@ impl Saved {
         yaw: f32,
         pitch: f32,
         gamemode: i32,
-        inventory: &[ItemStack],
+        inventory: &PlayerInventory,
     ) -> Self {
-        let inventory = inventory
+        let items = inventory
+            .slots()
             .iter()
             .enumerate()
-            .filter(|(_, stack)| stack.count > 0)
-            .map(|(slot, stack)| (slot as u8, stack.item_id, stack.count))
+            .filter(|(_, stack)| !stack.is_empty())
+            .filter_map(|(slot, stack)| match stack.encode_network() {
+                Ok(bytes) => Some((slot as u8, hex(&bytes))),
+                Err(error) => {
+                    tracing::warn!(slot, %error, "not saving an unencodable item stack");
+                    None
+                }
+            })
             .collect();
         Self {
             pos,
             yaw,
             pitch,
             gamemode,
-            inventory,
+            items,
+            selected: inventory.selected_slot() as u8,
+            inventory: Vec::new(),
         }
     }
 
-    /// Rebuild the 46-slot window-0 inventory, ignoring slots outside the window.
-    pub fn inventory_array(&self) -> [ItemStack; 46] {
-        let mut slots = [ItemStack::default(); 46];
-        for &(slot, item_id, count) in &self.inventory {
-            if let Some(target) = slots.get_mut(usize::from(slot)) {
-                *target = ItemStack { count, item_id };
+    /// Rebuilds the inventory, ignoring unknown slots and unreadable stacks.
+    pub fn inventory(&self) -> PlayerInventory {
+        let mut inventory = PlayerInventory::new();
+        inventory.selected = usize::from(self.selected).min(ferrite_inventory::HOTBAR - 1);
+        for &(menu_slot, item_id, count) in &self.inventory {
+            if let (Some(slot), Ok(item)) = (legacy_slot(menu_slot), u16::try_from(item_id)) {
+                inventory.set(slot, ItemStack::with_count(item, count));
             }
         }
-        slots
+        for (slot, bytes) in &self.items {
+            let stack = unhex(bytes).and_then(|bytes| ItemStack::decode_network(&bytes).ok());
+            match stack {
+                Some(stack) if usize::from(*slot) < ferrite_inventory::SIZE => {
+                    inventory.set(usize::from(*slot), stack)
+                }
+                _ => tracing::warn!(slot, "ignoring an unreadable saved item stack"),
+            }
+        }
+        inventory
     }
 }
 
@@ -128,22 +185,24 @@ mod tests {
     fn round_trips_position_mode_and_inventory() {
         let dir = temp_dir("roundtrip");
         let uuid = Uuid::from_u128(7);
-        let mut inventory = [ItemStack::default(); 46];
-        inventory[36] = ItemStack {
-            count: 64,
-            item_id: 1,
-        };
-        inventory[44] = ItemStack {
-            count: 3,
-            item_id: 99,
-        };
+        let mut inventory = PlayerInventory::new();
+        inventory.selected = 4;
+        inventory.set(
+            0,
+            ItemStack::from_name("stone").unwrap().copy_with_count(64),
+        );
+        let mut sword = ItemStack::from_name("diamond_sword").unwrap();
+        sword.components.insert(
+            ferrite_item::component_ids::DAMAGE,
+            ferrite_item::Component::Damage(12),
+        );
+        inventory.set(ferrite_inventory::OFFHAND, sword.clone());
         let saved = Saved::capture([12.5, 70.0, -3.25], 90.0, -15.0, 1, &inventory);
         save_to(&dir, &uuid, &saved).unwrap();
         let loaded = load_from(&dir, &uuid).unwrap();
         assert_eq!(loaded, saved);
-        assert_eq!(loaded.inventory_array()[36].count, 64);
-        assert_eq!(loaded.inventory_array()[44].item_id, 99);
-        assert_eq!(loaded.inventory_array()[0], ItemStack::default());
+        assert_eq!(loaded.inventory(), inventory);
+        assert_eq!(loaded.inventory().get(ferrite_inventory::OFFHAND), &sword);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -159,16 +218,18 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_slots_are_ignored() {
-        let saved = Saved {
-            pos: [0.0; 3],
-            yaw: 0.0,
-            pitch: 0.0,
-            gamemode: 0,
-            inventory: vec![(200, 1, 1), (3, 2, 5)],
-        };
-        let slots = saved.inventory_array();
-        assert_eq!(slots[3].count, 5);
-        assert_eq!(slots.iter().filter(|s| s.count > 0).count(), 1);
+    fn older_saves_and_bad_slots_are_converted_or_ignored() {
+        let saved: Saved = serde_json::from_str(
+            r#"{"pos":[0,0,0],"yaw":0,"pitch":0,"gamemode":0,
+                "inventory":[[200,1,1],[36,1,5],[5,1,1],[45,1,2]],
+                "items":[[99,"0101"],[3,"zz"]]}"#,
+        )
+        .unwrap();
+        let inventory = saved.inventory();
+        assert_eq!(inventory.get(0).count, 5);
+        assert_eq!(inventory.get(ferrite_inventory::HEAD).count, 1);
+        assert_eq!(inventory.get(ferrite_inventory::OFFHAND).count, 2);
+        let filled = inventory.slots().iter().filter(|s| !s.is_empty()).count();
+        assert_eq!(filled, 3);
     }
 }

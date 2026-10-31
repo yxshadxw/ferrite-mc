@@ -18,6 +18,30 @@ public final class TestPlugin extends JavaPlugin implements Listener {
     }
     @EventHandler public void onJoin(org.bukkit.event.player.PlayerJoinEvent event) { appendEvent("join " + event.getPlayer().getName()); }
     @EventHandler public void onQuit(org.bukkit.event.player.PlayerQuitEvent event) { appendEvent("quit " + event.getPlayer().getName()); }
+    @EventHandler public void onMove(org.bukkit.event.player.PlayerMoveEvent event) {
+        appendEvent("move " + event.getPlayer().getName() + " " + event.getTo().getBlockX() + " " + event.getTo().getBlockY() + " " + event.getTo().getBlockZ());
+        if (event.getTo().getY() > 90.0) { appendEvent("move-cancel " + event.getPlayer().getName()); event.setCancelled(true); }
+    }
+    @EventHandler public void onInteract(org.bukkit.event.player.PlayerInteractEvent event) {
+        var clicked = event.getClickedBlock();
+        appendEvent("interact " + (event.getAction() == org.bukkit.event.block.Action.LEFT_CLICK_BLOCK ? "left" : "right") + " " + clicked.getX() + " " + clicked.getY() + " " + clicked.getZ());
+    }
+    @EventHandler public void onBreak(org.bukkit.event.block.BlockBreakEvent event) {
+        var block = event.getBlock();
+        appendEvent("break " + block.getX() + " " + block.getY() + " " + block.getZ());
+        appendEvent("break-type " + block.getType().getKey() + " " + block.getWorld().getName());
+        if (block.getX() == 1) { appendEvent("break-cancel " + block.getX() + " " + block.getY() + " " + block.getZ()); event.setCancelled(true); }
+    }
+    @EventHandler public void onCommand(org.bukkit.event.player.PlayerCommandPreprocessEvent event) {
+        appendEvent("command " + event.getMessage());
+        if (event.getMessage().equals("/testping nope")) event.setCancelled(true);
+    }
+    @EventHandler public void onPlace(org.bukkit.event.block.BlockPlaceEvent event) {
+        var block = event.getBlockPlaced();
+        appendEvent("place " + block.getX() + " " + block.getY() + " " + block.getZ());
+        appendEvent("place-cancel " + block.getX() + " " + block.getY() + " " + block.getZ());
+        event.setCancelled(true);
+    }
     @EventHandler public void onChat(io.papermc.paper.event.player.AsyncChatEvent event) {
         String message = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.message());
         appendEvent("chat " + message);

@@ -44,6 +44,41 @@ pub enum Coordinates {
     Local { left: f64, up: f64, forwards: f64 },
 }
 
+impl Coordinates {
+    /// Resolves against the source's position and rotation (Brigadier's
+    /// `WorldCoordinates`/`LocalCoordinates.toAbsolute`).
+    ///
+    /// Local coordinates use Minecraft's axes: yaw 0 faces +Z, yaw 90 faces -X,
+    /// and positive pitch looks down.
+    pub fn resolve(&self, origin: [f64; 3], yaw: f32, pitch: f32) -> [f64; 3] {
+        match self {
+            Self::World([x, y, z]) => [
+                x.resolve(origin[0]),
+                y.resolve(origin[1]),
+                z.resolve(origin[2]),
+            ],
+            Self::Local { left, up, forwards } => {
+                let (sin_yaw, cos_yaw) = f64::from(yaw).to_radians().sin_cos();
+                let (sin_pitch, cos_pitch) = f64::from(pitch).to_radians().sin_cos();
+                let forward = [-sin_yaw * cos_pitch, -sin_pitch, cos_yaw * cos_pitch];
+                let up_axis = [sin_yaw * sin_pitch, cos_pitch, -cos_yaw * sin_pitch];
+                let left_axis = [cos_yaw, 0.0, -sin_yaw];
+                [0, 1, 2].map(|i| {
+                    origin[i] + left_axis[i] * left + up_axis[i] * up + forward[i] * forwards
+                })
+            }
+        }
+    }
+}
+
+/// Resolves a `rotation` pair against the source's yaw and pitch.
+pub fn resolve_rotation(rotation: [WorldCoordinate; 2], yaw: f32, pitch: f32) -> (f32, f32) {
+    (
+        rotation[0].resolve(f64::from(yaw)) as f32,
+        rotation[1].resolve(f64::from(pitch)) as f32,
+    )
+}
+
 fn read_relative(reader: &mut StringReader) -> bool {
     if reader.peek_is('~') {
         reader.skip();
@@ -260,5 +295,32 @@ mod tests {
         );
         let e = parse_pair(&mut StringReader::new("5"), false, false).unwrap_err();
         assert_eq!(e.message(), "Incomplete (expected 2 coordinates)");
+    }
+
+    #[test]
+    fn coordinates_resolve_against_position_and_rotation() {
+        let origin = [10.0, 64.0, -5.0];
+        let world = Coordinates::World([
+            WorldCoordinate::absolute(1.5),
+            WorldCoordinate::relative(2.0),
+            WorldCoordinate::absolute(-3.0),
+        ]);
+        assert_eq!(world.resolve(origin, 0.0, 0.0), [1.5, 66.0, -3.0]);
+
+        let local = Coordinates::Local {
+            left: 1.0,
+            up: 2.0,
+            forwards: 3.0,
+        };
+        assert_eq!(local.resolve([0.0; 3], 0.0, 0.0), [1.0, 2.0, 3.0]);
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
+        assert!(close(local.resolve([0.0; 3], 90.0, 0.0), [-3.0, 2.0, -1.0]));
+        assert!(close(local.resolve([0.0; 3], 0.0, 90.0), [1.0, -3.0, -2.0]));
+
+        let rotation = [
+            WorldCoordinate::relative(90.0),
+            WorldCoordinate::absolute(-10.0),
+        ];
+        assert_eq!(resolve_rotation(rotation, 45.0, 5.0), (135.0, -10.0));
     }
 }

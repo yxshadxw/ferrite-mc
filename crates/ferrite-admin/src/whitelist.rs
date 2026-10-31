@@ -64,6 +64,17 @@ impl Whitelist {
         removed
     }
 
+    /// Every whitelisted name, sorted case-insensitively.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = read(&self.shared.state)
+            .whitelist
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names
+    }
+
     /// Whether `uuid` is whitelisted.
     pub fn contains(&self, uuid: Uuid) -> bool {
         read(&self.shared.state)

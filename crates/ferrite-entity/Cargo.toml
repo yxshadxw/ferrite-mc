@@ -10,6 +10,7 @@ uuid.workspace = true
 ferrite-data.workspace = true
 ferrite-protocol.workspace = true
 ferrite-item = { path = "../ferrite-item" }
+ferrite-inventory = { path = "../ferrite-inventory" }
 
 [dev-dependencies]
 uuid.workspace = true

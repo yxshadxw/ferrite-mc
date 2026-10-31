@@ -399,9 +399,10 @@ mod tests {
         profiler.start_profile().unwrap();
         {
             let _slow = profiler.timings().scope("slow");
-            // Keep a wide gap: on a loaded test runner a 15 ms/2 ms pair can invert when one
-            // scope's thread is preempted.
-            thread::sleep(Duration::from_millis(100));
+            // Windows' scheduler granularity is ~15 ms, and a busy test run can deschedule
+            // a thread for tens of milliseconds; keep the two scopes far enough apart that
+            // their order cannot invert.
+            thread::sleep(Duration::from_millis(120));
         }
         {
             let _fast = profiler.timings().scope("fast");

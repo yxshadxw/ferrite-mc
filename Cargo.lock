@@ -592,7 +592,9 @@ dependencies = [
 name = "ferrite-command"
 version = "0.1.0"
 dependencies = [
+ "ferrite-nbt",
  "ferrite-protocol",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]
@@ -632,6 +634,7 @@ name = "ferrite-entity"
 version = "0.1.0"
 dependencies = [
  "ferrite-data",
+ "ferrite-inventory",
  "ferrite-item",
  "ferrite-math",
  "ferrite-protocol",
@@ -643,6 +646,14 @@ name = "ferrite-fluid"
 version = "0.1.0"
 dependencies = [
  "ferrite-data",
+]
+
+[[package]]
+name = "ferrite-inventory"
+version = "0.1.0"
+dependencies = [
+ "ferrite-item",
+ "ferrite-nbt",
 ]
 
 [[package]]
@@ -706,6 +717,7 @@ dependencies = [
  "aes",
  "anyhow",
  "criterion 0.5.1",
+ "ferrite-item",
  "ferrite-nbt",
  "ferrite-protocol",
  "hmac",
@@ -796,10 +808,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "ferrite-admin",
  "ferrite-command",
  "ferrite-data",
  "ferrite-entity",
  "ferrite-fluid",
+ "ferrite-inventory",
  "ferrite-item",
  "ferrite-jvm",
  "ferrite-loot",
@@ -810,8 +824,10 @@ dependencies = [
  "ferrite-plugin",
  "ferrite-profiler",
  "ferrite-protocol",
+ "ferrite-recipe",
  "ferrite-region",
  "ferrite-world",
+ "md5",
  "mimalloc",
  "rand 0.8.8",
  "rsa",

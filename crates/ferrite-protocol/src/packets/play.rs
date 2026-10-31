@@ -383,9 +383,89 @@ packet!(UseItemOn,66,Serverbound,{hand:VarInt,location:i64,face:VarInt,cursor_x:
 packet!(BlockUpdate,8,Clientbound,{location:i64,block_state:VarInt});
 packet!(AcknowledgeBlockChange,4,Clientbound,{sequence:VarInt});
 packet!(SetHeldItem,54,Serverbound,{slot:i16});
-packet!(CreativeSlot,57,Serverbound,{slot:i16,item:ItemStack});
-packet!(ContainerContent,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<ItemStack>,carried:ItemStack});
-packet!(ContainerSlot,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:ItemStack});
+
+/// Packets carrying item stacks are generic over the stack type: this crate cannot depend on
+/// `ferrite-item`, whose full `ItemStack` (and `HashedSlot`) implement `Encode`/`Decode` behind
+/// its `protocol` feature. The default is the minimal [`ItemStack`].
+macro_rules! item_packet {($name:ident<$g:ident $(= $d:ty)?>,$id:expr,$bound:ident,{$($f:ident:$t:ty),* $(,)?})=>{
+    #[derive(Debug,Clone,PartialEq)] pub struct $name<$g $(= $d)?> {$(pub $f:$t),*}
+    impl<$g: Encode> Encode for $name<$g> {fn encode(&self,out:&mut Vec<u8>){$(self.$f.encode(out);)*}}
+    impl<$g: Decode> Decode for $name<$g> {fn decode(buf:&mut &[u8])->Result<Self,DecodeError>{Ok(Self{$($f:<$t>::decode(buf)?),*})}}
+    impl<$g: Encode + Decode> Packet for $name<$g> {const ID:i32=$id;const STATE:State=State::Play;const BOUND:Bound=Bound::$bound;}
+};}
+item_packet!(CreativeSlot<I = ItemStack>,57,Serverbound,{slot:i16,item:I});
+item_packet!(ContainerContent<I = ItemStack>,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<I>,carried:I});
+item_packet!(ContainerSlot<I = ItemStack>,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:I});
+packet!(SetExperience,105,Clientbound,{progress:f32,level:VarInt,total:VarInt});
+item_packet!(SetCursorItem<I = ItemStack>,98,Clientbound,{item:I});
+item_packet!(SetPlayerInventory<I = ItemStack>,110,Clientbound,{slot:VarInt,item:I});
+packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
+packet!(ClientboundContainerClose,17,Clientbound,{window:VarInt});
+packet!(SetHeldSlot,107,Clientbound,{slot:VarInt});
+packet!(OpenScreen,60,Clientbound,{window:VarInt,menu:VarInt,title:crate::types::Translatable});
+
+/// Vanilla `ServerboundContainerClickPacket.MAX_SLOT_COUNT`.
+pub const CONTAINER_CLICK_MAX_SLOTS: usize = 128;
+
+/// `container_click`. `H` is the hashed stack (`ferrite_item::HashedSlot`); `changed` holds at
+/// most [`CONTAINER_CLICK_MAX_SLOTS`] `(slot, predicted stack)` pairs, `None` being empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerClick<H> {
+    pub window: VarInt,
+    pub state: VarInt,
+    pub slot: i16,
+    pub button: i8,
+    pub input: VarInt,
+    pub changed: Vec<(i16, Option<H>)>,
+    pub carried: Option<H>,
+}
+impl<H: Encode> Encode for ContainerClick<H> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.window.encode(out);
+        self.state.encode(out);
+        self.slot.encode(out);
+        self.button.encode(out);
+        self.input.encode(out);
+        VarInt(self.changed.len() as i32).encode(out);
+        for (slot, item) in &self.changed {
+            slot.encode(out);
+            item.encode(out);
+        }
+        self.carried.encode(out);
+    }
+}
+impl<H: Decode> Decode for ContainerClick<H> {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let window = VarInt::decode(buf)?;
+        let state = VarInt::decode(buf)?;
+        let slot = i16::decode(buf)?;
+        let button = i8::decode(buf)?;
+        let input = VarInt::decode(buf)?;
+        let len = usize::try_from(VarInt::decode(buf)?.0)
+            .ok()
+            .filter(|&len| len <= CONTAINER_CLICK_MAX_SLOTS)
+            .ok_or(DecodeError::Invalid("too many changed slots"))?;
+        let mut changed = Vec::with_capacity(len);
+        for _ in 0..len {
+            changed.push((i16::decode(buf)?, Option::<H>::decode(buf)?));
+        }
+        let carried = Option::<H>::decode(buf)?;
+        Ok(Self {
+            window,
+            state,
+            slot,
+            button,
+            input,
+            changed,
+            carried,
+        })
+    }
+}
+impl<H: Encode + Decode> Packet for ContainerClick<H> {
+    const ID: i32 = 18;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Serverbound;
+}
 
 /// Minimal item stack; component patches are deliberately rejected until supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1008,6 +1088,48 @@ mod interaction_tests {
         assert!(data.is_empty());
     }
     #[test]
+    fn container_packets_roundtrip() {
+        let stone = ItemStack {
+            count: 3,
+            item_id: 1,
+        };
+        roundtrip(ContainerClick::<ItemStack> {
+            window: VarInt(1),
+            state: VarInt(7),
+            slot: 36,
+            button: 1,
+            input: VarInt(5),
+            changed: vec![(36, None), (9, Some(stone))],
+            carried: Some(stone),
+        });
+        roundtrip(SetCursorItem { item: stone });
+        roundtrip(SetPlayerInventory {
+            slot: VarInt(40),
+            item: stone,
+        });
+        roundtrip(ServerboundContainerClose { window: VarInt(3) });
+        roundtrip(ClientboundContainerClose { window: VarInt(3) });
+        roundtrip(SetHeldSlot { slot: VarInt(4) });
+        roundtrip(OpenScreen {
+            window: VarInt(1),
+            menu: VarInt(12),
+            title: crate::types::Translatable("container.crafting".into()),
+        });
+        // More than 128 changed slots is rejected like vanilla.
+        let mut bytes = Vec::new();
+        ContainerClick::<ItemStack> {
+            window: VarInt(0),
+            state: VarInt(0),
+            slot: 0,
+            button: 0,
+            input: VarInt(0),
+            changed: vec![(0, None); 129],
+            carried: None,
+        }
+        .encode(&mut bytes);
+        assert!(ContainerClick::<ItemStack>::decode(&mut bytes.as_slice()).is_err());
+    }
+    #[test]
     fn interaction_packets_roundtrip() {
         roundtrip(PlayerGameMode {
             uuid: Uuid::nil(),
@@ -1062,6 +1184,11 @@ mod interaction_tests {
             state: VarInt(3),
             slot: 36,
             item: ItemStack::default(),
+        });
+        roundtrip(SetExperience {
+            progress: 0.5,
+            level: VarInt(12),
+            total: VarInt(456),
         });
     }
     #[test]

@@ -33,7 +33,7 @@ pub mod suggestion;
 pub mod tree;
 pub mod vanilla;
 
-pub use arguments::{ArgumentType, ArgumentValue, StringKind};
+pub use arguments::{ArgumentType, ArgumentValue, EntityAnchor, StringKind};
 pub use context::{CommandContext, ParsedArgument, ParsedNode};
 pub use dispatcher::{Ambiguity, CommandDispatcher, ParseResults};
 pub use error::{CommandError, CommandSyntaxError, ErrorContext};
@@ -48,3 +48,5 @@ pub use vanilla::{
     CommandFactory, LoadError, LoadOptions, LoadReport, PermissionLevel, PermissionSource,
     RequirementFactory,
 };
+
+pub mod gamerule;
