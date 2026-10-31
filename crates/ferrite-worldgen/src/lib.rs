@@ -46,6 +46,7 @@ mod noise_settings;
 mod resolve;
 mod seeded_noise;
 mod strict;
+mod surface;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -79,6 +80,7 @@ pub use noise_settings::{
 };
 pub use resolve::ResolveError;
 pub use seeded_noise::{SeededContext, SeededNoise};
+pub use surface::{SurfaceError, SurfaceGenerator};
 
 /// All world generation data loaded from one generated data set.
 ///

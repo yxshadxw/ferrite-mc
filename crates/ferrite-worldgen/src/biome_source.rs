@@ -123,6 +123,8 @@ pub enum MultiNoiseError {
 pub struct MultiNoiseBiomeSource {
     entries: Vec<Entry>,
     root: Node,
+    vanilla_root: Node,
+    vanilla_hint: std::cell::Cell<Option<usize>>,
 }
 
 impl MultiNoiseBiomeSource {
@@ -141,7 +143,19 @@ impl MultiNoiseBiomeSource {
 
         let mut indices: Vec<usize> = (0..entries.len()).collect();
         let root = build(&entries, &mut indices);
-        Ok(Self { entries, root })
+        let vanilla_root = vanilla_build(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Node::leaf(i, e.point))
+                .collect(),
+        );
+        Ok(Self {
+            entries,
+            root,
+            vanilla_root,
+            vanilla_hint: std::cell::Cell::new(None),
+        })
     }
 
     /// Loads a preset (`minecraft:overworld` or `minecraft:nether`) from already-loaded
@@ -184,6 +198,46 @@ impl MultiNoiseBiomeSource {
     /// Ties are resolved by the first matching parameter point in list order.
     pub fn find_biome(&self, target: ClimateTargetPoint) -> &ResourceId {
         let index = self.find_index(&target.as_array());
+        &self.entries[index].biome
+    }
+
+    /// Selects using vanilla's R-tree ordering and last-result hint.
+    pub fn find_biome_vanilla(&self, target: ClimateTargetPoint) -> &ResourceId {
+        fn search(
+            node: &Node,
+            target: &[i64; 6],
+            entries: &[Entry],
+            mut best: Option<usize>,
+        ) -> Option<usize> {
+            match &node.kind {
+                NodeKind::Leaf(index) => Some(*index),
+                NodeKind::Branch(children) => {
+                    let mut distance = best.map_or(i64::MAX, |i| entries[i].point.fitness(target));
+                    for child in children {
+                        let bound = child.bounds.distance(target);
+                        if bound >= distance {
+                            continue;
+                        }
+                        if let Some(index) = search(child, target, entries, best) {
+                            let found = entries[index].point.fitness(target);
+                            if found < distance {
+                                distance = found;
+                                best = Some(index);
+                            }
+                        }
+                    }
+                    best
+                }
+            }
+        }
+        let index = search(
+            &self.vanilla_root,
+            &target.as_array(),
+            &self.entries,
+            self.vanilla_hint.get(),
+        )
+        .expect("nonempty tree");
+        self.vanilla_hint.set(Some(index));
         &self.entries[index].biome
     }
 
@@ -399,7 +453,7 @@ impl Bounds {
             let distance = parameter.distance(*value);
             sum = sum.wrapping_add(distance.wrapping_mul(distance));
         }
-        let offset = self.0[6].min;
+        let offset = self.0[6].distance(0);
         sum.wrapping_add(offset.wrapping_mul(offset))
     }
 }
@@ -489,6 +543,67 @@ impl Node {
             kind: NodeKind::Branch(children),
         }
     }
+}
+
+// Climate.RTree bulk loading and search ordering from Minecraft Java 26.3.
+fn vanilla_build(mut nodes: Vec<Node>) -> Node {
+    const FANOUT: usize = 19;
+    if nodes.len() == 1 {
+        return nodes.pop().expect("one node");
+    }
+    if nodes.len() <= FANOUT {
+        nodes.sort_by_key(|node| {
+            node.bounds
+                .0
+                .iter()
+                .map(|p| ((p.min + p.max) / 2).abs())
+                .sum::<i64>()
+        });
+        return Node::branch(nodes);
+    }
+    fn sort(nodes: &mut [Node], dimension: usize, absolute: bool) {
+        nodes.sort_by_key(|node| {
+            std::array::from_fn::<_, PARAMETER_COUNT, _>(|i| {
+                let p = node.bounds.0[(dimension + i) % PARAMETER_COUNT];
+                let center = (p.min + p.max) / 2;
+                if absolute { center.abs() } else { center }
+            })
+        });
+    }
+    let mut bucket_size = 1;
+    while bucket_size * FANOUT < nodes.len() {
+        bucket_size *= FANOUT;
+    }
+    let mut best_cost = i64::MAX;
+    let mut best_dimension = 0;
+    let mut best_buckets = Vec::new();
+    for dimension in 0..PARAMETER_COUNT {
+        sort(&mut nodes, dimension, false);
+        let buckets: Vec<Node> = nodes
+            .chunks(bucket_size)
+            .map(|chunk| Node::branch(chunk.to_vec()))
+            .collect();
+        let cost: i64 = buckets
+            .iter()
+            .flat_map(|b| b.bounds.0)
+            .map(|p| (p.max - p.min).abs())
+            .sum();
+        if cost < best_cost {
+            best_cost = cost;
+            best_dimension = dimension;
+            best_buckets = buckets;
+        }
+    }
+    sort(&mut best_buckets, best_dimension, true);
+    Node::branch(
+        best_buckets
+            .into_iter()
+            .map(|bucket| match bucket.kind {
+                NodeKind::Branch(children) => vanilla_build(children),
+                NodeKind::Leaf(_) => unreachable!(),
+            })
+            .collect(),
+    )
 }
 
 /// Bulk-loads the R-tree by recursively splitting the entries along the widest axis.

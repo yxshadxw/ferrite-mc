@@ -24,7 +24,7 @@ pub enum NoiseChunkError {
 /// Seeded overworld density router for filling new chunks.
 pub struct NoiseChunkGenerator {
     density: DensityFunction,
-    noise: SeededNoise,
+    pub(crate) noise: SeededNoise,
     min_y: i32,
     height: i32,
     sea_level: i32,
