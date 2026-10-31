@@ -4,15 +4,16 @@ use ferrite_world::{
     chunk_to_nbt,
 };
 
-fn fixture(full: bool) -> (Tag, RuntimeRegistry) {
+/// The fixture world is generated locally and gitignored, so CI skips these tests.
+fn fixture(full: bool) -> Option<(Tag, RuntimeRegistry)> {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let path = base.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca");
+    if !path.exists() {
+        eprintln!("SKIP fixture-world test: {} absent", path.display());
+        return None;
+    }
     let registry = RuntimeRegistry::load(base.join("generated")).unwrap();
-    let region = RegionFile::open(
-        base.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
-        0,
-        0,
-    )
-    .unwrap();
+    let region = RegionFile::open(path, 0, 0).unwrap();
     for z in 0..32 {
         for x in 0..32 {
             if let Some(bytes) = region.read_chunk(x, z).unwrap() {
@@ -20,7 +21,7 @@ fn fixture(full: bool) -> (Tag, RuntimeRegistry) {
                 if let Tag::Compound(root) = &tag
                     && (root.get("Status") == Some(&Tag::String("minecraft:full".into()))) == full
                 {
-                    return (tag, registry);
+                    return Some((tag, registry));
                 }
             }
         }
@@ -30,7 +31,9 @@ fn fixture(full: bool) -> (Tag, RuntimeRegistry) {
 
 #[test]
 fn full_chunk_preserves_entities_biomes_light_and_unknown_metadata() {
-    let (mut input, registry) = fixture(true);
+    let Some((mut input, registry)) = fixture(true) else {
+        return;
+    };
     let Tag::Compound(root) = &mut input else {
         unreachable!()
     };
@@ -121,7 +124,9 @@ fn full_chunk_preserves_entities_biomes_light_and_unknown_metadata() {
 
 #[test]
 fn proto_chunk_from_fixture_roundtrips_status_and_blocks() {
-    let (input, registry) = fixture(false);
+    let Some((input, registry)) = fixture(false) else {
+        return;
+    };
     let Tag::Compound(root) = &input else {
         panic!()
     };

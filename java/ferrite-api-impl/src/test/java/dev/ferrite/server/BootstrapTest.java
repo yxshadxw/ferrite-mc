@@ -136,6 +136,28 @@ class BootstrapTest {
         assertNull(org.bukkit.Registry.ATTRIBUTE.get(org.bukkit.NamespacedKey.minecraft("not_an_attribute")));
         assertTrue(org.bukkit.Material.STONE.isBlock());
         assertFalse(org.bukkit.Material.STONE.isAir());
+        var stoneKey = org.bukkit.NamespacedKey.minecraft("stone");
+        assertNotNull(Bukkit.getRegistry(org.bukkit.block.BlockType.class).get(stoneKey));
+        assertSame(org.bukkit.Material.STONE, Bukkit.getRegistry(org.bukkit.block.BlockType.class).get(stoneKey).asMaterial());
+        assertSame(org.bukkit.Material.STONE, Bukkit.getRegistry(org.bukkit.inventory.ItemType.class).get(stoneKey).asMaterial());
+        assertSame(Bukkit.getServer().getUnsafe(), Bukkit.getUnsafe());
+        assertEquals(777, Bukkit.getUnsafe().getProtocolVersion());
+        assertEquals(5023, Bukkit.getUnsafe().getDataVersion());
+        assertEquals("world", Bukkit.getUnsafe().getMainLevelName());
+        assertTrue(Bukkit.getUnsafe().isSupportedApiVersion("26.3"));
+        assertFalse(Bukkit.getUnsafe().isSupportedApiVersion("1.12"));
+        var stoneData = Bukkit.createBlockData(org.bukkit.Material.STONE);
+        assertEquals(org.bukkit.Material.STONE, stoneData.getMaterial());
+        assertEquals("minecraft:stone", stoneData.getAsString());
+        assertTrue(stoneData.matches(Bukkit.createBlockData("minecraft:stone")));
+        assertThrows(IllegalArgumentException.class, () -> Bukkit.createBlockData("minecraft:not_a_block"));
+        assertEquals(20.0, Bukkit.getTPS()[0], 0.001);
+        assertEquals(50.0, Bukkit.getAverageTickTime(), 0.001);
+        assertEquals(100, Bukkit.getTickTimes().length);
+        assertFalse(Bukkit.isStopping());
+        assertEquals(org.bukkit.GameMode.ADVENTURE, Bukkit.getDefaultGameMode());
+        assertEquals("", Bukkit.getIp());
+        assertEquals(29999984, Bukkit.getMaxWorldSize());
         assertTrue(org.bukkit.Material.AIR.isAir());
         var inventory = Bukkit.createInventory(null, 9, "test");
         assertEquals(9, inventory.getSize());
@@ -163,6 +185,12 @@ class BootstrapTest {
         });
         assertTrue(Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "plain"));
         assertTrue(dispatched.get());
+        assertEquals(org.bukkit.NamespacedKey.minecraft("stone"), org.bukkit.craftbukkit.util.CraftNamespacedKey.fromString("minecraft:stone"));
+        assertEquals(org.bukkit.Material.STONE, org.bukkit.craftbukkit.inventory.CraftItemStack.asCraftCopy(new org.bukkit.inventory.ItemStack(org.bukkit.Material.STONE)).getType());
+        assertEquals(org.bukkit.Material.STONE, org.bukkit.craftbukkit.block.data.CraftBlockData.create(Bukkit.createBlockData("minecraft:stone")).getMaterial());
+        for (String shim : java.util.List.of("org.bukkit.craftbukkit.CraftWorld", "org.bukkit.craftbukkit.CraftOfflinePlayer", "org.bukkit.craftbukkit.entity.CraftPlayer", "org.bukkit.craftbukkit.block.CraftBlock", "org.bukkit.craftbukkit.inventory.CraftInventory", "org.bukkit.craftbukkit.inventory.CraftInventoryPlayer")) {
+            assertDoesNotThrow(() -> Class.forName(shim), shim);
+        }
         assertTrue(Bukkit.isPrimaryThread());
         assertTrue(Bukkit.getPluginManager().isPluginEnabled("FerriteTest"));
         assertTrue(((FerriteServer) Bukkit.getServer()).plugins.isLegacy(Bukkit.getPluginManager().getPlugin("FerriteLegacyTest")));

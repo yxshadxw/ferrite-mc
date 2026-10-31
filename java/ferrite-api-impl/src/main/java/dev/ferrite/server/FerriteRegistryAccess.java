@@ -22,6 +22,12 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
     }
     private static boolean contains(String registry, org.bukkit.NamespacedKey key) { return KEYS.getOrDefault(registry, java.util.Set.of()).contains(key.toString()); }
     @SuppressWarnings("unchecked") @Override public <T extends org.bukkit.Keyed> org.bukkit.Registry<T> getRegistry(Class<T> type) {
+        if (type == org.bukkit.block.BlockType.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.BLOCK);
+        if (type == org.bukkit.inventory.ItemType.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.ITEM);
+        if (type == org.bukkit.inventory.MenuType.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.MENU);
+        if (type == org.bukkit.entity.EntityType.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.ENTITY_TYPE);
+        if (type == org.bukkit.attribute.Attribute.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.ATTRIBUTE);
+        if (type == org.bukkit.Sound.class) return (org.bukkit.Registry<T>) getRegistry(io.papermc.paper.registry.RegistryKey.SOUND_EVENT);
         if (type == org.bukkit.enchantments.Enchantment.class) return (org.bukkit.Registry<T>) cached("enchantment", FerriteRegistryAccess::enchantmentRegistry);
         if (type == org.bukkit.potion.PotionEffectType.class) return (org.bukkit.Registry<T>) cached("mob_effect", FerriteRegistryAccess::potionRegistry);
         if (type == org.bukkit.block.Biome.class) return (org.bukkit.Registry<T>) cached("worldgen/biome", () -> identityRegistry("worldgen/biome", org.bukkit.block.Biome.class));
@@ -66,8 +72,12 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                 return entries.computeIfAbsent(key, k -> (org.bukkit.inventory.ItemType) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.inventory.ItemType.Typed.class}, (proxy, method, args) -> switch (method.getName()) {
                     case "getKey", "key" -> k;
                     case "typed" -> proxy;
-                    case "createItemStack" -> new FerriteItemStack(material, args == null || args.length == 0 ? 1 : (int) args[0]);
+                    case "asMaterial" -> material;
+                    case "hasBlockType" -> contains("block", k);
+                    case "getBlockType" -> org.bukkit.Registry.BLOCK.get(k);
+                    case "getMaxStackSize" -> 64;
                     case "translationKey", "getTranslationKey" -> (material != null && material.isBlock() ? "block." : "item.") + k.getNamespace() + "." + k.getKey();
+                    case "createItemStack" -> new FerriteItemStack(material, args == null || args.length == 0 ? 1 : (int) args[0]);
                     case "hashCode" -> k.hashCode();
                     case "equals" -> proxy == args[0];
                     case "toString" -> "ItemType[" + k + "]";
@@ -87,10 +97,11 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                     case "getKey", "key" -> key;
                     case "typed" -> proxy;
                     case "asMaterial" -> material;
+                    case "createBlockData" -> FerriteBlockData.create(key.toString());
+                    case "translationKey", "getTranslationKey" -> "block." + key.getNamespace() + "." + key.getKey();
                     case "isAir" -> key.getKey().equals("air") || key.getKey().equals("cave_air") || key.getKey().equals("void_air");
                     case "hasItemType" -> contains("item", key);
                     case "getItemType" -> org.bukkit.Registry.ITEM.get(key);
-                    case "translationKey", "getTranslationKey" -> "block." + key.getNamespace() + "." + key.getKey();
                     case "hashCode" -> key.hashCode();
                     case "equals" -> proxy == args[0];
                     case "toString" -> "BlockType[" + key + "]";

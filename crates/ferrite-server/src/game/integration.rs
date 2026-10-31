@@ -372,10 +372,11 @@ async fn crossing_region_boundary_keeps_chat_and_movement_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_world_streams_disk_chunk() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let path = root.join("vanilla/26.3/fixture-world/world");
-    let registry =
-        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
+    let path = root.join("fixture-world/world");
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
     let expected = super::anvil::read_chunk(&path, &registry, 0, 7)
         .unwrap()
         .unwrap();
@@ -1311,7 +1312,9 @@ async fn water_bucket_spread_reaches_tracking_bot_on_fixture_world() {
         packets::play::{BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
         types::BlockPos,
     };
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
     let temp = std::env::temp_dir().join(format!("ferrite-fluid-{}", uuid::Uuid::new_v4()));
     let dir = temp.join("dimensions/minecraft/overworld/region");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2169,7 +2172,9 @@ async fn breaking_support_drops_torch_for_tracking_bot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grass_spread_reaches_tracking_bot_on_fixture_world() {
     use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
     let temp = std::env::temp_dir().join(format!("ferrite-grass-{}", uuid::Uuid::new_v4()));
     let dir = temp.join("dimensions/minecraft/overworld/region");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2631,6 +2636,78 @@ async fn crafting_planks_and_sticks_in_the_grid_and_on_a_table() {
     server.abort();
 }
 
+/// Saved player state belongs to one world's save directory. Worlds never share it, and a world
+/// without one keeps nothing. A single process-wide directory used to hand a bot the gamemode,
+/// position and inventory a same-named bot from another test world had saved, which is what made
+/// the drop tests wait out their 20 s timeouts in full-suite runs but pass alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn player_data_is_scoped_to_one_world() {
+    use ferrite_protocol::packets::play::PositionSync;
+    let start = |dir: Option<std::path::PathBuf>| async move {
+        let world = World::start_configured(
+            None,
+            [0, 65, 0],
+            super::WorldSettings {
+                gamemode: 0,
+                playerdata: dir,
+                ..Default::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(
+            listener,
+            ServerConfig {
+                online_mode: false,
+                view_distance: 2,
+                game: Some(world.sender.clone()),
+                ..Default::default()
+            },
+        ));
+        (world, addr, server)
+    };
+    // Where the server puts a joining player, from the play-state teleport.
+    async fn spawn_x(addr: std::net::SocketAddr, name: &str) -> f64 {
+        let mut bot = Bot::begin_join(addr, name).await;
+        let body = bot.until(PositionSync::ID).await;
+        let sync = PositionSync::decode(&mut body.as_slice()).unwrap();
+        sync.x
+    }
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let uuid = ferrite_net::offline_uuid("Mover");
+    let saved = first.path().join(format!("{uuid}.json"));
+    // The first world saves where the player walked before it leaves.
+    let (world, addr, server) = start(Some(first.path().to_path_buf())).await;
+    let mut bot = Bot::join(addr, "Mover").await;
+    bot.send(&MovePosition {
+        x: 5.5,
+        y: 65.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    drop(bot);
+    for _ in 0..200 {
+        if saved.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(saved.exists(), "leaving did not write {}", saved.display());
+    world.shutdown().await.unwrap();
+    server.abort();
+    // The same directory resumes the saved position; another one starts at world spawn.
+    let (world, addr, server) = start(Some(first.path().to_path_buf())).await;
+    assert!((spawn_x(addr, "Mover").await - 5.5).abs() < 1e-9);
+    world.shutdown().await.unwrap();
+    server.abort();
+    let (world, addr, server) = start(Some(second.path().to_path_buf())).await;
+    assert!((spawn_x(addr, "Mover").await - 0.5).abs() < 1e-9);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chest_contents_are_shared_saved_and_spilled_when_broken() {
     use ferrite_inventory::ClickInput::*;
@@ -2767,7 +2844,9 @@ async fn chest_contents_are_shared_saved_and_spilled_when_broken() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gamerule_zero_stops_grass_spread_for_bot() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let Some(root) = super::fixture_version_root() else {
+        return;
+    };
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join("dimensions/minecraft/overworld/region");
     std::fs::create_dir_all(&dir).unwrap();

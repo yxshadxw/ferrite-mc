@@ -277,4 +277,27 @@ public class FerriteServer extends ServerStubs {
     private final org.bukkit.inventory.ItemFactory itemFactory = new FerriteItemFactory();
     @Override public org.bukkit.inventory.ItemFactory getItemFactory() { return itemFactory; }
     @Override public void reloadPermissions() { facade.permissions.values().forEach(plugins::recalculatePermissionDefaults); }
+    // ---- plugin-facing runtime surface kept from the fb4 bridge -----------------------------
+    private final FerriteUnsafe unsafe = new FerriteUnsafe();
+    @Override public org.bukkit.UnsafeValues getUnsafe() { return unsafe; }
+    @Override public org.bukkit.block.data.BlockData createBlockData(String data) { return FerriteBlockData.create(data); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material) { return FerriteBlockData.create(material); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, String data) {
+        java.util.Objects.requireNonNull(material, "material");
+        if (data != null && !data.isEmpty()) throw new UnsupportedOperationException("Ferrite: block-state properties are owned by the Rust server: " + data);
+        return FerriteBlockData.create(material);
+    }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, java.util.function.Consumer<? super org.bukkit.block.data.BlockData> consumer) {
+        var data = FerriteBlockData.create(material);
+        consumer.accept(data);
+        return data;
+    }
+    private static final double[] NOMINAL_TPS = {20.0, 20.0, 20.0};
+    /** Nominal until per-region tick metrics are exposed to the bridge (see docs/BACKLOG.md). */
+    @Override public double[] getTPS() { return NOMINAL_TPS.clone(); }
+    @Override public double getAverageTickTime() { return 50.0; }
+    @Override public long[] getTickTimes() { return new long[100]; }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getWhitelistedPlayers() { return java.util.Set.of(); }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getBannedPlayers() { return java.util.Set.of(); }
+    @Override public String getWorldType() { return "normal"; }
 }

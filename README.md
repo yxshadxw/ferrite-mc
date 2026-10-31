@@ -11,8 +11,10 @@
 > translation, a Folia-style regionizer and Starlight-style lighting (0 mismatches vs vanilla).
 > World generation (density functions, noise chunks, aquifers, surface rules, carvers) matches
 > the vanilla Java reference on the fixture world; terrain features and structures are still in
-> progress. **Honest caveat: it has been verified with protocol-level
-> bots and Java differential harnesses, not yet with a real 26.3 client.**
+> progress. Plugins load on an embedded JVM with a growing Paper/Bukkit `Server` surface, a
+> Folia-style scheduler and a minimal `org.bukkit.craftbukkit` shim. **Honest caveat: it has been
+> verified with protocol-level bots and Java differential harnesses, not yet with a real 26.3
+> client.**
 > Build with Rust stable + Java 25, generate vanilla data with `python tools/fetch_vanilla.py`,
 > then `cargo test --workspace`. No Mojang code or assets are distributed here; see the legal
 > note below. Licensed under GPL-3.0-or-later (see `LICENSE`).
@@ -58,7 +60,11 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능합니다.
 - **플러그인** — `plugin.yml`/`paper-plugin.yml` 로딩, 내장 JVM(Java 25) 위에서 플러그인
   `onEnable` 실행, 플레이어 이동·상호작용·블록 파괴/설치·명령 이벤트(취소 가능),
-  오류 정책 `plugins.on-event-error = allow | deny`
+  오류 정책 `plugins.on-event-error = allow | deny`. Bukkit `Server`/`Player`/`World`/
+  `Inventory`/`Scheduler`/`ConfigurationSection`의 자주 쓰는 표면과 최소
+  `org.bukkit.craftbukkit` shim을 제공합니다(미구현 메서드는 명확한 메시지의
+  `UnsupportedOperationException`). Bukkit 스케줄러 작업은 Folia 규칙에 맞춰 리전/글로벌/
+  async 스케줄러로 전달됩니다
 - **관리** — `/tps`, `/mspt`, `/profile`
 - **월드젠 (진행 중)** — 밀도 함수, 노이즈 청크, aquifer, 표면 규칙, 동굴·협곡 카버가
   바닐라 Java 참조 구현과 일치하는 것을 확인했습니다. 서버는 전용 생성 스레드에서 바닐라
@@ -70,9 +76,10 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 아직 아닌 것(솔직하게):
 
 - **실제 클라이언트로 접속 테스트를 하지 않았습니다.**
-- 적대 몹 AI·전투, 상태 효과·포션, 화재, 피스톤은 개발 중이거나 아직 없습니다.
-- 플러그인 API는 Paper `Server` 기준 일부만 구현되어 있고, EssentialsX 같은 대형 플러그인용
-  CraftBukkit 호환 계층은 아직 없습니다.
+- 적대 몹 AI·전투, 화재(진행 중), 피스톤은 개발 중이거나 아직 없습니다.
+- 플러그인 API는 Paper `Server`의 일부(약 120/206 메서드)와 최소 CraftBukkit shim만
+  구현되어 있습니다. EssentialsX 같은 대형 플러그인의 모든 호출 경로는 아직 동작하지 않고,
+  NMS 타입에 의존하는 메서드는 `UnsupportedOperationException`을 던집니다.
 - 바닐라와 동일한 구조물 생성은 아직입니다. 다중 버전 변환은 26.2 클라이언트 등 일부
   버전만 확인되어 있습니다.
 
@@ -116,8 +123,9 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 
 필요한 것:
 
-- **Rust stable** (`rust-toolchain.toml`에 채널이 고정되어 있음)
-- **Java 25** — 바닐라 데이터 생성기 실행용 (예: Temurin 25)
+- **Rust stable** — `rust-toolchain.toml`이 Windows MSVC 채널을 고정합니다. Linux/macOS에서는
+  `RUSTUP_TOOLCHAIN=stable`로 덮어쓰세요(CI가 그렇게 합니다).
+- **Java 25** — 바닐라 데이터 생성기와 내장 JVM/플러그인 브리지용 (예: Temurin 25)
 - **Python 3** — `tools/fetch_vanilla.py` 실행용
 
 ```sh
@@ -126,20 +134,28 @@ source tools/env.sh
 # PowerShell
 . .\tools\env.ps1
 
-# 1) 바닐라 데이터 생성 (최초 1회, 네트워크 필요)
+# 1) 바닐라 데이터 생성 (최초 1회, 네트워크 + Java 25 필요)
 python tools/fetch_vanilla.py
 
-# 2) 빌드/검증
+# 2) 선택: 픽스처 월드 (fixture-world를 읽는 테스트용, Java 25 필요)
+python tools/make_fixture_world.py
+
+# 3) 빌드/검증
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+cargo fmt --all --check
+
+# 4) 실행 (오프라인 모드 로컬 서버)
+cargo run --release -p ferrite-server
 ```
 
 `tools/fetch_vanilla.py`는 공식 서버 jar를 내려받아 데이터 제너레이터를 실행하고,
 그 결과를 `vanilla/<버전>/generated/`에 남깁니다. 이 디렉터리는 git에 포함되지 않으며,
 패킷 ID·블록·레지스트리 같은 수치는 추측하지 말고 이 파일들에서 읽어야 합니다.
-CI(GitHub Actions)에서도 같은 스크립트로 데이터를 생성한 뒤 검사/테스트를 돌립니다
-(`.github/workflows/ci.yml`, Linux/Windows).
+`fixture-world`가 없으면 픽스처를 읽는 테스트는 건너뜁니다(CI가 그 상태입니다).
+GitHub Actions(`.github/workflows/ci.yml`)는 Linux/Windows에서 같은 스크립트로 데이터를
+생성한 뒤 fmt/clippy/test를 돌리고, 바닐라 데이터가 커밋되지 않았는지도 확인합니다.
+Linux 잡은 `RUSTUP_TOOLCHAIN=stable`로 MSVC 고정을 덮어씁니다.
 
 ## 법적 고지
 

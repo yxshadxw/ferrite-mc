@@ -61,6 +61,11 @@ pub enum Command {
         unit: XpUnit,
         feedback: Option<OutboundSender>,
     },
+    /// A plugin's `PlayerInventory#setItem`, applied on the owning region thread.
+    SetInventorySlot {
+        slot: u8,
+        item: Option<ferrite_plugin::ItemSnapshot>,
+    },
     /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
     Kill,
     /// `/effect give`: apply a mob effect on the owning region thread.
@@ -214,6 +219,8 @@ pub struct Player {
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// Directory this player's state is saved to on leave; `None` keeps nothing (test worlds).
+    pub playerdata: Option<std::path::PathBuf>,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -878,6 +885,32 @@ impl Player {
             feedback,
             format!("Removed {removed} items from {target_name}"),
         );
+    }
+    /// A plugin's `PlayerInventory#setItem`: replaces one slot and syncs it to the client.
+    fn set_inventory_slot(&mut self, slot: u8, item: Option<ferrite_plugin::ItemSnapshot>) {
+        let slot = usize::from(slot);
+        if slot >= ferrite_inventory::SIZE {
+            return;
+        }
+        let stack = match item {
+            None => ferrite_item::ItemStack::empty(),
+            Some(item) => {
+                let Some(id) = ferrite_item::item_id(&item.material) else {
+                    tracing::warn!(material = %item.material, "plugin set an unknown item");
+                    return;
+                };
+                ferrite_item::ItemStack::with_count(id, i32::from(item.amount))
+            }
+        };
+        self.inventory.set(slot, stack.clone());
+        send(
+            self,
+            &SetPlayerInventory {
+                slot: VarInt(slot as i32),
+                item: stack,
+            },
+        );
+        self.sync_containers();
     }
     /// `/give`: places the stack back in the inventory, dropping what does not fit.
     fn give_items(
@@ -1561,16 +1594,21 @@ impl Player {
             let msg = match command {
                 Command::Leave => {
                     self.close_container();
-                    super::playerdata::save(
-                        &self.uuid,
-                        &super::playerdata::Saved::capture(
-                            self.pos,
-                            self.yaw,
-                            self.pitch,
-                            self.gamemode,
-                            &self.inventory,
-                        ),
-                    );
+                    if let Some(dir) = &self.playerdata
+                        && let Err(error) = super::playerdata::save_to(
+                            dir,
+                            &self.uuid,
+                            &super::playerdata::Saved::capture(
+                                self.pos,
+                                self.yaw,
+                                self.pitch,
+                                self.gamemode,
+                                &self.inventory,
+                            ),
+                        )
+                    {
+                        tracing::error!(%error, "failed to save player data");
+                    }
                     return false;
                 }
                 Command::SetMode(mode) => {
@@ -1652,6 +1690,10 @@ impl Player {
                             feedback.as_ref(),
                         );
                     }
+                    continue;
+                }
+                Command::SetInventorySlot { slot, item } => {
+                    self.set_inventory_slot(slot, item);
                     continue;
                 }
                 Command::Kill => {

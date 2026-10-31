@@ -520,7 +520,8 @@ pub struct Source {
 }
 
 /// Vanilla's `commands/entity_selectors` permission maps to gamemasters: any `@` selector
-/// in a command argument requires this level, even for commands open to every player.
+/// in a command argument requires this level, even for commands open to every player. It is
+/// enforced once, by the dispatcher's selector requirement in [`dispatcher`].
 pub const SELECTOR_PERMISSION: u8 = 2;
 
 impl Source {
@@ -602,26 +603,13 @@ fn plugin_command_node(literal_name: &str) -> ferrite_command::NodeBuilder<Sourc
         )
 }
 
+/// Reads an entity argument. Selector permissions are not checked here: the dispatcher
+/// rejects `@` selectors while parsing, for every command at once.
 fn entity(ctx: &CommandContext<Source>, name: &str) -> Result<EntityTarget, CommandError> {
-    let target = ctx
-        .argument(name)
+    ctx.argument(name)
         .and_then(ArgumentValue::as_entity)
         .cloned()
-        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))?;
-    check_entity_selector(ctx.source(), &target)?;
-    Ok(target)
-}
-
-/// Vanilla `EntitySelector.checkPermissions`: any selector needs permission level 2.
-fn check_entity_selector(source: &Source, target: &EntityTarget) -> Result<(), CommandError> {
-    if source.permission < 2 && matches!(target, EntityTarget::Selector { .. }) {
-        return Err(syntax_error(
-            "argument.entity.selector.not_allowed",
-            Vec::new(),
-            "Selector not allowed",
-        ));
-    }
-    Ok(())
+        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))
 }
 
 pub(crate) fn coordinates(
@@ -3037,17 +3025,9 @@ mod tests {
                 "argument.entity.selector.not_allowed",
                 "{selector} must be rejected below permission 2"
             );
-        }
-        // `msg` only accepts player selectors, so cover the entity-only `@e` directly.
-        let (guest, _) = player_source(0, None, state.clone());
-        let all_entities = EntityTarget::Selector {
-            kind: SelectorKind::AllEntities,
-            options: Vec::new(),
-        };
-        assert_eq!(
-            error_key(check_entity_selector(&guest, &all_entities).unwrap_err()),
-            "argument.entity.selector.not_allowed"
-        );
+        } // `msg` only accepts player selectors, and every server command that takes an
+        // entity-only selector already requires gamemasters, so the `@e` case lives in the
+        // dispatcher's own test (`ferrite-command/tests/dispatcher.rs`).
         let (operator, _received) = player_source(2, Some((ALICE, "Alice")), state);
         let result = tree.execute("msg @a hi", operator);
         assert!(result.is_ok(), "{result:?}");

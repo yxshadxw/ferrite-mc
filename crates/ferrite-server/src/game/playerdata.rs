@@ -1,37 +1,18 @@
 //! Per-player save data so a player who leaves resumes where they were instead of at world spawn.
 //!
-//! Stored as `<world>/playerdata/<uuid>.json` (or `./playerdata` without a world) and written
-//! atomically (temp file + rename) when the player leaves. A vanilla NBT `.dat` compatible format can
+//! Stored as `<world>/playerdata/<uuid>.json` and written atomically (temp file + rename) when
+//! the player leaves. The directory is owned by the world ([`super::WorldSettings::playerdata`]),
+//! not by the process: a world without one keeps no player state at all, which is what test
+//! worlds use. A process-wide directory made every same-named bot in an integration run resume
+//! whichever world happened to save that name first. A vanilla NBT `.dat` compatible format can
 //! replace this later without touching callers.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use ferrite_inventory::PlayerInventory;
 use ferrite_item::ItemStack;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-static DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Set the save directory once at startup. Later calls are ignored.
-pub fn init(dir: PathBuf) {
-    let _ = DIR.set(dir);
-}
-
-fn dir() -> &'static Path {
-    if let Some(dir) = DIR.get() {
-        return dir;
-    }
-    if cfg!(test) {
-        // Unit tests must not resume from (or leave behind) a previous run's saved positions.
-        static TEST_DIR: OnceLock<PathBuf> = OnceLock::new();
-        return TEST_DIR.get_or_init(|| {
-            std::env::temp_dir().join(format!("ferrite-test-playerdata-{}", std::process::id()))
-        });
-    }
-    Path::new("playerdata")
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Saved {
@@ -158,16 +139,6 @@ pub fn save_to(dir: &Path, uuid: &Uuid, saved: &Saved) -> std::io::Result<()> {
         serde_json::to_vec_pretty(saved).map_err(std::io::Error::other)?,
     )?;
     std::fs::rename(temp, target)
-}
-
-pub fn load(uuid: &Uuid) -> Option<Saved> {
-    load_from(dir(), uuid)
-}
-
-pub fn save(uuid: &Uuid, saved: &Saved) {
-    if let Err(error) = save_to(dir(), uuid, saved) {
-        tracing::error!(%uuid, %error, "failed to save player data");
-    }
 }
 
 #[cfg(test)]

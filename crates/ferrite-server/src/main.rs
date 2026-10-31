@@ -191,6 +191,15 @@ async fn main() -> anyhow::Result<()> {
         .context("binding server listener")?;
     tracing::info!(address = %listener.local_addr()?, online_mode = config.online_mode, view_distance = config.view_distance, "Ferrite listener started");
 
+    let spawn = if let Some(path) = &config.world {
+        game::load_spawn(path).context("reading world spawn")?
+    } else {
+        [0, 65, 0]
+    };
+    // Plugins call the Bukkit API from their own threads; the game loop owns the world, so
+    // player mutations (inventory, teleport, gamemode, ...) arrive through this channel and are
+    // routed to the region that owns the player.
+    let (plugin_command_tx, plugin_commands) = tokio::sync::mpsc::unbounded_channel();
     let plugin_bridge =
         ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
             directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
@@ -203,6 +212,21 @@ async fn main() -> anyhow::Result<()> {
             view_distance: config.view_distance,
             online_mode: config.online_mode,
             whitelist: false,
+            world: ferrite_plugin::WorldSnapshot {
+                id: ferrite_plugin::default_world_id(),
+                name: "world".into(),
+                time: 0,
+                spawn: ferrite_plugin::BlockPosition {
+                    x: spawn[0],
+                    y: spawn[1],
+                    z: spawn[2],
+                },
+                blocks: Vec::new(),
+                heights: Vec::new(),
+            },
+            player_handler: Some(std::sync::Arc::new(move |command| {
+                let _ = plugin_command_tx.send(command);
+            })),
         })
         .context("starting plugins")?;
     let settings = game::WorldSettings {
@@ -221,13 +245,14 @@ async fn main() -> anyhow::Result<()> {
         },
         admin: Some(admin),
         whitelist: config.whitelist,
+        playerdata: Some(
+            config
+                .world
+                .as_ref()
+                .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
+        ),
+        plugin_commands: Some(plugin_commands),
     };
-    game::playerdata::init(
-        config
-            .world
-            .as_ref()
-            .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
-    );
     let terrain = match config.generator {
         WorldGenerator::Vanilla => Some(std::sync::Arc::new(
             game::VanillaTerrain::spawn(0).context("starting the vanilla world generator")?,
@@ -235,7 +260,6 @@ async fn main() -> anyhow::Result<()> {
         WorldGenerator::Superflat => None,
     };
     let world = if let Some(path) = config.world {
-        let spawn = game::load_spawn(&path).context("reading world spawn")?;
         let registry = ferrite_world::RuntimeRegistry::load("vanilla/26.3/generated")
             .context("loading vanilla registry")?;
         let source = game::new_anvil_source_with(path, registry, terrain);

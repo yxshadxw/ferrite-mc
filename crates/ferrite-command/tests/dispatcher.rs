@@ -456,6 +456,22 @@ fn selectors_require_the_configured_permission() {
     }
     // A player name is not a selector and stays available at every level.
     assert_eq!(d.execute("msg Alex hi", player("A", 0)).unwrap(), 1);
+    // Entity-only selectors are gated the same way, for a command open to every player.
+    d.register(
+        literal::<Source>("kill")
+            .then(argument::<Source>("targets", ArgumentType::entities()).executes(|_| Ok(1))),
+    );
+    for input in ["kill @e", "kill @e[type=minecraft:item]"] {
+        let CommandError::Syntax(error) = d.execute(input, player("A", 1)).unwrap_err() else {
+            panic!("{input} should be a syntax error");
+        };
+        assert_eq!(
+            error.translation_key(),
+            "argument.entity.selector.not_allowed",
+            "{input}"
+        );
+        assert_eq!(d.execute(input, player("Op", 2)).unwrap(), 1, "{input}");
+    }
 }
 
 #[test]

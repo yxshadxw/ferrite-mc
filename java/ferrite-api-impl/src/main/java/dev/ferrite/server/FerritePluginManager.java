@@ -72,6 +72,8 @@ final class FerritePluginManager extends PluginManagerStubs {
     }
     private final java.util.Map<Plugin, Boolean> regionAware = java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
     boolean isLegacy(Plugin plugin) { return !regionAware.getOrDefault(plugin, false); }
+    /** Permissions each plugin declared in its descriptor, removed when it disables. */
+    private final Map<Plugin, List<org.bukkit.permissions.Permission>> declaredPermissions = new IdentityHashMap<>();
     private final FerriteServer server;
     private final List<JavaPlugin> plugins = new ArrayList<>();
     private final Map<String, FerriteClassLoader> loaders = new java.util.concurrent.ConcurrentHashMap<>();
@@ -136,6 +138,13 @@ final class FerritePluginManager extends PluginManagerStubs {
                 for (String alias : desc.getProvidedPlugins()) loaders.putIfAbsent(alias.toLowerCase(Locale.ROOT), loader);
                 JavaPlugin plugin = Class.forName(desc.getMain(), true, loader).asSubclass(JavaPlugin.class).getDeclaredConstructor().newInstance();
                 plugins.add(plugin); regionAware.put(plugin, aware); server.registerCommands(plugin); plugin.onLoad();
+                List<org.bukkit.permissions.Permission> declared = new ArrayList<>();
+                for (org.bukkit.permissions.Permission permission : desc.getPermissions()) {
+                    if (getPermission(permission.getName()) != null) continue;
+                    addPermission(permission);
+                    declared.add(permission);
+                }
+                declaredPermissions.put(plugin, declared);
             }
             for (JavaPlugin plugin : plugins) plugin.setEnabled(true);
         } catch (Throwable e) { disablePlugins(); throw new IllegalStateException("Failed to load plugin", e); }
@@ -149,7 +158,10 @@ final class FerritePluginManager extends PluginManagerStubs {
             JavaPlugin plugin = plugins.get(i);
             try { plugin.setEnabled(false); }
             catch (Throwable e) { plugin.getLogger().log(java.util.logging.Level.SEVERE, "Plugin disable failed", e); }
-            finally { server.scheduler.cancelTasks(plugin); server.regionScheduler.cancelTasks(plugin); server.asyncScheduler.cancelTasks(plugin); server.entitySchedulers.cancelTasks(plugin); }
+            finally {
+                server.scheduler.cancelTasks(plugin); server.regionScheduler.cancelTasks(plugin); server.asyncScheduler.cancelTasks(plugin); server.entitySchedulers.cancelTasks(plugin);
+                for (org.bukkit.permissions.Permission permission : declaredPermissions.getOrDefault(plugin, List.of())) removePermission(permission.getName());
+            }
         }
         synchronized (this) { handlers.clear(); }
         listened.clear();
@@ -158,6 +170,6 @@ final class FerritePluginManager extends PluginManagerStubs {
             try { loader.close(); } catch (IOException e) { server.getLogger().warning("Could not close plugin classloader: " + e); }
         }
         for (JavaPlugin plugin : plugins) server.unregisterCommands(plugin);
-        plugins.clear(); regionAware.clear(); loaders.clear();
+        plugins.clear(); regionAware.clear(); loaders.clear(); declaredPermissions.clear();
     }
 }
