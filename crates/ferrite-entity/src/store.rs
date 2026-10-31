@@ -79,6 +79,10 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Block state carried by a falling block (vanilla `FallingBlockEntity.blockState`).
+    pub block_state: Option<u16>,
+    /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
+    pub fuse: Option<i32>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -101,6 +105,8 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            block_state: None,
+            fuse: None,
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }
