@@ -216,7 +216,7 @@ fn pending_merge_chain_across_three_regions_applies_in_order() {
     scheduler.check_invariants().unwrap();
     release.send(()).unwrap();
     let start = Instant::now();
-    while scheduler.pending_mutations() != 0 {
+    while scheduler.owner(ChunkPos(1, 0)).is_some() {
         assert!(start.elapsed() < Duration::from_secs(2));
         thread::yield_now();
     }
@@ -476,6 +476,36 @@ fn bridge_absorbs_idle_neighbor_while_other_region_ticks() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while scheduler.owner(ChunkPos(0, 0)) != scheduler.owner(ChunkPos(2, 0)) {
         assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
+#[test]
+fn removal_of_ticking_chunk_updates_holder_count_immediately() {
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    let scheduler = Scheduler::new(topology, (), 2, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    scheduler.remove_chunk(ChunkPos(0, 0));
+    assert_eq!(scheduler.holder_count(ChunkPos(0, 0)), 0);
+    scheduler.add_chunk(ChunkPos(0, 0));
+    assert_eq!(scheduler.holder_count(ChunkPos(0, 0)), 1);
+    release.send(()).unwrap();
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
+#[test]
+fn dead_section_is_retired_after_its_tick() {
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    let scheduler = Scheduler::new(topology, (), 2, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    scheduler.remove_chunk(ChunkPos(0, 0));
+    assert_eq!(scheduler.holder_count(ChunkPos(0, 0)), 0);
+    scheduler.check_invariants().unwrap();
+    release.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while scheduler.region_count() != 0 {
+        assert!(Instant::now() < until);
         thread::yield_now();
     }
     assert!(scheduler.shutdown().pending_tasks.is_empty());
