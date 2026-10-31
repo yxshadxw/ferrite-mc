@@ -1430,6 +1430,8 @@ mod tests {
                 actions,
                 anchor: ferrite_command::EntityAnchor::Feet,
                 world: None,
+                tree: None,
+                function_depth: 0,
             },
             received,
         )

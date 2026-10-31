@@ -6,7 +6,7 @@
 //! messages are noted next to each string (the strings themselves are the 26.3 `en_us` text).
 
 use super::commands::{Action, Source};
-use super::region::Player;
+use super::region::{Player, Tracking};
 use ferrite_command::{
     ArgumentType, CommandContext, CommandDispatcher, CommandError, argument,
     arguments::{BlockStateValue, Coordinates},
@@ -14,9 +14,11 @@ use ferrite_command::{
 };
 use ferrite_net::game::packet;
 use ferrite_protocol::{
-    packets::play::SystemChat,
+    VarInt,
+    packets::play::{BlockUpdate, SystemChat},
     types::{BlockPos, PlainText},
 };
+use ferrite_region::ChunkPos;
 
 /// Vanilla's cap on the volume of a single `/fill` or `/clone`.
 pub const MAX_BLOCKS: u128 = 32768;
@@ -442,6 +444,44 @@ pub fn resolve(coords: &Coordinates, origin: &Origin) -> [i32; 3] {
     [x.floor() as i32, y.floor() as i32, z.floor() as i32]
 }
 
+/// The chunk whose region owns the command's first block, for routing a world edit.
+pub fn command_chunk(command: &WorldCommand, origin: &Origin) -> ChunkPos {
+    let [x, _, z] = match command {
+        WorldCommand::SetBlock { pos, .. } => resolve(pos, origin),
+        WorldCommand::Fill { from, .. } => resolve(from, origin),
+        WorldCommand::Clone { begin, .. } => resolve(begin, origin),
+    };
+    ChunkPos(x.div_euclid(16), z.div_euclid(16))
+}
+
+/// Applies a world command on the region owning its first block and sends each changed
+/// block to every player that has it loaded. Console and function commands have no player
+/// mailbox to run through, so they use this path.
+pub fn apply_world(
+    command: &WorldCommand,
+    origin: &Origin,
+    world: &dyn WorldBlocks,
+    tracking: &Tracking,
+) {
+    let Ok(outcome) = execute(command, origin, world) else {
+        return;
+    };
+    let tracking = tracking.lock().unwrap();
+    for change in outcome.changes {
+        let pos = BlockPos::unpack(change.location);
+        let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+        let update = packet(&BlockUpdate {
+            location: change.location,
+            block_state: VarInt(change.state as i32),
+        });
+        for (loaded, outbound) in tracking.values() {
+            if loaded.contains(&chunk) {
+                let _ = outbound.send(update.clone());
+            }
+        }
+    }
+}
+
 fn bounds(a: [i32; 3], b: [i32; 3]) -> ([i32; 3], [i32; 3]) {
     (
         [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])],
@@ -663,6 +703,8 @@ mod tests {
             actions,
             anchor: ferrite_command::EntityAnchor::Feet,
             world: None,
+            tree: None,
+            function_depth: 0,
         }
     }
 

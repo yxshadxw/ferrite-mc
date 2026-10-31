@@ -815,6 +815,8 @@ mod tests {
                 name: Some("Alice".into()),
                 anchor: EntityAnchor::Feet,
                 world: None,
+                tree: None,
+                function_depth: 0,
                 state,
                 actions: tx,
             },

@@ -34,6 +34,7 @@ mod drops;
 pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
 mod explosion;
 mod feedback;
+mod functions;
 pub mod interaction;
 mod nbt_path;
 mod profile;
@@ -435,13 +436,14 @@ async fn run(
     let mut pending: HashMap<Uuid, GameMessage> = HashMap::new();
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
     let mut names: HashMap<Uuid, String> = HashMap::new();
-    let mut command_tree = commands::dispatcher();
+    let mut tree = commands::dispatcher();
     if let Some(plugins) = &settings.plugins {
         match plugins.plugin_commands() {
-            Ok(commands) => commands::register_plugin_commands(&mut command_tree, &commands),
+            Ok(commands) => commands::register_plugin_commands(&mut tree, &commands),
             Err(error) => tracing::warn!(%error, "plugin commands unavailable"),
         }
     }
+    let command_tree = Arc::new(tree);
     let mut online: HashMap<Uuid, commands::OnlinePlayer> = HashMap::new();
     let mut admin = settings.admin.clone();
     let mut whitelist_enabled = settings.whitelist;
@@ -457,13 +459,14 @@ async fn run(
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let positions = Arc::new(Mutex::new(HashMap::new()));
     commands::load_lang(&registry_dir);
-    let command_state = Arc::new(Mutex::new(commands::GameState::new(
-        settings.gamemode,
-        0,
-        settings.max_players,
-    )));
+    let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
+    initial_state.functions = Arc::new(functions::FunctionStore::load(
+        source.as_ref().and_then(|source| source.path()),
+    ));
+    let command_state = Arc::new(Mutex::new(initial_state));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut load_ran = false;
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
@@ -510,7 +513,7 @@ async fn run(
            let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions, tree: Some(Arc::clone(&command_tree)), function_depth: 0 }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet.into()));
            }
            emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
@@ -564,7 +567,7 @@ async fn run(
               let (actions, mut received) = mpsc::unbounded_channel();
               let (origin, yaw, pitch) = online.get(&uuid).map_or(([0.0; 3], 0.0, 0.0), |player| (player.pos, player.yaw, player.pitch));
               let name = command_state.lock().unwrap().players.iter().find(|p| p.uuid == uuid).map(|p| p.name.clone());
-              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions, tree: Some(Arc::clone(&command_tree)), function_depth: 0 };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), command_source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               let source_name = online.get(&uuid).map_or_else(|| "Server".to_owned(), |player| player.name.clone());
               let mut runtime = CommandRuntime {
@@ -583,6 +586,8 @@ async fn run(
                   source: &source,
                   events: &event_tx,
                   stop: &stop_tx,
+                  scheduler: &scheduler,
+                  tracking: &tracking,
               };
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::GameMode { mode, targets } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { target_mailbox.lock().unwrap().push_back(Command::SetMode(mode)); } scheduler.schedule_global(move |g| g.set_mode(target, mode)); } },
@@ -619,7 +624,7 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions, tree: Some(Arc::clone(&command_tree)), function_depth: 0 };
               let result = command_tree.execute(command.trim().trim_start_matches('/'), command_source).map_err(|e| e.to_string());
               let mut stop = false;
               let mut runtime = CommandRuntime {
@@ -638,6 +643,8 @@ async fn run(
                   source: &source,
                   events: &event_tx,
                   stop: &stop_tx,
+                  scheduler: &scheduler,
+                  tracking: &tracking,
               };
               while let Ok(action) = received.try_recv() { match action {
                   commands::Action::DefaultGameMode(mode) => tracing::info!(mode, "default game mode changed"),
@@ -702,6 +709,31 @@ async fn run(
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
              command_state.lock().unwrap().tick(advance_time);
+             // Vanilla runs `minecraft:load` once at startup and `minecraft:tick` every
+             // tick. Both go through the console command path so their actions
+             // (setblock, say, ...) are applied like any other command.
+             let tags: &[&str] = if load_ran {
+                 &[functions::TICK_TAG]
+             } else {
+                 load_ran = true;
+                 &[functions::LOAD_TAG, functions::TICK_TAG]
+             };
+             for tag in tags {
+                 let known = command_state
+                     .lock()
+                     .unwrap()
+                     .functions
+                     .tag(tag)
+                     .is_some_and(|functions| !functions.is_empty());
+                 if !known {
+                     continue;
+                 }
+                 let (complete, _unused) = oneshot::channel();
+                 let _ = event_tx.send(GameMessage::Console {
+                     command: format!("function #{tag}"),
+                     complete,
+                 });
+             }
          }
         }
     }
@@ -764,6 +796,8 @@ struct CommandRuntime<'a> {
     source: &'a Option<Arc<anvil::AnvilChunkSource>>,
     events: &'a mpsc::UnboundedSender<GameMessage>,
     stop: &'a tokio::sync::watch::Sender<bool>,
+    scheduler: &'a Scheduler<Region, GlobalRegion>,
+    tracking: &'a region::Tracking,
 }
 
 fn flush_admin(admin: &AdminLists) {
@@ -892,8 +926,28 @@ impl CommandRuntime<'_> {
             | Action::Give { .. }
             | Action::Experience { .. }
             | Action::GameRule(..)
-            | Action::World(_)
             | Action::Enchant { .. } => false,
+            Action::World(command) => {
+                let origin = commands_world::Origin {
+                    pos: self.origin,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                };
+                let chunk = commands_world::command_chunk(&command, &origin);
+                if self.scheduler.owner(chunk).is_some() {
+                    if let Some(source) = self.source.clone() {
+                        let tracking = Arc::clone(self.tracking);
+                        self.scheduler.schedule_at_chunk(chunk, move |_region| {
+                            commands_world::apply_world(&command, &origin, &*source, &tracking);
+                        });
+                    }
+                } else if let Some(source) = self.source
+                    && let Err(error) = commands_world::execute(&command, &origin, &**source)
+                {
+                    self.reply.text(&error);
+                }
+                false
+            }
             Action::Data(command) => {
                 match commands_data::apply_block(self.source.as_deref(), &command) {
                     Ok(feedback) => self.reply.text(&feedback.text),
