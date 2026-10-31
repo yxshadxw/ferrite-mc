@@ -43,7 +43,7 @@ public final class Bootstrap {
     public static void runGlobalTask(long id) { synchronized (LEGACY_LOCK) { server.scheduler.executeId(id); } }
     public static void runEntityTask(long id) { server.entitySchedulers.execute(id); }
     public static void runRegionTask(long id) { server.regionScheduler.execute(id); }
-    public static void shutdown() { synchronized (LEGACY_LOCK) { server.markStopping(); server.getPluginManager().disablePlugins(); server.asyncScheduler.shutdown(); } }
+    public static void shutdown() { synchronized (LEGACY_LOCK) { server.beginShutdown(); server.getPluginManager().disablePlugins(); server.asyncScheduler.shutdown(); } }
     /** Resolves the live player object, registering a snapshot when the server has none yet. */
     private static org.bukkit.entity.Player ensurePlayer(String id, String name) {
         var uuid = java.util.UUID.fromString(id);
