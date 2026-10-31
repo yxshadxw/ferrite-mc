@@ -1,3 +1,4 @@
+use super::terrain::VanillaTerrain;
 use ferrite_command::gamerule::GameRules;
 use ferrite_nbt::{List, Tag, binary};
 use ferrite_world::{
@@ -156,9 +157,19 @@ pub struct AnvilChunkSource {
     runtime: tokio::runtime::Handle,
     flush_lock: tokio::sync::Mutex<()>,
     flat: Mutex<HashMap<i32, (Chunk, LightData)>>,
+    /// Vanilla overworld generation for chunks missing from disk; `None` is the
+    /// flat test world.
+    terrain: Option<Arc<VanillaTerrain>>,
 }
 impl AnvilChunkSource {
     pub fn new(path: PathBuf, registry: RuntimeRegistry) -> Arc<Self> {
+        Self::new_with_terrain(path, registry, None)
+    }
+    pub fn new_with_terrain(
+        path: PathBuf,
+        registry: RuntimeRegistry,
+        terrain: Option<Arc<VanillaTerrain>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             path: Some(path),
             registry: Arc::new(registry),
@@ -171,9 +182,13 @@ impl AnvilChunkSource {
             runtime: tokio::runtime::Handle::current(),
             flush_lock: tokio::sync::Mutex::new(()),
             flat: Mutex::new(HashMap::new()),
+            terrain,
         })
     }
     pub fn new_memory() -> Arc<Self> {
+        Self::new_memory_with_terrain(None)
+    }
+    pub fn new_memory_with_terrain(terrain: Option<Arc<VanillaTerrain>>) -> Arc<Self> {
         static REGISTRY: OnceLock<Arc<RuntimeRegistry>> = OnceLock::new();
         let registry = REGISTRY
             .get_or_init(|| {
@@ -198,7 +213,16 @@ impl AnvilChunkSource {
             runtime: tokio::runtime::Handle::current(),
             flush_lock: tokio::sync::Mutex::new(()),
             flat: Mutex::new(HashMap::new()),
+            terrain,
         })
+    }
+    /// Whether missing chunks use the flat test world instead of vanilla terrain.
+    pub fn is_flat(&self) -> bool {
+        self.terrain.is_none()
+    }
+    /// The first free block above the generated surface, when vanilla generation is enabled.
+    pub fn spawn_height(&self, x: i32, z: i32) -> Option<i32> {
+        self.terrain.as_ref()?.spawn_height(x, z).ok()
     }
     /// The 26.3 world data file that stores the live game rule values.
     pub(super) fn game_rules_path(&self) -> Option<PathBuf> {
@@ -668,19 +692,24 @@ impl AnvilChunkSource {
                 let (chunk, light) = match loaded {
                     Some(column) => column,
                     None => {
-                        let mut flat = source.flat.lock().unwrap();
-                        if let Some(column) = flat.get(&biome) {
-                            column.clone()
+                        if let Some(terrain) = &source.terrain {
+                            let generated = terrain.generate(x, z)?;
+                            (generated.chunk, generated.light)
                         } else {
-                            let column = (
-                                flat_chunk(&source.registry, biome)?,
-                                LightData {
-                                    sky: vec![LightSection::Empty; 26],
-                                    block: vec![LightSection::Empty; 26],
-                                },
-                            );
-                            flat.insert(biome, column.clone());
-                            column
+                            let mut flat = source.flat.lock().unwrap();
+                            if let Some(column) = flat.get(&biome) {
+                                column.clone()
+                            } else {
+                                let column = (
+                                    flat_chunk(&source.registry, biome)?,
+                                    LightData {
+                                        sky: vec![LightSection::Empty; 26],
+                                        block: vec![LightSection::Empty; 26],
+                                    },
+                                );
+                                flat.insert(biome, column.clone());
+                                column
+                            }
                         }
                     }
                 };

@@ -826,8 +826,10 @@ async fn message_command_reaches_target_and_sender() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_command_disconnects_the_target() {
-    use ferrite_protocol::packets::play::PlayDisconnect;
+async fn kill_command_shows_the_death_screen_even_in_creative() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, Respawn, ServerboundClientCommand, SetHealth,
+    };
 
     let world = World::start_configured(
         None,
@@ -858,9 +860,18 @@ async fn kill_command_disconnects_the_target() {
     bob.until(46).await;
 
     alice.raw(7, "kill Bob").await;
-    let body = bob.until(32).await;
-    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
-    assert_eq!(disconnect.reason.0, "You died!");
+    // `DamageTypes.GENERIC_KILL` is in `bypasses_invulnerability`, so creative mode dies too;
+    // the client gets `ClientboundPlayerCombatKillPacket`, not a disconnect.
+    let body = bob.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(kill.message.0, "Bob was killed");
+    let body = bob.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.health, 0.0);
+    // The connection survives death: a respawn request is answered.
+    bob.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    bob.until(Respawn::ID).await;
     alice.chat_containing("Killed Bob").await;
 
     drop((alice, bob));
@@ -1433,6 +1444,8 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         source: None,
         dimension: super::Dimension::Overworld,
         raining: false,
+        rules: Default::default(),
+        spawn: [0.0, 65.0, 0.0],
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),
@@ -2769,6 +2782,215 @@ async fn setblock_command_updates_block_for_tracking_player() {
     server.abort();
 }
 
+fn block_state(name: &str, props: &[(&str, &str)]) -> u32 {
+    u32::from(
+        ferrite_data::blocks::state_id(name, props)
+            .unwrap_or_else(|| panic!("vanilla state {name} {props:?}")),
+    )
+}
+
+/// A fixture-world copy with a stone floor at y=63, clear air above it, and the given block
+/// states, served with a creative bot.
+async fn redstone_fixture(
+    states: &[([i32; 3], u32)],
+) -> (
+    World,
+    tempfile::TempDir,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.path().to_path_buf(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let stone = block_state("minecraft:stone", &[]);
+    let air = block_state("minecraft:air", &[]);
+    // Stay inside chunk (0, 0), the only chunk loaded by the fixture source here.
+    for x in 0..=3 {
+        for z in 0..=2 {
+            source.set_block(x, 63, z, stone).unwrap();
+            for y in 64..=66 {
+                source.set_block(x, y, z, air).unwrap();
+            }
+        }
+    }
+    for (pos, state) in states {
+        source.set_block(pos[0], pos[1], pos[2], *state).unwrap();
+    }
+    let (world, addr, server) = op_world(Some(source), 1, &["RedstoneBot"]).await;
+    (world, temp, addr, server)
+}
+
+async fn click_block(bot: &mut Bot, pos: [i32; 3]) {
+    use ferrite_protocol::{
+        VarInt,
+        packets::play::{MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(pos[0], pos[1], pos[2]).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+}
+
+async fn wait_for_lamp(bot: &mut Bot, pos: [i32; 3], next: u32) {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let body = bot.until(8).await;
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            let found = BlockPos::unpack(update.location);
+            if (found.x, found.y, found.z) == (pos[0], pos[1], pos[2])
+                && update.block_state.0 == i32::try_from(next).unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("expected the lamp block update");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_lever_lights_lamp_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        (
+            [1, 64, 0],
+            block_state("minecraft:redstone_wire", &[("power", "0")]),
+        ),
+        (
+            [2, 64, 0],
+            block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 0],
+        block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+    )
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_repeater_delay_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        (
+            [1, 64, 0],
+            block_state(
+                "minecraft:repeater",
+                &[("facing", "east"), ("delay", "4"), ("powered", "false")],
+            ),
+        ),
+        (
+            [2, 64, 0],
+            block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    let start = std::time::Instant::now();
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 0],
+        block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "repeater switched after {elapsed:?}, before its 8-tick delay"
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_torch_inverter_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        ([1, 64, 0], block_state("minecraft:stone", &[])),
+        (
+            [2, 64, 0],
+            block_state(
+                "minecraft:redstone_wall_torch",
+                &[("facing", "east"), ("lit", "true")],
+            ),
+        ),
+        (
+            [2, 64, 1],
+            block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 1],
+        block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+    )
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
 /// A bot that stops reading must be disconnected as timed out, and its blocked writer must not
 /// slow down the region ticks or the other players' connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2893,6 +3115,245 @@ async fn clear_give_and_xp_commands_act_on_a_bot_session() {
     bot.raw(7, "xp query @s levels").await;
     bot.chat_containing("Giver has 2 experience levels").await;
 
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_fall_damage_and_natural_regeneration_with_bot() {
+    use ferrite_protocol::packets::play::{MovePosition, SetHealth};
+    // Survival mode: creative ignores fall damage (`Player.isInvulnerableTo`).
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 0,
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Faller").await;
+    // Superflat ground is y=64; step off at y=70, then land six blocks lower.
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 70.0,
+        z: 0.5,
+        flags: 0,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 64.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    // `Player.causeFallDamage`: ceil(6 - 3) = 3 damage.
+    assert_eq!(health.health, 17.0, "fall damage");
+    assert_eq!((health.food.0, health.saturation), (20, 5.0));
+    // Full food and saturation 5 heal `min(saturation, 6) / 6` after ten ticks (`FoodData.tick`).
+    let body = bot.until(SetHealth::ID).await;
+    let healed = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        (healed.health - (17.0 + 5.0 / 6.0)).abs() < 1e-4,
+        "natural regeneration: {}",
+        healed.health
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_eating_uses_food_component_after_use_duration() {
+    use ferrite_protocol::packets::play::{ServerboundUseItem, SetHealth, SetPlayerInventory};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = root.join("vanilla/26.3/fixture-world/world");
+    let registry =
+        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let spawn = super::anvil::read_spawn(&path).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(path, registry);
+    let world = World::start_configured(
+        Some(source),
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Eater").await;
+    // Enchanted golden apples have `can_always_eat`, so the full bar does not block eating.
+    world
+        .console_command("give Eater enchanted_golden_apple 2".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&ServerboundUseItem {
+        hand: VarInt(0),
+        sequence: VarInt(1),
+        yaw: 0.0,
+        pitch: 0.0,
+    })
+    .await;
+    // The stack is consumed after `minecraft:consumable`'s 1.6 s; the item update goes first.
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bot.until(SetPlayerInventory::<ferrite_protocol::packets::play::ItemStack>::ID),
+    )
+    .await
+    .expect("food use duration");
+    let slot: SetPlayerInventory<ferrite_protocol::packets::play::ItemStack> =
+        SetPlayerInventory::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(slot.slot.0, 0);
+    assert_eq!(slot.item.count, 1, "survival eats one item");
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.food.0, 20);
+    assert_eq!(health.saturation, 20.0, "saturation capped by the food bar");
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_kill_death_screen_and_keep_inventory_respawn() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, PositionSync, Respawn, ServerboundClientCommand, SetExperience, SetHealth,
+    };
+    // The in-memory world keeps `gamerule` changes off the read-only fixture world.
+    let spawn = [0, 65, 0];
+    let world = World::start_configured(
+        None,
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Victim"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Victim").await;
+    world
+        .console_command("gamerule keep_inventory true".into())
+        .await
+        .unwrap();
+    bot.raw(7, "xp set @s 10 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(xp.level.0, 10);
+    world.console_command("kill Victim".into()).await.unwrap();
+    // Vanilla `ClientboundPlayerCombatKillPacket` opens the death screen.
+    let body = bot.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        kill.message.0.contains("Victim") && kill.message.0.contains("killed"),
+        "death message: {}",
+        kill.message.0
+    );
+    let body = bot.until(SetHealth::ID).await;
+    let dead = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(dead.health, 0.0);
+    // `ServerboundClientCommandPacket.Action.PERFORM_RESPAWN`.
+    bot.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    let body = bot.until(Respawn::ID).await;
+    let respawn = Respawn::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(respawn.data_to_keep, 3);
+    assert_eq!(respawn.dimension, "minecraft:overworld");
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        (health.health, health.food.0, health.saturation),
+        (20.0, 20, 5.0)
+    );
+    // keepInventory keeps the level through death and respawn.
+    let body = bot.until(SetExperience::ID).await;
+    let kept = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(kept.level.0, 10);
+    let body = bot.until(PositionSync::ID).await;
+    let pos = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        [pos.x, pos.y, pos.z],
+        [
+            f64::from(spawn[0]) + 0.5,
+            f64::from(spawn[1]),
+            f64::from(spawn[2]) + 0.5
+        ]
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_void_damage_kills_and_sends_the_death_screen() {
+    use ferrite_protocol::packets::play::{PlayerCombatKill, SetHealth};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Voider").await;
+    // Below min build height - 64 (`Player.isBelowWorld`): 4 bypassing damage per tick.
+    world
+        .console_command("tp Voider 0 -200 0".into())
+        .await
+        .unwrap();
+    let body = bot.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        kill.message.0.contains("fell out of the world"),
+        "{}",
+        kill.message.0
+    );
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.health, 0.0);
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();

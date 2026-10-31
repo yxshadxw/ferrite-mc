@@ -345,7 +345,7 @@ pub fn resolve_filter(value: &BlockStateValue) -> Result<BlockFilter, CommandErr
 // ---------------------------------------------------------------------------------------------
 
 /// Runs a world command for a player and sends its feedback as chat.
-pub fn run(player: &Player, command: WorldCommand) {
+pub fn run(player: &mut Player, command: WorldCommand) {
     let origin = Origin {
         pos: player.pos,
         yaw: player.yaw,
@@ -358,7 +358,12 @@ pub fn run(player: &Player, command: WorldCommand) {
     match execute(&command, &origin, &**source) {
         Ok(outcome) => {
             for change in outcome.changes {
-                player.change_block(change.location, None, change.state);
+                // Like a player-placed block, a command change notifies neighbours and the
+                // region's redstone/gravity systems on the next tick.
+                if player.change_block(change.location, None, change.state) {
+                    let pos = BlockPos::unpack(change.location);
+                    player.changed_blocks.push([pos.x, pos.y, pos.z]);
+                }
             }
             feedback(player, &outcome.message);
         }
@@ -661,6 +666,8 @@ mod tests {
                 super::super::commands::GameState::default(),
             )),
             actions,
+            anchor: ferrite_command::EntityAnchor::Feet,
+            world: None,
         }
     }
 

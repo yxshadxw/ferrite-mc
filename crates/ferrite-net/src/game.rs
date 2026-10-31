@@ -13,7 +13,7 @@ use uuid::Uuid;
 pub enum ServerboundPlay {
     PlayerAction(PlayerAction),
     UseItemOn(UseItemOn),
-    PlayerCommand(PlayerCommand),
+    PlayerCommand(ServerboundPlayerCommand),
     SignUpdate(SignUpdate),
     SetHeldItem(SetHeldItem),
     CreativeSlot(CreativeSlot<ferrite_item::ItemStack>),
@@ -33,6 +33,10 @@ pub enum ServerboundPlay {
     ChatCommand(ServerboundChatCommand),
     ChatCommandSigned(ServerboundChatCommandSigned),
     ChatSessionUpdate(ServerboundChatSessionUpdate),
+    /// Vanilla `ServerboundClientCommandPacket`: 0 respawns, 1 requests stats.
+    ClientCommand(ferrite_protocol::packets::play::ServerboundClientCommand),
+    /// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating, throwing, ...).
+    UseItem(Box<ferrite_protocol::packets::play::ServerboundUseItem>),
 }
 #[derive(Debug)]
 pub enum GameMessage {
@@ -266,13 +270,19 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
             ServerboundContainerClose::decode(&mut b)?.window.0,
         )),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
-        42 => Some(ServerboundPlay::PlayerCommand(PlayerCommand::decode(
-            &mut b,
-        )?)),
+        42 => Some(ServerboundPlay::PlayerCommand(
+            ServerboundPlayerCommand::decode(&mut b)?,
+        )),
         62 => Some(ServerboundPlay::SignUpdate(SignUpdate::decode(&mut b)?)),
         54 => Some(ServerboundPlay::SetHeldItem(SetHeldItem::decode(&mut b)?)),
         57 => Some(ServerboundPlay::CreativeSlot(CreativeSlot::decode(&mut b)?)),
         66 => Some(ServerboundPlay::UseItemOn(UseItemOn::decode(&mut b)?)),
+        67 => Some(ServerboundPlay::UseItem(Box::new(
+            ferrite_protocol::packets::play::ServerboundUseItem::decode(&mut b)?,
+        ))),
+        12 => Some(ServerboundPlay::ClientCommand(
+            ferrite_protocol::packets::play::ServerboundClientCommand::decode(&mut b)?,
+        )),
         44 => {
             PlayerLoaded::decode(&mut b)?;
             Some(ServerboundPlay::Loaded)
@@ -323,6 +333,48 @@ mod interaction_tests {
             Some(ServerboundPlay::PlayerAction(_))
         ));
     }
+    #[test]
+    fn routes_survival_input_packets() {
+        use ferrite_protocol::packets::play::{
+            ServerboundClientCommand, ServerboundPlayerCommand, ServerboundUseItem,
+        };
+        let mut bytes = Vec::new();
+        encode_packet(&ServerboundClientCommand { action: VarInt(0) }, &mut bytes);
+        assert!(matches!(
+            decode_play(&bytes).unwrap(),
+            Some(ServerboundPlay::ClientCommand(ServerboundClientCommand {
+                action: VarInt(0)
+            }))
+        ));
+        let mut bytes = Vec::new();
+        encode_packet(
+            &ServerboundUseItem {
+                hand: VarInt(0),
+                sequence: VarInt(7),
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            &mut bytes,
+        );
+        assert!(matches!(
+            decode_play(&bytes).unwrap(),
+            Some(ServerboundPlay::UseItem(_))
+        ));
+        let mut bytes = Vec::new();
+        encode_packet(
+            &ServerboundPlayerCommand {
+                entity_id: VarInt(3),
+                action: VarInt(3),
+                data: VarInt(0),
+            },
+            &mut bytes,
+        );
+        assert!(matches!(
+            decode_play(&bytes).unwrap(),
+            Some(ServerboundPlay::PlayerCommand(_))
+        ));
+    }
+
     #[test]
     fn routes_signed_chat_and_acknowledgements() {
         use ferrite_protocol::packets::play::{LastSeenUpdate, MessageSignature};

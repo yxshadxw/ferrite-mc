@@ -400,6 +400,19 @@ item_packet!(CreativeSlot<I = ItemStack>,57,Serverbound,{slot:i16,item:I});
 item_packet!(ContainerContent<I = ItemStack>,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<I>,carried:I});
 item_packet!(ContainerSlot<I = ItemStack>,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:I});
 packet!(SetExperience,105,Clientbound,{progress:f32,level:VarInt,total:VarInt});
+// Vanilla `ClientboundSetHealthPacket`: health, food level and saturation.
+packet!(SetHealth,106,Clientbound,{health:f32,food:VarInt,saturation:f32});
+// Vanilla `ClientboundPlayerCombatKillPacket`: the death screen (`player_id`, death message).
+packet!(PlayerCombatKill,69,Clientbound,{player_id:VarInt,message:crate::types::PlainText});
+// Vanilla `ClientboundRespawnPacket`: `CommonPlayerSpawnInfo` followed by the
+// `dataToKeep` bit set (1 = attributes, 2 = entity data, 3 = both).
+packet!(Respawn,84,Clientbound,{dimension_type:VarInt,dimension:String,seed:i64,game_mode:VarInt,previous_game_mode:VarInt,debug:bool,flat:bool,death_location:Option<DeathLocation>,portal_cooldown:VarInt,sea_level:VarInt,data_to_keep:u8});
+// Vanilla `ServerboundClientCommandPacket`: 0 = perform respawn, 1 = request stats.
+packet!(ServerboundClientCommand,12,Serverbound,{action:VarInt});
+// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating uses this).
+packet!(ServerboundUseItem,67,Serverbound,{hand:VarInt,sequence:VarInt,yaw:f32,pitch:f32});
+// Vanilla `ServerboundPlayerCommandPacket`: 3/4 = start/stop sprinting.
+packet!(ServerboundPlayerCommand,42,Serverbound,{entity_id:VarInt,action:VarInt,data:VarInt});
 item_packet!(SetCursorItem<I = ItemStack>,98,Clientbound,{item:I});
 item_packet!(SetPlayerInventory<I = ItemStack>,110,Clientbound,{slot:VarInt,item:I});
 packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
@@ -1193,6 +1206,43 @@ mod interaction_tests {
             level: VarInt(12),
             total: VarInt(456),
         });
+        roundtrip(SetHealth {
+            health: 17.5,
+            food: VarInt(14),
+            saturation: 3.25,
+        });
+        roundtrip(PlayerCombatKill {
+            player_id: VarInt(5),
+            message: crate::types::PlainText("Steve fell from a high place".into()),
+        });
+        roundtrip(Respawn {
+            dimension_type: VarInt(0),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            game_mode: VarInt(0),
+            previous_game_mode: VarInt(0),
+            debug: false,
+            flat: true,
+            death_location: Some(DeathLocation {
+                dimension: "minecraft:overworld".into(),
+                position: 15,
+            }),
+            portal_cooldown: VarInt(0),
+            sea_level: VarInt(63),
+            data_to_keep: 3,
+        });
+        roundtrip(ServerboundClientCommand { action: VarInt(0) });
+        roundtrip(ServerboundUseItem {
+            hand: VarInt(0),
+            sequence: VarInt(9),
+            yaw: 90.0,
+            pitch: 10.0,
+        });
+        roundtrip(ServerboundPlayerCommand {
+            entity_id: VarInt(5),
+            action: VarInt(3),
+            data: VarInt(0),
+        });
     }
     #[test]
     fn entity_packets_roundtrip() {
@@ -1642,9 +1692,6 @@ impl Packet for PlayerTeam {
     const BOUND: Bound = Bound::Clientbound;
 }
 
-// Vanilla `ServerboundPlayerCommandPacket`: entity, action and jump-boost amount.
-packet!(PlayerCommand,42,Serverbound,{entity:VarInt,action:VarInt,jump_boost:VarInt});
-
 /// Vanilla `ServerboundSignUpdatePacket`: the four lines of one side of a sign.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignUpdate {
@@ -1687,6 +1734,7 @@ packet!(OpenSignEditor,61,Clientbound,{location:i64,is_front_text:bool});
 #[cfg(test)]
 mod sign_packet_tests {
     use super::*;
+    use crate::types::BlockPos;
 
     fn rt<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
         let mut bytes = Vec::new();
@@ -1698,11 +1746,6 @@ mod sign_packet_tests {
 
     #[test]
     fn player_command_sign_update_and_editor_roundtrip() {
-        rt(PlayerCommand {
-            entity: VarInt(7),
-            action: VarInt(2),
-            jump_boost: VarInt(0),
-        });
         rt(SignUpdate {
             location: i64::from(BlockPos::new(1, 2, 3).pack() as i32),
             is_front_text: true,

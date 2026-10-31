@@ -30,6 +30,10 @@ pub type RedirectModifier<S> =
 /// Fills suggestions for an argument.
 pub type SuggestionProvider<S> =
     Arc<dyn Fn(&CommandContext<S>, &mut SuggestionsBuilder) + Send + Sync>;
+/// Receives the result of the command parsed under this node (vanilla's
+/// `CommandSourceStack` result callback, used by `execute store`).
+pub type StoreHook<S> =
+    Arc<dyn Fn(&CommandContext<S>, i32) -> Result<(), CommandError> + Send + Sync>;
 
 /// Wire identifiers for the `Commands` packet suggestion type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,6 +105,7 @@ pub struct Node<S> {
     pub(crate) modifier: Option<RedirectModifier<S>>,
     pub(crate) forks: bool,
     pub(crate) suggester: Option<Suggester<S>>,
+    pub(crate) store: Option<StoreHook<S>>,
 }
 
 impl<S> Node<S> {
@@ -118,6 +123,7 @@ impl<S> Node<S> {
             modifier: None,
             forks: false,
             suggester: None,
+            store: None,
         }
     }
 
@@ -183,6 +189,11 @@ impl<S> Node<S> {
         self.suggester.as_ref()
     }
 
+    /// The result callback of an `execute store` node.
+    pub fn store_hook(&self) -> Option<&StoreHook<S>> {
+        self.store.as_ref()
+    }
+
     /// Whether `source` passes this node's requirement.
     pub fn can_use(&self, source: &S) -> bool {
         self.requirement.as_ref().is_none_or(|r| r(source))
@@ -213,6 +224,7 @@ pub struct NodeBuilder<S> {
     pub(crate) modifier: Option<RedirectModifier<S>>,
     pub(crate) forks: bool,
     pub(crate) suggester: Option<Suggester<S>>,
+    pub(crate) store: Option<StoreHook<S>>,
 }
 
 /// Starts a literal node.
@@ -240,6 +252,7 @@ impl<S> NodeBuilder<S> {
             modifier: None,
             forks: false,
             suggester: None,
+            store: None,
         }
     }
 
@@ -335,6 +348,22 @@ impl<S> NodeBuilder<S> {
             kind: SuggestionKind::AskServer,
             provider: Some(Arc::new(provider)),
         })
+    }
+
+    /// Adds `siblings` as further children of this node (a flat alternative to chaining
+    /// `then`, which would nest them).
+    pub fn also(mut self, siblings: impl IntoIterator<Item = NodeBuilder<S>>) -> Self {
+        self.children.extend(siblings);
+        self
+    }
+
+    /// Calls `hook` with the command result parsed below this node (`execute store`).
+    pub fn stores(
+        mut self,
+        hook: impl Fn(&CommandContext<S>, i32) -> Result<(), CommandError> + Send + Sync + 'static,
+    ) -> Self {
+        self.store = Some(Arc::new(hook));
+        self
     }
 
     /// Sets the suggestion type and provider. Panics on literal nodes.

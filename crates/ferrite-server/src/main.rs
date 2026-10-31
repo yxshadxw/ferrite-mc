@@ -17,10 +17,15 @@ struct Config {
     server_icon: Option<std::path::PathBuf>,
     max_players: u32,
     view_distance: u8,
+    /// Which client protocol versions are accepted: `all` translates older clients,
+    /// `native` serves only the core protocol.
+    supported_versions: SupportedVersionsMode,
     compression_threshold: usize,
     forwarding: ForwardingMode,
     forwarding_secret: String,
     world: Option<std::path::PathBuf>,
+    /// New chunks are generated with vanilla terrain or the flat test world.
+    generator: WorldGenerator,
     gamemode: GameMode,
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
@@ -96,12 +101,28 @@ fn parse_ops(ops: Vec<OpConfig>) -> anyhow::Result<Vec<game::Operator>> {
         })
         .collect()
 }
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WorldGenerator {
+    /// The superflat world used by the existing tests and examples.
+    Superflat,
+    /// The 26.3 overworld noise generator with surface rules and carvers.
+    #[default]
+    Vanilla,
+}
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum GameMode {
     Survival,
     #[default]
     Creative,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SupportedVersionsMode {
+    #[default]
+    All,
+    Native,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -121,10 +142,12 @@ impl Default for Config {
             server_icon: Some("server-icon.png".into()),
             max_players: 20,
             view_distance: 10,
+            supported_versions: SupportedVersionsMode::All,
             compression_threshold: 256,
             forwarding: ForwardingMode::None,
             forwarding_secret: String::new(),
             world: None,
+            generator: WorldGenerator::Vanilla,
             gamemode: GameMode::Creative,
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
@@ -207,14 +230,26 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
     );
+    let terrain = match config.generator {
+        WorldGenerator::Vanilla => Some(std::sync::Arc::new(
+            game::VanillaTerrain::spawn(0).context("starting the vanilla world generator")?,
+        )),
+        WorldGenerator::Superflat => None,
+    };
     let world = if let Some(path) = config.world {
         let spawn = game::load_spawn(&path).context("reading world spawn")?;
         let registry = ferrite_world::RuntimeRegistry::load("vanilla/26.3/generated")
             .context("loading vanilla registry")?;
-        let source = game::new_anvil_source(path, registry);
+        let source = game::new_anvil_source_with(path, registry, terrain);
         game::World::start_configured(Some(source), spawn, settings)
     } else {
-        game::World::start_configured(None, [0, 65, 0], settings)
+        let source = game::new_memory_source(terrain);
+        let spawn = if source.is_flat() {
+            [0, 65, 0]
+        } else {
+            [0, source.spawn_height(0, 0).unwrap_or(100), 0]
+        };
+        game::World::start_configured(Some(source), spawn, settings)
     };
     let mut server = tokio::spawn(ferrite_net::serve(
         listener,
@@ -226,6 +261,10 @@ async fn main() -> anyhow::Result<()> {
             enforce_secure_profile: config.enforce_secure_profile,
             compression_threshold: config.compression_threshold,
             view_distance: config.view_distance,
+            supported_versions: match config.supported_versions {
+                SupportedVersionsMode::All => ferrite_net::SupportedVersions::All,
+                SupportedVersionsMode::Native => ferrite_net::SupportedVersions::Native,
+            },
             forwarding,
             favicon,
             status: Default::default(),
@@ -382,10 +421,20 @@ mod tests {
         let defaults: Config = toml::from_str("").unwrap();
         assert_eq!(defaults.bind_address, "0.0.0.0:25565");
         assert_eq!(defaults.max_players, 20);
+        assert_eq!(defaults.supported_versions, SupportedVersionsMode::All);
+        let native: Config = toml::from_str("supported-versions = 'native'").unwrap();
+        assert_eq!(native.supported_versions, SupportedVersionsMode::Native);
         assert_eq!(defaults.compression_threshold, 256);
         assert_eq!(defaults.forwarding, ForwardingMode::None);
         assert!(defaults.forwarding_secret.is_empty());
         assert_eq!(defaults.world, None);
+        assert_eq!(defaults.generator, WorldGenerator::Vanilla);
+        assert_eq!(
+            toml::from_str::<Config>("generator = 'superflat'")
+                .unwrap()
+                .generator,
+            WorldGenerator::Superflat
+        );
         assert!(matches!(
             build_forwarding(ForwardingMode::None, "").unwrap(),
             ferrite_net::forwarding::Forwarding::None
