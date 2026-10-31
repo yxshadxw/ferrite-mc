@@ -113,3 +113,21 @@ still stubs that answer "Command not implemented".
 - Release: choose the repository name, tag `v0.1.0`, publish the first release notes; review
   `LICENSE`, `NOTICE.md` and every ported-code header.
 - Docs: keep `docs/CONFIG.md` and `docs/CONFIG-PAPER.md` in step with `ferrite-config`.
+
+### Plugin bridge gaps found while wiring the typical fixture (2026-10-31)
+
+- Bukkit scheduler tasks (`runTask`, `runTaskLater`, `runTaskTimer`) register with the host's
+  global queue, but the live server never executes them in the integration harness: neither
+  `FerriteTest tick` nor the typical fixture's `task N` lines appear. `BootstrapTest` covers
+  scheduling in the Java fallback only. Check `PluginHost::tick` in `ferrite-plugin` before
+  plugins can rely on timers.
+- The Java bridge is not told about worlds or player snapshots on join in the live server, so
+  `Player#getLocation`, `World#getSpawnLocation` and `Block#getType` throw "no world/snapshot"
+  until `Bootstrap.registerWorld`/`setBlockSnapshot` are called. The typical fixture reports
+  `where unavailable`; register the main world and the joining player's position at startup.
+- `Native.playerInventory` returns false in the same path, so `PlayerInventory#setItem` throws
+  "No player command handler"; the fixture reports `give unavailable`.
+- Remaining `Server` stubs still throw (help map, recipes, boss bars, maps, world creation, tags,
+  entity serialization). CraftBukkit shims cannot declare NMS-typed methods
+  (`CraftItemStack.asNMSCopy`, `CraftWorld#getHandle`, `CraftMagicNumbers`); those remain
+  NoSuchMethodError by design and are listed here as the NMS boundary.
