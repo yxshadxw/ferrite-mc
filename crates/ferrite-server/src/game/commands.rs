@@ -2751,6 +2751,22 @@ mod tests {
     }
 
     #[test]
+    fn kill_accepts_entity_type_tags() {
+        assert_eq!(
+            only("kill @e[type=#minecraft:zombies]", 2),
+            Action::Kill {
+                targets: EntityTarget::Selector {
+                    kind: SelectorKind::AllEntities,
+                    options: vec![ferrite_command::arguments::SelectorOption {
+                        key: "type".into(),
+                        value: "#minecraft:zombies".into(),
+                    }],
+                },
+            }
+        );
+    }
+
+    #[test]
     fn op_and_deop_require_admin() {
         denied("op Alice");
         denied("deop Alice");
