@@ -10,7 +10,7 @@ fn stop_on_stdin_shuts_down_server() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("ferrite.toml"),
-        "bind-address = '127.0.0.1:0'\nonline-mode = false\n",
+        "bind-address = '127.0.0.1:0'\nonline-mode = false\ngenerator = 'superflat'\n",
     )
     .unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_ferrite-server"))

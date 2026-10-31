@@ -1,5 +1,8 @@
 use super::login::Property;
-use crate::{Bound, Decode, DecodeError, Encode, Packet, State, VarInt, VarLong, types::LpVec3};
+use crate::{
+    Bound, Decode, DecodeError, Encode, Packet, State, VarInt, VarLong,
+    types::{LpVec3, PlainText},
+};
 use uuid::Uuid;
 macro_rules! fields { ($name:ident {$($f:ident:$t:ty),* $(,)?})=>{ #[derive(Debug,Clone,PartialEq)] pub struct $name {$(pub $f:$t),*} impl Encode for $name {fn encode(&self,out:&mut Vec<u8>){$(self.$f.encode(out);)*}} impl Decode for $name {fn decode(buf:&mut &[u8])->Result<Self,DecodeError>{Ok(Self{$($f:<$t>::decode(buf)?),*})}} }; }
 macro_rules! packet {($name:ident,$id:expr,$bound:ident,{$($f:ident:$t:ty),* $(,)?})=>{ fields!($name {$($f:$t),*}); impl Packet for $name {const ID:i32=$id;const STATE:State=State::Play;const BOUND:Bound=Bound::$bound;} };}
@@ -397,6 +400,19 @@ item_packet!(CreativeSlot<I = ItemStack>,57,Serverbound,{slot:i16,item:I});
 item_packet!(ContainerContent<I = ItemStack>,18,Clientbound,{window:VarInt,state:VarInt,slots:Vec<I>,carried:I});
 item_packet!(ContainerSlot<I = ItemStack>,20,Clientbound,{window:VarInt,state:VarInt,slot:i16,item:I});
 packet!(SetExperience,105,Clientbound,{progress:f32,level:VarInt,total:VarInt});
+// Vanilla `ClientboundSetHealthPacket`: health, food level and saturation.
+packet!(SetHealth,106,Clientbound,{health:f32,food:VarInt,saturation:f32});
+// Vanilla `ClientboundPlayerCombatKillPacket`: the death screen (`player_id`, death message).
+packet!(PlayerCombatKill,69,Clientbound,{player_id:VarInt,message:crate::types::PlainText});
+// Vanilla `ClientboundRespawnPacket`: `CommonPlayerSpawnInfo` followed by the
+// `dataToKeep` bit set (1 = attributes, 2 = entity data, 3 = both).
+packet!(Respawn,84,Clientbound,{dimension_type:VarInt,dimension:String,seed:i64,game_mode:VarInt,previous_game_mode:VarInt,debug:bool,flat:bool,death_location:Option<DeathLocation>,portal_cooldown:VarInt,sea_level:VarInt,data_to_keep:u8});
+// Vanilla `ServerboundClientCommandPacket`: 0 = perform respawn, 1 = request stats.
+packet!(ServerboundClientCommand,12,Serverbound,{action:VarInt});
+// Vanilla `ServerboundUseItemPacket`: right-click in the air (eating uses this).
+packet!(ServerboundUseItem,67,Serverbound,{hand:VarInt,sequence:VarInt,yaw:f32,pitch:f32});
+// Vanilla `ServerboundPlayerCommandPacket`: 3/4 = start/stop sprinting.
+packet!(ServerboundPlayerCommand,42,Serverbound,{entity_id:VarInt,action:VarInt,data:VarInt});
 item_packet!(SetCursorItem<I = ItemStack>,98,Clientbound,{item:I});
 item_packet!(SetPlayerInventory<I = ItemStack>,110,Clientbound,{slot:VarInt,item:I});
 packet!(ServerboundContainerClose,19,Serverbound,{window:VarInt});
@@ -1190,6 +1206,43 @@ mod interaction_tests {
             level: VarInt(12),
             total: VarInt(456),
         });
+        roundtrip(SetHealth {
+            health: 17.5,
+            food: VarInt(14),
+            saturation: 3.25,
+        });
+        roundtrip(PlayerCombatKill {
+            player_id: VarInt(5),
+            message: crate::types::PlainText("Steve fell from a high place".into()),
+        });
+        roundtrip(Respawn {
+            dimension_type: VarInt(0),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            game_mode: VarInt(0),
+            previous_game_mode: VarInt(0),
+            debug: false,
+            flat: true,
+            death_location: Some(DeathLocation {
+                dimension: "minecraft:overworld".into(),
+                position: 15,
+            }),
+            portal_cooldown: VarInt(0),
+            sea_level: VarInt(63),
+            data_to_keep: 3,
+        });
+        roundtrip(ServerboundClientCommand { action: VarInt(0) });
+        roundtrip(ServerboundUseItem {
+            hand: VarInt(0),
+            sequence: VarInt(9),
+            yaw: 90.0,
+            pitch: 10.0,
+        });
+        roundtrip(ServerboundPlayerCommand {
+            entity_id: VarInt(5),
+            action: VarInt(3),
+            data: VarInt(0),
+        });
     }
     #[test]
     fn entity_packets_roundtrip() {
@@ -1260,5 +1313,566 @@ mod interaction_tests {
         .encode(&mut bytes);
         let back = SetEntityMotion::decode(&mut bytes.as_slice()).unwrap();
         assert!((back.velocity.0[1] - 0.2).abs() < 1e-4);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Command feedback packets (26.3 protocol ids from `reports/packets.json`).
+// ---------------------------------------------------------------------------------------------
+
+packet!(UpdateMobEffect,135,Clientbound,{entity_id:VarInt,effect:VarInt,amplifier:VarInt,duration:VarInt,flags:u8});
+packet!(RemoveMobEffect,79,Clientbound,{entity_id:VarInt,effect:VarInt});
+packet!(SetTitleText,116,Clientbound,{text:PlainText});
+packet!(SetSubtitleText,114,Clientbound,{text:PlainText});
+packet!(SetActionBarText,89,Clientbound,{text:PlainText});
+packet!(SetTitlesAnimation,117,Clientbound,{fade_in:i32,stay:i32,fade_out:i32});
+packet!(ClearTitles,14,Clientbound,{reset:bool});
+// `minecraft:sound`: a registry holder, the source category, fixed-point position, volume,
+// pitch and the random seed used to pick a sound variant.
+packet!(SoundEffect,119,Clientbound,{sound:VarInt,source:VarInt,x:i32,y:i32,z:i32,volume:f32,pitch:f32,seed:i64});
+// `minecraft:level_particles` for particle options without extra type data.
+packet!(LevelParticles,48,Clientbound,{particle:VarInt,long_distance:bool,always_show:bool,x:f64,y:f64,z:f64,velocity_x:f32,velocity_y:f32,velocity_z:f32,speed:f32,count:i32});
+packet!(InitializeBorder,44,Clientbound,{x:f64,z:f64,old_diameter:f64,new_diameter:f64,speed:VarLong,portal_teleport_boundary:VarInt,warning_blocks:VarInt,warning_time:VarInt});
+packet!(SetBorderCenter,90,Clientbound,{x:f64,z:f64});
+packet!(SetBorderLerpSize,91,Clientbound,{old_diameter:f64,new_diameter:f64,speed:VarLong});
+packet!(SetBorderSize,92,Clientbound,{diameter:f64});
+packet!(SetBorderWarningDelay,93,Clientbound,{warning_delay:VarInt});
+packet!(SetBorderWarningDistance,94,Clientbound,{warning_distance:VarInt});
+packet!(SetDisplayObjective,100,Clientbound,{slot:VarInt,objective:String});
+
+/// `minecraft:stop_sound`: a flags byte says whether a source category and/or a sound id
+/// follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopSound {
+    pub source: Option<VarInt>,
+    pub sound: Option<String>,
+}
+
+impl Encode for StopSound {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let mut flags = 0u8;
+        if self.source.is_some() {
+            flags |= 1;
+        }
+        if self.sound.is_some() {
+            flags |= 2;
+        }
+        flags.encode(out);
+        if let Some(source) = self.source {
+            source.encode(out);
+        }
+        if let Some(sound) = &self.sound {
+            sound.encode(out);
+        }
+    }
+}
+
+impl Decode for StopSound {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let flags = u8::decode(buf)?;
+        if flags & !3 != 0 {
+            return Err(DecodeError::Invalid("stop sound flags"));
+        }
+        Ok(Self {
+            source: (flags & 1 != 0).then(|| VarInt::decode(buf)).transpose()?,
+            sound: (flags & 2 != 0).then(|| String::decode(buf)).transpose()?,
+        })
+    }
+}
+
+impl Packet for StopSound {
+    const ID: i32 = 121;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+/// `minecraft:set_objective`: add (0), remove (1) or change (2). Add and change carry the
+/// display component, render type and an optional number format; Ferrite always writes the
+/// "no number format" marker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetObjective {
+    pub name: String,
+    pub mode: u8,
+    pub display_name: Option<PlainText>,
+    pub render_type: Option<VarInt>,
+}
+
+impl Encode for SetObjective {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.name.encode(out);
+        self.mode.encode(out);
+        if self.mode != 1 {
+            self.display_name
+                .clone()
+                .unwrap_or_else(|| PlainText(String::new()))
+                .encode(out);
+            self.render_type.unwrap_or(VarInt(0)).encode(out);
+            false.encode(out);
+        }
+    }
+}
+
+impl Decode for SetObjective {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let name = String::decode(buf)?;
+        let mode = u8::decode(buf)?;
+        if mode == 1 {
+            return Ok(Self {
+                name,
+                mode,
+                display_name: None,
+                render_type: None,
+            });
+        }
+        let display_name = Some(PlainText::decode(buf)?);
+        let render_type = Some(VarInt::decode(buf)?);
+        if bool::decode(buf)? {
+            return Err(DecodeError::Invalid("objective number format unsupported"));
+        }
+        Ok(Self {
+            name,
+            mode,
+            display_name,
+            render_type,
+        })
+    }
+}
+
+impl Packet for SetObjective {
+    const ID: i32 = 108;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+/// `minecraft:set_score`: the owner, objective and value, with optional display name and number
+/// format (never written by Ferrite).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetScore {
+    pub entity: String,
+    pub objective: String,
+    pub value: VarInt,
+    pub display_name: Option<PlainText>,
+}
+
+impl Encode for SetScore {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.entity.encode(out);
+        self.objective.encode(out);
+        self.value.encode(out);
+        self.display_name.encode(out);
+        false.encode(out);
+    }
+}
+
+impl Decode for SetScore {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let entity = String::decode(buf)?;
+        let objective = String::decode(buf)?;
+        let value = VarInt::decode(buf)?;
+        let display_name = Option::<PlainText>::decode(buf)?;
+        if bool::decode(buf)? {
+            return Err(DecodeError::Invalid("score number format unsupported"));
+        }
+        Ok(Self {
+            entity,
+            objective,
+            value,
+            display_name,
+        })
+    }
+}
+
+impl Packet for SetScore {
+    const ID: i32 = 112;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+// `minecraft:reset_score`: an owner and an optional objective (`None` removes all scores).
+fields!(ResetScore {
+    entity: String,
+    objective: Option<String>
+});
+
+impl Packet for ResetScore {
+    const ID: i32 = 80;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+/// `minecraft:boss_event`: 26.3 merged every boss bar action into one packet.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BossBarAction {
+    Add {
+        name: PlainText,
+        progress: f32,
+        color: VarInt,
+        overlay: u8,
+        flags: u8,
+    },
+    Remove,
+    UpdateProgress(f32),
+    UpdateName(PlainText),
+    UpdateStyle {
+        color: VarInt,
+        overlay: u8,
+    },
+    UpdateProperties(u8),
+}
+
+impl BossBarAction {
+    fn operation(&self) -> VarInt {
+        VarInt(match self {
+            Self::Add { .. } => 0,
+            Self::Remove => 1,
+            Self::UpdateProgress(_) => 2,
+            Self::UpdateName(_) => 3,
+            Self::UpdateStyle { .. } => 4,
+            Self::UpdateProperties(_) => 5,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BossBar {
+    pub uuid: Uuid,
+    pub action: BossBarAction,
+}
+
+impl Encode for BossBar {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.uuid.encode(out);
+        self.action.operation().encode(out);
+        match &self.action {
+            BossBarAction::Add {
+                name,
+                progress,
+                color,
+                overlay,
+                flags,
+            } => {
+                name.encode(out);
+                progress.encode(out);
+                color.encode(out);
+                overlay.encode(out);
+                flags.encode(out);
+            }
+            BossBarAction::Remove => {}
+            BossBarAction::UpdateProgress(progress) => progress.encode(out),
+            BossBarAction::UpdateName(name) => name.encode(out),
+            BossBarAction::UpdateStyle { color, overlay } => {
+                color.encode(out);
+                overlay.encode(out);
+            }
+            BossBarAction::UpdateProperties(flags) => flags.encode(out),
+        }
+    }
+}
+
+impl Decode for BossBar {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let uuid = Uuid::decode(buf)?;
+        let operation = VarInt::decode(buf)?.0;
+        let action = match operation {
+            0 => BossBarAction::Add {
+                name: PlainText::decode(buf)?,
+                progress: f32::decode(buf)?,
+                color: VarInt::decode(buf)?,
+                overlay: u8::decode(buf)?,
+                flags: u8::decode(buf)?,
+            },
+            1 => BossBarAction::Remove,
+            2 => BossBarAction::UpdateProgress(f32::decode(buf)?),
+            3 => BossBarAction::UpdateName(PlainText::decode(buf)?),
+            4 => BossBarAction::UpdateStyle {
+                color: VarInt::decode(buf)?,
+                overlay: u8::decode(buf)?,
+            },
+            5 => BossBarAction::UpdateProperties(u8::decode(buf)?),
+            _ => return Err(DecodeError::Invalid("unknown boss bar operation")),
+        };
+        Ok(Self { uuid, action })
+    }
+}
+
+impl Packet for BossBar {
+    const ID: i32 = 9;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+/// `minecraft:set_player_team`: 26.3 has one team packet with a method selector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TeamAction {
+    Add {
+        display_name: PlainText,
+        flags: u8,
+        nametag_visibility: String,
+        collision_rule: String,
+        color: VarInt,
+        prefix: PlainText,
+        suffix: PlainText,
+    },
+    Remove,
+    Join(Vec<String>),
+    Leave(Vec<String>),
+}
+
+impl TeamAction {
+    fn method(&self) -> u8 {
+        match self {
+            Self::Add { .. } => 0,
+            Self::Remove => 1,
+            Self::Join(_) => 2,
+            Self::Leave(_) => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerTeam {
+    pub name: String,
+    pub action: TeamAction,
+}
+
+impl Encode for PlayerTeam {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.name.encode(out);
+        self.action.method().encode(out);
+        match &self.action {
+            TeamAction::Add {
+                display_name,
+                flags,
+                nametag_visibility,
+                collision_rule,
+                color,
+                prefix,
+                suffix,
+            } => {
+                display_name.encode(out);
+                flags.encode(out);
+                nametag_visibility.encode(out);
+                collision_rule.encode(out);
+                color.encode(out);
+                prefix.encode(out);
+                suffix.encode(out);
+            }
+            TeamAction::Remove => {}
+            TeamAction::Join(players) | TeamAction::Leave(players) => players.encode(out),
+        }
+    }
+}
+
+impl Decode for PlayerTeam {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let name = String::decode(buf)?;
+        let method = u8::decode(buf)?;
+        let action = match method {
+            0 => TeamAction::Add {
+                display_name: PlainText::decode(buf)?,
+                flags: u8::decode(buf)?,
+                nametag_visibility: String::decode(buf)?,
+                collision_rule: String::decode(buf)?,
+                color: VarInt::decode(buf)?,
+                prefix: PlainText::decode(buf)?,
+                suffix: PlainText::decode(buf)?,
+            },
+            1 => TeamAction::Remove,
+            2 => TeamAction::Join(Vec::decode(buf)?),
+            3 => TeamAction::Leave(Vec::decode(buf)?),
+            _ => return Err(DecodeError::Invalid("unknown team method")),
+        };
+        Ok(Self { name, action })
+    }
+}
+
+impl Packet for PlayerTeam {
+    const ID: i32 = 111;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+#[cfg(test)]
+mod command_feedback_tests {
+    use super::*;
+    use crate::{Decode, Encode};
+
+    fn rt<T: Encode + Decode + PartialEq + std::fmt::Debug>(value: T) {
+        let mut bytes = Vec::new();
+        value.encode(&mut bytes);
+        let mut input = bytes.as_slice();
+        assert_eq!(T::decode(&mut input).unwrap(), value);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn effect_and_title_packets_roundtrip() {
+        rt(UpdateMobEffect {
+            entity_id: VarInt(7),
+            effect: VarInt(1),
+            amplifier: VarInt(2),
+            duration: VarInt(100),
+            flags: 0b110,
+        });
+        rt(RemoveMobEffect {
+            entity_id: VarInt(7),
+            effect: VarInt(1),
+        });
+        rt(SetTitleText {
+            text: PlainText("Hello".into()),
+        });
+        rt(SetSubtitleText {
+            text: PlainText("Sub".into()),
+        });
+        rt(SetActionBarText {
+            text: PlainText("Bar".into()),
+        });
+        rt(SetTitlesAnimation {
+            fade_in: 10,
+            stay: 70,
+            fade_out: 20,
+        });
+        rt(ClearTitles { reset: true });
+    }
+
+    #[test]
+    fn sound_and_particle_packets_roundtrip() {
+        rt(SoundEffect {
+            sound: VarInt(4),
+            source: VarInt(0),
+            x: 8,
+            y: 64,
+            z: -8,
+            volume: 1.0,
+            pitch: 1.0,
+            seed: 42,
+        });
+        rt(StopSound {
+            source: Some(VarInt(0)),
+            sound: None,
+        });
+        rt(StopSound {
+            source: None,
+            sound: Some("minecraft:block.note_block.harp".into()),
+        });
+        rt(StopSound {
+            source: None,
+            sound: None,
+        });
+        rt(LevelParticles {
+            particle: VarInt(9),
+            long_distance: false,
+            always_show: false,
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            velocity_x: 0.0,
+            velocity_y: 0.1,
+            velocity_z: 0.0,
+            speed: 0.2,
+            count: 12,
+        });
+    }
+
+    #[test]
+    fn world_border_packets_roundtrip() {
+        rt(InitializeBorder {
+            x: 0.0,
+            z: 0.0,
+            old_diameter: 100.0,
+            new_diameter: 120.0,
+            speed: VarLong(20),
+            portal_teleport_boundary: VarInt(29_999_984),
+            warning_blocks: VarInt(5),
+            warning_time: VarInt(15),
+        });
+        rt(SetBorderCenter { x: 1.0, z: -2.0 });
+        rt(SetBorderLerpSize {
+            old_diameter: 10.0,
+            new_diameter: 20.0,
+            speed: VarLong(2),
+        });
+        rt(SetBorderSize { diameter: 42.0 });
+        rt(SetBorderWarningDelay {
+            warning_delay: VarInt(15),
+        });
+        rt(SetBorderWarningDistance {
+            warning_distance: VarInt(5),
+        });
+    }
+
+    #[test]
+    fn scoreboard_packets_roundtrip() {
+        rt(SetObjective {
+            name: "objective".into(),
+            mode: 0,
+            display_name: Some(PlainText("Objective".into())),
+            render_type: Some(VarInt(0)),
+        });
+        rt(SetObjective {
+            name: "objective".into(),
+            mode: 1,
+            display_name: None,
+            render_type: None,
+        });
+        rt(SetScore {
+            entity: "Alice".into(),
+            objective: "objective".into(),
+            value: VarInt(5),
+            display_name: None,
+        });
+        rt(ResetScore {
+            entity: "Alice".into(),
+            objective: None,
+        });
+        rt(SetDisplayObjective {
+            slot: VarInt(1),
+            objective: "objective".into(),
+        });
+    }
+
+    #[test]
+    fn boss_bar_and_team_packets_roundtrip() {
+        for action in [
+            BossBarAction::Add {
+                name: PlainText("Boss".into()),
+                progress: 0.5,
+                color: VarInt(1),
+                overlay: 0,
+                flags: 0b101,
+            },
+            BossBarAction::Remove,
+            BossBarAction::UpdateProgress(0.75),
+            BossBarAction::UpdateName(PlainText("Renamed".into())),
+            BossBarAction::UpdateStyle {
+                color: VarInt(2),
+                overlay: 1,
+            },
+            BossBarAction::UpdateProperties(0),
+        ] {
+            rt(BossBar {
+                uuid: Uuid::from_u128(9),
+                action,
+            });
+        }
+        for action in [
+            TeamAction::Add {
+                display_name: PlainText("Team".into()),
+                flags: 1,
+                nametag_visibility: "always".into(),
+                collision_rule: "always".into(),
+                color: VarInt(1),
+                prefix: PlainText("[".into()),
+                suffix: PlainText("]".into()),
+            },
+            TeamAction::Remove,
+            TeamAction::Join(vec!["Alice".into()]),
+            TeamAction::Leave(vec!["Alice".into()]),
+        ] {
+            rt(PlayerTeam {
+                name: "team".into(),
+                action,
+            });
+        }
     }
 }
