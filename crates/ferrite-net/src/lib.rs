@@ -814,17 +814,25 @@ async fn play(
                 }
                 frame = read_packet(&mut reader, &mut decoder) => {
                     let frame = frame?;
-                    let packets = match &translator {
-                        Some(translator) => translator
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .serverbound(State::Play, RawPacket::parse(&frame)?)?,
-                        None => vec![RawPacket::parse(&frame)?],
-                    };
-                    for packet in packets {
-                        if let Some(packet) = game::decode_play(&packet.to_frame())? {
-                            game.send(GameMessage::Input { session, uuid, packet })
-                                .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                    match &translator {
+                        // Native clients decode the frame directly, as before translation.
+                        None => {
+                            if let Some(packet) = game::decode_play(&frame)? {
+                                game.send(GameMessage::Input { session, uuid, packet })
+                                    .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                            }
+                        }
+                        Some(translator) => {
+                            let packets = translator
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .serverbound(State::Play, RawPacket::parse(&frame)?)?;
+                            for packet in packets {
+                                if let Some(packet) = game::decode_play(&packet.to_frame())? {
+                                    game.send(GameMessage::Input { session, uuid, packet })
+                                        .map_err(|_| anyhow::anyhow!("game loop stopped"))?;
+                                }
+                            }
                         }
                     }
                 }
@@ -848,6 +856,8 @@ async fn write_loop(
         packets::play::{PlayDisconnect, PlayKeepAlive},
         types::PlainText,
     };
+    let mut keepalive_body = Vec::new();
+    encode_packet(&PlayKeepAlive { id: 1 }, &mut keepalive_body);
     let mut keepalive = tokio::time::interval_at(
         tokio::time::Instant::now() + std::time::Duration::from_secs(10),
         std::time::Duration::from_secs(10),
@@ -858,12 +868,18 @@ async fn write_loop(
         let mut close = None;
         tokio::select! {
             biased;
-            _ = keepalive.tick() => queue_raw(
-                &mut batch,
-                &encoder,
-                &translator,
-                RawPacket::of(&PlayKeepAlive { id: 1 }),
-            ),
+            _ = keepalive.tick() => {
+                if translator.is_none() {
+                    encoder.encode(&keepalive_body, &mut batch);
+                } else {
+                    queue_raw(
+                        &mut batch,
+                        &encoder,
+                        &translator,
+                        RawPacket::of(&PlayKeepAlive { id: 1 }),
+                    );
+                }
+            }
             incoming = queue.next() => match incoming {
                 game::Incoming::Overflow => {
                     queue.discard();
@@ -887,14 +903,25 @@ async fn write_loop(
             close = Some("Timed out".to_string());
         }
         if let Some(reason) = close {
-            queue_raw(
-                &mut batch,
-                &encoder,
-                &translator,
-                RawPacket::of(&PlayDisconnect {
-                    reason: PlainText(reason),
-                }),
-            );
+            if translator.is_none() {
+                let mut body = Vec::new();
+                encode_packet(
+                    &PlayDisconnect {
+                        reason: PlainText(reason),
+                    },
+                    &mut body,
+                );
+                encoder.encode(&body, &mut batch);
+            } else {
+                queue_raw(
+                    &mut batch,
+                    &encoder,
+                    &translator,
+                    RawPacket::of(&PlayDisconnect {
+                        reason: PlainText(reason),
+                    }),
+                );
+            }
             if !batch.is_empty() {
                 write_batch(&mut writer, &mut batch, write_timeout).await?;
             }
@@ -913,13 +940,20 @@ fn queue_batch(
     close: &mut Option<String>,
 ) {
     match msg {
-        game::Outbound::Packet(body) => match RawPacket::parse(&body) {
-            Ok(packet) => queue_raw(batch, encoder, translator, packet),
-            Err(error) => {
-                tracing::error!(%error, "invalid core packet");
-                *close = Some("Internal error".into());
+        game::Outbound::Packet(body) => {
+            if translator.is_none() {
+                // Native clients: the bytes are already in the client's protocol.
+                encoder.encode(&body, batch);
+                return;
             }
-        },
+            match RawPacket::parse(&body) {
+                Ok(packet) => queue_raw(batch, encoder, translator, packet),
+                Err(error) => {
+                    tracing::error!(%error, "invalid core packet");
+                    *close = Some("Internal error".into());
+                }
+            }
+        }
         game::Outbound::Disconnect(reason) => *close = Some(reason),
     }
 }
