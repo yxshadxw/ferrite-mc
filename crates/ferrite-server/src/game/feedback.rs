@@ -58,6 +58,216 @@ fn template(key: &str) -> Option<&'static str> {
         "commands.whitelist.reloaded" => "Reloaded the whitelist",
         "commands.whitelist.remove.failed" => "Player is not whitelisted",
         "commands.whitelist.remove.success" => "Removed %s from the whitelist",
+        "commands.effect.clear.everything.failed" => "Target has no effects to remove",
+        "commands.effect.clear.everything.success.multiple" => {
+            "Removed every effect from %s targets"
+        }
+        "commands.effect.clear.everything.success.single" => "Removed every effect from %s",
+        "commands.effect.clear.specific.failed" => "Target doesn't have the requested effect",
+        "commands.effect.clear.specific.success.multiple" => "Removed effect %s from %s targets",
+        "commands.effect.clear.specific.success.single" => "Removed effect %s from %s",
+        "commands.effect.give.failed" => {
+            "Unable to apply this effect (target is either immune to effects, or has something stronger)"
+        }
+        "commands.effect.give.success.multiple" => "Applied effect %s to %s targets",
+        "commands.effect.give.success.single" => "Applied effect %s to %s",
+        "commands.enchant.failed" => {
+            "Nothing changed. Targets either have no item in their hands or the enchantment could not be applied"
+        }
+        "commands.enchant.failed.entity" => "%s is not a valid entity for this command",
+        "commands.enchant.failed.incompatible" => "%s cannot support that enchantment",
+        "commands.enchant.failed.itemless" => "%s is not holding any item",
+        "commands.enchant.failed.level" => {
+            "%s is higher than the maximum level of %s supported by that enchantment"
+        }
+        "commands.enchant.success.multiple" => "Applied enchantment %s to %s entities",
+        "commands.enchant.success.single" => "Applied enchantment %s to %s's item",
+        "commands.title.cleared.multiple" => "Cleared titles for %s players",
+        "commands.title.cleared.single" => "Cleared titles for %s",
+        "commands.title.reset.multiple" => "Reset title options for %s players",
+        "commands.title.reset.single" => "Reset title options for %s",
+        "commands.title.show.actionbar.multiple" => "Showing new actionbar title for %s players",
+        "commands.title.show.actionbar.single" => "Showing new actionbar title for %s",
+        "commands.title.show.subtitle.multiple" => "Showing new subtitle for %s players",
+        "commands.title.show.subtitle.single" => "Showing new subtitle for %s",
+        "commands.title.show.title.multiple" => "Showing new title for %s players",
+        "commands.title.show.title.single" => "Showing new title for %s",
+        "commands.title.times.multiple" => "Changed title display times for %s players",
+        "commands.title.times.single" => "Changed title display times for %s",
+        "commands.playsound.failed" => "The sound is too far away to be heard",
+        "commands.playsound.success.multiple" => "Played sound %s to %s players",
+        "commands.playsound.success.single" => "Played sound %s to %s",
+        "commands.stopsound.success.source.any" => "Stopped all '%s' sounds",
+        "commands.stopsound.success.source.sound" => "Stopped sound '%s' on source '%s'",
+        "commands.stopsound.success.sourceless.any" => "Stopped all sounds",
+        "commands.stopsound.success.sourceless.sound" => "Stopped sound '%s'",
+        "commands.particle.failed" => "The particle was not visible for anybody",
+        "commands.particle.success" => "Displaying particle %s",
+        "commands.spawnpoint.success.multiple" => {
+            "Set spawn point to %s, %s, %s [%s] in %s for %s players"
+        }
+        "commands.spawnpoint.success.multiple.new" => {
+            "Set spawn point to %s, %s, %s [%s, %s] in %s for %s players"
+        }
+        "commands.spawnpoint.success.single" => "Set spawn point to %s, %s, %s [%s] in %s for %s",
+        "commands.spawnpoint.success.single.new" => {
+            "Set spawn point to %s, %s, %s [%s, %s] in %s for %s"
+        }
+        "commands.setworldspawn.failure.not_overworld" => {
+            "Can only set the world spawn for the Overworld"
+        }
+        "commands.setworldspawn.success" => "Set the world spawn point to %s, %s, %s [%s]",
+        "commands.setworldspawn.success.new" => {
+            "Set the world spawn point to %s, %s, %s [%s, %s] in %s"
+        }
+        "commands.worldborder.center.failed" => {
+            "Nothing changed. The world border is already centered there"
+        }
+        "commands.worldborder.center.success" => "Set the center of the world border to %s, %s",
+        "commands.worldborder.damage.amount.failed" => {
+            "Nothing changed. The world border damage is already that amount"
+        }
+        "commands.worldborder.damage.amount.success" => {
+            "Set the world border damage to %s per block each second"
+        }
+        "commands.worldborder.damage.buffer.failed" => {
+            "Nothing changed. The world border damage buffer is already that distance"
+        }
+        "commands.worldborder.damage.buffer.success" => {
+            "Set the world border damage buffer to %s block(s)"
+        }
+        "commands.worldborder.get" => "The world border is currently %s block(s) wide",
+        "commands.worldborder.set.failed.big" => {
+            "World border cannot be bigger than %s blocks wide"
+        }
+        "commands.worldborder.set.failed.far" => {
+            "World border cannot be further out than %s blocks"
+        }
+        "commands.worldborder.set.failed.nochange" => {
+            "Nothing changed. The world border is already that size"
+        }
+        "commands.worldborder.set.failed.small" => {
+            "World border cannot be smaller than 1 block wide"
+        }
+        "commands.worldborder.set.grow" => {
+            "Growing the world border to %s block(s) wide over %s second(s)"
+        }
+        "commands.worldborder.set.immediate" => "Set the world border to %s block(s) wide",
+        "commands.worldborder.set.shrink" => {
+            "Shrinking the world border to %s block(s) wide over %s second(s)"
+        }
+        "commands.worldborder.warning.distance.failed" => {
+            "Nothing changed. The world border warning is already that distance"
+        }
+        "commands.worldborder.warning.distance.success" => {
+            "Set the world border warning distance to %s block(s)"
+        }
+        "commands.worldborder.warning.time.failed" => {
+            "Nothing changed. The world border warning is already that amount of time"
+        }
+        "commands.worldborder.warning.time.success" => {
+            "Set the world border warning time to %s second(s)"
+        }
+        "commands.bossbar.create.success" => "Created custom bossbar %s",
+        "commands.bossbar.get.max" => "Custom bossbar %s has a maximum of %s",
+        "commands.bossbar.get.players.none" => "Custom bossbar %s has no players currently online",
+        "commands.bossbar.get.players.some" => {
+            "Custom bossbar %s has %s player(s) currently online: %s"
+        }
+        "commands.bossbar.get.value" => "Custom bossbar %s has a value of %s",
+        "commands.bossbar.get.visible.hidden" => "Custom bossbar %s is currently hidden",
+        "commands.bossbar.get.visible.visible" => "Custom bossbar %s is currently visible",
+        "commands.bossbar.list.bars.none" => "There are no custom bossbars active",
+        "commands.bossbar.list.bars.some" => "There are %s custom bossbar(s) active: %s",
+        "commands.bossbar.remove.success" => "Removed custom bossbar %s",
+        "commands.bossbar.set.color.success" => "Custom bossbar %s has changed color",
+        "commands.bossbar.set.max.success" => "Custom bossbar %s has changed maximum to %s",
+        "commands.bossbar.set.name.success" => "Custom bossbar %s has been renamed",
+        "commands.bossbar.set.players.success.none" => {
+            "Custom bossbar %s no longer has any players"
+        }
+        "commands.bossbar.set.players.success.some" => "Custom bossbar %s now has %s player(s): %s",
+        "commands.bossbar.set.style.success" => "Custom bossbar %s has changed style",
+        "commands.bossbar.set.value.success" => "Custom bossbar %s has changed value to %s",
+        "commands.bossbar.set.visible.success.hidden" => "Custom bossbar %s is now hidden",
+        "commands.bossbar.set.visible.success.visible" => "Custom bossbar %s is now visible",
+        "commands.scoreboard.objectives.add.success" => "Created new objective %s",
+        "commands.scoreboard.objectives.display.cleared" => {
+            "Cleared any objectives in display slot %s"
+        }
+        "commands.scoreboard.objectives.display.set" => "Set display slot %s to show objective %s",
+        "commands.scoreboard.objectives.list.empty" => "There are no objectives",
+        "commands.scoreboard.objectives.list.success" => "There are %s objective(s): %s",
+        "commands.scoreboard.objectives.modify.displayname" => {
+            "Changed the display name of %s to %s"
+        }
+        "commands.scoreboard.objectives.modify.rendertype" => {
+            "Changed the render type of objective %s"
+        }
+        "commands.scoreboard.objectives.remove.success" => "Removed objective %s",
+        "commands.scoreboard.players.add.success.multiple" => "Added %s to %s for %s entities",
+        "commands.scoreboard.players.add.success.single" => "Added %s to %s for %s (now %s)",
+        "commands.scoreboard.players.enable.success.multiple" => {
+            "Enabled trigger %s for %s entities"
+        }
+        "commands.scoreboard.players.enable.success.single" => "Enabled trigger %s for %s",
+        "commands.scoreboard.players.get.success" => "%s has %s %s",
+        "commands.scoreboard.players.list.empty" => "There are no tracked entities",
+        "commands.scoreboard.players.list.entity.empty" => "%s has no scores to show",
+        "commands.scoreboard.players.list.entity.entry" => "%s: %s",
+        "commands.scoreboard.players.list.entity.success" => "%s has %s score(s):",
+        "commands.scoreboard.players.list.success" => "There are %s tracked entity/entities: %s",
+        "commands.scoreboard.players.operation.success.multiple" => "Updated %s for %s entities",
+        "commands.scoreboard.players.operation.success.single" => "Set %s for %s to %s",
+        "commands.scoreboard.players.remove.success.multiple" => {
+            "Removed %s from %s for %s entities"
+        }
+        "commands.scoreboard.players.remove.success.single" => "Removed %s from %s for %s (now %s)",
+        "commands.scoreboard.players.reset.all.multiple" => "Reset all scores for %s entities",
+        "commands.scoreboard.players.reset.all.single" => "Reset all scores for %s",
+        "commands.scoreboard.players.reset.specific.multiple" => "Reset %s for %s entities",
+        "commands.scoreboard.players.reset.specific.single" => "Reset %s for %s",
+        "commands.scoreboard.players.set.success.multiple" => "Set %s for %s entities to %s",
+        "commands.scoreboard.players.set.success.single" => "Set %s for %s to %s",
+        "commands.tag.add.success.multiple" => "Added tag '%s' to %s entities",
+        "commands.tag.add.success.single" => "Added tag '%s' to %s",
+        "commands.tag.list.multiple.empty" => "There are no tags on the %s entities",
+        "commands.tag.list.multiple.success" => "The %s entities have %s total tag(s): %s",
+        "commands.tag.list.single.empty" => "%s has no tags",
+        "commands.tag.list.single.success" => "%s has %s tag(s): %s",
+        "commands.tag.remove.success.multiple" => "Removed tag '%s' from %s entities",
+        "commands.tag.remove.success.single" => "Removed tag '%s' from %s",
+        "commands.team.add.success" => "Created team %s",
+        "commands.team.empty.success" => "Removed %s member(s) from team %s",
+        "commands.team.join.success.multiple" => "Added %s members to team %s",
+        "commands.team.join.success.single" => "Added %s to team %s",
+        "commands.team.leave.success.multiple" => "Removed %s members from any team",
+        "commands.team.leave.success.single" => "Removed %s from any team",
+        "commands.team.list.members.empty" => "There are no members on team %s",
+        "commands.team.list.members.success" => "Team %s has %s member(s): %s",
+        "commands.team.list.teams.empty" => "There are no teams",
+        "commands.team.list.teams.success" => "There are %s team(s): %s",
+        "commands.team.option.collisionRule.success" => "Collision rule for team %s is now \"%s\"",
+        "commands.team.option.color.clear.success" => "Cleared the color for team %s",
+        "commands.team.option.color.success" => "Updated the color for team %s to %s",
+        "commands.team.option.deathMessageVisibility.success" => {
+            "Death message visibility for team %s is now \"%s\""
+        }
+        "commands.team.option.friendlyfire.disabled" => "Disabled friendly fire for team %s",
+        "commands.team.option.friendlyfire.enabled" => "Enabled friendly fire for team %s",
+        "commands.team.option.name.success" => "Updated the name of team %s",
+        "commands.team.option.nametagVisibility.success" => {
+            "Nametag visibility for team %s is now \"%s\""
+        }
+        "commands.team.option.prefix.success" => "Team prefix set to %s",
+        "commands.team.option.seeFriendlyInvisibles.disabled" => {
+            "Team %s can no longer see invisible teammates"
+        }
+        "commands.team.option.seeFriendlyInvisibles.enabled" => {
+            "Team %s can now see invisible teammates"
+        }
+        "commands.team.option.suffix.success" => "Team suffix set to %s",
+        "commands.team.remove.success" => "Removed team %s",
         _ => return None,
     })
 }
