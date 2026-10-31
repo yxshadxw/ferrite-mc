@@ -1,4 +1,5 @@
 use super::{
+    PluginEventPolicy,
     chunk::{ChunkSource, FlatGenerator},
     commands::{XpOperation, XpUnit},
     valid_move,
@@ -130,6 +131,8 @@ pub struct Player {
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
+    /// What a failed plugin event means for the action it guards.
+    pub plugin_event_errors: PluginEventPolicy,
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
@@ -257,6 +260,32 @@ fn chunk_window(
 }
 pub(super) fn send<P: ferrite_protocol::Packet>(p: &Player, msg: &P) {
     let _ = p.outbound.send(packet(msg));
+}
+/// Namespaced block id of a global state id, for Bukkit event materials.
+fn material_name(state: u32) -> &'static str {
+    u16::try_from(state)
+        .ok()
+        .and_then(ferrite_data::blocks::state)
+        .map_or("minecraft:air", |(name, _)| name)
+}
+/// Runs an event hook. A missing bridge allows the action; a failed call is
+/// decided by `plugin-event-errors` (Bukkit-compatible default: allow).
+fn event_allows(
+    plugins: Option<&dyn ferrite_plugin::ServerHooks>,
+    policy: PluginEventPolicy,
+    event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
+) -> bool {
+    let Some(plugins) = plugins else {
+        return true;
+    };
+    match event(plugins) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            let allow = policy == PluginEventPolicy::Allow;
+            tracing::warn!(%error, allow, "plugin event failed");
+            allow
+        }
+    }
 }
 /// Vanilla's total experience required to reach `level`.
 fn total_for_level(level: i32) -> i64 {
@@ -591,6 +620,8 @@ impl Player {
                     z: target.z,
                 },
                 u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+                material_name(u32::from(state)),
+                material_name(u32::from(old)),
             )
         }) {
             self.send_block_snapshot(target.pack());
@@ -634,21 +665,14 @@ impl Player {
             }
         }
     }
-    /// Runs an event hook; a missing bridge or a failed call allows the action.
+    /// Runs an event hook; a missing bridge or a failed call is decided by the
+    /// configured [`PluginEventPolicy`]. Callers cancel the action on `false`,
+    /// which resends the original block or teleport state.
     fn plugin_allows(
         &self,
         event: impl FnOnce(&dyn ferrite_plugin::ServerHooks) -> Result<bool, ferrite_plugin::Error>,
     ) -> bool {
-        let Some(plugins) = &self.plugins else {
-            return true;
-        };
-        match event(plugins.as_ref()) {
-            Ok(allowed) => allowed,
-            Err(error) => {
-                tracing::warn!(%error, "plugin event failed");
-                true
-            }
-        }
+        event_allows(self.plugins.as_deref(), self.plugin_event_errors, event)
     }
 
     fn feedback(&self, feedback: Option<&OutboundSender>, text: String) {
@@ -949,6 +973,10 @@ impl Player {
                                 y: pos.y,
                                 z: pos.z,
                             };
+                            let state = self
+                                .source
+                                .as_ref()
+                                .and_then(|s| s.block(pos.x, pos.y, pos.z));
                             let allowed = self.plugin_allows(|plugins| {
                                 plugins.player_interacted(
                                     self.uuid,
@@ -956,37 +984,42 @@ impl Player {
                                     InteractAction::LeftClickBlock,
                                     clicked,
                                     u8::try_from(p.face.clamp(0, 5)).unwrap_or(0),
+                                    material_name(state.unwrap_or(0)),
                                 )
                             });
-                            if allowed {
-                                let state = self
-                                    .source
-                                    .as_ref()
-                                    .and_then(|s| s.block(pos.x, pos.y, pos.z));
-                                if let Some(state) = state {
-                                    if self.gamemode == 1 {
+                            if allowed && let Some(state) = state {
+                                if self.gamemode == 1 {
+                                    if self.plugin_allows(|plugins| {
+                                        plugins.block_broken(
+                                            self.uuid,
+                                            &self.name,
+                                            clicked,
+                                            material_name(state),
+                                        )
+                                    }) {
+                                        self.break_block(p.location, state);
+                                    }
+                                } else if self.gamemode == 0 {
+                                    // Zero hardness breaks on the first hit (vanilla: destroy
+                                    // progress >= 1 on START), so no finish action follows.
+                                    let instant = u16::try_from(state).is_ok_and(|s| {
+                                        usize::from(s) < ferrite_data::blocks::STATE_COUNT
+                                            && ferrite_data::block_props::get(s).hardness == 0.0
+                                    });
+                                    if instant {
                                         if self.plugin_allows(|plugins| {
-                                            plugins.block_broken(self.uuid, &self.name, clicked)
-                                        }) {
-                                            self.break_block(p.location, state);
+                                            plugins.block_broken(
+                                                self.uuid,
+                                                &self.name,
+                                                clicked,
+                                                material_name(state),
+                                            )
+                                        }) && self.break_block(p.location, state)
+                                        {
+                                            self.broken.push((pos, state));
                                         }
-                                    } else if self.gamemode == 0 {
-                                        // Zero hardness breaks on the first hit (vanilla: destroy
-                                        // progress >= 1 on START), so no finish action follows.
-                                        let instant = u16::try_from(state).is_ok_and(|s| {
-                                            usize::from(s) < ferrite_data::blocks::STATE_COUNT
-                                                && ferrite_data::block_props::get(s).hardness == 0.0
-                                        });
-                                        if instant {
-                                            if self.plugin_allows(|plugins| {
-                                                plugins.block_broken(self.uuid, &self.name, clicked)
-                                            }) && self.break_block(p.location, state)
-                                            {
-                                                self.broken.push((pos, state));
-                                            }
-                                        } else {
-                                            self.breaking = Some((p.location, state, 0));
-                                        }
+                                    } else {
+                                        self.breaking = Some((p.location, state, 0));
                                     }
                                 }
                             }
@@ -1009,6 +1042,7 @@ impl Player {
                                             y: pos.y,
                                             z: pos.z,
                                         },
+                                        material_name(state),
                                     )
                                 })
                                 && self.break_block(location, state)
@@ -1028,6 +1062,10 @@ impl Player {
                 }
                 ServerboundPlay::UseItemOn(p) => {
                     let clicked = ferrite_protocol::types::BlockPos::unpack(p.location);
+                    let state = self
+                        .source
+                        .as_ref()
+                        .and_then(|s| s.block(clicked.x, clicked.y, clicked.z));
                     let allowed = self.plugin_allows(|plugins| {
                         plugins.player_interacted(
                             self.uuid,
@@ -1039,6 +1077,7 @@ impl Player {
                                 z: clicked.z,
                             },
                             u8::try_from(p.face.0.clamp(0, 5)).unwrap_or(0),
+                            material_name(state.unwrap_or(0)),
                         )
                     });
                     if allowed {
@@ -1485,4 +1524,111 @@ fn chunk_holders_follow_region_merge_and_split() {
     assert_eq!(right.held_chunks.get(&ChunkPos(32, 0)), Some(&1));
     right.release_chunk(ChunkPos(32, 0));
     assert!(right.held_chunks.is_empty());
+}
+
+#[cfg(test)]
+mod event_policy_tests {
+    use super::*;
+    use ferrite_plugin::{BlockPosition, CommandSender, PluginCommand, PluginCommandResult};
+
+    /// A bridge whose every call fails, standing in for a broken JVM call.
+    struct Failing;
+    impl ferrite_plugin::ServerHooks for Failing {
+        fn player_joined(&self, _: Uuid, _: &str) -> Result<(), ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_left(&self, _: Uuid, _: &str) -> Result<(), ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn chat(&self, _: Uuid, _: &str, _: &str) -> Result<Option<String>, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_moved(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &ferrite_plugin::PlayerMove,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_interacted(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: InteractAction,
+            _: BlockPosition,
+            _: u8,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn block_broken(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: BlockPosition,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn block_placed(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: BlockPosition,
+            _: u8,
+            _: &str,
+            _: &str,
+        ) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn player_command(&self, _: Uuid, _: &str, _: &str) -> Result<bool, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn plugin_commands(&self) -> Result<Vec<PluginCommand>, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+        fn run_plugin_command(
+            &self,
+            _: CommandSender,
+            _: &str,
+        ) -> Result<PluginCommandResult, ferrite_plugin::Error> {
+            Err(ferrite_plugin::Error::InvalidTask)
+        }
+    }
+
+    fn decide(policy: PluginEventPolicy, result: Result<bool, ferrite_plugin::Error>) -> bool {
+        let failing: &dyn ferrite_plugin::ServerHooks = &Failing;
+        event_allows(Some(failing), policy, |_| result)
+    }
+
+    #[test]
+    fn failed_plugin_events_follow_the_configured_policy() {
+        assert!(decide(
+            PluginEventPolicy::Allow,
+            Err(ferrite_plugin::Error::InvalidTask)
+        ));
+        assert!(!decide(
+            PluginEventPolicy::Deny,
+            Err(ferrite_plugin::Error::InvalidTask)
+        ));
+        assert!(!decide(PluginEventPolicy::Allow, Ok(false)));
+        assert!(decide(PluginEventPolicy::Deny, Ok(true)));
+    }
+
+    #[test]
+    fn a_missing_plugin_bridge_always_allows_the_action() {
+        assert!(event_allows(None, PluginEventPolicy::Deny, |_| Err(
+            ferrite_plugin::Error::InvalidTask
+        )));
+    }
+
+    #[test]
+    fn block_materials_come_from_the_state_table() {
+        let stone = ferrite_data::blocks::default_state("stone").unwrap();
+        let grass = ferrite_data::blocks::default_state("grass_block").unwrap();
+        assert_eq!(material_name(u32::from(stone)), "minecraft:stone");
+        assert_eq!(material_name(u32::from(grass)), "minecraft:grass_block");
+        assert_eq!(material_name(u32::MAX), "minecraft:air");
+    }
 }
