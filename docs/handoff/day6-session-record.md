@@ -116,3 +116,15 @@ Earlier task texts of the Freebuff sessions are kept for reference: `fb1c.md` (r
 3. Finish and merge `wip/day6-oc3` (done work), then `wip/day6-oc4` and `wip/day6-oc5`.
 4. Start the unstarted tasks in this order: `oc6.md` (throughput), `oc8.md`, `oc7.md`.
 5. After every merge: full suite, clippy, fmt, push, README update.
+
+## 7. Addendum (late Day 6): opencode on the NVIDIA free API
+
+After the opencode quota ran out, opencode was switched to NVIDIA's free hosted DeepSeek model
+(`nvidia/deepseek-ai/deepseek-v4.1-flash`, connected once with `/connect` in the opencode TUI; the
+global default model in `~/.config/opencode/opencode.json` was changed). OC4, OC5, OC6, OC7 and
+OC8 were restarted on it, OC4/OC5 continuing from their `wip/day6-*` snapshots. Notes: the free
+endpoint is slow (about 47-90 s per agent turn); it only serves chat completions (Codex cannot be
+pointed at it); `worker-start --agent opencode2` takes no `--model` flag; opencode v2 keeps
+credentials in its own database, not in `auth.json` or the environment. `wip/day6-oc3` was merged
+(`1f82fb9`) and is on `main` at `275bcc8` (984 tests passed, clippy and fmt clean).
+
