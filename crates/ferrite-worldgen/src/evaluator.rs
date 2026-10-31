@@ -19,6 +19,25 @@ pub trait FunctionContext {
     }
     #[doc(hidden)]
     fn store_cell(&self, _node: usize, _x: i32, _y: i32, _z: i32, _value: f32) {}
+
+    /// Evaluates an `interpolated` node from a context-owned corner grid.
+    ///
+    /// `sample` evaluates the node's input at a cell corner. Contexts that keep a dense
+    /// grid per node (the chunk fill) answer here so the eight corner lookups per block do
+    /// not go through the default cache one call at a time. Returning `None` falls back to
+    /// the generic path.
+    #[doc(hidden)]
+    fn interpolated(
+        &self,
+        _node: usize,
+        _cell: [i32; 2],
+        _x: i32,
+        _y: i32,
+        _z: i32,
+        _sample: &dyn Fn(i32, i32, i32) -> f32,
+    ) -> Option<f32> {
+        None
+    }
 }
 
 struct Positioned<'a> {
@@ -135,6 +154,24 @@ impl DensityFunction {
                         let y = ctx.block_y() - ry;
                         let z = ctx.block_z() - rz;
                         let node_id = input.as_ref() as *const DensityFunction as usize;
+                        let corner = |cx, cy, cz| {
+                            input.compute_float(&Positioned {
+                                parent: ctx,
+                                x: cx,
+                                y: cy,
+                                z: cz,
+                            })
+                        };
+                        if let Some(value) = ctx.interpolated(
+                            node_id,
+                            [sx, sy],
+                            ctx.block_x(),
+                            ctx.block_y(),
+                            ctx.block_z(),
+                            &corner,
+                        ) {
+                            return value;
+                        }
                         let sample = |dx, dy, dz| {
                             let (x, y, z) = (x + dx, y + dy, z + dz);
                             if let Some(value) = ctx.cached_cell(node_id, x, y, z) {

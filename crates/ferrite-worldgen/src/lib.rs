@@ -80,6 +80,7 @@ pub use multi_noise::{
 };
 pub use noise::NoiseParameters;
 pub use noise_chunk::{NoiseChunkError, NoiseChunkGenerator};
+
 pub use noise_settings::{
     AquiferSettings, DebugFunction, NoiseRouter, NoiseSamplingSettings, NoiseSettings,
 };

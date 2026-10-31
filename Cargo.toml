@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v3", "v4"] }
 flate2 = "1"
 parking_lot = "0.12"
 crossbeam = "0.8"
+rayon = "1.8"
 
 [profile.release]
 lto = "fat"

@@ -5,14 +5,27 @@
 //! `MaterialSystem.buildSurface` ([`ferrite_worldgen::SurfaceGenerator`]), then
 //! the carvers. It runs on a dedicated thread so a region tick never evaluates
 //! density functions; callers wait for a result from a `spawn_blocking` task.
+use crossbeam::channel::{Receiver, Sender, bounded};
 use ferrite_world::{
     BlockInfo, BlockStateRegistry, Chunk, HeightmapKind, LightData, LightSection, RuntimeRegistry,
 };
 use ferrite_worldgen::{FeatureGenerator, NoiseChunkGenerator, SurfaceGenerator, WorldgenData};
-use std::{
-    path::PathBuf,
-    sync::mpsc::{Receiver, Sender, channel},
-};
+use std::{path::PathBuf, sync::Arc};
+
+/// Bounded worker pool size: the happy medium between the 20 available cores and the
+/// memory each generator copy needs. `FERRITE_WORLDGEN_THREADS` overrides it.
+const DEFAULT_WORLDGEN_THREADS: usize = 8;
+
+fn worldgen_threads() -> usize {
+    std::env::var("FERRITE_WORLDGEN_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |threads| threads.get().min(DEFAULT_WORLDGEN_THREADS))
+        })
+}
 
 /// How new chunks are produced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -28,6 +41,19 @@ pub enum TerrainKind {
 pub struct Generated {
     pub chunk: Chunk,
     pub light: LightData,
+    /// Wall-clock milliseconds per pipeline stage, for the throughput benchmark.
+    pub timings: StageTimings,
+}
+
+/// Wall-clock time spent in each worldgen stage, in milliseconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimings {
+    pub noise_ms: f64,
+    pub surface_ms: f64,
+    pub carve_ms: f64,
+    pub biomes_ms: f64,
+    pub features_ms: f64,
+    pub light_ms: f64,
 }
 
 enum Job {
@@ -50,7 +76,7 @@ enum Job {
     },
 }
 
-/// A handle to the dedicated vanilla terrain thread.
+/// A handle to the bounded vanilla terrain worker pool.
 pub struct VanillaTerrain {
     jobs: Sender<Job>,
 }
@@ -63,24 +89,39 @@ fn vanilla_root() -> PathBuf {
 }
 
 impl VanillaTerrain {
-    /// Loads the vanilla data and starts the generator thread.
+    /// Loads the vanilla data and starts the bounded worker pool.
+    ///
+    /// Chunk columns are independent (the carver mask is seeded per chunk), so each
+    /// worker keeps its own reusable generator set and pulls jobs from the shared
+    /// bounded queue. The queue bounds memory under a burst of chunk requests.
     pub fn spawn(seed: i64) -> anyhow::Result<Self> {
         let root = vanilla_root();
-        let data = WorldgenData::load(&root)
-            .map_err(|error| anyhow::anyhow!("loading worldgen data: {error}"))?;
-        let registry = RuntimeRegistry::load(&root)
-            .map_err(|error| anyhow::anyhow!("loading vanilla registry: {error}"))?;
-        let (jobs, receiver) = channel();
-        std::thread::Builder::new()
-            .name("ferrite-worldgen".into())
-            .spawn(move || worker(data, registry, seed, receiver))
-            .map_err(|error| anyhow::anyhow!("starting worldgen thread: {error}"))?;
+        let data = Arc::new(
+            WorldgenData::load(&root)
+                .map_err(|error| anyhow::anyhow!("loading worldgen data: {error}"))?,
+        );
+        let registry = Arc::new(
+            RuntimeRegistry::load(&root)
+                .map_err(|error| anyhow::anyhow!("loading vanilla registry: {error}"))?,
+        );
+        let threads = worldgen_threads();
+        let (jobs, receiver) = bounded::<Job>(threads * 8);
+        for index in 0..threads {
+            let data = Arc::clone(&data);
+            let registry = Arc::clone(&registry);
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("ferrite-worldgen-{index}"))
+                .spawn(move || worker(data, registry, seed, receiver))
+                .map_err(|error| anyhow::anyhow!("starting worldgen worker: {error}"))?;
+        }
+        drop(receiver);
         Ok(Self { jobs })
     }
 
     /// Generates a full column (noise, surface rules and carvers) off the region threads.
     pub fn generate(&self, x: i32, z: i32) -> anyhow::Result<Generated> {
-        let (reply, result) = channel();
+        let (reply, result) = bounded(1);
         self.jobs
             .send(Job::Chunk { x, z, reply })
             .map_err(|_| anyhow::anyhow!("worldgen thread stopped"))?;
@@ -92,7 +133,7 @@ impl VanillaTerrain {
 
     /// The first free block above the generated surface at `(x, z)`.
     pub fn spawn_height(&self, x: i32, z: i32) -> anyhow::Result<i32> {
-        let (reply, result) = channel();
+        let (reply, result) = bounded(1);
         self.jobs
             .send(Job::Height { x, z, reply })
             .map_err(|_| anyhow::anyhow!("worldgen thread stopped"))?;
@@ -111,7 +152,7 @@ impl VanillaTerrain {
         z: i32,
         radius: i32,
     ) -> anyhow::Result<Option<(i32, i32)>> {
-        let (reply, result) = channel();
+        let (reply, result) = bounded(1);
         self.jobs
             .send(Job::LocateBiome {
                 target: target.to_owned(),
@@ -128,7 +169,7 @@ impl VanillaTerrain {
     }
 }
 
-fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiver<Job>) {
+fn worker(data: Arc<WorldgenData>, registry: Arc<RuntimeRegistry>, seed: i64, jobs: Receiver<Job>) {
     let noise = match NoiseChunkGenerator::new(&data, seed) {
         Ok(noise) => noise,
         Err(error) => {
@@ -149,13 +190,17 @@ fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiv
             return;
         }
     };
-    let biome_source = match SurfaceGenerator::new(&data, &noise, seed) {
+    // One generator set per worker: building the surface rules costs ~16 ms and the
+    // feature placement tables ~2 ms, so they are reused for every chunk instead of
+    // being rebuilt inside `generate`.
+    let surface = match SurfaceGenerator::new(&data, &noise, seed) {
         Ok(source) => Some(source),
         Err(error) => {
-            tracing::error!(%error, "creating the biome source for /locate failed");
+            tracing::error!(%error, "creating the worldgen biome source failed");
             None
         }
     };
+    let mut features = FeatureGenerator::new(&data, seed, noise.min_y(), noise.height());
     for job in jobs {
         match job {
             Job::LocateBiome {
@@ -165,17 +210,25 @@ fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiv
                 radius,
                 reply,
             } => {
-                let result = match &biome_source {
+                let result = match &surface {
                     Some(source) => Ok(locate_biome_on_worker(source, &target, x, z, radius)),
                     None => Err("the overworld biome source is unavailable".into()),
                 };
                 let _ = reply.send(result);
             }
             Job::Chunk { x, z, reply } => {
-                let _ = reply.send(generate(&data, &registry, &noise, seed, x, z));
+                let result = match &surface {
+                    Some(source) => generate(&data, &registry, &noise, source, &mut features, x, z),
+                    None => Err("the overworld surface generator is unavailable".into()),
+                };
+                let _ = reply.send(result);
             }
             Job::Height { x, z, reply } => {
-                let result = generate(&data, &registry, &noise, seed, x, z).map(|column| {
+                let result = match &surface {
+                    Some(source) => generate(&data, &registry, &noise, source, &mut features, x, z),
+                    None => Err("the overworld surface generator is unavailable".into()),
+                }
+                .map(|column| {
                     let local_x = x.rem_euclid(16) as u8;
                     let local_z = z.rem_euclid(16) as u8;
                     let height = column
@@ -235,25 +288,33 @@ fn generate(
     data: &WorldgenData,
     registry: &RuntimeRegistry,
     noise: &NoiseChunkGenerator,
-    seed: i64,
+    surface: &SurfaceGenerator<'_>,
+    features: &mut FeatureGenerator,
     x: i32,
     z: i32,
 ) -> Result<Generated, String> {
+    let mut timings = StageTimings::default();
+    let mark = std::time::Instant::now();
     let mut chunk = noise
         .fill_noise_chunk(x, z, registry)
         .map_err(|error| format!("noise fill for chunk {x},{z}: {error}"))?;
-    let surface = SurfaceGenerator::new(data, noise, seed)
-        .map_err(|error| format!("surface rules for chunk {x},{z}: {error}"))?;
+    timings.noise_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     surface
         .apply(&mut chunk, x, z, registry)
         .map_err(|error| format!("surface for chunk {x},{z}: {error}"))?;
+    timings.surface_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     noise
         .carve_chunk(&mut chunk, x, z, registry)
         .map_err(|error| format!("carving chunk {x},{z}: {error}"))?;
+    timings.carve_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     fill_biomes(&mut chunk, &surface, registry, x, z)
         .map_err(|error| format!("biomes for chunk {x},{z}: {error}"))?;
-    let mut features =
-        FeatureGenerator::new(data, seed, chunk.min_y(), chunk.height_blocks() as i32);
+    timings.biomes_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let _ = data;
+    let mark = std::time::Instant::now();
     features
         .decorate(
             &mut chunk,
@@ -263,8 +324,15 @@ fn generate(
             registry,
         )
         .map_err(|error| format!("features for chunk {x},{z}: {error}"))?;
+    timings.features_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    let mark = std::time::Instant::now();
     let light = sky_light(&chunk, registry);
-    Ok(Generated { chunk, light })
+    timings.light_ms = mark.elapsed().as_secs_f64() * 1000.0;
+    Ok(Generated {
+        chunk,
+        light,
+        timings,
+    })
 }
 
 /// Writes vanilla `MultiNoiseBiomeSource` selections into the chunk's 4x4x4 biome cells.
@@ -276,6 +344,9 @@ fn fill_biomes(
     chunk_z: i32,
 ) -> Result<(), String> {
     let min_y = chunk.min_y();
+    // 1,536 biome cells per chunk return a handful of distinct ResourceIds; resolve each
+    // name once instead of allocating a string and hashing it for every cell.
+    let mut ids: std::collections::HashMap<_, _> = std::collections::HashMap::new();
     for (section_index, section) in chunk.sections_mut().iter_mut().enumerate() {
         for qy in 0..4 {
             let y = min_y + section_index as i32 * 16 + qy * 4 + 2;
@@ -284,9 +355,16 @@ fn fill_biomes(
                 for qx in 0..4 {
                     let x = chunk_x * 16 + qx * 4 + 2;
                     let name = surface.biome_at(x, y, z);
-                    let id = registry
-                        .biome_id(&name.to_string())
-                        .ok_or_else(|| format!("unknown biome {name}"))?;
+                    let id = match ids.get(&name) {
+                        Some(id) => *id,
+                        None => {
+                            let id = registry
+                                .biome_id(&name.to_string())
+                                .ok_or_else(|| format!("unknown biome {name}"))?;
+                            ids.insert(name.clone(), id);
+                            id
+                        }
+                    };
                     section
                         .set_biome((qy * 16 + qz * 4 + qx) as usize, id)
                         .map_err(|error| format!("setting biome: {error}"))?;
