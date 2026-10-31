@@ -46,6 +46,8 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
         getServer().getScheduler().runTask(this, () -> append("scheduler task"));
         getServer().getScheduler().runTaskLater(this, () -> append("later task"), 2);
         getServer().getScheduler().runTaskAsynchronously(this, () -> append("async task"));
+        getServer().getScheduler().runTaskLaterAsynchronously(this, () -> append("later async task"), 2);
+        getServer().getScheduler().runTaskTimerAsynchronously(this, task -> { append("timer async task"); task.cancel(); }, 1, 1);
 
         var command = getCommand("typical");
         command.setExecutor((sender, cmd, label, args) -> execute(sender, args));

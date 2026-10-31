@@ -782,6 +782,8 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     wait_for_line(&events, "scheduler task", &stdout, &stderr);
     wait_for_line(&events, "later task", &stdout, &stderr);
     wait_for_line(&events, "async task", &stdout, &stderr);
+    wait_for_line(&events, "later async task", &stdout, &stderr);
+    wait_for_line(&events, "timer async task", &stdout, &stderr);
     wait_for_line(&events, "task 1", &stdout, &stderr);
     wait_for_line(&events, "task 3", &stdout, &stderr);
     assert!(
