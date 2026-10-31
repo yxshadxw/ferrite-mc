@@ -58,12 +58,23 @@ pub struct Operator {
     pub uuid: Uuid,
     pub level: u8,
 }
+/// What a failed plugin event (for example a JVM exception) means for the action it guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginEventPolicy {
+    /// Bukkit-compatible (the default): the action proceeds as if nothing was cancelled.
+    #[default]
+    Allow,
+    /// Treat the failure like a cancellation: undo the action and resend block/teleport state.
+    Deny,
+}
 #[derive(Clone)]
 pub struct WorldSettings {
     pub gamemode: i32,
     pub ops: Vec<Operator>,
     /// Plugin event and command hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
+    /// What a failed plugin event means for the action it guards.
+    pub plugin_event_errors: PluginEventPolicy,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -79,6 +90,7 @@ impl Default for WorldSettings {
             gamemode: 1,
             ops: Vec::new(),
             plugins: None,
+            plugin_event_errors: PluginEventPolicy::Allow,
         }
     }
 }
@@ -357,7 +369,7 @@ async fn run(
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -613,6 +625,7 @@ fn operator_permissions_require_the_configured_uuid() {
             level: 3,
         }],
         plugins: None,
+        plugin_event_errors: PluginEventPolicy::Allow,
     };
     assert_eq!(settings.permission(Uuid::from_u128(11)), 0);
     assert_eq!(settings.permission(Uuid::from_u128(10)), 3);

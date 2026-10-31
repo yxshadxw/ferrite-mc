@@ -455,6 +455,7 @@ async fn operator_teleport_command_moves_player() {
                 level: 4,
             }],
             plugins: None,
+            plugin_event_errors: super::PluginEventPolicy::Allow,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -694,6 +695,7 @@ async fn survival_break_requires_elapsed_ticks() {
             gamemode: 0,
             ops: vec![],
             plugins: None,
+            plugin_event_errors: super::PluginEventPolicy::Allow,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1279,6 +1281,7 @@ async fn survival_break_drops_an_item_that_falls_and_is_picked_up() {
             gamemode: 0,
             ops: vec![],
             plugins: None,
+            plugin_event_errors: super::PluginEventPolicy::Allow,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,6 +1,6 @@
 package dev.ferrite.server;
 
-/** Coordinate-only stand-ins for Bukkit event objects fired from the host. */
+/** Stand-ins for Bukkit event objects fired from the host; only explicit data is known. */
 final class FerriteEventObjects {
     private FerriteEventObjects() {}
     /** Vanilla's direction order: down, up, north, south, west, east. */
@@ -13,31 +13,33 @@ final class FerriteEventObjects {
         org.bukkit.block.BlockFace.EAST,
     };
     static org.bukkit.block.BlockFace face(int index) { return FACES[Math.floorMod(index, FACES.length)]; }
-    static org.bukkit.Location location(double x, double y, double z, float yaw, float pitch) { return new org.bukkit.Location(null, x, y, z, yaw, pitch); }
-    /** A block that knows where it is; its type and world are unknown to the host. */
-    static org.bukkit.block.Block block(int x, int y, int z) {
+    /** A block that knows its position, world and type; the host sends no other block data. */
+    static org.bukkit.block.Block block(int x, int y, int z, org.bukkit.Material type) {
         return (org.bukkit.block.Block) java.lang.reflect.Proxy.newProxyInstance(FerriteEventObjects.class.getClassLoader(), new Class<?>[]{org.bukkit.block.Block.class}, (self, method, args) -> switch (method.getName()) {
             case "getX" -> x;
             case "getY" -> y;
             case "getZ" -> z;
-            case "getLocation" -> location(x, y, z, 0.0f, 0.0f);
-            case "getType", "getBlockData", "getBlockKey" -> throw new UnsupportedOperationException("Ferrite: event blocks have no block snapshot");
-            case "getWorld" -> throw new UnsupportedOperationException("Ferrite: event blocks have no world snapshot");
+            case "getWorld" -> Bootstrap.defaultWorld();
+            case "getLocation" -> new org.bukkit.Location(Bootstrap.defaultWorld(), x, y, z, 0.0f, 0.0f);
+            case "getType" -> type;
+            case "getBlockData", "getBlockKey" -> throw new UnsupportedOperationException("Ferrite: event blocks have no block data snapshot");
             case "hashCode" -> java.util.Objects.hash(x, y, z);
             case "equals" -> self == args[0];
             case "toString" -> "Block[" + x + "," + y + "," + z + "]";
             default -> throw new UnsupportedOperationException("Ferrite: not implemented: Block#" + method.getName());
         });
     }
-    /** The replaced block state of a {@code BlockPlaceEvent}; only identity is known. */
-    static org.bukkit.block.BlockState state(org.bukkit.block.Block block) {
+    /** The replaced block state of a {@code BlockPlaceEvent}; identity and type only. */
+    static org.bukkit.block.BlockState state(org.bukkit.block.Block block, org.bukkit.Material type) {
         return (org.bukkit.block.BlockState) java.lang.reflect.Proxy.newProxyInstance(FerriteEventObjects.class.getClassLoader(), new Class<?>[]{org.bukkit.block.BlockState.class}, (self, method, args) -> switch (method.getName()) {
             case "getBlock" -> block;
             case "getX" -> block.getX();
             case "getY" -> block.getY();
             case "getZ" -> block.getZ();
+            case "getWorld" -> block.getWorld();
             case "getLocation" -> block.getLocation();
-            case "getType" -> throw new UnsupportedOperationException("Ferrite: event blocks have no block snapshot");
+            case "getType" -> type;
+            case "getBlockData" -> throw new UnsupportedOperationException("Ferrite: event blocks have no block data snapshot");
             case "hashCode" -> block.hashCode();
             case "equals" -> self == args[0];
             case "toString" -> "BlockState[" + block + "]";

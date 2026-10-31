@@ -23,6 +23,25 @@ struct Config {
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
     plugin_bridge: Option<std::path::PathBuf>,
+    /// Plugin bridge settings from the `[plugins]` table.
+    plugins: PluginSettings,
+}
+
+/// Plugin bridge settings from the `[plugins]` table.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct PluginSettings {
+    /// What a failed plugin event means for the action it guards.
+    on_event_error: EventErrorPolicy,
+}
+
+/// What a failed plugin event means for the action it guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EventErrorPolicy {
+    #[default]
+    Allow,
+    Deny,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +124,7 @@ impl Default for Config {
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
             plugin_bridge: None,
+            plugins: PluginSettings::default(),
         }
     }
 }
@@ -162,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
         plugins: plugin_bridge
             .as_ref()
             .map(ferrite_server::plugins::PluginBridge::hooks),
+        plugin_event_errors: match config.plugins.on_event_error {
+            EventErrorPolicy::Allow => game::PluginEventPolicy::Allow,
+            EventErrorPolicy::Deny => game::PluginEventPolicy::Deny,
+        },
     };
     game::playerdata::init(
         config
@@ -259,6 +283,9 @@ mod tests {
             Some(std::path::Path::new("plugins"))
         );
         assert_eq!(defaults.plugin_bridge, None);
+        assert_eq!(defaults.plugins.on_event_error, EventErrorPolicy::Allow);
+        let denied: Config = toml::from_str("[plugins]\non-event-error = 'deny'").unwrap();
+        assert_eq!(denied.plugins.on_event_error, EventErrorPolicy::Deny);
         assert!(parse_ops(vec![OpConfig::Uuid("Alice".into())]).is_err());
         let parsed = parse_ops(vec![OpConfig::Detailed {
             uuid: "00000000-0000-0000-0000-00000000000a".into(),
