@@ -114,20 +114,21 @@ still stubs that answer "Command not implemented".
   `LICENSE`, `NOTICE.md` and every ported-code header.
 - Docs: keep `docs/CONFIG.md` and `docs/CONFIG-PAPER.md` in step with `ferrite-config`.
 
-### Plugin bridge gaps found while wiring the typical fixture (2026-10-31)
+### Plugin bridge status (2026-10-31)
 
-- Bukkit scheduler tasks (`runTask`, `runTaskLater`, `runTaskTimer`) register with the host's
-  global queue, but the live server never executes them in the integration harness: neither
-  `FerriteTest tick` nor the typical fixture's `task N` lines appear. `BootstrapTest` covers
-  scheduling in the Java fallback only. Check `PluginHost::tick` in `ferrite-plugin` before
-  plugins can rely on timers.
-- The Java bridge is not told about worlds or player snapshots on join in the live server, so
-  `Player#getLocation`, `World#getSpawnLocation` and `Block#getType` throw "no world/snapshot"
-  until `Bootstrap.registerWorld`/`setBlockSnapshot` are called. The typical fixture reports
-  `where unavailable`; register the main world and the joining player's position at startup.
-- `Native.playerInventory` returns false in the same path, so `PlayerInventory#setItem` throws
-  "No player command handler"; the fixture reports `give unavailable`.
-- Remaining `Server` stubs still throw (help map, recipes, boss bars, maps, world creation, tags,
-  entity serialization). CraftBukkit shims cannot declare NMS-typed methods
-  (`CraftItemStack.asNMSCopy`, `CraftWorld#getHandle`, `CraftMagicNumbers`); those remain
-  NoSuchMethodError by design and are listed here as the NMS boundary.
+- Fixed: the game loop drives `PluginHost::tick` from the 50 ms clock, so Bukkit
+  `runTask`/`runTaskLater`/`runTaskTimer` and Paper's global scheduler tasks execute on the
+  live server; the typical fixture's repeating task reaches tick 5 and cancels itself.
+- Fixed: the main world is published before plugins load and every joining player is registered
+  with location, mode and operator state, so `Player#getLocation`, `World#getSpawnLocation`,
+  `World#getPlayers` and join-time chat work against real values.
+- Fixed: `plugin.yml` permissions are registered on load and removed on disable, so
+  `default: true` reaches players and command permission gates pass.
+- Open: `Native.playerInventory` still needs a `PlayerHandler`; until the server routes
+  `PlayerCommand::SetInventorySlot` et al., `PlayerInventory#setItem` reports "No player command
+  handler". The typical fixture asserts the `give unavailable` branch until then.
+- Open: block snapshots are still opt-in via `setBlockSnapshot`, so `Block#getType` for arbitrary
+  coordinates throws; and the remaining `Server` stubs throw (help map, recipes, boss bars, maps,
+  world creation, tags, entity serialization). CraftBukkit shims cannot declare NMS-typed methods
+  (`CraftItemStack.asNMSCopy`, `CraftWorld#getHandle`, `CraftMagicNumbers`); those stay
+  NoSuchMethodError by design.
