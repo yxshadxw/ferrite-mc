@@ -14,7 +14,13 @@ fn generated() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3/generated")
 }
 
-fn fill_biomes(chunk: &mut Chunk, surface: &SurfaceGenerator<'_>, registry: &RuntimeRegistry, cx: i32, cz: i32) {
+fn fill_biomes(
+    chunk: &mut Chunk,
+    surface: &SurfaceGenerator<'_>,
+    registry: &RuntimeRegistry,
+    cx: i32,
+    cz: i32,
+) {
     let min_y = chunk.min_y();
     for (section_index, section) in chunk.sections_mut().iter_mut().enumerate() {
         for qy in 0..4 {
@@ -27,7 +33,9 @@ fn fill_biomes(chunk: &mut Chunk, surface: &SurfaceGenerator<'_>, registry: &Run
                     let id = registry
                         .biome_id(&name.to_string())
                         .expect("biome in registry");
-                    section.set_biome((qy * 16 + qz * 4 + qx) as usize, id).unwrap();
+                    section
+                        .set_biome((qy * 16 + qz * 4 + qx) as usize, id)
+                        .unwrap();
                 }
             }
         }
@@ -62,10 +70,16 @@ fn main() {
     // One-time setup cost for the reusable generators.
     let setup = Instant::now();
     let surface = SurfaceGenerator::new(&data, &noise, seed).expect("surface");
-    println!("surface setup: {:.2} ms", setup.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "surface setup: {:.2} ms",
+        setup.elapsed().as_secs_f64() * 1000.0
+    );
     let setup = Instant::now();
     let mut features = FeatureGenerator::new(&data, seed, -64, 384);
-    println!("feature setup: {:.2} ms", setup.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "feature setup: {:.2} ms",
+        setup.elapsed().as_secs_f64() * 1000.0
+    );
 
     let mut noise_fill = Stage::default();
     let mut surface_apply = Stage::default();
@@ -81,15 +95,21 @@ fn main() {
         let chunk_start = Instant::now();
 
         let mark = Instant::now();
-        let mut chunk = noise.fill_noise_chunk(cx, cz, &registry).expect("noise fill");
+        let mut chunk = noise
+            .fill_noise_chunk(cx, cz, &registry)
+            .expect("noise fill");
         noise_fill.add(mark);
 
         let mark = Instant::now();
-        surface.apply(&mut chunk, cx, cz, &registry).expect("surface");
+        surface
+            .apply(&mut chunk, cx, cz, &registry)
+            .expect("surface");
         surface_apply.add(mark);
 
         let mark = Instant::now();
-        noise.carve_chunk(&mut chunk, cx, cz, &registry).expect("carve");
+        noise
+            .carve_chunk(&mut chunk, cx, cz, &registry)
+            .expect("carve");
         carve.add(mark);
 
         let mark = Instant::now();

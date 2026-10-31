@@ -28,13 +28,8 @@ fn main() {
         let generated = terrain.generate(cx, cz).unwrap();
         generate += mark.elapsed().as_secs_f64() * 1000.0;
         let mark = Instant::now();
-        let packet = ferrite_world::encode_chunk_packet(
-            cx,
-            cz,
-            &generated.chunk,
-            &generated.light,
-        )
-        .unwrap();
+        let packet =
+            ferrite_world::encode_chunk_packet(cx, cz, &generated.chunk, &generated.light).unwrap();
         encode += mark.elapsed().as_secs_f64() * 1000.0;
         std::hint::black_box(packet.len());
     }
