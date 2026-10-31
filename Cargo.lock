@@ -871,7 +871,9 @@ dependencies = [
 name = "ferrite-worldgen"
 version = "0.1.0"
 dependencies = [
+ "ferrite-nbt",
  "ferrite-noise",
+ "ferrite-world",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

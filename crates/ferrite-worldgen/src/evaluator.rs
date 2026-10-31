@@ -13,6 +13,12 @@ pub trait FunctionContext {
     fn sample_blended(&self, _settings: [f64; 5], _x: i32, _y: i32, _z: i32) -> f32 {
         panic!("blended noise sampler not available")
     }
+    #[doc(hidden)]
+    fn cached_cell(&self, _node: usize, _x: i32, _y: i32, _z: i32) -> Option<f32> {
+        None
+    }
+    #[doc(hidden)]
+    fn store_cell(&self, _node: usize, _x: i32, _y: i32, _z: i32, _value: f32) {}
 }
 
 struct Positioned<'a> {
@@ -37,6 +43,12 @@ impl FunctionContext for Positioned<'_> {
     }
     fn sample_blended(&self, settings: [f64; 5], x: i32, y: i32, z: i32) -> f32 {
         self.parent.sample_blended(settings, x, y, z)
+    }
+    fn cached_cell(&self, node: usize, x: i32, y: i32, z: i32) -> Option<f32> {
+        self.parent.cached_cell(node, x, y, z)
+    }
+    fn store_cell(&self, node: usize, x: i32, y: i32, z: i32, value: f32) {
+        self.parent.store_cell(node, x, y, z, value);
     }
 }
 
@@ -122,13 +134,20 @@ impl DensityFunction {
                         let x = ctx.block_x() - rx;
                         let y = ctx.block_y() - ry;
                         let z = ctx.block_z() - rz;
+                        let node_id = input.as_ref() as *const DensityFunction as usize;
                         let sample = |dx, dy, dz| {
-                            input.compute_float(&Positioned {
+                            let (x, y, z) = (x + dx, y + dy, z + dz);
+                            if let Some(value) = ctx.cached_cell(node_id, x, y, z) {
+                                return value;
+                            }
+                            let value = input.compute_float(&Positioned {
                                 parent: ctx,
-                                x: x + dx,
-                                y: y + dy,
-                                z: z + dz,
-                            })
+                                x,
+                                y,
+                                z,
+                            });
+                            ctx.store_cell(node_id, x, y, z, value);
+                            value
                         };
                         let lerp = |t: f32, a: f32, b: f32| a + t * (b - a);
                         let tx = rx as f32 / sx as f32;

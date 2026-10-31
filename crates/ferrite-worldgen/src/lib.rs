@@ -29,8 +29,10 @@
 //! that contains untagged enums (where `serde_ignored` cannot see dropped fields). The tests
 //! load the complete vanilla data set in strict mode so a new vanilla field fails loudly.
 
+mod aquifer;
 mod biome;
 mod biome_source;
+mod carver;
 mod density;
 mod dimension;
 mod evaluator;
@@ -39,6 +41,7 @@ mod loader;
 mod material;
 mod multi_noise;
 mod noise;
+mod noise_chunk;
 mod noise_settings;
 mod resolve;
 mod seeded_noise;
@@ -70,6 +73,7 @@ pub use multi_noise::{
     ParameterRange,
 };
 pub use noise::NoiseParameters;
+pub use noise_chunk::{NoiseChunkError, NoiseChunkGenerator};
 pub use noise_settings::{
     AquiferSettings, DebugFunction, NoiseRouter, NoiseSamplingSettings, NoiseSettings,
 };
