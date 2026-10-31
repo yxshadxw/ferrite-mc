@@ -57,7 +57,8 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 - **명령(약 70개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
   `give`, `clear`, `xp`, `effect`, `enchant`, `title`, `scoreboard`, `bossbar`, `team`,
   `worldborder`, `setblock`, `fill`, `clone`, `execute`(as/at/if/unless/store/run 등),
-  `data`(get/merge/modify/remove), `op`, `ban`, `whitelist`, `stop` 등.
+  `data`(get/merge/modify/remove), `function`(월드 데이터팩의 `.mcfunction`, `load`/`tick`
+  태그, 매크로, `return`), `op`, `ban`, `whitelist`, `stop` 등.
   선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능합니다.
 - **플러그인** — `plugin.yml`/`paper-plugin.yml` 로딩, 내장 JVM(Java 25) 위에서 플러그인
   `onEnable` 실행, 플레이어 이동·상호작용·블록 파괴/설치·명령 이벤트(취소 가능),
