@@ -7,6 +7,7 @@ pub fn new_anvil_source(
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
 }
+mod block_container;
 mod chat;
 mod chunk;
 mod commands;

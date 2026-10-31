@@ -110,6 +110,40 @@ pub fn pop_resource(block: [i32; 3], stack: ItemStack, rng: &mut Rng) -> EntityR
     record
 }
 
+/// The items a broken container spills (vanilla `Containers.dropItemStack`): one random spot
+/// inside the block, split into stacks of 10 to 30 with a small random push each.
+pub fn drop_from_container(
+    block: [i32; 3],
+    mut stack: ItemStack,
+    rng: &mut Rng,
+) -> Vec<EntityRecord> {
+    let spread = 1.0 - WIDTH;
+    let pos = Vec3::new(
+        f64::from(block[0]) + rng.next_f64() * spread + WIDTH / 2.0,
+        f64::from(block[1]) + rng.next_f64() * spread,
+        f64::from(block[2]) + rng.next_f64() * spread + WIDTH / 2.0,
+    );
+    let mut records = Vec::new();
+    while stack.count > 0 {
+        let part = stack.count.min(rng.next_int(21) + 10);
+        stack.count -= part;
+        let mut triangle =
+            |mode: f64| mode + 0.114_850_001_711_398_36 * (rng.next_f64() - rng.next_f64());
+        let vel = Vec3::new(triangle(0.0), triangle(0.2), triangle(0.0));
+        // No pickup delay: vanilla adds these without `setDefaultPickUpDelay`.
+        records.push(new_item(
+            pos,
+            vel,
+            ItemStack {
+                count: part,
+                ..stack
+            },
+            rng,
+        ));
+    }
+    records
+}
+
 /// Pickup delay of items a player throws (vanilla `Player.drop`).
 pub const THROWN_PICKUP_DELAY: i32 = 40;
 

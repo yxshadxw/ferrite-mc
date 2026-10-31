@@ -447,6 +447,21 @@ impl Player {
             false
         }
     }
+    /// Breaks a block (to air); an inventory block drops its contents (vanilla
+    /// `Containers.dropContentsOnDestroy`).
+    fn break_block(&mut self, location: i64, state: u32) -> bool {
+        if !self.change_block(location, state, 0) {
+            return false;
+        }
+        if let Some(source) = &self.source {
+            let pos = ferrite_protocol::types::BlockPos::unpack(location);
+            let pos = [pos.x, pos.y, pos.z];
+            for stack in super::block_container::take_contents(source, pos, state) {
+                self.menus.spilled.push((pos, stack));
+            }
+        }
+        true
+    }
     fn place(&mut self, p: &UseItemOn) {
         if !(self.gamemode == 0 || self.gamemode == 1)
             || !(0..=1).contains(&p.hand.0)
@@ -680,7 +695,7 @@ impl Player {
                                         if self.plugin_allows(|plugins| {
                                             plugins.block_broken(self.uuid, &self.name, clicked)
                                         }) {
-                                            self.change_block(p.location, state, 0);
+                                            self.break_block(p.location, state);
                                         }
                                     } else if self.gamemode == 0 {
                                         // Zero hardness breaks on the first hit (vanilla: destroy
@@ -692,7 +707,7 @@ impl Player {
                                         if instant {
                                             if self.plugin_allows(|plugins| {
                                                 plugins.block_broken(self.uuid, &self.name, clicked)
-                                            }) && self.change_block(p.location, state, 0)
+                                            }) && self.break_block(p.location, state)
                                             {
                                                 self.broken.push((pos, state));
                                             }
@@ -723,7 +738,7 @@ impl Player {
                                         },
                                     )
                                 })
-                                && self.change_block(location, state, 0)
+                                && self.break_block(location, state)
                             {
                                 self.broken.push((pos, state));
                             }
@@ -756,7 +771,7 @@ impl Player {
                     if allowed {
                         let used = (0..=1).contains(&p.hand.0)
                             && self.hit(clicked).is_some()
-                            && self.use_crafting_table(p.location);
+                            && self.use_block(p.location);
                         if !used {
                             self.place(&p);
                         }
@@ -986,6 +1001,15 @@ impl Region {
     /// entities in front of it. Item entities hold plain stacks for now, so components are not
     /// carried over.
     fn spawn_thrown(&mut self, p: &mut Player) {
+        for (block, stack) in p.menus.spilled.drain(..) {
+            let plain = ItemStack {
+                count: stack.count,
+                item_id: i32::from(stack.item),
+            };
+            for record in item::drop_from_container(block, plain, &mut self.rng) {
+                self.entities.insert(record);
+            }
+        }
         for stack in p.menus.thrown.drain(..) {
             let plain = ItemStack {
                 count: stack.count,

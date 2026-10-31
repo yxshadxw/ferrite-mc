@@ -2178,3 +2178,137 @@ async fn crafting_planks_and_sticks_in_the_grid_and_on_a_table() {
     world.shutdown().await.unwrap();
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chest_contents_are_shared_saved_and_spilled_when_broken() {
+    use ferrite_inventory::ClickInput::*;
+    use ferrite_protocol::{
+        packets::play::{
+            ContainerContent, ContainerSlot, CreativeSlot, ItemStack, MoveRotation, OpenScreen,
+            PlayerAction, ServerboundContainerClose, UseItemOn,
+        },
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    let (world, addr, server) = op_world(Some(source.clone()), 1, &[]).await;
+    let mut keeper = join_with_inventory(addr, "Keeper").await;
+    keeper.until(46).await;
+    let chest = u32::from(ferrite_data::blocks::default_state("chest").unwrap());
+    source.set_block(0, 64, 0, chest).unwrap();
+    keeper
+        .send(&CreativeSlot {
+            slot: 36,
+            item: plain("stone", 40),
+        })
+        .await;
+    let open = |sequence: i32| UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 0.875,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(sequence),
+    };
+    let look_down = MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    };
+    let generic_9x3 =
+        ferrite_data::registries::id("minecraft:menu", "minecraft:generic_9x3").unwrap();
+    async fn opened(bot: &mut Bot) -> (OpenScreen, Vec<ItemStack>) {
+        let body = bot.until(OpenScreen::ID).await;
+        let screen = OpenScreen::decode(&mut body.as_slice()).unwrap();
+        let body = bot.until(18).await;
+        let content = ContainerContent::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+        assert_eq!(content.window, screen.window);
+        (screen, content.slots)
+    }
+    keeper.send(&look_down).await;
+    keeper.send(&open(1)).await;
+    let (screen, slots) = opened(&mut keeper).await;
+    assert_eq!(
+        (screen.menu.0, screen.title.0.as_str()),
+        (generic_9x3, "container.chest")
+    );
+    assert_eq!(slots.len(), 27 + 36);
+    let window = screen.window.0;
+    // Into the chest: hotbar slot 0 is menu slot 54.
+    click_in(&mut keeper, window, 54, 0, Pickup).await;
+    let slots = click_in(&mut keeper, window, 0, 0, Pickup).await;
+    assert_eq!(
+        (slots[0], slots[54]),
+        (plain("stone", 40), ItemStack::default())
+    );
+    let entity = source.block_entity(0, 64, 0).expect("chest block entity");
+    assert!(matches!(
+        entity.data.get("Items"),
+        Some(ferrite_nbt::Tag::List(ferrite_nbt::List::Compound(items))) if items.len() == 1
+    ));
+    // A second player opening the same chest sees the stone.
+    let mut visitor = join_with_inventory(addr, "Visitor").await;
+    visitor.until(46).await;
+    visitor.send(&look_down).await;
+    visitor.send(&open(1)).await;
+    let (visitor_screen, slots) = opened(&mut visitor).await;
+    assert_eq!(slots[0], plain("stone", 40));
+    // The keeper splits the stack; the visitor is sent the change.
+    click_in(&mut keeper, window, 0, 1, Pickup).await;
+    click_in(&mut keeper, window, 1, 0, Pickup).await;
+    loop {
+        let body = visitor.until(ContainerSlot::<ItemStack>::ID).await;
+        let slot = ContainerSlot::<ItemStack>::decode(&mut body.as_slice()).unwrap();
+        if slot.window == visitor_screen.window && slot.slot == 1 {
+            assert_eq!(slot.item, plain("stone", 20));
+            break;
+        }
+    }
+    keeper
+        .send(&ServerboundContainerClose {
+            window: VarInt(window),
+        })
+        .await;
+    // Breaking the chest spills its items and removes the block entity.
+    keeper
+        .send(&PlayerAction {
+            status: VarInt(0),
+            location: BlockPos::new(0, 64, 0).pack(),
+            face: 1,
+            sequence: VarInt(2),
+        })
+        .await;
+    keeper.until(4).await;
+    assert_eq!(source.block(0, 64, 0), Some(0));
+    assert!(source.block_entity(0, 64, 0).is_none());
+    // The chest is gone, so the visitor's screen closes (the inventory clicks below are only
+    // answered on window 0 once it has). Spilled items have no pickup delay, so the two players
+    // standing on the chest collect all 40 stone again.
+    let stone = plain("stone", 1).item_id;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut total = 0;
+        for bot in [&mut keeper, &mut visitor] {
+            total += inventory_of(bot)
+                .await
+                .iter()
+                .filter(|s| s.item_id == stone)
+                .map(|s| s.count)
+                .sum::<i32>();
+        }
+        if total == 40 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "picked up {total} stone"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    drop(keeper);
+    drop(visitor);
+    world.shutdown().await.unwrap();
+    server.abort();
+}

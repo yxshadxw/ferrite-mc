@@ -10,6 +10,7 @@ use ferrite_protocol::packets::play::{
     OpenScreen, SetCursorItem,
 };
 
+use super::block_container::{self, Opened};
 use super::region::{Player, send};
 
 /// The player's menus: the inventory menu (container 0) and the open container, if any.
@@ -23,8 +24,19 @@ pub struct Containers {
     counter: i32,
     /// Stacks the player dropped, spawned as item entities by the region this tick.
     pub thrown: Vec<ItemStack>,
-    /// The block the open menu belongs to (a crafting table), for vanilla `stillValid`.
-    pub open_at: Option<[i32; 3]>,
+    /// The block the open menu belongs to, for vanilla `stillValid` and shared contents.
+    pub open_at: Option<OpenAt>,
+    /// Contents of broken inventory blocks, spilled as item entities by the region this tick.
+    pub spilled: Vec<([i32; 3], ItemStack)>,
+}
+
+/// What an open menu is attached to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpenAt {
+    /// A crafting table, whose grid belongs to the menu.
+    Table([i32; 3]),
+    /// A chest, trapped chest or barrel, whose items live in its block entities.
+    Inventory(Opened),
 }
 
 impl Default for Containers {
@@ -35,6 +47,7 @@ impl Default for Containers {
             counter: 0,
             thrown: Vec::new(),
             open_at: None,
+            spilled: Vec::new(),
         }
     }
 }
@@ -108,6 +121,7 @@ impl Player {
     /// Once per tick, like `ServerPlayer.tick`: `containerMenu.broadcastChanges()`, then the
     /// open menu closes if it is no longer valid.
     pub fn tick_containers(&mut self) {
+        self.load_shared_contents();
         let out = self.menus.current().broadcast_changes(&self.inventory);
         emit(self, out);
         if !self.container_still_valid() {
@@ -118,14 +132,27 @@ impl Player {
     /// Vanilla `AbstractContainerMenu.stillValid` for a block menu: the block is still there
     /// and within the player's block interaction range plus 4 (`canInteractWithBlock(pos, 4)`).
     fn container_still_valid(&self) -> bool {
-        let Some([x, y, z]) = self.menus.open_at else {
+        let Some(source) = self.source.as_ref() else {
             return true;
         };
-        let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
-        let present = self.source.as_ref().and_then(|s| s.block(x, y, z));
-        if present.is_none() || present != table {
-            return false;
+        match &self.menus.open_at {
+            None => true,
+            Some(OpenAt::Table([x, y, z])) => {
+                let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
+                let present = source.block(*x, *y, *z);
+                present.is_some() && present == table && self.within_reach([*x, *y, *z])
+            }
+            // A double chest stays usable while both halves are there and in reach.
+            Some(OpenAt::Inventory(opened)) => {
+                block_container::still_there(source, opened)
+                    && opened.parts.iter().all(|&pos| self.within_reach(pos))
+            }
         }
+    }
+
+    /// Vanilla `Player.canInteractWithBlock(pos, 4.0)`: the block box is closer to the eyes
+    /// than the block interaction range plus 4.
+    fn within_reach(&self, [x, y, z]: [i32; 3]) -> bool {
         let eye = [self.pos[0], self.pos[1] + 1.62, self.pos[2]];
         let distance_sq: f64 = [x, y, z]
             .iter()
@@ -180,6 +207,12 @@ impl Player {
             .open
             .as_mut()
             .unwrap_or(&mut self.menus.inventory);
+        // Another viewer may have changed a shared container since this player last saw it.
+        if let (Some(OpenAt::Inventory(opened)), Some(source)) = (&self.menus.open_at, &self.source)
+        {
+            let items = block_container::load(source, opened);
+            menu.container_mut().clone_from_slice(&items);
+        }
         let mut clicker = Clicker::new(&mut self.inventory, infinite, crafter());
         let out = menu.handle_click(
             &mut clicker,
@@ -191,8 +224,24 @@ impl Player {
             p.carried,
         );
         let drops = clicker.drops;
+        if let (Some(OpenAt::Inventory(opened)), Some(source)) = (&self.menus.open_at, &self.source)
+        {
+            block_container::store(source, opened, menu.container());
+        }
         self.menus.thrown.extend(drops);
         emit(self, out);
+    }
+
+    /// Copies a shared container's current items into the open menu.
+    fn load_shared_contents(&mut self) {
+        if let (Some(OpenAt::Inventory(opened)), Some(source), Some(menu)) =
+            (&self.menus.open_at, &self.source, self.menus.open.as_mut())
+        {
+            let items = block_container::load(source, opened);
+            if items.len() == menu.container().len() {
+                menu.container_mut().clone_from_slice(&items);
+            }
+        }
     }
 
     /// Vanilla `doCloseContainer`: the open menu (or the inventory screen's grid and cursor)
@@ -215,7 +264,7 @@ impl Player {
     /// Opens a container screen (vanilla `ServerPlayer.openMenu`): any open menu closes first,
     /// then the client gets `open_screen` and the menu's full contents. `at` is the block the
     /// menu belongs to.
-    pub fn open_menu(&mut self, make: impl FnOnce(i32) -> Menu, title: &str, at: Option<[i32; 3]>) {
+    pub fn open_menu(&mut self, make: impl FnOnce(i32) -> Menu, title: &str, at: Option<OpenAt>) {
         self.close_open_container();
         let id = self.menus.next_id();
         let mut menu = make(id);
@@ -240,22 +289,38 @@ impl Player {
         emit(self, vec![full]);
     }
 
-    /// Vanilla `CraftingTableBlock.useWithoutItem`: using a crafting table opens its menu
-    /// instead of placing the held item. Returns whether the block was used.
-    pub fn use_crafting_table(&mut self, location: i64) -> bool {
+    /// Vanilla `useWithoutItem` of blocks with a menu: a crafting table opens `CraftingMenu`
+    /// (`CraftingTableBlock`), a chest or barrel a `ChestMenu` over its items (`ChestBlock`,
+    /// `BarrelBlock`). Using them opens the menu instead of placing the held item; returns
+    /// whether the block was used.
+    pub fn use_block(&mut self, location: i64) -> bool {
         let pos = ferrite_protocol::types::BlockPos::unpack(location);
-        let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
-        let state = self
-            .source
-            .as_ref()
-            .and_then(|s| s.block(pos.x, pos.y, pos.z));
-        if state.is_none() || state != table {
+        let Some(source) = self.source.clone() else {
             return false;
+        };
+        let table = ferrite_data::blocks::default_state("crafting_table").map(u32::from);
+        let state = source.block(pos.x, pos.y, pos.z);
+        if state.is_some() && state == table {
+            self.open_menu(
+                Menu::crafting,
+                "container.crafting",
+                Some(OpenAt::Table([pos.x, pos.y, pos.z])),
+            );
+            return true;
         }
+        let Some(opened) = block_container::at(&source, [pos.x, pos.y, pos.z]) else {
+            return false;
+        };
+        let items = block_container::load(&source, &opened);
+        let (rows, title) = (opened.rows, opened.title);
         self.open_menu(
-            Menu::crafting,
-            "container.crafting",
-            Some([pos.x, pos.y, pos.z]),
+            |id| {
+                let mut menu = Menu::generic(id, rows);
+                menu.container_mut().clone_from_slice(&items);
+                menu
+            },
+            title,
+            Some(OpenAt::Inventory(opened)),
         );
         true
     }
