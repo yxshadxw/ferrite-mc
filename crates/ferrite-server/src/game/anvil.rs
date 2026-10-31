@@ -228,6 +228,18 @@ impl AnvilChunkSource {
     pub fn spawn_height(&self, x: i32, z: i32) -> Option<i32> {
         self.terrain.as_ref()?.spawn_height(x, z).ok()
     }
+
+    /// The nearest position with the given surface biome, when vanilla generation is enabled.
+    /// A flat test world has no biome source and reports no match.
+    pub fn locate_biome(
+        &self,
+        target: &str,
+        x: i32,
+        z: i32,
+    ) -> Option<anyhow::Result<Option<(i32, i32)>>> {
+        let terrain = self.terrain.as_ref()?;
+        Some(terrain.locate_biome(target, x, z, 6_400))
+    }
     /// The 26.3 world data file that stores the live game rule values.
     pub(super) fn game_rules_path(&self) -> Option<PathBuf> {
         self.path

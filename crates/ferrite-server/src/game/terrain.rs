@@ -41,6 +41,13 @@ enum Job {
         z: i32,
         reply: Sender<Result<i32, String>>,
     },
+    LocateBiome {
+        target: String,
+        x: i32,
+        z: i32,
+        radius: i32,
+        reply: Sender<Result<Option<(i32, i32)>, String>>,
+    },
 }
 
 /// A handle to the dedicated vanilla terrain thread.
@@ -94,6 +101,31 @@ impl VanillaTerrain {
             .map_err(|_| anyhow::anyhow!("worldgen reply lost"))?
             .map_err(anyhow::Error::msg)
     }
+
+    /// The nearest block position whose surface biome is `target`, searched in 32-block rings
+    /// like vanilla's `/locate biome`.
+    pub fn locate_biome(
+        &self,
+        target: &str,
+        x: i32,
+        z: i32,
+        radius: i32,
+    ) -> anyhow::Result<Option<(i32, i32)>> {
+        let (reply, result) = channel();
+        self.jobs
+            .send(Job::LocateBiome {
+                target: target.to_owned(),
+                x,
+                z,
+                radius,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("worldgen thread stopped"))?;
+        result
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worldgen reply lost"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiver<Job>) {
@@ -104,18 +136,41 @@ fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiv
                 let message = format!("creating the overworld generator: {error}");
                 match job {
                     Job::Chunk { reply, .. } => {
-                        let _ = reply.send(Err(message));
+                        let _ = reply.send(Err(message.clone()));
                     }
                     Job::Height { reply, .. } => {
-                        let _ = reply.send(Err(message));
+                        let _ = reply.send(Err(message.clone()));
+                    }
+                    Job::LocateBiome { reply, .. } => {
+                        let _ = reply.send(Err(message.clone()));
                     }
                 }
             }
             return;
         }
     };
+    let biome_source = match SurfaceGenerator::new(&data, &noise, seed) {
+        Ok(source) => Some(source),
+        Err(error) => {
+            tracing::error!(%error, "creating the biome source for /locate failed");
+            None
+        }
+    };
     for job in jobs {
         match job {
+            Job::LocateBiome {
+                target,
+                x,
+                z,
+                radius,
+                reply,
+            } => {
+                let result = match &biome_source {
+                    Some(source) => Ok(locate_biome_on_worker(source, &target, x, z, radius)),
+                    None => Err("the overworld biome source is unavailable".into()),
+                };
+                let _ = reply.send(result);
+            }
             Job::Chunk { x, z, reply } => {
                 let _ = reply.send(generate(&data, &registry, &noise, seed, x, z));
             }
@@ -138,6 +193,42 @@ fn worker(data: WorldgenData, registry: RuntimeRegistry, seed: i64, jobs: Receiv
             }
         }
     }
+}
+
+/// Ring search for `/locate biome`: vanilla steps 32 blocks per sample and stops at the first
+/// ring with a match, so the returned block is the closest sampled one.
+fn locate_biome_on_worker(
+    surface: &SurfaceGenerator<'_>,
+    target: &str,
+    x: i32,
+    z: i32,
+    radius: i32,
+) -> Option<(i32, i32)> {
+    const STEP: i32 = 32;
+    let rings = radius.max(0) / STEP;
+    for ring in 0..=rings {
+        let mut best: Option<(i32, i32, i64)> = None;
+        for dx in -ring..=ring {
+            for dz in -ring..=ring {
+                if ring > 0 && dx.abs() != ring && dz.abs() != ring {
+                    continue;
+                }
+                let sample_x = x.saturating_add(dx.saturating_mul(STEP));
+                let sample_z = z.saturating_add(dz.saturating_mul(STEP));
+                if surface.biome_at(sample_x, 64, sample_z).to_string() != target {
+                    continue;
+                }
+                let distance = i64::from(sample_x - x).pow(2) + i64::from(sample_z - z).pow(2);
+                if best.is_none_or(|(_, _, best_distance)| distance < best_distance) {
+                    best = Some((sample_x, sample_z, distance));
+                }
+            }
+        }
+        if let Some((x, z, _)) = best {
+            return Some((x, z));
+        }
+    }
+    None
 }
 
 fn generate(
@@ -264,6 +355,26 @@ fn sky_light(chunk: &Chunk, registry: &RuntimeRegistry) -> LightData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locate_biome_finds_a_common_biome() {
+        let terrain = match VanillaTerrain::spawn(0) {
+            Ok(terrain) => terrain,
+            Err(error) => {
+                eprintln!("skipping worldgen test: {error}");
+                return;
+            }
+        };
+        let found = [
+            "minecraft:ocean",
+            "minecraft:plains",
+            "minecraft:forest",
+            "minecraft:desert",
+        ]
+        .iter()
+        .any(|target| matches!(terrain.locate_biome(target, 0, 0, 256), Ok(Some(_))));
+        assert!(found, "no common biome within 256 blocks of the origin");
+    }
 
     #[test]
     fn generates_overworld_terrain_with_surface_and_biomes() {

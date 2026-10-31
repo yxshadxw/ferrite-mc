@@ -30,6 +30,7 @@ mod commands_data;
 mod commands_exec;
 mod commands_extras;
 mod commands_meta;
+mod commands_server;
 mod commands_world;
 mod container;
 mod crafting;
@@ -513,8 +514,11 @@ async fn run(
     commands::load_lang(&registry_dir);
     let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
     initial_state.entities = command_entities;
-    initial_state.functions = Arc::new(functions::FunctionStore::load(
-        source.as_ref().and_then(|source| source.path()),
+    let world_path = source.as_ref().and_then(|source| source.path());
+    let disabled_packs = world_path.map(functions::read_disabled).unwrap_or_default();
+    initial_state.functions = Arc::new(functions::FunctionStore::load_with_disabled(
+        world_path,
+        &disabled_packs,
     ));
     let command_state = Arc::new(Mutex::new(initial_state));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -813,7 +817,14 @@ async fn run(
          },
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
-             command_state.lock().unwrap().tick(advance_time);
+             let due = command_state.lock().unwrap().tick(advance_time);
+             for function in due {
+                 let (complete, _unused) = oneshot::channel();
+                 let _ = event_tx.send(GameMessage::Console {
+                     command: format!("function {function}"),
+                     complete,
+                 });
+             }
              if let Some(plugins) = &settings.plugins && let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
              // Vanilla runs `minecraft:load` once at startup and `minecraft:tick` every
              // tick. Both go through the console command path so their actions
@@ -1167,6 +1178,103 @@ impl CommandRuntime<'_> {
                 match commands_data::apply_block(self.source.as_deref(), &command) {
                     Ok(feedback) => self.reply.text(&feedback.text),
                     Err(message) => self.reply.text(&message),
+                }
+                false
+            }
+            Action::Reload => {
+                let world = self
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.path())
+                    .map(std::path::Path::to_path_buf);
+                match functions::reload(world.as_deref(), self.state) {
+                    Ok(()) => self.reply.key("commands.reload.success", &[]),
+                    Err(error) => self.reply.key("commands.reload.failure", &[&error]),
+                }
+                false
+            }
+            Action::DatapackList => {
+                let world = self.source.as_ref().and_then(|source| source.path());
+                let packs = functions::datapack_names(world);
+                if packs.is_empty() {
+                    self.reply.key("commands.datapack.list.enabled.none", &[]);
+                    return false;
+                }
+                let disabled = world.map(functions::read_disabled).unwrap_or_default();
+                let enabled: Vec<&str> = packs
+                    .iter()
+                    .filter(|pack| !disabled.contains(*pack))
+                    .map(String::as_str)
+                    .collect();
+                if enabled.is_empty() {
+                    self.reply.key("commands.datapack.list.enabled.none", &[]);
+                } else {
+                    self.reply.key(
+                        "commands.datapack.list.enabled.success",
+                        &[&enabled.len().to_string(), &enabled.join(", ")],
+                    );
+                }
+                let available: Vec<&str> = packs
+                    .iter()
+                    .filter(|pack| disabled.contains(*pack))
+                    .map(String::as_str)
+                    .collect();
+                if !available.is_empty() {
+                    self.reply.key(
+                        "commands.datapack.list.available.success",
+                        &[&available.len().to_string(), &available.join(", ")],
+                    );
+                }
+                false
+            }
+            Action::DatapackSet { pack, enable } => {
+                let Some(world) = self
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.path())
+                    .map(std::path::Path::to_path_buf)
+                else {
+                    self.reply.key("commands.datapack.unknown", &[&pack]);
+                    return false;
+                };
+                let packs = functions::datapack_names(Some(&world));
+                if !packs.contains(&pack) {
+                    self.reply.key("commands.datapack.unknown", &[&pack]);
+                    return false;
+                }
+                let mut disabled = functions::read_disabled(&world);
+                let already = !disabled.contains(&pack);
+                if enable == already {
+                    self.reply.key(
+                        if enable {
+                            "commands.datapack.enable.failed"
+                        } else {
+                            "commands.datapack.disable.failed"
+                        },
+                        &[&pack],
+                    );
+                    return false;
+                }
+                if enable {
+                    disabled.remove(&pack);
+                } else {
+                    disabled.insert(pack.clone());
+                }
+                if let Err(error) = functions::write_disabled(&world, &disabled) {
+                    self.reply
+                        .key("commands.reload.failure", &[&error.to_string()]);
+                    return false;
+                }
+                match functions::reload(Some(&world), self.state) {
+                    Ok(()) => self.reply.key(
+                        if enable {
+                            "commands.datapack.enable.success"
+                        } else {
+                            "commands.datapack.disable.success"
+                        },
+                        &[&pack],
+                    ),
+                    Err(error) => self.reply.key("commands.reload.failure", &[&error]),
                 }
                 false
             }

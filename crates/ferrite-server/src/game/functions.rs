@@ -10,8 +10,9 @@ use ferrite_command::{
     ArgumentType, CommandContext, CommandDispatcher, CommandError, NodeBuilder, argument, literal,
 };
 use ferrite_nbt::{Compound, Tag, snbt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The vanilla tag run once after startup.
 pub const LOAD_TAG: &str = "minecraft:load";
@@ -152,6 +153,12 @@ impl FunctionStore {
     /// Loads `<world>/datapacks/*`, later packs overriding earlier ones. A world without a
     /// datapacks folder (or a memory-only world) gives an empty store.
     pub fn load(world: Option<&Path>) -> Self {
+        Self::load_with_disabled(world, &BTreeSet::new())
+    }
+
+    /// Loads every pack except the disabled ones. `/datapack disable` persists its choice in
+    /// `<world>/datapacks/.ferrite-disabled` and reloads through this function.
+    pub fn load_with_disabled(world: Option<&Path>, disabled: &BTreeSet<String>) -> Self {
         let mut store = Self::default();
         let Some(packs) = world.map(|world| world.join("datapacks")) else {
             return store;
@@ -163,6 +170,11 @@ impl FunctionStore {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !disabled.contains(name))
+            })
             .collect();
         packs.sort();
         for pack in packs {
@@ -254,6 +266,66 @@ impl FunctionStore {
     pub fn tag_names(&self) -> impl Iterator<Item = &str> {
         self.tags.keys().map(String::as_str)
     }
+}
+
+/// Folder names of every data pack in `<world>/datapacks`.
+pub fn datapack_names(world: Option<&Path>) -> Vec<String> {
+    let Some(world) = world else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(world.join("datapacks")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        // `.ferrite-disabled` is this server's own marker file, not a pack.
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
+fn disabled_path(world: &Path) -> PathBuf {
+    world.join("datapacks/.ferrite-disabled")
+}
+
+/// Pack folder names disabled by `/datapack disable`.
+pub fn read_disabled(world: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(disabled_path(world))
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persists disabled pack names. Ferrite has no `level.dat` data-pack settings yet, so this
+/// small marker file is the host-side equivalent.
+pub fn write_disabled(world: &Path, disabled: &BTreeSet<String>) -> std::io::Result<()> {
+    let dir = world.join("datapacks");
+    std::fs::create_dir_all(&dir)?;
+    let text = disabled.iter().cloned().collect::<Vec<_>>().join("\n");
+    std::fs::write(disabled_path(world), text)
+}
+
+/// Reloads the function store from disk, honouring the persisted disabled pack list.
+pub fn reload(
+    world: Option<&Path>,
+    state: &Arc<std::sync::Mutex<super::commands::GameState>>,
+) -> Result<(), String> {
+    let disabled = world.map(read_disabled).unwrap_or_default();
+    let store = if disabled.is_empty() {
+        FunctionStore::load(world)
+    } else {
+        FunctionStore::load_with_disabled(world, &disabled)
+    };
+    state.lock().unwrap().functions = Arc::new(store);
+    Ok(())
 }
 
 fn files_in(dir: &Path, extension: &str) -> Vec<(String, PathBuf)> {

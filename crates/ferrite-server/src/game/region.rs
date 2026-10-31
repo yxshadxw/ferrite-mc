@@ -2986,6 +2986,36 @@ mod tests {
     }
 
     #[test]
+    fn kill_and_teleport_apply_to_region_entities_and_hand_off() {
+        use ferrite_entity::{EntityData, EntityRecord, allocate_id, random_uuid};
+        use ferrite_math::Vec3;
+        let mut region = Region::default();
+        let record = |x: f64| EntityRecord {
+            pos: Vec3::new(x, 64.0, 0.5),
+            vel: Vec3::ZERO,
+            flags: Flags::default(),
+            data: EntityData::new(allocate_id(), random_uuid(), 71, 0.25, 0.25),
+        };
+
+        let key = region.entities.insert(record(1.5));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.kill_entity(uuid));
+        assert!(region.entities.flags(key).unwrap().has(Flags::REMOVED));
+        assert_eq!(region.entities.sweep_removed().len(), 1);
+
+        // Teleporting across the default region section hands the record to the owner of the
+        // destination chunk on the next crossing pass.
+        let key = region.entities.insert(record(250.0));
+        let uuid = region.entities.data(key).unwrap().uuid;
+        assert!(region.teleport_entity(uuid, [300.5, 64.0, 0.5], 90.0, 10.0));
+        assert_eq!(region.entities.data(key).unwrap().yaw, 90.0);
+        assert!(region.entities.flags(key).unwrap().has(Flags::TELEPORTED));
+        let out = region.entities.take_crossing();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk(), (18, 0));
+    }
+
+    #[test]
     fn window_is_sorted_and_unloads_outside() {
         let old = std::collections::HashSet::from([(0, 0), (1, 0), (-1, 0)]);
         let (forget, new) = chunk_window((3, 0), 2, &old);
