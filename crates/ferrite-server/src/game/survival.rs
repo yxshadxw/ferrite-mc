@@ -61,6 +61,10 @@ pub enum DamageKind {
     /// `DamageTypes.EXPLOSION`: reserved for the explosion crate (bypasses armor, not invulnerability).
     #[allow(dead_code)]
     Explosion,
+    /// `DamageTypes.MOB_ATTACK`: melee damage from a hostile mob.
+    Mob,
+    /// `DamageTypes.ARROW`: projectile damage.
+    Arrow,
     /// `DamageTypes.GENERIC_KILL` (`/kill`): bypasses invulnerability and creative mode.
     GenericKill,
 }
@@ -87,6 +91,8 @@ impl DamageKind {
             Self::Void => format!("{name} fell out of the world"),
             Self::Starve => format!("{name} starved to death"),
             Self::Explosion => format!("{name} blew up"),
+            Self::Mob => format!("{name} was slain"),
+            Self::Arrow => format!("{name} was shot"),
             Self::GenericKill => format!("{name} was killed"),
         }
     }

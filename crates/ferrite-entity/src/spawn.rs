@@ -20,6 +20,12 @@ pub const MIN_SPAWN_DISTANCE: f64 = 24.0;
 pub const MAX_SPAWN_DISTANCE: f64 = 128.0;
 /// Vanilla animals spawn where the light level is above eight.
 pub const MIN_LIGHT: u8 = 9;
+/// Vanilla `MobCategory.MONSTER` mob cap, per player.
+pub const MONSTER_CAP_PER_PLAYER: usize = 70;
+/// Vanilla monsters need a light level at or below seven.
+pub const MONSTER_MAX_LIGHT: u8 = 7;
+/// How far below the surface the monster spawn search looks for a dark floor.
+const MONSTER_DEPTH: i32 = 32;
 /// Highest block the surface search looks at.
 const MAX_SURFACE_Y: i32 = 96;
 /// Lowest block the surface search looks at.
@@ -96,6 +102,117 @@ pub fn natural_spawn(
         }
     }
     out
+}
+
+/// Number of live hostile mobs in a store.
+pub fn monster_count(store: &EntityStore) -> usize {
+    store
+        .keys()
+        .iter()
+        .filter(|key| {
+            store
+                .data(**key)
+                .is_some_and(|data| data.mob.is_some_and(|mob| mob.kind.is_hostile()))
+                && store
+                    .flags(**key)
+                    .is_some_and(|flags| !flags.has(Flags::REMOVED))
+        })
+        .count()
+}
+
+/// Attempts `attempts` monster spawns and returns the new mobs; the caller inserts them.
+///
+/// Follows vanilla `NaturalSpawner` for the monster category: a dark floor at least 24 blocks
+/// from every player and within 128 of one, in a pack of one to four, while the monster cap of
+/// seventy per player is not reached. The search walks down from the surface into caves.
+pub fn natural_spawn_monsters(
+    store: &EntityStore,
+    env: &impl SpawnEnv,
+    players: &[Vec3],
+    rng: &mut Rng,
+    attempts: usize,
+) -> Vec<EntityRecord> {
+    if players.is_empty() {
+        return Vec::new();
+    }
+    let cap = MONSTER_CAP_PER_PLAYER * players.len();
+    if monster_count(store) >= cap {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for _ in 0..attempts {
+        if monster_count(store) + out.len() >= cap {
+            break;
+        }
+        let player = &players[rng.next_int(players.len() as i32) as usize];
+        let angle = rng.next_f64() * std::f64::consts::TAU;
+        let distance = rng.range(MIN_SPAWN_DISTANCE, MAX_SPAWN_DISTANCE);
+        let x = (player.x + angle.cos() * distance).floor() as i32;
+        let z = (player.z + angle.sin() * distance).floor() as i32;
+        let Some(surface) = surface(env, x, z) else {
+            continue;
+        };
+        let mut floor = None;
+        for y in (surface - MONSTER_DEPTH..=surface).rev() {
+            if can_spawn_monster(env, x, y, z) && far_enough(players, x, z) {
+                floor = Some(y);
+                break;
+            }
+        }
+        let Some(y) = floor else {
+            continue;
+        };
+        let kind = MobKind::HOSTILE[rng.next_int(MobKind::HOSTILE.len() as i32) as usize];
+        // Vanilla monster packs: one to four of the same kind around the spawn block.
+        for _ in 0..1 + rng.next_int(4) {
+            let ox = x + rng.next_int(3) - 1;
+            let oz = z + rng.next_int(3) - 1;
+            if !can_spawn_monster(env, ox, y, oz) || !far_enough(players, ox, oz) {
+                continue;
+            }
+            let pos = Vec3::new(f64::from(ox) + 0.5, f64::from(y), f64::from(oz) + 0.5);
+            out.push(new_mob(kind, pos, rng));
+            if monster_count(store) + out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a block can carry a monster: a solid floor, two passable blocks above and a light
+/// level at or below seven (vanilla `Monster.isDarkEnoughToSpawn`).
+pub fn can_spawn_monster(env: &impl SpawnEnv, x: i32, y: i32, z: i32) -> bool {
+    let (Some(below), Some(feet), Some(head)) = (
+        env.block_state(x, y - 1, z),
+        env.block_state(x, y, z),
+        env.block_state(x, y + 1, z),
+    ) else {
+        return false;
+    };
+    is_solid(below)
+        && is_passable(feet)
+        && is_passable(head)
+        && env.light(x, y, z) <= MONSTER_MAX_LIGHT
+}
+
+fn is_solid(state: u16) -> bool {
+    if usize::from(state) >= ferrite_data::blocks::STATE_COUNT {
+        return false;
+    }
+    let props = ferrite_data::block_props::get(state);
+    !props.is_air
+        && props.fluid.is_none()
+        && !ferrite_data::block_props::collision_shape(state).is_empty()
+}
+
+fn is_passable(state: u16) -> bool {
+    if usize::from(state) >= ferrite_data::blocks::STATE_COUNT {
+        return false;
+    }
+    let props = ferrite_data::block_props::get(state);
+    props.is_air
+        || props.fluid.is_none() && ferrite_data::block_props::collision_shape(state).is_empty()
 }
 
 /// Whether a spawn column is at least 24 blocks from every player and within 128 of one.
@@ -237,6 +354,48 @@ mod tests {
         // A second player raises the cap, so the meadow is used again.
         let other = Vec3::new(64.5, 64.0, 64.5);
         assert!(!natural_spawn(&store, &env, &[player(), other], &mut rng, 64).is_empty());
+    }
+
+    #[test]
+    fn monsters_spawn_on_dark_floors_up_to_the_monster_cap() {
+        struct Cave {
+            light: u8,
+        }
+        impl BlockGetter for Cave {
+            fn block_state(&self, _x: i32, y: i32, _z: i32) -> Option<u16> {
+                let name = if y < 50 { "stone" } else { "air" };
+                Some(ferrite_data::blocks::default_state(name).unwrap())
+            }
+        }
+        impl SpawnEnv for Cave {
+            fn light(&self, _x: i32, _y: i32, _z: i32) -> u8 {
+                self.light
+            }
+        }
+        let dark = Cave { light: 3 };
+        let store = EntityStore::default();
+        let mut rng = Rng::new(21);
+        let spawned = natural_spawn_monsters(&store, &dark, &[player()], &mut rng, 64);
+        assert!(!spawned.is_empty(), "a dark cave spawns monsters");
+        assert!(
+            spawned
+                .iter()
+                .all(|record| record.data.mob.is_some_and(|mob| mob.kind.is_hostile()))
+        );
+        // A lit cave never spawns monsters.
+        let bright = Cave { light: 15 };
+        assert!(natural_spawn_monsters(&store, &bright, &[player()], &mut rng, 64).is_empty());
+        // The monster cap stops spawning.
+        let mut full = EntityStore::default();
+        for _ in 0..MONSTER_CAP_PER_PLAYER {
+            full.insert(new_mob(
+                MobKind::Zombie,
+                Vec3::new(0.5, 50.0, 0.5),
+                &mut rng,
+            ));
+        }
+        assert_eq!(monster_count(&full), MONSTER_CAP_PER_PLAYER);
+        assert!(natural_spawn_monsters(&full, &dark, &[player()], &mut rng, 64).is_empty());
     }
 
     #[test]
