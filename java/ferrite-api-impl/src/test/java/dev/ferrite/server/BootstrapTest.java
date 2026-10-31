@@ -143,6 +143,12 @@ class BootstrapTest {
         });
         assertTrue(Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "plain"));
         assertTrue(dispatched.get());
+        assertEquals(org.bukkit.NamespacedKey.minecraft("stone"), org.bukkit.craftbukkit.util.CraftNamespacedKey.fromString("minecraft:stone"));
+        assertEquals(org.bukkit.Material.STONE, org.bukkit.craftbukkit.inventory.CraftItemStack.asCraftCopy(new org.bukkit.inventory.ItemStack(org.bukkit.Material.STONE)).getType());
+        assertEquals(org.bukkit.Material.STONE, org.bukkit.craftbukkit.block.data.CraftBlockData.create(Bukkit.createBlockData("minecraft:stone")).getMaterial());
+        for (String shim : java.util.List.of("org.bukkit.craftbukkit.CraftWorld", "org.bukkit.craftbukkit.CraftOfflinePlayer", "org.bukkit.craftbukkit.entity.CraftPlayer", "org.bukkit.craftbukkit.block.CraftBlock", "org.bukkit.craftbukkit.inventory.CraftInventory", "org.bukkit.craftbukkit.inventory.CraftInventoryPlayer")) {
+            assertDoesNotThrow(() -> Class.forName(shim), shim);
+        }
         assertTrue(Bukkit.isPrimaryThread());
         assertTrue(Bukkit.getPluginManager().isPluginEnabled("FerriteTest"));
         assertTrue(((FerriteServer) Bukkit.getServer()).plugins.isLegacy(Bukkit.getPluginManager().getPlugin("FerriteLegacyTest")));
