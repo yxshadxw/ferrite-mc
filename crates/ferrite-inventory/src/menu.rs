@@ -143,6 +143,8 @@ pub enum MenuKind {
     Smithing,
     /// A loom (vanilla `LoomMenu`).
     Loom,
+    /// A villager's merchant screen (vanilla `MerchantMenu`).
+    Merchant,
 }
 
 impl MenuKind {
@@ -159,6 +161,96 @@ impl MenuKind {
             Self::Stonecutter => Some("minecraft:stonecutter".into()),
             Self::Smithing => Some("minecraft:smithing".into()),
             Self::Loom => Some("minecraft:loom".into()),
+            Self::Merchant => Some("minecraft:merchant".into()),
+        }
+    }
+}
+
+/// One offer of a merchant menu (vanilla `MerchantOffer`), with the price it currently asks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trade {
+    /// Vanilla `baseCostA`: the item and its base price.
+    pub wants: ItemStack,
+    /// Vanilla `result`.
+    pub gives: ItemStack,
+    /// Vanilla `costB`, the optional second input.
+    pub second_wants: Option<ItemStack>,
+    pub uses: i32,
+    pub max_uses: i32,
+    /// Experience both the player and the villager gain from one sale.
+    pub xp: i32,
+    /// Vanilla `specialPriceDiff`, added to the base price (negative discounts).
+    pub special_price: i32,
+    /// Vanilla `priceMultiplier`, applied to the demand.
+    pub price_multiplier: f32,
+    /// Vanilla `demand`, raised by every sale.
+    pub demand: i32,
+}
+
+impl Trade {
+    /// A never-used trade.
+    pub fn new(wants: ItemStack, gives: ItemStack, max_uses: i32, xp: i32) -> Self {
+        Self {
+            wants,
+            gives,
+            second_wants: None,
+            uses: 0,
+            max_uses,
+            xp,
+            special_price: 0,
+            price_multiplier: 0.05,
+            demand: 0,
+        }
+    }
+
+    /// Vanilla `MerchantOffer.getModifiedCostCount`: the base price plus the demand and the
+    /// special price, never below one item.
+    pub fn price(&self) -> i32 {
+        let demand = if self.demand > 0 {
+            self.demand as f32 * self.price_multiplier
+        } else {
+            0.0
+        };
+        ((self.wants.count as f32 + demand + self.special_price as f32).round() as i32).max(1)
+    }
+
+    /// The first input the trade asks for, at its current price.
+    pub fn cost_a(&self) -> ItemStack {
+        self.wants.copy_with_count(self.price())
+    }
+
+    pub fn is_out_of_stock(&self) -> bool {
+        self.uses >= self.max_uses
+    }
+
+    /// Vanilla `MerchantOffer.updateDemand`: one sale raises the demand, which raises the price
+    /// until the next restock.
+    pub fn on_sale(&mut self) {
+        self.uses = (self.uses + 1).min(self.max_uses);
+        self.demand = self.demand.saturating_add(1);
+    }
+
+    /// Vanilla `MerchantOffer.resetUses` when the villager restocks.
+    pub fn restock(&mut self) {
+        self.uses = 0;
+        self.demand = 0;
+        self.special_price = 0;
+    }
+
+    /// Whether `a` and `b` satisfy the trade's two inputs (vanilla `MerchantOffer.satisfiedBy`).
+    pub fn satisfied_by(&self, a: &ItemStack, b: &ItemStack) -> bool {
+        fn matches(stack: &ItemStack, cost: &ItemStack) -> bool {
+            !stack.is_empty()
+                && stack.is_same_item(cost)
+                && stack.components == cost.components
+                && stack.count >= cost.count
+        }
+        if !matches(a, &self.cost_a()) {
+            return false;
+        }
+        match &self.second_wants {
+            Some(cost) => matches(b, cost),
+            None => b.is_empty(),
         }
     }
 }
@@ -313,6 +405,10 @@ enum Rule {
     Dye,
     /// A loom banner-pattern slot.
     BannerPattern,
+    /// A merchant's first or second input slot.
+    TradeInput,
+    /// A merchant's output slot (`MerchantResultSlot`).
+    TradeOutput,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -386,6 +482,12 @@ pub struct Menu {
     stonecutting_index: usize,
     /// Vanilla `LoomMenu.selectedPattern` (the pattern list itself is not modelled yet).
     loom_pattern: usize,
+    /// Vanilla `MerchantMenu.trades`: the villager's offers, owned by the menu while it is open.
+    trades: Vec<Trade>,
+    /// Vanilla `MerchantMenu.selectionHint`: the index of the offer the client selected.
+    trade: usize,
+    /// Villager trade XP earned through completed trades since the server last read it.
+    villager_xp: i32,
     /// Experience a grindstone take awards.
     station_xp: f32,
     carried: ItemStack,
@@ -417,7 +519,8 @@ impl Menu {
             | MenuKind::Grindstone
             | MenuKind::Stonecutter
             | MenuKind::Smithing
-            | MenuKind::Loom => 0,
+            | MenuKind::Loom
+            | MenuKind::Merchant => 0,
         };
         let container = match kind {
             MenuKind::Generic { rows } => vec![ItemStack::empty(); usize::from(rows) * 9],
@@ -427,6 +530,7 @@ impl Menu {
             MenuKind::Grindstone => vec![ItemStack::empty(); 2],
             MenuKind::Stonecutter => vec![ItemStack::empty(); 1],
             MenuKind::Smithing | MenuKind::Loom => vec![ItemStack::empty(); 3],
+            MenuKind::Merchant => vec![ItemStack::empty(); 3],
             _ => Vec::new(),
         };
         let data_len = match kind {
@@ -453,6 +557,9 @@ impl Menu {
             stonecutting: Vec::new(),
             stonecutting_index: 0,
             loom_pattern: 0,
+            trades: Vec::new(),
+            trade: 0,
+            villager_xp: 0,
             station_xp: 0.0,
             carried: ItemStack::empty(),
             state_id: 0,
@@ -659,6 +766,77 @@ impl Menu {
         Self::with_slots(container_id, MenuKind::Loom, slots)
     }
 
+    /// A villager merchant screen (vanilla `MerchantMenu`): offers `0` and `1` are the inputs,
+    /// `2` the result and `3..39` the player's inventory.
+    pub fn merchant(container_id: i32, trades: Vec<Trade>) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::TradeInput,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::TradeInput,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::TradeOutput,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        let mut menu = Self::with_slots(container_id, MenuKind::Merchant, slots);
+        menu.trades = trades;
+        menu
+    }
+
+    /// The merchant menu's offers.
+    pub fn trades(&self) -> &[Trade] {
+        &self.trades
+    }
+
+    /// Replaces the offers (after a restock or a villager level-up).
+    pub fn set_trades(&mut self, trades: Vec<Trade>) {
+        self.trades = trades;
+        self.trade = self.trade.min(self.trades.len().saturating_sub(1));
+        self.update_merchant();
+    }
+
+    /// Vanilla `MerchantMenu.setSelectionHint`: selects an offer and recomputes the result.
+    /// Returns whether the index names an offer.
+    pub fn select_trade(&mut self, index: usize) -> bool {
+        if self.kind != MenuKind::Merchant || index >= self.trades.len() {
+            return false;
+        }
+        self.trade = index;
+        self.update_merchant();
+        true
+    }
+
+    /// The selected offer's index.
+    pub fn selected_trade(&self) -> usize {
+        self.trade
+    }
+
+    /// Vanilla `MerchantMenu.getFutureXp`: villager XP earned since the last call.
+    pub fn take_villager_xp(&mut self) -> i32 {
+        std::mem::take(&mut self.villager_xp)
+    }
+
+    /// Recomputes the merchant result from the selected offer and the two input slots (vanilla
+    /// `MerchantMenu.slotsChanged`).
+    fn update_merchant(&mut self) {
+        self.result = ItemStack::empty();
+        let Some(trade) = self.trades.get(self.trade) else {
+            return;
+        };
+        if trade.is_out_of_stock() {
+            return;
+        }
+        if trade.satisfied_by(&self.container[0], &self.container[1]) {
+            self.result = trade.gives.clone();
+        }
+    }
+
     pub fn container_id(&self) -> i32 {
         self.container_id
     }
@@ -825,6 +1003,7 @@ impl Menu {
                 self.sync_data();
             }
             MenuKind::Loom => self.update_loom(),
+            MenuKind::Merchant => self.update_merchant(),
             _ => {}
         }
     }
@@ -1181,6 +1360,10 @@ impl Menu {
             Rule::BannerPattern => stack
                 .name()
                 .is_some_and(|name| name.ends_with("_banner_pattern")),
+            // Vanilla merchant input slots take any stack; the selected offer decides what the
+            // result slot shows. The result slot itself only ever gives items out.
+            Rule::TradeInput => true,
+            Rule::TradeOutput => false,
         }
     }
 
@@ -1210,7 +1393,7 @@ impl Menu {
 
     /// `CraftingMenu.canDragTo` / `canTakeItemForPickAll`: never the result slot.
     fn is_result(&self, slot: usize) -> bool {
-        self.slots[slot].rule == Rule::Result
+        matches!(self.slots[slot].rule, Rule::Result | Rule::TradeOutput)
     }
 
     /// `Slot.remove`; a `ResultContainer` always gives up its whole stack.
@@ -1294,7 +1477,7 @@ impl Menu {
     /// `Slot.onTake`; for a `ResultSlot` this consumes one of each ingredient and leaves the
     /// crafting remainders (vanilla `ResultSlot.onTake`).
     fn on_take(&mut self, p: &mut Clicker, slot: usize) {
-        if self.slots[slot].rule == Rule::Output {
+        if matches!(self.slots[slot].rule, Rule::Output | Rule::TradeOutput) {
             match self.kind {
                 MenuKind::Furnace(_) => {
                     if let Some(furnace) = &mut self.furnace {
@@ -1335,6 +1518,27 @@ impl Menu {
                         self.container[cell] = normalize(left);
                     }
                     self.result = ItemStack::empty();
+                }
+                MenuKind::Merchant => {
+                    let Some(trade) = self.trades.get_mut(self.trade) else {
+                        return;
+                    };
+                    let price = trade.price();
+                    let second = trade.second_wants.clone();
+                    let xp = trade.xp;
+                    let mut first = self.container[0].clone();
+                    first.count -= price;
+                    self.container[0] = normalize(first);
+                    if let Some(cost) = second {
+                        let mut other = self.container[1].clone();
+                        other.count -= cost.count;
+                        self.container[1] = normalize(other);
+                    }
+                    trade.on_sale();
+                    p.xp += xp as f32;
+                    self.villager_xp += xp;
+                    self.result = ItemStack::empty();
+                    self.update_merchant();
                 }
                 _ => {}
             }
@@ -1795,6 +1999,19 @@ impl Menu {
                         || self.move_item_stack_to(p, &mut stack, 2, 3, false)
                 }
             }
+            MenuKind::Merchant => {
+                if i == 2 {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, true)
+                } else if i >= 3 {
+                    // Vanilla `MerchantMenu.quickMoveStack`: fill the first input before the
+                    // second, then fall back to whichever still accepts the stack.
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                        || self.move_item_stack_to(p, &mut stack, 1, 2, false)
+                        || self.move_item_stack_to(p, &mut stack, 0, 2, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, false)
+                }
+            }
             MenuKind::Furnace(kind) => {
                 if i == 2 {
                     self.move_item_stack_to(p, &mut stack, 3, 39, true)
@@ -1839,6 +2056,16 @@ impl Menu {
             self.result = ItemStack::empty();
             for cell in 0..self.grid.len() {
                 let stack = std::mem::take(&mut self.grid[cell]);
+                if let Some(rest) = p.inventory.place_back(stack) {
+                    p.drop(rest);
+                }
+            }
+        }
+        // Vanilla `MerchantMenu.removed` returns both input stacks to the player.
+        if self.kind == MenuKind::Merchant {
+            self.result = ItemStack::empty();
+            for cell in 0..2 {
+                let stack = std::mem::take(&mut self.container[cell]);
                 if let Some(rest) = p.inventory.place_back(stack) {
                     p.drop(rest);
                 }

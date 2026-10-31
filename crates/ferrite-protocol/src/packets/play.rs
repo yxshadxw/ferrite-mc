@@ -296,6 +296,12 @@ pub enum MetaValue {
     ItemStack(ItemStack),
     Boolean(bool),
     Pose(i32),
+    /// Vanilla `VillagerData`: type and profession registry ids and the trade level.
+    VillagerData {
+        kind: i32,
+        profession: i32,
+        level: i32,
+    },
 }
 impl MetaValue {
     /// Serializer id in `EntityDataSerializers` registration order (26.3).
@@ -308,6 +314,7 @@ impl MetaValue {
             Self::String(_) => 4,
             Self::ItemStack(_) => 7,
             Self::Boolean(_) => 8,
+            Self::VillagerData { .. } => 18,
             Self::Pose(_) => 20,
         }
     }
@@ -330,6 +337,15 @@ impl Encode for MetaEntry {
             MetaValue::String(v) => v.encode(out),
             MetaValue::ItemStack(v) => v.encode(out),
             MetaValue::Boolean(v) => v.encode(out),
+            MetaValue::VillagerData {
+                kind,
+                profession,
+                level,
+            } => {
+                VarInt(*kind).encode(out);
+                VarInt(*profession).encode(out);
+                VarInt(*level).encode(out);
+            }
         }
     }
 }
@@ -343,6 +359,11 @@ impl MetaEntry {
             4 => MetaValue::String(String::decode(buf)?),
             7 => MetaValue::ItemStack(ItemStack::decode(buf)?),
             8 => MetaValue::Boolean(bool::decode(buf)?),
+            18 => MetaValue::VillagerData {
+                kind: VarInt::decode(buf)?.0,
+                profession: VarInt::decode(buf)?.0,
+                level: VarInt::decode(buf)?.0,
+            },
             20 => MetaValue::Pose(VarInt::decode(buf)?.0),
             _ => return Err(DecodeError::Invalid("unsupported entity data serializer")),
         };
@@ -434,6 +455,137 @@ packet!(ContainerSetData,19,Clientbound,{window:VarInt,id:i16,value:i16});
 packet!(ContainerButtonClick,17,Serverbound,{window:VarInt,button:VarInt});
 // Vanilla `ServerboundRenameItemPacket` (anvil): the name field is capped at 50 by the server.
 packet!(RenameItem,49,Serverbound,{name:String});
+
+/// Vanilla `ItemCost`: an item, the count of it the trade wants and the data-component predicate
+/// the stack must match. Offers generated from the vanilla trade data never carry a predicate, so
+/// decoding a non-empty one is rejected rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemCost {
+    pub item: VarInt,
+    pub count: VarInt,
+}
+impl Encode for ItemCost {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.item.encode(out);
+        self.count.encode(out);
+        // `DataComponentExactPredicate.STREAM_CODEC`: a list length, then typed components.
+        VarInt(0).encode(out);
+    }
+}
+impl Decode for ItemCost {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let item = VarInt::decode(buf)?;
+        let count = VarInt::decode(buf)?;
+        if VarInt::decode(buf)?.0 != 0 {
+            return Err(DecodeError::Invalid("item cost component predicate"));
+        }
+        Ok(Self { item, count })
+    }
+}
+
+/// One vanilla `MerchantOffer`, as encoded in `merchant_offers`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MerchantOffer<I = ItemStack> {
+    pub wants: ItemCost,
+    pub gives: I,
+    /// Vanilla `costB`, shown as a second input slot.
+    pub second_wants: Option<ItemCost>,
+    /// Vanilla `isOutOfStock()`: `uses >= max_uses`.
+    pub out_of_stock: bool,
+    pub uses: i32,
+    pub max_uses: i32,
+    pub xp: i32,
+    pub special_price: i32,
+    pub price_multiplier: f32,
+    pub demand: i32,
+}
+impl<I: Encode> Encode for MerchantOffer<I> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.wants.encode(out);
+        self.gives.encode(out);
+        self.second_wants.encode(out);
+        self.out_of_stock.encode(out);
+        self.uses.encode(out);
+        self.max_uses.encode(out);
+        self.xp.encode(out);
+        self.special_price.encode(out);
+        self.price_multiplier.encode(out);
+        self.demand.encode(out);
+    }
+}
+impl<I: Decode> Decode for MerchantOffer<I> {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            wants: ItemCost::decode(buf)?,
+            gives: I::decode(buf)?,
+            second_wants: Option::<ItemCost>::decode(buf)?,
+            out_of_stock: bool::decode(buf)?,
+            uses: i32::decode(buf)?,
+            max_uses: i32::decode(buf)?,
+            xp: i32::decode(buf)?,
+            special_price: i32::decode(buf)?,
+            price_multiplier: f32::decode(buf)?,
+            demand: i32::decode(buf)?,
+        })
+    }
+}
+
+/// Vanilla `ClientboundMerchantOffersPacket.MAX_OFFERS`.
+pub const MAX_MERCHANT_OFFERS: usize = 128;
+
+/// `merchant_offers`: the merchant menu's offers plus the villager's level, trade XP and restock
+/// state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MerchantOffers<I = ItemStack> {
+    pub window: VarInt,
+    pub offers: Vec<MerchantOffer<I>>,
+    pub level: VarInt,
+    pub xp: VarInt,
+    pub show_progress: bool,
+    pub can_restock: bool,
+}
+impl<I: Encode> Encode for MerchantOffers<I> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.window.encode(out);
+        VarInt(self.offers.len() as i32).encode(out);
+        for offer in &self.offers {
+            offer.encode(out);
+        }
+        self.level.encode(out);
+        self.xp.encode(out);
+        self.show_progress.encode(out);
+        self.can_restock.encode(out);
+    }
+}
+impl<I: Decode> Decode for MerchantOffers<I> {
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let window = VarInt::decode(buf)?;
+        let len = usize::try_from(VarInt::decode(buf)?.0)
+            .ok()
+            .filter(|&len| len <= MAX_MERCHANT_OFFERS)
+            .ok_or(DecodeError::Invalid("too many merchant offers"))?;
+        let mut offers = Vec::with_capacity(len);
+        for _ in 0..len {
+            offers.push(MerchantOffer::<I>::decode(buf)?);
+        }
+        Ok(Self {
+            window,
+            offers,
+            level: VarInt::decode(buf)?,
+            xp: VarInt::decode(buf)?,
+            show_progress: bool::decode(buf)?,
+            can_restock: bool::decode(buf)?,
+        })
+    }
+}
+impl<I: Encode + Decode> Packet for MerchantOffers<I> {
+    const ID: i32 = 53;
+    const STATE: State = State::Play;
+    const BOUND: Bound = Bound::Clientbound;
+}
+
+// Vanilla `ServerboundSelectTradePacket`: the index of the offer the client selected.
+packet!(SelectTrade,52,Serverbound,{slot:VarInt});
 
 /// Vanilla `ServerboundContainerClickPacket.MAX_SLOT_COUNT`.
 pub const CONTAINER_CLICK_MAX_SLOTS: usize = 128;
@@ -1350,6 +1502,27 @@ mod interaction_tests {
                 .map(|(index, value)| MetaEntry { index, value })
                 .collect(),
         });
+        // The villager's synched data: index 19, serializer 18 (`VILLAGER_DATA`), then the
+        // villager type, profession and level as registry ids.
+        let mut bytes = Vec::new();
+        MetaEntry {
+            index: 19,
+            value: MetaValue::VillagerData {
+                kind: 2,
+                profession: 5,
+                level: 1,
+            },
+        }
+        .encode(&mut bytes);
+        assert_eq!(bytes[..3], [19, 18, 2]);
+        assert_eq!(
+            MetaEntry::decode_at(19, &mut &bytes[1..]).unwrap().value,
+            MetaValue::VillagerData {
+                kind: 2,
+                profession: 5,
+                level: 1
+            }
+        );
         // A non-zero velocity survives within LpVec3 precision.
         let mut bytes = Vec::new();
         SetEntityMotion {
@@ -1359,6 +1532,67 @@ mod interaction_tests {
         .encode(&mut bytes);
         let back = SetEntityMotion::decode(&mut bytes.as_slice()).unwrap();
         assert!((back.velocity.0[1] - 0.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn merchant_packets_roundtrip() {
+        roundtrip(SelectTrade { slot: VarInt(2) });
+        roundtrip(MerchantOffers {
+            window: VarInt(4),
+            offers: vec![
+                MerchantOffer {
+                    wants: ItemCost {
+                        item: VarInt(1),
+                        count: VarInt(12),
+                    },
+                    gives: ItemStack {
+                        count: 6,
+                        item_id: 32,
+                    },
+                    second_wants: None,
+                    out_of_stock: false,
+                    uses: 3,
+                    max_uses: 16,
+                    xp: 2,
+                    special_price: -1,
+                    price_multiplier: 0.05,
+                    demand: 4,
+                },
+                MerchantOffer {
+                    wants: ItemCost {
+                        item: VarInt(3),
+                        count: VarInt(1),
+                    },
+                    gives: ItemStack {
+                        count: 1,
+                        item_id: 7,
+                    },
+                    second_wants: Some(ItemCost {
+                        item: VarInt(9),
+                        count: VarInt(2),
+                    }),
+                    out_of_stock: true,
+                    uses: 12,
+                    max_uses: 12,
+                    xp: 5,
+                    special_price: 0,
+                    price_multiplier: 0.2,
+                    demand: 0,
+                },
+            ],
+            level: VarInt(2),
+            xp: VarInt(30),
+            show_progress: true,
+            can_restock: false,
+        });
+    }
+
+    #[test]
+    fn merchant_offers_reject_an_oversized_list() {
+        let mut bytes = Vec::new();
+        VarInt(1).encode(&mut bytes);
+        VarInt(MAX_MERCHANT_OFFERS as i32 + 1).encode(&mut bytes);
+        assert!(MerchantOffers::<ItemStack>::decode(&mut bytes.as_slice()).is_err());
     }
 }
 

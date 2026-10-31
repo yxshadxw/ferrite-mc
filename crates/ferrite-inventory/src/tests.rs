@@ -981,3 +981,122 @@ fn click_input_ids_round_trip() {
     }
     assert_eq!(ClickInput::from_id(7), None);
 }
+
+fn merchant_trade(wants: ItemStack, gives: ItemStack, max_uses: i32, xp: i32) -> crate::Trade {
+    crate::Trade::new(wants, gives, max_uses, xp)
+}
+
+#[test]
+fn merchant_menu_trades_matching_inputs_and_tracks_uses() {
+    let gives = item("bread", 6);
+    let mut f = Fixture::new(Menu::merchant(
+        9,
+        vec![merchant_trade(item("emerald", 2), gives.clone(), 2, 3)],
+    ));
+    assert_eq!(f.menu.len(), 39);
+    assert_eq!(f.menu.kind(), crate::MenuKind::Merchant);
+    assert_eq!(f.menu.kind().menu_type(), Some("minecraft:merchant".into()));
+    assert_eq!(f.menu.trades().len(), 1);
+
+    // A wrong item does not satisfy the offer.
+    f.set(0, item("dirt", 2));
+    assert!(f.slot(2).is_empty());
+    // The right item, but too few.
+    f.set(0, item("emerald", 1));
+    assert!(f.slot(2).is_empty());
+    f.set(0, item("emerald", 2));
+    assert_eq!(f.slot(2), gives);
+
+    // Taking the output consumes the input, grants both kinds of experience and bumps the uses.
+    {
+        let mut p = Clicker::new(&mut f.inv, false, &TestCrafter);
+        f.menu.clicked(&mut p, 2, 0, Pickup);
+        assert_eq!(p.xp, 3.0);
+    }
+    assert_eq!(f.carried(), gives);
+    assert_eq!(f.menu.take_villager_xp(), 3);
+    assert_eq!(f.menu.trades()[0].uses, 1);
+    assert!(f.slot(0).is_empty());
+    assert!(f.slot(2).is_empty());
+    // The XP is drained once.
+    assert_eq!(f.menu.take_villager_xp(), 0);
+}
+
+#[test]
+fn merchant_price_rises_with_demand_and_stops_at_max_uses() {
+    let mut trade = merchant_trade(item("emerald", 4), item("bread", 1), 2, 2);
+    trade.price_multiplier = 1.0;
+    let mut f = Fixture::new(Menu::merchant(3, vec![trade]));
+    assert_eq!(f.menu.trades()[0].price(), 4);
+    f.set(0, item("emerald", 4));
+    assert_eq!(f.slot(2), item("bread", 1));
+    f.click(2, 0, Pickup);
+    // One sale raised the demand by one, and the multiplier is one item per demand point.
+    assert_eq!(f.menu.trades()[0].price(), 5);
+    f.set(0, item("emerald", 5));
+    assert_eq!(f.slot(2), item("bread", 1));
+    f.click(2, 0, Pickup);
+    assert!(f.menu.trades()[0].is_out_of_stock());
+    // An out-of-stock offer shows no result even with matching inputs.
+    f.set(0, item("emerald", 9));
+    assert!(f.slot(2).is_empty());
+
+    // Restocking clears the uses and the demand.
+    f.menu.set_trades(vec![merchant_trade(
+        item("emerald", 4),
+        item("bread", 1),
+        2,
+        2,
+    )]);
+    f.set(0, item("emerald", 4));
+    assert_eq!(f.slot(2), item("bread", 1));
+    assert_eq!(f.menu.trades()[0].price(), 4);
+}
+
+#[test]
+fn merchant_second_input_is_required_and_consumed() {
+    let mut trade = merchant_trade(item("emerald", 1), item("enchanted_book", 1), 12, 5);
+    trade.second_wants = Some(item("book", 1));
+    let mut f = Fixture::new(Menu::merchant(1, vec![trade]));
+    f.set(0, item("emerald", 1));
+    assert!(f.slot(2).is_empty(), "the second input is still missing");
+    f.set(1, item("book", 1));
+    assert_eq!(f.slot(2).item, item("enchanted_book", 1).item);
+    f.click(2, 0, Pickup);
+    assert!(f.slot(0).is_empty());
+    assert!(f.slot(1).is_empty());
+    // An unselected offer index is rejected and keeps the current selection.
+    assert!(!f.menu.select_trade(7));
+    assert_eq!(f.menu.selected_trade(), 0);
+}
+
+#[test]
+fn merchant_selection_changes_the_result() {
+    let first = merchant_trade(item("emerald", 1), item("bread", 2), 12, 1);
+    let second = merchant_trade(item("wheat", 3), item("cookie", 4), 12, 1);
+    let mut f = Fixture::new(Menu::merchant(2, vec![first, second]));
+    f.set(0, item("emerald", 1));
+    assert_eq!(f.slot(2), item("bread", 2));
+    assert!(f.menu.select_trade(1));
+    assert!(f.slot(2).is_empty(), "wheat is not in the input slot");
+    f.set(0, item("wheat", 3));
+    assert_eq!(f.slot(2), item("cookie", 4));
+    assert_eq!(f.menu.selected_trade(), 1);
+}
+
+#[test]
+fn closing_a_merchant_menu_returns_its_inputs() {
+    let mut f = Fixture::new(Menu::merchant(
+        1,
+        vec![merchant_trade(item("emerald", 2), item("bread", 1), 12, 1)],
+    ));
+    f.set(0, item("emerald", 5));
+    let mut p = Clicker::new(&mut f.inv, false, &TestCrafter);
+    f.menu.close(&mut p);
+    // Five emeralds went back to the player's main inventory.
+    assert!(
+        (0..36).any(|slot| f.inv.get(slot).name() == Some("minecraft:emerald")
+            && f.inv.get(slot).count == 5)
+    );
+    assert!(f.menu.container().iter().all(ItemStack::is_empty));
+}

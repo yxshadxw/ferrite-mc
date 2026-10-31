@@ -332,6 +332,28 @@ pub fn tick_with(
             }
         }
 
+        // Villagers stay within sight of home and refuse to walk into water or lava.
+        if kind == MobKind::Villager {
+            let home = store
+                .data(key)
+                .and_then(|data| data.villager.as_ref().map(|villager| villager.home));
+            if let Some(home) = home {
+                let dx = home[0] - start.x;
+                let dz = home[2] - start.z;
+                if dx * dx + dz * dz > crate::villager::WANDER_RADIUS.powi(2) {
+                    walking = Some(yaw_towards(dx, dz));
+                } else if let Some(yaw) = walking
+                    && crate::villager::ahead_is_liquid(blocks, start, yaw)
+                {
+                    walking = None;
+                    if let Some(state) = mob::state_mut(store, key) {
+                        state.moving = false;
+                        state.wander_timer = 0;
+                    }
+                }
+            }
+        }
+
         // Look at player: wins over the walking direction for body, head and pitch.
         if let Some((yaw, pitch)) = look
             && let Some(data) = store.data_mut(key)

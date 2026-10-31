@@ -418,6 +418,77 @@ pub mod tags {
     }
 }
 
+pub mod villager_trades {
+    //! Villager trade offers from the 26.3 data generator: `data/minecraft/villager_trade` for
+    //! the offers, `trade_set` for how many a profession level draws and the `villager_trade`
+    //! tags for the pools.
+    //!
+    //! Offers whose `merchant_predicate` restricts them to a villager variant are skipped, and
+    //! an offer's result keeps its base item when the data attaches `given_item_modifier`
+    //! effects (enchantment rolls, discards) that the item component model cannot apply.
+
+    /// One offer definition, with item protocol ids and the counts the data asks for.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TradeDef {
+        /// Namespaced trade name, e.g. `minecraft:farmer/1/wheat_emerald`.
+        pub name: &'static str,
+        pub wants: u16,
+        pub wants_count: i32,
+        pub gives: u16,
+        pub gives_count: i32,
+        /// The optional second cost (`additional_wants`).
+        pub second_wants: Option<(u16, i32)>,
+        pub max_uses: i32,
+        pub xp: i32,
+        /// Vanilla `reputation_discount`, used as the price multiplier.
+        pub price_multiplier: f32,
+    }
+
+    /// The offer pool of one profession level.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TradeSet {
+        /// Namespaced profession, e.g. `minecraft:farmer`.
+        pub profession: &'static str,
+        pub level: u8,
+        /// How many distinct offers the level draws (vanilla `TradeSet.amount`).
+        pub amount: usize,
+        /// Trade names in the pool, sorted.
+        pub trades: &'static [&'static str],
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/villager_trades.rs"));
+
+    /// The pool for a profession level, falling back to the closest lower level the data has
+    /// (the vanilla smith family only defines some levels).
+    pub fn set(profession: &str, level: u8) -> Option<&'static TradeSet> {
+        let profession = super::key(profession);
+        (1..=level.clamp(1, 5)).rev().find_map(|level| {
+            TRADE_SETS
+                .iter()
+                .find(|set| super::key(set.profession) == profession && set.level == level)
+        })
+    }
+
+    /// A trade definition by namespaced name.
+    pub fn offer(name: &str) -> Option<&'static TradeDef> {
+        let name = super::key(name);
+        TRADES
+            .binary_search_by(|def| super::key(def.name).cmp(name))
+            .ok()
+            .map(|index| &TRADES[index])
+    }
+
+    /// Number of compiled trade definitions.
+    pub const fn count() -> usize {
+        TRADES.len()
+    }
+
+    /// Number of profession level pools.
+    pub const fn set_count() -> usize {
+        TRADE_SETS.len()
+    }
+}
+
 pub mod packets {
     //! Packet ids per connection state and direction (`reports/packets.json`).
 
@@ -449,7 +520,7 @@ pub mod packets {
 
 #[cfg(test)]
 mod tests {
-    use super::{blocks, packets, registries};
+    use super::{blocks, packets, registries, villager_trades};
 
     #[test]
     fn stone_state_matches_its_default() {
@@ -514,6 +585,32 @@ mod tests {
                 "{defaulted:?} missing from {props:?}"
             );
         }
+    }
+
+    #[test]
+    fn villager_trade_data_is_compiled_in() {
+        assert!(
+            villager_trades::count() > 250,
+            "{} trades",
+            villager_trades::count()
+        );
+        assert!(
+            villager_trades::set_count() >= 60,
+            "{} sets",
+            villager_trades::set_count()
+        );
+        let set = villager_trades::set("farmer", 1).expect("a farmer level-1 pool");
+        assert_eq!(set.amount, 2);
+        assert!(!set.trades.is_empty());
+        let def = villager_trades::offer(set.trades[0]).expect("the pool names real trades");
+        assert!(def.wants_count > 0);
+        assert!(def.gives_count > 0);
+        assert!(def.max_uses > 0);
+        assert!(villager_trades::set("farmer", 5).is_some());
+        // The smith family has no level 2 pool; the closest lower level is used.
+        assert_eq!(villager_trades::set("toolsmith", 2).unwrap().level, 1);
+        assert!(villager_trades::set("not_a_profession", 1).is_none());
+        assert!(villager_trades::offer("minecraft:not/a/trade").is_none());
     }
 
     #[test]
