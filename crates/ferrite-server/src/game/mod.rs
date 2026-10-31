@@ -1,11 +1,23 @@
 mod anvil;
 pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
+mod terrain;
+pub use terrain::{Generated, TerrainKind, VanillaTerrain};
 pub mod playerdata;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
     registry: ferrite_world::RuntimeRegistry,
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
+}
+pub fn new_anvil_source_with(
+    path: std::path::PathBuf,
+    registry: ferrite_world::RuntimeRegistry,
+    terrain: Option<Arc<VanillaTerrain>>,
+) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_with_terrain(path, registry, terrain)
+}
+pub fn new_memory_source(terrain: Option<Arc<VanillaTerrain>>) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_memory_with_terrain(terrain)
 }
 mod block_container;
 mod chat;
@@ -142,7 +154,7 @@ impl World {
         spawn: [i32; 3],
         settings: WorldSettings,
     ) -> Self {
-        let flat = source.is_none();
+        let flat = source.as_ref().is_none_or(|source| source.is_flat());
         let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();

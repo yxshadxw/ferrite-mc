@@ -21,6 +21,8 @@ struct Config {
     forwarding: ForwardingMode,
     forwarding_secret: String,
     world: Option<std::path::PathBuf>,
+    /// New chunks are generated with vanilla terrain or the flat test world.
+    generator: WorldGenerator,
     gamemode: GameMode,
     ops: Vec<OpConfig>,
     plugins_dir: Option<std::path::PathBuf>,
@@ -96,6 +98,15 @@ fn parse_ops(ops: Vec<OpConfig>) -> anyhow::Result<Vec<game::Operator>> {
         })
         .collect()
 }
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WorldGenerator {
+    /// The superflat world used by the existing tests and examples.
+    Superflat,
+    /// The 26.3 overworld noise generator with surface rules and carvers.
+    #[default]
+    Vanilla,
+}
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum GameMode {
@@ -125,6 +136,7 @@ impl Default for Config {
             forwarding: ForwardingMode::None,
             forwarding_secret: String::new(),
             world: None,
+            generator: WorldGenerator::Vanilla,
             gamemode: GameMode::Creative,
             ops: Vec::new(),
             plugins_dir: Some("plugins".into()),
@@ -205,14 +217,26 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
     );
+    let terrain = match config.generator {
+        WorldGenerator::Vanilla => Some(std::sync::Arc::new(
+            game::VanillaTerrain::spawn(0).context("starting the vanilla world generator")?,
+        )),
+        WorldGenerator::Superflat => None,
+    };
     let world = if let Some(path) = config.world {
         let spawn = game::load_spawn(&path).context("reading world spawn")?;
         let registry = ferrite_world::RuntimeRegistry::load("vanilla/26.3/generated")
             .context("loading vanilla registry")?;
-        let source = game::new_anvil_source(path, registry);
+        let source = game::new_anvil_source_with(path, registry, terrain);
         game::World::start_configured(Some(source), spawn, settings)
     } else {
-        game::World::start_configured(None, [0, 65, 0], settings)
+        let source = game::new_memory_source(terrain);
+        let spawn = if source.is_flat() {
+            [0, 65, 0]
+        } else {
+            [0, source.spawn_height(0, 0).unwrap_or(100), 0]
+        };
+        game::World::start_configured(Some(source), spawn, settings)
     };
     let mut server = tokio::spawn(ferrite_net::serve(
         listener,
@@ -384,6 +408,13 @@ mod tests {
         assert_eq!(defaults.forwarding, ForwardingMode::None);
         assert!(defaults.forwarding_secret.is_empty());
         assert_eq!(defaults.world, None);
+        assert_eq!(defaults.generator, WorldGenerator::Vanilla);
+        assert_eq!(
+            toml::from_str::<Config>("generator = 'superflat'")
+                .unwrap()
+                .generator,
+            WorldGenerator::Superflat
+        );
         assert!(matches!(
             build_forwarding(ForwardingMode::None, "").unwrap(),
             ferrite_net::forwarding::Forwarding::None

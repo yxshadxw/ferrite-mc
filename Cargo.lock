@@ -827,6 +827,7 @@ dependencies = [
  "ferrite-recipe",
  "ferrite-region",
  "ferrite-world",
+ "ferrite-worldgen",
  "md5",
  "mimalloc",
  "rand 0.8.8",
