@@ -8,7 +8,9 @@ use super::{
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, item,
+    BlockGetter, EntityRecord, EntityStore, Rng, ai, item,
+    mob::{self, MobKind},
+    spawn::{self, SpawnEnv},
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
@@ -150,6 +152,25 @@ impl BlockGetter for TickBlocks<'_> {
             .borrow_mut()
             .entry((x, y, z))
             .or_insert_with(|| source.block(x, y, z).and_then(|s| u16::try_from(s).ok()))
+    }
+}
+impl SpawnEnv for TickBlocks<'_> {
+    fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if let Some(source) = self.source
+            && let Some(level) = source.brightness(x, y, z)
+        {
+            return level;
+        }
+        // Without stored light (a superflat test world) only open sky counts as daylight.
+        for scan in y..=y.saturating_add(64) {
+            match self.block_state(x, scan, z) {
+                Some(state)
+                    if usize::from(state) < ferrite_data::blocks::STATE_COUNT
+                        && ferrite_data::block_props::get(state).is_air => {}
+                _ => return 0,
+            }
+        }
+        15
     }
 }
 /// How many queued chunks to request ahead of the batch being sent.
@@ -1719,6 +1740,65 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
+    /// Creates a mob at an absolute position (`/summon`).
+    pub fn summon(&mut self, kind: MobKind, pos: [f64; 3]) -> bool {
+        if !pos
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= 30_000_000.0)
+        {
+            return false;
+        }
+        let record = mob::new_mob(
+            kind,
+            ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+            &mut self.rng,
+        );
+        self.entities.insert(record);
+        true
+    }
+    /// Ticks the modelled mobs: goals, movement, fall damage, despawn, natural spawning and
+    /// death loot.
+    fn tick_mobs(&mut self, blocks: &TickBlocks<'_>) {
+        let players: Vec<_> = self
+            .players
+            .values()
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        ai::tick(&mut self.entities, blocks, &players, &mut self.rng);
+        for record in spawn::natural_spawn(&self.entities, blocks, &players, &mut self.rng, 1) {
+            self.entities.insert(record);
+        }
+        // Mobs that died this tick drop their entity loot table once (vanilla
+        // `LivingEntity.dropFromLootTable`). The entity itself stays in the store until the
+        // tracker has sent `remove_entities` and `sweep_removed` drops the record.
+        let dead: Vec<_> = self
+            .entities
+            .keys()
+            .iter()
+            .filter_map(|&key| {
+                let data = self.entities.data(key)?;
+                let mob = data.mob?;
+                if !mob.is_dead() || mob.loot_dropped {
+                    return None;
+                }
+                Some((key, mob.kind, self.entities.pos(key)?))
+            })
+            .collect();
+        for (key, kind, pos) in dead {
+            if let Some(mob) = mob::state_mut(&mut self.entities, key) {
+                mob.loot_dropped = true;
+            }
+            for stack in super::drops::mob_drops(kind, &mut self.rng) {
+                let block = [
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ];
+                let record = item::pop_resource(block, stack, &mut self.rng);
+                self.entities.insert(record);
+            }
+        }
+    }
     /// Runs the neighbor updates of this tick's block changes (vanilla
     /// `Level.markAndNotifyBlock` -> `Block.updateNeighbourShapes`). Unsupported blocks break
     /// here; their loot drops as item entities through the normal loot tables.
@@ -2224,6 +2304,7 @@ impl Region {
             seen: Default::default(),
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
+        self.tick_mobs(&blocks);
         self.pick_up_items(ctx);
         self.tick_falling(ctx);
         self.tick_tnt(ctx);

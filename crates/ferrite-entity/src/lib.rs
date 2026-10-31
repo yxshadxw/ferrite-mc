@@ -16,13 +16,16 @@
 //! section leaves its store by value ([`EntityStore::take_crossing`]) to be handed to the new
 //! owner through that region's task queue.
 
+pub mod ai;
 pub mod falling;
 mod id;
 mod index;
 pub mod item;
 pub mod metadata;
+pub mod mob;
 pub mod physics;
 mod rng;
+pub mod spawn;
 mod store;
 pub mod tnt;
 pub mod tracker;

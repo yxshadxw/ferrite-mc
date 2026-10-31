@@ -19,6 +19,7 @@ use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
 use crate::item::ItemState;
 use crate::metadata::Metadata;
+use crate::mob::MobState;
 use crate::tracker::TrackerState;
 use ferrite_math::{AABB, Vec3};
 use std::collections::HashMap;
@@ -79,6 +80,8 @@ pub struct EntityData {
     pub tracker: TrackerState,
     /// Item entity state, for `minecraft:item`.
     pub item: Option<ItemState>,
+    /// Living state, for the modelled mobs.
+    pub mob: Option<MobState>,
     /// Block state carried by a falling block (vanilla `FallingBlockEntity.blockState`).
     pub block_state: Option<u16>,
     /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
@@ -105,6 +108,7 @@ impl EntityData {
             metadata: Metadata::default(),
             tracker: TrackerState::default(),
             item: None,
+            mob: None,
             block_state: None,
             fuse: None,
             cell: Cell::new(0, 0, 0),
