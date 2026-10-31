@@ -10,7 +10,9 @@ pub enum ServerboundPlay {
     PlayerAction(PlayerAction),
     UseItemOn(UseItemOn),
     SetHeldItem(SetHeldItem),
-    CreativeSlot(CreativeSlot),
+    CreativeSlot(CreativeSlot<ferrite_item::ItemStack>),
+    ContainerClick(ContainerClick<ferrite_item::HashedSlot>),
+    ContainerClose(i32),
     Position(MovePosition),
     PositionRotation(MovePositionRotation),
     Rotation(MoveRotation),
@@ -105,6 +107,12 @@ pub fn decode_play(data: &[u8]) -> Result<Option<ServerboundPlay>, DecodeError> 
         )),
         32 => Some(ServerboundPlay::Rotation(MoveRotation::decode(&mut b)?)),
         33 => Some(ServerboundPlay::Flags(MoveFlags::decode(&mut b)?)),
+        18 => Some(ServerboundPlay::ContainerClick(ContainerClick::decode(
+            &mut b,
+        )?)),
+        19 => Some(ServerboundPlay::ContainerClose(
+            ServerboundContainerClose::decode(&mut b)?.window.0,
+        )),
         41 => Some(ServerboundPlay::PlayerAction(PlayerAction::decode(&mut b)?)),
         54 => Some(ServerboundPlay::SetHeldItem(SetHeldItem::decode(&mut b)?)),
         57 => Some(ServerboundPlay::CreativeSlot(CreativeSlot::decode(&mut b)?)),

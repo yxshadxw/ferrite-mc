@@ -632,6 +632,7 @@ name = "ferrite-entity"
 version = "0.1.0"
 dependencies = [
  "ferrite-data",
+ "ferrite-inventory",
  "ferrite-item",
  "ferrite-math",
  "ferrite-protocol",
@@ -643,6 +644,14 @@ name = "ferrite-fluid"
 version = "0.1.0"
 dependencies = [
  "ferrite-data",
+]
+
+[[package]]
+name = "ferrite-inventory"
+version = "0.1.0"
+dependencies = [
+ "ferrite-item",
+ "ferrite-nbt",
 ]
 
 [[package]]
@@ -706,6 +715,7 @@ dependencies = [
  "aes",
  "anyhow",
  "criterion 0.5.1",
+ "ferrite-item",
  "ferrite-nbt",
  "ferrite-protocol",
  "hmac",
@@ -801,6 +811,7 @@ dependencies = [
  "ferrite-data",
  "ferrite-entity",
  "ferrite-fluid",
+ "ferrite-inventory",
  "ferrite-item",
  "ferrite-jvm",
  "ferrite-loot",
@@ -811,6 +822,7 @@ dependencies = [
  "ferrite-plugin",
  "ferrite-profiler",
  "ferrite-protocol",
+ "ferrite-recipe",
  "ferrite-region",
  "ferrite-world",
  "md5",

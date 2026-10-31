@@ -7,9 +7,12 @@ pub fn new_anvil_source(
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
 }
+mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod container;
+mod crafting;
 mod drops;
 mod feedback;
 pub mod interaction;
@@ -128,6 +131,7 @@ impl World {
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
         drops::preload();
+        crafting::preload();
         let (stop_tx, stop) = tokio::sync::watch::channel(false);
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
@@ -402,7 +406,7 @@ async fn run(
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
            let start_mode = saved.as_ref().map_or(settings.gamemode, |s| s.gamemode);
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
-           let start_inventory = saved.as_ref().map_or([ItemStack::default(); 46], |s| s.inventory_array());
+           let start_inventory = container::restore(saved.as_ref());
            permissions.insert(uuid, permission);
            let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed:0,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
@@ -410,14 +414,14 @@ async fn run(
            if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet));
            }
-           emit(&outbound, &ContainerContent { window:VarInt(0), state:VarInt(0), slots:start_inventory.to_vec(), carried:ItemStack::default() });
+           emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,held_slot:0,breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
