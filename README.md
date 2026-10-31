@@ -48,7 +48,8 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 - **생존** — 체력·피해(낙하/익사/용암/불/공허), 허기와 포화도, 음식 먹기, 사망·리스폰
   (`keepInventory` 반영), 경험치 오브와 사망 시 경험치 드롭
 - **블록 변화** — 이웃 업데이트와 `canSurvive` 규칙, 낙하 블록(모래·자갈·콘크리트 가루·모루),
-  바닐라 폭발 알고리즘(TNT, 크리퍼 위력 상수)
+  바닐라 폭발 알고리즘(TNT, 크리퍼 위력 상수), 화재 번짐과 점화, 문·레버·침대·표지판 상호작용,
+  양동이(물·용암·가마솥)와 실크터치 드롭
 - **레드스톤** — 와이어 신호 감쇠, 레버·버튼·압력판·횃불(번아웃)·관찰자·반복기·비교기,
   램프·문·트랩도어·펜스 게이트·노트 블록 반응
 - **몹 (진행 중)** — 몹 프레임워크(체력·피해·넉백·전리품·디스폰), 수동 몹(돼지·소·양·닭)의
@@ -56,7 +57,8 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 - **명령(약 70개)** — `gamemode`, `tp`, `time`, `weather`, `difficulty`, `gamerule`,
   `give`, `clear`, `xp`, `effect`, `enchant`, `title`, `scoreboard`, `bossbar`, `team`,
   `worldborder`, `setblock`, `fill`, `clone`, `execute`(as/at/if/unless/store/run 등),
-  `data`(get/merge/modify/remove), `op`, `ban`, `whitelist`, `stop` 등.
+  `data`(get/merge/modify/remove), `function`(월드 데이터팩의 `.mcfunction`, `load`/`tick`
+  태그, 매크로, `return`), `op`, `ban`, `whitelist`, `stop` 등.
   선택자(`@a` 등)는 권한 레벨 2 이상만 사용 가능합니다.
 - **플러그인** — `plugin.yml`/`paper-plugin.yml` 로딩, 내장 JVM(Java 25) 위에서 플러그인
   `onEnable` 실행, 플레이어 이동·상호작용·블록 파괴/설치·명령 이벤트(취소 가능),
@@ -68,8 +70,8 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
 - **관리** — `/tps`, `/mspt`, `/profile`
 - **월드젠 (진행 중)** — 밀도 함수, 노이즈 청크, aquifer, 표면 규칙, 동굴·협곡 카버가
   바닐라 Java 참조 구현과 일치하는 것을 확인했습니다. 서버는 전용 생성 스레드에서 바닐라
-  지형을 생성합니다(`generator = vanilla | superflat`). 청크 생성 처리량 개선, 지형 지물
-  (광물·나무), 구조물은 진행 중입니다.
+  지형을 생성합니다(`generator = vanilla | superflat`). 광물과 지면 식생 장식이 들어가 있고,
+  청크 생성 처리량 개선, 나무, 구조물은 진행 중입니다.
 - **다중 버전** — `ferrite-translate`가 연결 단위로 구버전 클라이언트 패킷을 변환합니다
   (`supported-versions = all | native`, 네이티브 클라이언트 경로는 할당 없음).
 

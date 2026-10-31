@@ -160,6 +160,8 @@ pub struct GameState {
     pub teams: BTreeMap<String, TeamState>,
     /// Command storage (`/data ... storage` and `execute store ... storage`).
     pub storage: BTreeMap<String, Tag>,
+    /// Datapack functions loaded from the world's `datapacks` folder.
+    pub functions: Arc<super::functions::FunctionStore>,
 }
 
 impl GameState {
@@ -184,6 +186,7 @@ impl GameState {
             bossbars: BTreeMap::new(),
             teams: BTreeMap::new(),
             storage: BTreeMap::new(),
+            functions: Arc::new(super::functions::FunctionStore::default()),
         }
     }
 
@@ -517,6 +520,10 @@ pub struct Source {
     pub world: Option<Arc<super::anvil::AnvilChunkSource>>,
     pub state: Arc<Mutex<GameState>>,
     pub actions: UnboundedSender<Action>,
+    /// The command tree `/function` lines run against; `None` in tests that never call it.
+    pub tree: Option<Arc<CommandDispatcher<Source>>>,
+    /// Current `/function` nesting depth, checked against the recursion limit.
+    pub function_depth: u32,
 }
 
 /// Vanilla's `commands/entity_selectors` permission maps to gamemasters: any `@` selector
@@ -1898,6 +1905,7 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
     super::commands_extras::register(&mut tree);
     super::commands_meta::register(&mut tree);
     super::commands_data::register(&mut tree);
+    super::functions::register(&mut tree);
     // `execute` registers last: its `run` and every modifier redirect back to the root, so
     // the rest of the tree must already be in place.
     super::commands_exec::register(&mut tree);
@@ -2175,6 +2183,8 @@ mod tests {
             actions,
             anchor: ferrite_command::EntityAnchor::Feet,
             world: None,
+            tree: None,
+            function_depth: 0,
         }
     }
 
@@ -2773,6 +2783,8 @@ mod tests {
                 actions,
                 anchor: ferrite_command::EntityAnchor::Feet,
                 world: None,
+                tree: None,
+                function_depth: 0,
             },
             received,
         )
@@ -3104,6 +3116,8 @@ mod tests {
             world: None,
             state: Arc::new(Mutex::new(GameState::default())),
             actions: tx,
+            tree: None,
+            function_depth: 0,
         };
         tree.execute("testping", source.clone()).unwrap();
         assert_eq!(
@@ -3170,6 +3184,8 @@ mod tests {
                 actions,
                 anchor: ferrite_command::EntityAnchor::Feet,
                 world: None,
+                tree: None,
+                function_depth: 0,
             },
             received,
         )
