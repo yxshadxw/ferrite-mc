@@ -296,3 +296,41 @@ the compat report on the WIP branches lists what real plugins still need). Workt
 - The rest of the `Server` stubs and NMS-typed CraftBukkit methods (`CraftItemStack.asNMSCopy`,
   `CraftWorld#getHandle`, `CraftMagicNumbers`) remain; client-facing tab completion still goes
   through the Rust dispatcher, not plugin `TabCompleter`s.
+
+---
+
+# Day 7 (2026-11-01) — OC4 takeover: plugin region scheduler
+
+Branch `yxshadxw/oc4` on top of `c0c2835`. Finishes the Day 6 `wip/day6-oc4` bridge work that was
+left half-done when the opencode session hit its quota.
+
+## On the branch
+- `Bootstrap.startServer()` creates the Bukkit server without enabling plugins; the host publishes
+  the main world and then calls `Bootstrap.enablePlugins`, so `onEnable` already sees
+  `getWorlds()`.
+- Every accepted movement refreshes the Bukkit player snapshot
+  (`ServerHooks::update_player_location` -> `Bootstrap.updatePlayerLocation`), and
+  `registerPlayer` updates the existing `FerritePlayer` instead of replacing it, so plugin-held
+  `Player` references stay valid.
+- Paper's region scheduler is live: `PluginHost::take_region_tasks` returns due tasks to the game
+  loop, which schedules each on the region owning its chunk. Bukkit's sync scheduler and Paper's
+  global scheduler run on the global tick; `runTaskAsynchronously`,
+  `runTaskLaterAsynchronously` and `runTaskTimerAsynchronously` run on the async scheduler.
+- The typical fixture schedules through `RegionScheduler#run`, `runTask`, `runTaskLater`,
+  `runTaskTimer`, `runTaskAsynchronously`, `runTaskLaterAsynchronously` and
+  `runTaskTimerAsynchronously`, and asserts `/typical where` after a move plus `/typical give`
+  through `Native.playerInventory`.
+
+## Checks
+- `cargo test -p ferrite-server --test plugin_lifecycle`: 2/2 (129 s).
+- `cargo test --workspace`: 906 passed, 0 failed, 2 ignored across 70 binaries. The
+  `ferrite-worldgen` binary then exited abnormally while
+  `carver::tests::mask_matches_26_3_java_harness` was waiting on the Java harness under the shared
+  machine load; rerun alone it passes (1/1, 134.6 s), and no test assertion failed.
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`: clean.
+
+## Startup note
+On this machine a debug server spends about 80 s loading the vanilla registry and 60 s preloading
+1,763 recipes before it accepts logins, so the lifecycle test allows 300 s for the first response
+(all plugin assertions keep their 60 s deadlines). If startup regresses further, profile
+`RuntimeRegistry::load` and `crafting::preload` instead of raising the deadline again.
