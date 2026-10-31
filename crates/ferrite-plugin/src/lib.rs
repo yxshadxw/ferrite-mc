@@ -33,6 +33,18 @@ pub const BLOCK_BREAK_EVENT: &str = "org.bukkit.event.block.BlockBreakEvent";
 pub const BLOCK_PLACE_EVENT: &str = "org.bukkit.event.block.BlockPlaceEvent";
 pub const PLAYER_COMMAND_PREPROCESS_EVENT: &str =
     "org.bukkit.event.player.PlayerCommandPreprocessEvent";
+pub const INVENTORY_CLICK_EVENT: &str = "org.bukkit.event.inventory.InventoryClickEvent";
+pub const INVENTORY_CLOSE_EVENT: &str = "org.bukkit.event.inventory.InventoryCloseEvent";
+pub const PLAYER_DEATH_EVENT: &str = "org.bukkit.event.entity.PlayerDeathEvent";
+pub const PLAYER_RESPAWN_EVENT: &str = "org.bukkit.event.player.PlayerRespawnEvent";
+pub const ENTITY_DAMAGE_EVENT: &str = "org.bukkit.event.entity.EntityDamageEvent";
+pub const ENTITY_DEATH_EVENT: &str = "org.bukkit.event.entity.EntityDeathEvent";
+pub const CHUNK_LOAD_EVENT: &str = "org.bukkit.event.world.ChunkLoadEvent";
+pub const CHUNK_UNLOAD_EVENT: &str = "org.bukkit.event.world.ChunkUnloadEvent";
+pub const WEATHER_CHANGE_EVENT: &str = "org.bukkit.event.weather.WeatherChangeEvent";
+pub const WORLD_LOAD_EVENT: &str = "org.bukkit.event.world.WorldLoadEvent";
+pub const PLAYER_LEVEL_CHANGE_EVENT: &str = "org.bukkit.event.player.PlayerLevelChangeEvent";
+pub const PLAYER_EXP_CHANGE_EVENT: &str = "org.bukkit.event.player.PlayerExpChangeEvent";
 /// Event classes with at least one registered listener, reported by the JVM.
 static LISTENED_EVENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -366,6 +378,93 @@ pub trait ServerHooks: Send + Sync {
     ) -> Result<bool, Error>;
     /// Fires Bukkit's `PlayerCommandPreprocessEvent`; `false` means cancelled.
     fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error>;
+    /// Fires Bukkit's `ChunkLoadEvent` after the chunk's packet was queued.
+    fn chunk_loaded(&self, _world: uuid::Uuid, _x: i32, _z: i32, _new: bool) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Fires Bukkit's `ChunkUnloadEvent` before the client forgets the chunk.
+    fn chunk_unloaded(&self, _world: uuid::Uuid, _x: i32, _z: i32) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Fires Bukkit's `PlayerDeathEvent` once per death.
+    fn player_died(
+        &self,
+        _id: uuid::Uuid,
+        _name: &str,
+        _cause: &str,
+        _dropped_exp: i32,
+        _message: &str,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Fires Bukkit's `PlayerRespawnEvent`; returns the spawn a listener selected.
+    fn player_respawned(
+        &self,
+        _id: uuid::Uuid,
+        _name: &str,
+        spawn: [f64; 3],
+        _yaw: f32,
+        _pitch: f32,
+    ) -> Result<[f64; 3], Error> {
+        Ok(spawn)
+    }
+    /// Fires Bukkit's `EntityDamageEvent`; returns the damage after listeners.
+    fn entity_damaged(
+        &self,
+        _id: uuid::Uuid,
+        _name: &str,
+        _cause: &str,
+        amount: f64,
+    ) -> Result<f64, Error> {
+        Ok(amount)
+    }
+    /// Fires Bukkit's `EntityDeathEvent` for a non-player entity.
+    fn entity_died(
+        &self,
+        _id: uuid::Uuid,
+        _kind: &str,
+        _position: [f64; 3],
+        _dropped_exp: i32,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Fires Bukkit's `WeatherChangeEvent`; `false` cancels the change.
+    fn weather_changing(&self, _world: uuid::Uuid, _to_weather_state: bool) -> Result<bool, Error> {
+        Ok(true)
+    }
+    /// Fires Bukkit's `WorldLoadEvent` for a newly published world.
+    fn world_loaded(&self, _world: uuid::Uuid) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Fires Bukkit's `PlayerLevelChangeEvent`; returns the level to use.
+    fn player_level_changed(
+        &self,
+        _id: uuid::Uuid,
+        _name: &str,
+        _old_level: i32,
+        new_level: i32,
+    ) -> Result<i32, Error> {
+        Ok(new_level)
+    }
+    /// Fires Bukkit's `PlayerExpChangeEvent`; returns the amount to grant.
+    fn player_exp_changed(&self, _id: uuid::Uuid, _name: &str, amount: i32) -> Result<i32, Error> {
+        Ok(amount)
+    }
+    /// Fires Bukkit's `InventoryClickEvent`; `false` cancels the click.
+    fn inventory_clicked(
+        &self,
+        _id: uuid::Uuid,
+        _name: &str,
+        _slot: i32,
+        _click: &str,
+        _action: &str,
+    ) -> Result<bool, Error> {
+        Ok(true)
+    }
+    /// Fires Bukkit's `InventoryCloseEvent` when a menu closes.
+    fn inventory_closed(&self, _id: uuid::Uuid, _name: &str) -> Result<(), Error> {
+        Ok(())
+    }
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
     /// Runs plugin scheduler tasks and flushes plugin logs for one server tick.
@@ -2119,6 +2218,359 @@ impl PluginHost {
             Ok(Some(result))
         })?)
     }
+    fn fire_string_id(&self, method: &str, signature: &str, id: uuid::Uuid) -> Result<(), Error> {
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            env.call_static_method(BOOTSTRAP, method, signature, &[JValue::Object(id.as_ref())])?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `ChunkLoadEvent`; no JNI call without a registered listener.
+    pub fn fire_chunk_load(
+        &self,
+        world: uuid::Uuid,
+        x: i32,
+        z: i32,
+        new: bool,
+    ) -> Result<(), Error> {
+        if !self.listens_for(CHUNK_LOAD_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let world = env.new_string(world.to_string())?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "fireChunkLoad",
+                "(Ljava/lang/String;IIZ)V",
+                &[
+                    JValue::Object(world.as_ref()),
+                    JValue::Int(x),
+                    JValue::Int(z),
+                    JValue::Bool(u8::from(new)),
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `ChunkUnloadEvent`; no JNI call without a registered listener.
+    pub fn fire_chunk_unload(&self, world: uuid::Uuid, x: i32, z: i32) -> Result<(), Error> {
+        if !self.listens_for(CHUNK_UNLOAD_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let world = env.new_string(world.to_string())?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "fireChunkUnload",
+                "(Ljava/lang/String;II)V",
+                &[
+                    JValue::Object(world.as_ref()),
+                    JValue::Int(x),
+                    JValue::Int(z),
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `PlayerDeathEvent`; no JNI call without a registered listener.
+    pub fn fire_player_death(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        cause: &str,
+        dropped_exp: i32,
+        message: &str,
+    ) -> Result<(), Error> {
+        if !self.listens_for(PLAYER_DEATH_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let cause = env.new_string(cause)?;
+            let message = env.new_string(message)?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "firePlayerDeath",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V",
+                &[
+                    JValue::Object(id.as_ref()),
+                    JValue::Object(name.as_ref()),
+                    JValue::Object(cause.as_ref()),
+                    JValue::Int(dropped_exp),
+                    JValue::Object(message.as_ref()),
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `PlayerRespawnEvent`; returns the location a listener selected.
+    pub fn fire_player_respawn(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        spawn: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<[f64; 3], Error> {
+        if !self.listens_for(PLAYER_RESPAWN_EVENT) {
+            return Ok(spawn);
+        }
+        let result = self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let reason = env.new_string("DEATH")?;
+            let value = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerRespawn",
+                    "(Ljava/lang/String;Ljava/lang/String;DDDFFLjava/lang/String;)Ljava/lang/String;",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Double(spawn[0]),
+                        JValue::Double(spawn[1]),
+                        JValue::Double(spawn[2]),
+                        JValue::Float(yaw),
+                        JValue::Float(pitch),
+                        JValue::Object(reason.as_ref()),
+                    ],
+                )?
+                .l()?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            let text: String = env.get_string(&JString::from(value))?.into();
+            Ok(Some(text))
+        })?;
+        let Some(text) = result else {
+            return Ok(spawn);
+        };
+        let parts: Vec<f64> = text
+            .split_whitespace()
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        if parts.len() < 3 {
+            return Ok(spawn);
+        }
+        Ok([parts[0], parts[1], parts[2]])
+    }
+
+    /// Fires Bukkit's `EntityDamageEvent`; returns the final damage.
+    pub fn fire_entity_damage(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        cause: &str,
+        amount: f64,
+    ) -> Result<f64, Error> {
+        if !self.listens_for(ENTITY_DAMAGE_EVENT) {
+            return Ok(amount);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let cause = env.new_string(cause)?;
+            let value = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireEntityDamage",
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;D)D",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Object(cause.as_ref()),
+                        JValue::Double(amount),
+                    ],
+                )?
+                .d()?;
+            Ok(value)
+        })?)
+    }
+
+    /// Fires Bukkit's `EntityDeathEvent` for a non-player entity.
+    pub fn fire_entity_death(
+        &self,
+        id: uuid::Uuid,
+        kind: &str,
+        position: [f64; 3],
+        dropped_exp: i32,
+    ) -> Result<(), Error> {
+        if !self.listens_for(ENTITY_DEATH_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let kind = env.new_string(kind)?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "fireEntityDeath",
+                "(Ljava/lang/String;Ljava/lang/String;DDDI)V",
+                &[
+                    JValue::Object(id.as_ref()),
+                    JValue::Object(kind.as_ref()),
+                    JValue::Double(position[0]),
+                    JValue::Double(position[1]),
+                    JValue::Double(position[2]),
+                    JValue::Int(dropped_exp),
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Fires Bukkit's `WeatherChangeEvent`; `false` cancels the change.
+    pub fn fire_weather_change(
+        &self,
+        world: uuid::Uuid,
+        to_weather_state: bool,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(WEATHER_CHANGE_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let world = env.new_string(world.to_string())?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireWeatherChange",
+                    "(Ljava/lang/String;Z)Z",
+                    &[
+                        JValue::Object(world.as_ref()),
+                        JValue::Bool(u8::from(to_weather_state)),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `WorldLoadEvent` for a newly published world.
+    pub fn fire_world_load(&self, world: uuid::Uuid) -> Result<(), Error> {
+        if !self.listens_for(WORLD_LOAD_EVENT) {
+            return Ok(());
+        }
+        self.fire_string_id("fireWorldLoad", "(Ljava/lang/String;)V", world)
+    }
+
+    /// Fires Bukkit's `PlayerLevelChangeEvent`; returns the level to use.
+    pub fn fire_player_level(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        old_level: i32,
+        new_level: i32,
+    ) -> Result<i32, Error> {
+        if !self.listens_for(PLAYER_LEVEL_CHANGE_EVENT) {
+            return Ok(new_level);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let value = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerLevelChange",
+                    "(Ljava/lang/String;Ljava/lang/String;II)I",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(old_level),
+                        JValue::Int(new_level),
+                    ],
+                )?
+                .i()?;
+            Ok(value)
+        })?)
+    }
+
+    /// Fires Bukkit's `PlayerExpChangeEvent`; returns the amount to grant.
+    pub fn fire_player_exp(&self, id: uuid::Uuid, name: &str, amount: i32) -> Result<i32, Error> {
+        if !self.listens_for(PLAYER_EXP_CHANGE_EVENT) {
+            return Ok(amount);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let value = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "firePlayerExpChange",
+                    "(Ljava/lang/String;Ljava/lang/String;I)I",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(amount),
+                    ],
+                )?
+                .i()?;
+            Ok(value)
+        })?)
+    }
+
+    /// Fires Bukkit's `InventoryClickEvent`; `false` cancels the click.
+    pub fn fire_inventory_click(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        slot: i32,
+        click: &str,
+        action: &str,
+    ) -> Result<bool, Error> {
+        if !self.listens_for(INVENTORY_CLICK_EVENT) {
+            return Ok(true);
+        }
+        Ok(self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            let click = env.new_string(click)?;
+            let action = env.new_string(action)?;
+            let allowed = env
+                .call_static_method(
+                    BOOTSTRAP,
+                    "fireInventoryClick",
+                    "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)Z",
+                    &[
+                        JValue::Object(id.as_ref()),
+                        JValue::Object(name.as_ref()),
+                        JValue::Int(slot),
+                        JValue::Object(click.as_ref()),
+                        JValue::Object(action.as_ref()),
+                    ],
+                )?
+                .z()?;
+            Ok(allowed)
+        })?)
+    }
+
+    /// Fires Bukkit's `InventoryCloseEvent`.
+    pub fn fire_inventory_close(&self, id: uuid::Uuid, name: &str) -> Result<(), Error> {
+        if !self.listens_for(INVENTORY_CLOSE_EVENT) {
+            return Ok(());
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let name = env.new_string(name)?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "fireInventoryClose",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(id.as_ref()), JValue::Object(name.as_ref())],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn shutdown(&self) -> Result<(), Error> {
         self.issued_regions
             .lock()
@@ -2182,6 +2634,81 @@ impl ServerHooks for PluginHost {
     }
     fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error> {
         self.fire_player_command(id, name, message)
+    }
+    fn chunk_loaded(&self, world: uuid::Uuid, x: i32, z: i32, new: bool) -> Result<(), Error> {
+        self.fire_chunk_load(world, x, z, new)
+    }
+    fn chunk_unloaded(&self, world: uuid::Uuid, x: i32, z: i32) -> Result<(), Error> {
+        self.fire_chunk_unload(world, x, z)
+    }
+    fn player_died(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        cause: &str,
+        dropped_exp: i32,
+        message: &str,
+    ) -> Result<(), Error> {
+        self.fire_player_death(id, name, cause, dropped_exp, message)
+    }
+    fn player_respawned(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        spawn: [f64; 3],
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<[f64; 3], Error> {
+        self.fire_player_respawn(id, name, spawn, yaw, pitch)
+    }
+    fn entity_damaged(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        cause: &str,
+        amount: f64,
+    ) -> Result<f64, Error> {
+        self.fire_entity_damage(id, name, cause, amount)
+    }
+    fn entity_died(
+        &self,
+        id: uuid::Uuid,
+        kind: &str,
+        position: [f64; 3],
+        dropped_exp: i32,
+    ) -> Result<(), Error> {
+        self.fire_entity_death(id, kind, position, dropped_exp)
+    }
+    fn weather_changing(&self, world: uuid::Uuid, to_weather_state: bool) -> Result<bool, Error> {
+        self.fire_weather_change(world, to_weather_state)
+    }
+    fn world_loaded(&self, world: uuid::Uuid) -> Result<(), Error> {
+        self.fire_world_load(world)
+    }
+    fn player_level_changed(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        old_level: i32,
+        new_level: i32,
+    ) -> Result<i32, Error> {
+        self.fire_player_level(id, name, old_level, new_level)
+    }
+    fn player_exp_changed(&self, id: uuid::Uuid, name: &str, amount: i32) -> Result<i32, Error> {
+        self.fire_player_exp(id, name, amount)
+    }
+    fn inventory_clicked(
+        &self,
+        id: uuid::Uuid,
+        name: &str,
+        slot: i32,
+        click: &str,
+        action: &str,
+    ) -> Result<bool, Error> {
+        self.fire_inventory_click(id, name, slot, click, action)
+    }
+    fn inventory_closed(&self, id: uuid::Uuid, name: &str) -> Result<(), Error> {
+        self.fire_inventory_close(id, name)
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()

@@ -383,6 +383,9 @@ impl Player {
     /// Vanilla `doCloseContainer`: the open menu (or the inventory screen's grid and cursor)
     /// returns its items, and the inventory menu takes over what the client was shown.
     pub fn close_container(&mut self) {
+        if let Some(plugins) = self.plugins.clone() {
+            let _ = plugins.inventory_closed(self.uuid, &self.name);
+        }
         self.save_station();
         let infinite = self.infinite_materials();
         let mut clicker = Clicker::new(&mut self.inventory, infinite, crafter());

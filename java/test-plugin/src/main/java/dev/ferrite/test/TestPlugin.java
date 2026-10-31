@@ -47,6 +47,18 @@ public final class TestPlugin extends JavaPlugin implements Listener {
         appendEvent("chat " + message);
         if (message.startsWith("cancel")) event.setCancelled(true);
     }
+    @EventHandler public void onChunkLoad(org.bukkit.event.world.ChunkLoadEvent event) { appendEvent("chunk-load " + event.getChunk().getX() + " " + event.getChunk().getZ()); }
+    @EventHandler public void onChunkUnload(org.bukkit.event.world.ChunkUnloadEvent event) { appendEvent("chunk-unload " + event.getChunk().getX() + " " + event.getChunk().getZ()); }
+    @EventHandler public void onWorldLoad(org.bukkit.event.world.WorldLoadEvent event) { appendEvent("world-load " + event.getWorld().getName()); }
+    @EventHandler public void onWeather(org.bukkit.event.weather.WeatherChangeEvent event) { appendEvent("weather " + event.toWeatherState()); }
+    @EventHandler public void onDamage(org.bukkit.event.entity.EntityDamageEvent event) { appendEvent("damage " + event.getCause() + " " + event.getDamage()); }
+    @EventHandler public void onDeath(org.bukkit.event.entity.PlayerDeathEvent event) { appendEvent("death " + event.getPlayer().getName()); }
+    @EventHandler public void onEntityDeath(org.bukkit.event.entity.EntityDeathEvent event) { appendEvent("entity-death " + event.getEntityType()); }
+    @EventHandler public void onRespawn(org.bukkit.event.player.PlayerRespawnEvent event) { appendEvent("respawn " + event.getRespawnLocation().getBlockY()); }
+    @EventHandler public void onLevel(org.bukkit.event.player.PlayerLevelChangeEvent event) { appendEvent("level " + event.getOldLevel() + " " + event.getNewLevel()); }
+    @EventHandler public void onExp(org.bukkit.event.player.PlayerExpChangeEvent event) { appendEvent("exp " + event.getAmount()); }
+    @EventHandler public void onInventoryClick(org.bukkit.event.inventory.InventoryClickEvent event) { appendEvent("click " + event.getSlot()); }
+    @EventHandler public void onInventoryClose(org.bukkit.event.inventory.InventoryCloseEvent event) { appendEvent("close " + event.getPlayer().getName()); }
     @EventHandler public void onLegacyChat(org.bukkit.event.player.AsyncPlayerChatEvent event) {
         appendEvent("legacy-chat " + event.getMessage());
         if (event.getMessage().startsWith("cancel")) event.setCancelled(true);
