@@ -118,6 +118,10 @@ pub struct Source {
     pub actions: UnboundedSender<Action>,
 }
 
+/// Vanilla's `commands/entity_selectors` permission maps to gamemasters: any `@` selector
+/// in a command argument requires this level, even for commands open to every player.
+pub const SELECTOR_PERMISSION: u8 = 2;
+
 /// A player resolved from an entity argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPlayer {
@@ -583,6 +587,7 @@ fn save_all_builder() -> ferrite_command::NodeBuilder<Source> {
 /// The full server command graph.
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
+    tree.set_selector_requirement(|source: &Source| source.permission >= SELECTOR_PERMISSION);
 
     // ---- teleport ----
     let teleport = tree.register(teleport_builder());
@@ -1066,7 +1071,7 @@ mod tests {
                 text: "hi".into(),
             }
         });
-        assert_eq!(only("w @a hi", 0), {
+        assert_eq!(only("w @a hi", 2), {
             Action::Message {
                 targets: EntityTarget::Selector {
                     kind: SelectorKind::AllPlayers,
@@ -1076,6 +1081,51 @@ mod tests {
             }
         });
         assert!(run("msg", 0).0.is_err());
+    }
+
+    #[test]
+    fn entity_selectors_require_gamemaster() {
+        // Selectors are gated for every command, including /msg and its aliases, which
+        // have no command-level requirement of their own (vanilla checkPermissions).
+        for input in [
+            "msg @a hi",
+            "tell @a hi",
+            "w @a hi",
+            "msg @s hi",
+            "msg @a[name=Alice] hi",
+        ] {
+            let (result, actions) = run(input, 1);
+            let CommandError::Syntax(error) = result.unwrap_err() else {
+                panic!("{input} should be rejected at level 1");
+            };
+            assert_eq!(
+                error.translation_key(),
+                "argument.entity.selector.not_allowed",
+                "{input}"
+            );
+            assert!(actions.is_empty(), "{input} produced {actions:?}");
+            assert!(run(input, 2).0.is_ok(), "{input} at level 2");
+        }
+        // Plain names are not selectors and stay available to unprivileged sources.
+        assert_eq!(
+            only("msg Alice hi", 0),
+            Action::Message {
+                targets: EntityTarget::Name("Alice".into()),
+                text: "hi".into(),
+            }
+        );
+        // Commands that already require gamemasters: unprivileged sources are rejected
+        // and op sources are accepted.
+        for input in [
+            "kill @a",
+            "kill @s",
+            "tp @a 0 64 0",
+            "teleport @s ~ ~ ~",
+            "tp Alice",
+        ] {
+            assert!(run(input, 1).0.is_err(), "{input} at level 1");
+            assert!(run(input, 2).0.is_ok(), "{input} at level 2");
+        }
     }
 
     #[test]
@@ -1376,6 +1426,75 @@ mod tests {
             Uuid::parse_str("10920508-d5d8-3eed-93d2-92f193afe7d7").unwrap()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Vanilla levels from `commands.json`: `tp`/`teleport`/`kill` = gamemasters (2),
+    /// admin commands = admins (3), server control = owners (4), `/msg` = all (0).
+    const VANILLA_COMMAND_LEVELS: &[(&str, u8)] = &[
+        ("tp", 2),
+        ("teleport", 2),
+        ("msg", 0),
+        ("tell", 0),
+        ("w", 0),
+        ("kill", 2),
+        ("op", 3),
+        ("deop", 3),
+        ("whitelist", 3),
+        ("ban", 3),
+        ("ban-ip", 3),
+        ("pardon", 3),
+        ("pardon-ip", 3),
+        ("banlist", 3),
+        ("kick", 3),
+        ("stop", 4),
+        ("save-all", 4),
+        ("save-on", 4),
+        ("save-off", 4),
+    ];
+
+    fn vanilla_level(node: &serde_json::Value) -> u8 {
+        node.pointer("/permissions/permission/level")
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, |level| match level {
+                "all" => 0,
+                "moderators" => 1,
+                "gamemasters" => 2,
+                "admins" => 3,
+                "owners" => 4,
+                other => panic!("unknown vanilla permission level {other}"),
+            })
+    }
+
+    #[test]
+    fn command_permission_levels_match_vanilla() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vanilla/26.3/generated/reports/commands.json");
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} not generated", path.display());
+            return;
+        };
+        let root: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let tree = dispatcher();
+        for &(name, expected) in VANILLA_COMMAND_LEVELS {
+            let node = root["children"]
+                .get(name)
+                .unwrap_or_else(|| panic!("/{name} missing from vanilla commands.json"));
+            assert_eq!(
+                vanilla_level(node),
+                expected,
+                "/{name} table disagrees with commands.json"
+            );
+            let id = tree
+                .find_node(&[name])
+                .unwrap_or_else(|| panic!("/{name} missing from the dispatcher"));
+            for level in 0..=4 {
+                assert_eq!(
+                    tree.node(id).can_use(&source(level)),
+                    level >= expected,
+                    "/{name} at permission level {level}"
+                );
+            }
+        }
     }
 
     #[test]

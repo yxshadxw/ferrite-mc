@@ -292,6 +292,7 @@ pub mod minecraft {
     simple! {
         entity_invalid => "argument.entity.invalid", "Invalid name or UUID";
         selector_missing => "argument.entity.selector.missing", "Missing selector type";
+        selectors_not_allowed => "argument.entity.selector.not_allowed", "Selector not allowed";
         options_unterminated => "argument.entity.options.unterminated", "Expected end of options";
         entity_too_many => "argument.entity.toomany", "Only one entity is allowed, but the provided selector allows more than one";
         player_too_many => "argument.player.toomany", "Only one player is allowed, but the provided selector allows more than one";

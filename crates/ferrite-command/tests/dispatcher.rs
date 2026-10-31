@@ -431,6 +431,34 @@ fn merging_registrations() {
 }
 
 #[test]
+fn selectors_require_the_configured_permission() {
+    let log = Log::default();
+    let mut d = dispatcher(&log);
+    d.set_selector_requirement(|s: &Source| s.level >= 2);
+    d.register(
+        literal::<Source>("msg").then(argument::<Source>("targets", ArgumentType::players()).then(
+            argument::<Source>("message", ArgumentType::greedy_string()).executes(|_| Ok(1)),
+        )),
+    );
+
+    for input in ["msg @a hi", "msg @s hi", "msg @a[name=Alex] hi"] {
+        let CommandError::Syntax(error) = d.execute(input, player("A", 1)).unwrap_err() else {
+            panic!("{input} should be a syntax error");
+        };
+        assert_eq!(
+            error.translation_key(),
+            "argument.entity.selector.not_allowed",
+            "{input}"
+        );
+        assert_eq!(error.message(), "Selector not allowed");
+        assert_eq!(error.cursor(), Some(4), "{input}");
+        assert_eq!(d.execute(input, player("Op", 2)).unwrap(), 1, "{input}");
+    }
+    // A player name is not a selector and stays available at every level.
+    assert_eq!(d.execute("msg Alex hi", player("A", 0)).unwrap(), 1);
+}
+
+#[test]
 fn suggester_kind_is_kept() {
     let mut d = CommandDispatcher::<()>::new();
     d.register(literal("summon").then(
