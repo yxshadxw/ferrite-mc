@@ -1,12 +1,12 @@
 //! Item entities (vanilla `ItemEntity`): physics, merging, pickup and despawning.
 
-use crate::inventory::{self, max_stack_size};
 use crate::metadata::item::ITEM;
 use crate::physics::{self, BlockGetter};
 use crate::rng::Rng;
 use crate::store::{EntityData, EntityRecord, EntityStore, Flags};
 use crate::tracker::{self, Sink};
 use crate::{EntityKey, allocate_id, random_uuid};
+use ferrite_inventory::PlayerInventory;
 use ferrite_math::{AABB, Vec3};
 use ferrite_protocol::{
     VarInt,
@@ -106,6 +106,73 @@ pub fn pop_resource(block: [i32; 3], stack: ItemStack, rng: &mut Rng) -> EntityR
     let mut record = new_item(pos, vel, stack, rng);
     if let Some(item) = &mut record.data.item {
         item.pickup_delay = DEFAULT_PICKUP_DELAY;
+    }
+    record
+}
+
+/// The items a broken container spills (vanilla `Containers.dropItemStack`): one random spot
+/// inside the block, split into stacks of 10 to 30 with a small random push each.
+pub fn drop_from_container(
+    block: [i32; 3],
+    mut stack: ItemStack,
+    rng: &mut Rng,
+) -> Vec<EntityRecord> {
+    let spread = 1.0 - WIDTH;
+    let pos = Vec3::new(
+        f64::from(block[0]) + rng.next_f64() * spread + WIDTH / 2.0,
+        f64::from(block[1]) + rng.next_f64() * spread,
+        f64::from(block[2]) + rng.next_f64() * spread + WIDTH / 2.0,
+    );
+    let mut records = Vec::new();
+    while stack.count > 0 {
+        let part = stack.count.min(rng.next_int(21) + 10);
+        stack.count -= part;
+        let mut triangle =
+            |mode: f64| mode + 0.114_850_001_711_398_36 * (rng.next_f64() - rng.next_f64());
+        let vel = Vec3::new(triangle(0.0), triangle(0.2), triangle(0.0));
+        // No pickup delay: vanilla adds these without `setDefaultPickUpDelay`.
+        records.push(new_item(
+            pos,
+            vel,
+            ItemStack {
+                count: part,
+                ..stack
+            },
+            rng,
+        ));
+    }
+    records
+}
+
+/// Pickup delay of items a player throws (vanilla `Player.drop`).
+pub const THROWN_PICKUP_DELAY: i32 = 40;
+
+/// An item a player throws (vanilla `LivingEntity.drop(stack, false, true)`): from 0.3 below the
+/// eyes, pushed 0.3 along the look direction with a little jitter, and not collectable for two
+/// seconds.
+pub fn thrown_by_player(
+    feet: Vec3,
+    eye_height: f64,
+    yaw: f32,
+    pitch: f32,
+    stack: ItemStack,
+    rng: &mut Rng,
+) -> EntityRecord {
+    let pos = Vec3::new(feet.x, feet.y + eye_height - 0.3, feet.z);
+    let rad = std::f32::consts::PI / 180.0;
+    let (sin_pitch, cos_pitch) = (pitch * rad).sin_cos();
+    let (sin_yaw, cos_yaw) = (yaw * rad).sin_cos();
+    let angle = rng.next_f32() * std::f32::consts::TAU;
+    let spread = 0.02 * rng.next_f32();
+    let up = -sin_pitch * 0.3 + 0.1 + (rng.next_f32() - rng.next_f32()) * 0.1;
+    let vel = Vec3::new(
+        f64::from(-sin_yaw * cos_pitch * 0.3) + f64::from(angle).cos() * f64::from(spread),
+        f64::from(up),
+        f64::from(cos_yaw * cos_pitch * 0.3) + f64::from(angle).sin() * f64::from(spread),
+    );
+    let mut record = new_item(pos, vel, stack, rng);
+    if let Some(item) = &mut record.data.item {
+        item.pickup_delay = THROWN_PICKUP_DELAY;
     }
     record
 }
@@ -291,33 +358,35 @@ fn tick_item(store: &mut EntityStore, key: EntityKey, blocks: &impl BlockGetter,
     }
 }
 
+/// Maximum stack size of an item (64 for unknown ids).
+pub fn max_stack_size(item_id: i32) -> i32 {
+    u16::try_from(item_id)
+        .ok()
+        .and_then(ferrite_item::item_defaults)
+        .map_or(64, |d| d.max_stack_size)
+}
+
 /// A player that can pick items up.
 pub struct Picker<'a> {
     pub uuid: Uuid,
     /// Network entity id, the collector in `take_item_entity`.
     pub entity_id: i32,
     pub pos: Vec3,
-    /// Inventory menu slots (see [`inventory`]).
-    pub inventory: &'a mut [ItemStack; 46],
-    /// Selected hotbar slot, 0..=8.
-    pub selected: usize,
+    /// The player's inventory; its selected slot is filled first.
+    pub inventory: &'a mut PlayerInventory,
     /// Creative players take stacks that do not fit.
     pub infinite: bool,
 }
 
 /// Picks up the items a player touches (vanilla `Player.touch` + `ItemEntity.playerTouch`):
 /// items in the player's box widened by 1 x 0.5 x 1 whose pickup delay ran out. Sends
-/// `take_item_entity` to everyone tracking each item and returns the changed menu slots.
-pub fn pick_up(
-    store: &mut EntityStore,
-    picker: &mut Picker<'_>,
-    sink: &mut Sink<'_>,
-) -> Vec<usize> {
+/// `take_item_entity` to everyone tracking each item and returns whether anything was taken.
+pub fn pick_up(store: &mut EntityStore, picker: &mut Picker<'_>, sink: &mut Sink<'_>) -> bool {
     let p = picker.pos;
     let area = AABB::new(p.x - 0.3, p.y, p.z - 0.3, p.x + 0.3, p.y + 1.8, p.z + 0.3)
         .inflate(1.0, 0.5, 1.0);
     let kind = item_type();
-    let mut changed = Vec::new();
+    let mut changed = false;
     for key in store.query_vec(area) {
         let (Some(data), Some(flags)) = (store.data(key), store.flags(key)) else {
             continue;
@@ -332,20 +401,15 @@ pub fn pick_up(
         }
         let mut taken = stack(data);
         let original = taken.count;
-        let (added, slots) = inventory::add(
-            picker.inventory,
-            picker.selected,
-            &mut taken,
-            picker.infinite,
-        );
-        if !added {
+        let Ok(id) = u16::try_from(taken.item_id) else {
+            continue;
+        };
+        let mut full = ferrite_item::ItemStack::with_count(id, taken.count);
+        if !picker.inventory.add(&mut full, picker.infinite) {
             continue;
         }
-        for slot in slots {
-            if !changed.contains(&slot) {
-                changed.push(slot);
-            }
-        }
+        taken.count = if full.is_empty() { 0 } else { full.count };
+        changed = true;
         tracker::broadcast(
             store,
             key,
@@ -524,7 +588,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .pickup_delay = 1;
-        let mut inventory = [ItemStack::default(); 46];
+        let mut inventory = PlayerInventory::new();
         let mut sent = Vec::new();
         let mut sink = |_: tracker::ViewerKey, packet: &[u8]| sent.push(packet.to_vec());
         let mut picker = Picker {
@@ -532,10 +596,9 @@ mod tests {
             entity_id: 77,
             pos: Vec3::new(0.0, 64.0, 0.5),
             inventory: &mut inventory,
-            selected: 0,
             infinite: false,
         };
-        assert!(pick_up(&mut store, &mut picker, &mut sink).is_empty());
+        assert!(!pick_up(&mut store, &mut picker, &mut sink));
         store
             .data_mut(key)
             .unwrap()
@@ -545,10 +608,26 @@ mod tests {
             .pickup_delay = 0;
         // Too far away: the box reaches 1.3 blocks sideways.
         picker.pos = Vec3::new(3.0, 64.0, 0.5);
-        assert!(pick_up(&mut store, &mut picker, &mut sink).is_empty());
+        assert!(!pick_up(&mut store, &mut picker, &mut sink));
         picker.pos = Vec3::new(0.0, 64.0, 0.5);
-        assert_eq!(pick_up(&mut store, &mut picker, &mut sink), vec![36]);
+        assert!(pick_up(&mut store, &mut picker, &mut sink));
         assert!(store.flags(key).unwrap().has(Flags::REMOVED));
-        assert_eq!(inventory[36], dirt(2));
+        assert_eq!(
+            inventory.get(0),
+            &ferrite_item::ItemStack::with_count(dirt(2).item_id as u16, 2)
+        );
+    }
+
+    #[test]
+    fn thrown_items_fly_where_the_player_looks() {
+        let mut rng = Rng::new(9);
+        let record = thrown_by_player(Vec3::new(0.5, 64.0, 0.5), 1.62, 0.0, 0.0, dirt(1), &mut rng);
+        assert!((record.pos.y - 65.32).abs() < 1e-9);
+        assert!((0.28..=0.32).contains(&record.vel.z), "{:?}", record.vel);
+        assert!(record.vel.x.abs() <= 0.02 && (0.0..=0.2).contains(&record.vel.y));
+        assert_eq!(record.data.item.unwrap().pickup_delay, THROWN_PICKUP_DELAY);
+        // Yaw 90 looks toward -x.
+        let record = thrown_by_player(Vec3::ZERO, 1.62, 90.0, 0.0, dirt(1), &mut rng);
+        assert!(record.vel.x < -0.28);
     }
 }

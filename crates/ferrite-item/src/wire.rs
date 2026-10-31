@@ -178,6 +178,11 @@ fn decode_hashed_slot(reader: &mut Reader<'_>) -> Result<Option<HashedSlot>, Wir
     if !reader.bool()? {
         return Ok(None);
     }
+    decode_hashed_body(reader).map(Some)
+}
+
+/// A present hashed slot after its `has_item` boolean.
+fn decode_hashed_body(reader: &mut Reader<'_>) -> Result<HashedSlot, WireError> {
     let item = reader.item_id()?;
     let count = reader.count()?;
     let added_len = reader.count_len(MAX_HASHES)?;
@@ -191,12 +196,12 @@ fn decode_hashed_slot(reader: &mut Reader<'_>) -> Result<Option<HashedSlot>, Wir
     for _ in 0..removed_len {
         removed.push(reader.component_id()?);
     }
-    Ok(Some(HashedSlot {
+    Ok(HashedSlot {
         item,
         count,
         added,
         removed,
-    }))
+    })
 }
 
 impl ItemStack {
@@ -1575,7 +1580,7 @@ fn nbt_bytes(tag: &Tag) -> Result<Vec<u8>, WireError> {
 mod protocol_impl {
     use ferrite_protocol::{Decode, DecodeError, Encode};
 
-    use crate::ItemStack;
+    use crate::{HashedSlot, ItemStack};
 
     impl Encode for ItemStack {
         fn encode(&self, out: &mut Vec<u8>) {
@@ -1590,6 +1595,27 @@ mod protocol_impl {
                 .map_err(|_| DecodeError::Invalid("invalid item stack"))?;
             *buf = &buf[consumed..];
             Ok(stack)
+        }
+    }
+
+    /// The body of a present `HashedStack`; `Option<HashedSlot>` adds vanilla's `has_item`
+    /// boolean, so it is the full wire form.
+    impl Encode for HashedSlot {
+        fn encode(&self, out: &mut Vec<u8>) {
+            let bytes = self
+                .encode_network()
+                .expect("hashed slot lists fit a VarInt");
+            out.extend_from_slice(&bytes[1..]);
+        }
+    }
+
+    impl Decode for HashedSlot {
+        fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+            let mut reader = super::Reader::new(buf);
+            let slot = super::decode_hashed_body(&mut reader)
+                .map_err(|_| DecodeError::Invalid("invalid hashed item stack"))?;
+            *buf = &buf[reader.pos..];
+            Ok(slot)
         }
     }
 }

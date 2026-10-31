@@ -15,6 +15,9 @@ enforce-secure-profile = true
 # 서버 목록에 표시되는 설명 문구.
 motd = "A Ferrite server"
 
+# 서버 목록 아이콘 (64x64 PNG). 파일이 없거나 크기가 다르면 경고만 남기고 아이콘 없이 시작합니다.
+server-icon = "server-icon.png"
+
 # 최대 동시 접속자 수.
 max-players = 20
 

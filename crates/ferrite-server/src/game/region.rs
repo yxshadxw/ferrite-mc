@@ -22,7 +22,11 @@ pub enum Command {
     Input(ServerboundPlay),
     Leave,
     SetMode(i32),
-    Teleport([f64; 3]),
+    Teleport {
+        pos: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, UnboundedSender<Outbound>)>>>;
@@ -117,8 +121,8 @@ pub struct Player {
     pub signals: UnboundedSender<Signal>,
     pub biome: i32,
     pub gamemode: i32,
-    pub inventory: [ItemStack; 46],
-    pub held_slot: u8,
+    pub inventory: ferrite_inventory::PlayerInventory,
+    pub menus: super::container::Containers,
     pub breaking: Option<(i64, u32, u32)>,
     pub view: i32,
     pub pending_teleport: Option<i32>,
@@ -226,7 +230,7 @@ fn chunk_window(
     });
     (forget, new)
 }
-fn send<P: ferrite_protocol::Packet>(p: &Player, msg: &P) {
+pub(super) fn send<P: ferrite_protocol::Packet>(p: &Player, msg: &P) {
     let _ = p.outbound.send(packet(msg));
 }
 /// Namespaced block id of a global state id, for Bukkit event materials.
@@ -472,6 +476,21 @@ impl Player {
             false
         }
     }
+    /// Breaks a block (to air); an inventory block drops its contents (vanilla
+    /// `Containers.dropContentsOnDestroy`).
+    fn break_block(&mut self, location: i64, state: u32) -> bool {
+        if !self.change_block(location, state, 0) {
+            return false;
+        }
+        if let Some(source) = &self.source {
+            let pos = ferrite_protocol::types::BlockPos::unpack(location);
+            let pos = [pos.x, pos.y, pos.z];
+            for stack in super::block_container::take_contents(source, pos, state) {
+                self.menus.spilled.push((pos, stack));
+            }
+        }
+        true
+    }
     fn place(&mut self, p: &UseItemOn) {
         if !(self.gamemode == 0 || self.gamemode == 1)
             || !(0..=1).contains(&p.hand.0)
@@ -514,27 +533,19 @@ impl Player {
         if !ferrite_data::block_props::get(old).replaceable {
             return;
         }
-        let slot = if p.hand.0 == 0 {
-            36 + self.held_slot as usize
-        } else {
-            45
-        };
-        let item = self.inventory[slot];
-        if item.count <= 0 {
+        let slot = self.hand_slot(p.hand.0);
+        let item = self.inventory.get(slot).clone();
+        if item.is_empty() {
             return;
         }
-        let water_bucket = ferrite_data::registries::id("minecraft:item", "minecraft:water_bucket")
-            == Some(item.item_id);
+        let item_id = i32::from(item.item);
+        let water_bucket = item.name() == Some("minecraft:water_bucket");
         let state = if water_bucket {
             ferrite_data::blocks::default_state("water").expect("vanilla water")
         } else {
-            let Some(state) = super::interaction::placement_state(
-                item.item_id,
-                p.face.0,
-                p.cursor_y,
-                self.yaw,
-                old,
-            ) else {
+            let Some(state) =
+                super::interaction::placement_state(item_id, p.face.0, p.cursor_y, self.yaw, old)
+            else {
                 return;
             };
             state
@@ -580,28 +591,18 @@ impl Player {
         }
         let placed = self.change_block(target.pack(), u32::from(old), u32::from(state));
         drop(positions);
+        // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
+        // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
             if water_bucket {
-                self.inventory[slot] = ItemStack {
-                    count: 1,
-                    item_id: ferrite_data::registries::id("minecraft:item", "minecraft:bucket")
-                        .expect("vanilla bucket"),
-                };
+                self.inventory.set(
+                    slot,
+                    ferrite_item::ItemStack::from_name("bucket").expect("vanilla bucket"),
+                );
             } else {
-                self.inventory[slot].count -= 1;
-                if self.inventory[slot].count == 0 {
-                    self.inventory[slot] = ItemStack::default();
-                }
+                self.inventory
+                    .set(slot, item.copy_with_count(item.count - 1));
             }
-            send(
-                self,
-                &ContainerSlot {
-                    window: VarInt(0),
-                    state: VarInt(0),
-                    slot: slot as i16,
-                    item: self.inventory[slot],
-                },
-            );
         }
     }
     /// Runs an event hook; a missing bridge or a failed call is decided by the
@@ -640,6 +641,7 @@ impl Player {
             }
             let msg = match command {
                 Command::Leave => {
+                    self.close_container();
                     super::playerdata::save(
                         &self.uuid,
                         &super::playerdata::Saved::capture(
@@ -663,9 +665,15 @@ impl Player {
                     );
                     continue;
                 }
-                Command::Teleport(pos) => {
+                Command::Teleport { pos, yaw, pitch } => {
                     if pos.iter().all(|v| v.is_finite() && v.abs() <= 30_000_000.0) {
                         self.pos = pos;
+                        if let Some(yaw) = yaw {
+                            self.yaw = yaw;
+                        }
+                        if let Some(pitch) = pitch {
+                            self.pitch = pitch;
+                        }
                         self.teleport();
                         changed = true;
                     }
@@ -674,6 +682,15 @@ impl Player {
                 Command::Input(msg) => msg,
             };
             match msg {
+                ServerboundPlay::PlayerAction(p) if matches!(p.status.0, 3 | 4 | 6) => {
+                    match p.status.0 {
+                        3 => self.drop_selected(true),
+                        4 => self.drop_selected(false),
+                        _ => self.swap_hands(),
+                    }
+                }
+                ServerboundPlay::ContainerClick(p) => self.handle_container_click(p),
+                ServerboundPlay::ContainerClose(_) => self.close_container(),
                 ServerboundPlay::PlayerAction(p) => {
                     let pos = ferrite_protocol::types::BlockPos::unpack(p.location);
                     match p.status.0 {
@@ -707,7 +724,7 @@ impl Player {
                                             material_name(state),
                                         )
                                     }) {
-                                        self.change_block(p.location, state, 0);
+                                        self.break_block(p.location, state);
                                     }
                                 } else if self.gamemode == 0 {
                                     // Zero hardness breaks on the first hit (vanilla: destroy
@@ -724,7 +741,7 @@ impl Player {
                                                 clicked,
                                                 material_name(state),
                                             )
-                                        }) && self.change_block(p.location, state, 0)
+                                        }) && self.break_block(p.location, state)
                                         {
                                             self.broken.push((pos, state));
                                         }
@@ -755,7 +772,7 @@ impl Player {
                                         material_name(state),
                                     )
                                 })
-                                && self.change_block(location, state, 0)
+                                && self.break_block(location, state)
                             {
                                 self.broken.push((pos, state));
                             }
@@ -791,7 +808,12 @@ impl Player {
                         )
                     });
                     if allowed {
-                        self.place(&p);
+                        let used = (0..=1).contains(&p.hand.0)
+                            && self.hit(clicked).is_some()
+                            && self.use_block(p.location);
+                        if !used {
+                            self.place(&p);
+                        }
                     } else {
                         self.send_block_snapshot(p.location);
                     }
@@ -819,24 +841,12 @@ impl Player {
                     );
                 }
                 ServerboundPlay::SetHeldItem(p) => {
+                    // Vanilla `handleSetCarriedItem` ignores slots outside the hotbar.
                     if (0..=8).contains(&p.slot) {
-                        self.held_slot = p.slot as u8;
+                        self.inventory.selected = p.slot as usize;
                     }
                 }
-                ServerboundPlay::CreativeSlot(p) => {
-                    if self.gamemode == 1 && (0..46).contains(&p.slot) {
-                        self.inventory[p.slot as usize] = p.item;
-                        send(
-                            self,
-                            &ContainerSlot {
-                                window: VarInt(0),
-                                state: VarInt(0),
-                                slot: p.slot,
-                                item: p.item,
-                            },
-                        );
-                    }
-                }
+                ServerboundPlay::CreativeSlot(p) => self.handle_creative_slot(p),
                 ServerboundPlay::Confirm(p) => {
                     if self.pending_teleport == Some(p.id.0) {
                         self.pending_teleport = None;
@@ -988,7 +998,11 @@ impl Region {
     }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
-        let tool = p.inventory[36 + usize::from(p.held_slot.min(8))];
+        let held = p.inventory.selected_item();
+        let tool = ItemStack {
+            count: held.count.max(0),
+            item_id: i32::from(held.item),
+        };
         for (pos, state) in p.broken.drain(..) {
             let Ok(state) = u16::try_from(state) else {
                 continue;
@@ -1002,7 +1016,6 @@ impl Region {
     /// Lets every non-spectator player pick up the items it touches.
     fn pick_up_items(&mut self, ctx: &TickContext) {
         let mut sent = Vec::new();
-        let mut slots = Vec::new();
         for p in self.players.values_mut() {
             if p.gamemode == 3 {
                 continue;
@@ -1012,33 +1025,38 @@ impl Region {
                 entity_id: p.entity,
                 pos: ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
                 inventory: &mut p.inventory,
-                selected: usize::from(p.held_slot),
                 infinite: p.gamemode == 1,
             };
-            let changed = item::pick_up(&mut self.entities, &mut picker, &mut |viewer, bytes| {
+            item::pick_up(&mut self.entities, &mut picker, &mut |viewer, bytes| {
                 sent.push((viewer, bytes.to_vec()))
             });
-            if !changed.is_empty() {
-                slots.push((p.uuid, changed));
-            }
         }
         // Like vanilla: the take animation first, the inventory sync at the end of the tick.
         for (viewer, bytes) in sent {
             deliver(&self.players, ctx, viewer, &bytes);
         }
-        for (uuid, changed) in slots {
-            let p = &self.players[&uuid];
-            for slot in changed {
-                send(
-                    p,
-                    &ContainerSlot {
-                        window: VarInt(0),
-                        state: VarInt(0),
-                        slot: slot as i16,
-                        item: p.inventory[slot],
-                    },
-                );
+    }
+    /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
+    /// entities in front of it. Item entities hold plain stacks for now, so components are not
+    /// carried over.
+    fn spawn_thrown(&mut self, p: &mut Player) {
+        for (block, stack) in p.menus.spilled.drain(..) {
+            let plain = ItemStack {
+                count: stack.count,
+                item_id: i32::from(stack.item),
+            };
+            for record in item::drop_from_container(block, plain, &mut self.rng) {
+                self.entities.insert(record);
             }
+        }
+        for stack in p.menus.thrown.drain(..) {
+            let plain = ItemStack {
+                count: stack.count,
+                item_id: i32::from(stack.item),
+            };
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let record = item::thrown_by_player(feet, 1.62, p.yaw, p.pitch, plain, &mut self.rng);
+            self.entities.insert(record);
         }
     }
     /// Runs the entity tracker against this region's players.
@@ -1071,6 +1089,7 @@ impl Region {
                 }
                 None => p.update(),
             };
+            self.spawn_thrown(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -1112,6 +1131,9 @@ impl Region {
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
+        for p in self.players.values_mut() {
+            p.tick_containers();
+        }
         self.track_entities(ctx);
         self.entities.sweep_removed();
         for entity in self.entities.take_crossing() {

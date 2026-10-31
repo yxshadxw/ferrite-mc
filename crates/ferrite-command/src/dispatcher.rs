@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::context::{CommandContext, ParsedArgument};
-use crate::error::{CommandError, CommandSyntaxError, builtin};
+use crate::error::{CommandError, CommandSyntaxError, builtin, minecraft};
 use crate::reader::{ARGUMENT_SEPARATOR, StringReader};
 use crate::suggestion::{StringRange, Suggestions, SuggestionsBuilder};
 use crate::tree::{Command, Node, NodeBuilder, NodeId, NodeKind, Requirement};
@@ -38,6 +38,7 @@ pub struct Ambiguity {
 /// A command graph generic over the command source `S`.
 pub struct CommandDispatcher<S> {
     nodes: Vec<Node<S>>,
+    selector_requirement: Option<Requirement<S>>,
 }
 
 impl<S> Default for CommandDispatcher<S> {
@@ -52,6 +53,7 @@ impl<S> CommandDispatcher<S> {
     pub fn new() -> Self {
         Self {
             nodes: vec![Node::new(NodeKind::Root)],
+            selector_requirement: None,
         }
     }
 
@@ -147,6 +149,17 @@ impl<S> CommandDispatcher<S> {
         self.node_mut(node).restricted = restricted;
     }
 
+    /// Gates entity selectors on `requirement`, like vanilla's `commands/entity_selectors`
+    /// permission. When set, any entity, game-profile or score-holder argument that is a
+    /// selector (`@a`, `@e[...]`, `@s`, ...) fails to parse for a source that does not pass
+    /// `requirement`, for every command in the tree.
+    pub fn set_selector_requirement(
+        &mut self,
+        requirement: impl Fn(&S) -> bool + Send + Sync + 'static,
+    ) {
+        self.selector_requirement = Some(Arc::new(requirement));
+    }
+
     /// Sets (or clears) a plain redirect. Panics if the node has children.
     pub fn set_redirect(&mut self, node: NodeId, target: Option<NodeId>) {
         let n = self.node_mut(node);
@@ -219,6 +232,16 @@ impl<S> CommandDispatcher<S> {
             }
             NodeKind::Argument { name, ty } => {
                 let value = ty.parse(reader)?;
+                if value.has_selector()
+                    && self
+                        .selector_requirement
+                        .as_ref()
+                        .is_some_and(|requirement| !requirement(&context.source))
+                {
+                    let mut at_start = reader.clone();
+                    at_start.set_cursor(start);
+                    return Err(minecraft::selectors_not_allowed(&at_start));
+                }
                 let range = StringRange::new(start, reader.cursor());
                 context
                     .arguments

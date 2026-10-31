@@ -247,6 +247,17 @@ impl Bot {
         self.stream.write_all(&wire).unwrap();
     }
 
+    /// Sends an unsigned chat message (an offline-mode client's packet shape).
+    fn chat(&mut self, text: &str) {
+        self.send(&ServerboundChat {
+            message: text.into(),
+            timestamp: 1_700_000_000_000,
+            salt: 0,
+            signature: None,
+            last_seen: LastSeenUpdate::new(0, &[], 0),
+        });
+    }
+
     fn raw(&mut self, id: i32, text: &str) {
         let mut body = Vec::new();
         VarInt(id).encode(&mut body);
@@ -317,16 +328,6 @@ impl Bot {
                 return body;
             }
         }
-    }
-
-    fn chat(&mut self, text: &str) {
-        self.send(&ServerboundChat {
-            message: text.into(),
-            timestamp: 0,
-            salt: 0,
-            signature: None,
-            last_seen: LastSeenUpdate::new(0, &[], 0),
-        });
     }
 
     fn move_to(&mut self, x: f64, y: f64, z: f64) {

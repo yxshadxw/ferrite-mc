@@ -15,14 +15,17 @@ mimalloc = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
+md5 = "0.7"
 ferrite-region.workspace = true
 uuid.workspace = true
 ferrite-world.workspace = true
 ferrite-nbt.workspace = true
+base64 = "0.22"
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 
 ferrite-command = { path = "../ferrite-command" }
+ferrite-admin = { path = "../ferrite-admin" }
 ferrite-data.workspace = true
 ferrite-math = { path = "../ferrite-math" }
 ferrite-plugin = { path = "../ferrite-plugin" }
@@ -31,7 +34,9 @@ ferrite-fluid = { path = "../ferrite-fluid" }
 ferrite-noise = { path = "../ferrite-noise" }
 
 ferrite-entity = { path = "../ferrite-entity" }
-ferrite-item = { path = "../ferrite-item" }
+ferrite-item = { path = "../ferrite-item", features = ["protocol"] }
+ferrite-inventory = { path = "../ferrite-inventory" }
+ferrite-recipe = { path = "../ferrite-recipe" }
 ferrite-loot = { path = "../ferrite-loot" }
 
 [dev-dependencies]

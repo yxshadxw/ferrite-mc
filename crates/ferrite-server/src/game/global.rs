@@ -132,7 +132,7 @@ impl GlobalRegion {
             send(player, &update);
         }
     }
-    pub fn say(&self, message: &str) {
+    pub fn broadcast_text(&self, message: &str) {
         self.broadcast(message);
     }
     /// Registers or replaces a player's chat session and tells every client about it, so they

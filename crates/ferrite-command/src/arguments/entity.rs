@@ -160,6 +160,12 @@ impl EntityTarget {
             }
         )
     }
+
+    /// Whether this is an `@` selector (vanilla's `usesSelector()`), which needs the
+    /// `commands/entity_selectors` permission to resolve.
+    pub fn is_selector(&self) -> bool {
+        matches!(self, Self::Selector { .. })
+    }
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -321,6 +327,13 @@ pub enum ScoreHolder {
     /// `*`: every tracked score holder.
     All,
     Target(EntityTarget),
+}
+
+impl ScoreHolder {
+    /// Whether this is (or contains) an `@` selector.
+    pub fn is_selector(&self) -> bool {
+        matches!(self, Self::Target(target) if target.is_selector())
+    }
 }
 
 pub fn parse_score_holder(

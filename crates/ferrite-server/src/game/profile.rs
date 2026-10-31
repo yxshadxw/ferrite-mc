@@ -399,11 +399,14 @@ mod tests {
         profiler.start_profile().unwrap();
         {
             let _slow = profiler.timings().scope("slow");
-            thread::sleep(Duration::from_millis(15));
+            // Windows' scheduler granularity is ~15 ms, and a busy test run can deschedule
+            // a thread for tens of milliseconds; keep the two scopes far enough apart that
+            // their order cannot invert.
+            thread::sleep(Duration::from_millis(120));
         }
         {
             let _fast = profiler.timings().scope("fast");
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(1));
         }
         let report = profiler.stop_profile().unwrap();
 

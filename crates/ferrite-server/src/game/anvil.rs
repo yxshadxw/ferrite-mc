@@ -1,3 +1,4 @@
+use ferrite_command::gamerule::GameRules;
 use ferrite_nbt::{List, Tag, binary};
 use ferrite_world::{
     BlockStateRegistry, Chunk, LightData, LightSection, RegionFile, RuntimeRegistry,
@@ -199,6 +200,61 @@ impl AnvilChunkSource {
             flat: Mutex::new(HashMap::new()),
         })
     }
+    /// The 26.3 world data file that stores the live game rule values.
+    pub(super) fn game_rules_path(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|path| path.join("data/minecraft/game_rules.dat"))
+    }
+
+    /// Reads the persisted rules, falling back to the pre-26.3 `Data.GameRules`
+    /// compound in `level.dat` for worlds created by older versions.
+    pub(super) fn load_game_rules(&self) -> Option<GameRules> {
+        if let Some(path) = self.game_rules_path()
+            && let Ok(bytes) = std::fs::read(&path)
+            && let Ok((_, tag)) = binary::read_compressed(&bytes, binary::Compression::Gzip)
+            && let Some(rules) = GameRules::from_nbt(&tag)
+        {
+            return Some(rules);
+        }
+        let bytes = std::fs::read(self.path.as_ref()?.join("level.dat")).ok()?;
+        let (_, tag) = binary::read_compressed(&bytes, binary::Compression::Gzip).ok()?;
+        GameRules::from_level_dat(&tag)
+    }
+
+    /// Writes `data/minecraft/game_rules.dat`, stamped with `level.dat`'s `DataVersion`
+    /// like a vanilla save.
+    pub(super) fn save_game_rules(&self, rules: &GameRules) -> anyhow::Result<()> {
+        let Some(path) = self.game_rules_path() else {
+            return Ok(());
+        };
+        let data_version = self
+            .data_version()
+            .unwrap_or(ferrite_command::gamerule::DATA_VERSION);
+        let tag = rules.to_nbt(data_version);
+        let bytes = binary::write_compressed("", &tag, binary::Compression::Gzip)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn data_version(&self) -> Option<i32> {
+        let bytes = std::fs::read(self.path.as_ref()?.join("level.dat")).ok()?;
+        let (_, Tag::Compound(root)) =
+            binary::read_compressed(&bytes, binary::Compression::Gzip).ok()?
+        else {
+            return None;
+        };
+        let Tag::Compound(data) = root.get("Data")? else {
+            return None;
+        };
+        match data.get("DataVersion") {
+            Some(Tag::Int(version)) => Some(*version),
+            _ => None,
+        }
+    }
     pub fn modified_packet(&self, x: i32, z: i32) -> Option<Vec<u8>> {
         self.cache
             .lock()
@@ -293,6 +349,69 @@ impl AnvilChunkSource {
         column
             .chunk
             .block(x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8)
+    }
+    /// The block entity at a block, when its chunk is loaded and has one.
+    pub fn block_entity(&self, x: i32, y: i32, z: i32) -> Option<ferrite_world::BlockEntity> {
+        let local = (x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8);
+        self.with_loaded_chunk(x.div_euclid(16), z.div_euclid(16), |chunk| {
+            chunk.block_entities.get(&local).cloned()
+        })
+        .flatten()
+    }
+    /// Edits the block entity at a block (`None` when there is none) in a loaded chunk; the
+    /// chunk is marked modified when `f` reports a change, so it is resent and saved.
+    pub fn update_block_entity<R>(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        f: impl FnOnce(&mut Option<ferrite_world::BlockEntity>) -> (bool, R),
+    ) -> anyhow::Result<R> {
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        let local = (x.rem_euclid(16) as u8, y, z.rem_euclid(16) as u8);
+        let mut cache = self.cache.lock().unwrap();
+        let (mut chunk, light) = if let Some(d) = cache.dirty.get(&key) {
+            (d.chunk.clone(), d.light.clone())
+        } else {
+            let column = cache
+                .entries
+                .iter()
+                .find_map(|(&(cx, cz, _), entry)| match entry {
+                    Entry::Ready(Ok(c), _) if (cx, cz) == key => Some(c),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("chunk not loaded"))?;
+            (column.chunk.clone(), column.light.clone())
+        };
+        let mut entity = chunk.block_entities.remove(&local);
+        let (changed, result) = f(&mut entity);
+        if !changed {
+            return Ok(result);
+        }
+        anyhow::ensure!(
+            self.path.is_none()
+                || cache.dirty.contains_key(&key)
+                || cache.dirty.len() < CACHE_LIMIT,
+            "dirty chunk cache is full"
+        );
+        if let Some(entity) = entity {
+            chunk.block_entities.insert(local, entity);
+        }
+        self.stats.encodes.fetch_add(1, Ordering::Relaxed);
+        let packet = encode_column_packet(key.0, key.1, &chunk, &light)?;
+        cache.clock += 1;
+        let version = cache.clock;
+        invalidate(&mut cache, &self.stats, key.0, key.1);
+        cache.dirty.insert(
+            key,
+            Dirty {
+                chunk,
+                light,
+                packet,
+                version,
+            },
+        );
+        Ok(result)
     }
     pub fn set_block(&self, x: i32, y: i32, z: i32, state: u32) -> anyhow::Result<()> {
         self.compare_set_block(x, y, z, None, state)

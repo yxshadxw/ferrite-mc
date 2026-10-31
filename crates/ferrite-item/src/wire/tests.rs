@@ -784,3 +784,28 @@ fn protocol_traits_round_trip() {
     assert_eq!(ItemStack::decode(&mut input).unwrap(), stack);
     assert!(input.is_empty());
 }
+
+#[cfg(feature = "protocol")]
+#[test]
+fn optional_hashed_slot_matches_the_wire_form() {
+    use ferrite_protocol::{Decode, Encode};
+
+    let slot = HashedSlot {
+        item: 1,
+        count: 5,
+        added: vec![(ids::DAMAGE, -7)],
+        removed: vec![ids::FOOD],
+    };
+    let mut bytes = Vec::new();
+    Some(slot.clone()).encode(&mut bytes);
+    assert_eq!(bytes, slot.encode_network().unwrap());
+    let mut input = bytes.as_slice();
+    assert_eq!(
+        Option::<HashedSlot>::decode(&mut input).unwrap(),
+        Some(slot)
+    );
+    assert!(input.is_empty());
+    let mut bytes = Vec::new();
+    None::<HashedSlot>.encode(&mut bytes);
+    assert_eq!(bytes, encode_empty_hashed_slot());
+}
