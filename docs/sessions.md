@@ -27,3 +27,24 @@ update the table before sending anything.
 Terra (`term_dad9fe26-deed-4d13-a9c0-084b3176edd7`) and Terra-2
 (`term_a70e887c-6078-4f6c-b323-ba8599cf4583`): **out of quota until 2026-10-31 00:00**, no session
 running. OC1 (`term_d0c78d1c-...)` and OC2 (`term_3f4ae1f3-...`) are closed; do not reuse them.
+
+## Day 6 (2026-10-31) end state
+
+All opencode quota is exhausted and Codex (Terra) is out of quota; Freebuff is resumed manually at
+midnight. Full record, unmerged snapshot branches (`wip/day6-*`), the never-started tasks and the
+orchestration procedure are in [`docs/handoff/day6-session-record.md`](handoff/day6-session-record.md);
+the task texts are in `docs/handoff/day6-tasks/`.
+
+| Session | Agent | Last task | State |
+|---|---|---|---|
+| FB1 | freebuff | translation layer, redstone core | merged to main |
+| FB2 | freebuff | worldgen W2-W4, ores and vegetation | merged to main |
+| FB3 / FB3b | freebuff | commands 3-5 (execute, data) | merged; `/function` finished by OC3 |
+| FB4 | freebuff | playerdata fix, plugin bridge | merged; remainder on `wip/day6-oc4` |
+| FB5 | freebuff | blocks, fire, explosions | merged to main |
+| FB6 | freebuff | mobs | passive mobs merged; hostile mobs on `wip/day6-oc5` |
+| FB7 | freebuff | survival, effects, potions | merged to main |
+| OC3 | opencode2 | function command and datapack loader | done, on `wip/day6-oc3`, to merge |
+| OC4 | opencode2 | plugin bridge takeover | WIP on `wip/day6-oc4` |
+| OC5 | opencode2 | hostile mobs takeover | WIP on `wip/day6-oc5` |
+| OC6, OC7, OC8 | opencode2 | worldgen throughput, containers, commands | never started |
