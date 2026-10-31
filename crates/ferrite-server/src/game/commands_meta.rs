@@ -2092,6 +2092,8 @@ mod tests {
                 name: Some("Alice".into()),
                 state: std::sync::Arc::new(std::sync::Mutex::new(state)),
                 actions,
+                anchor: ferrite_command::EntityAnchor::Feet,
+                world: None,
             },
             received,
         )

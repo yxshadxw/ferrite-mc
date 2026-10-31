@@ -23,6 +23,8 @@ mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod commands_data;
+mod commands_exec;
 mod commands_extras;
 mod commands_meta;
 mod commands_world;
@@ -33,6 +35,7 @@ pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
 mod explosion;
 mod feedback;
 pub mod interaction;
+mod nbt_path;
 mod profile;
 #[cfg(test)]
 mod tests {
@@ -499,6 +502,7 @@ async fn run(
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
            let start_mode = saved.as_ref().map_or_else(|| command_state.lock().unwrap().default_gamemode, |s| s.gamemode);
            command_state.lock().unwrap().join(uuid, name.clone(), start_mode, max_players as i32);
+           command_state.lock().unwrap().set_position(uuid, start_pos, start_yaw, start_pitch);
            let seed = command_state.lock().unwrap().seed;
            let start_chunk = ChunkPos((start_pos[0].floor() as i32).div_euclid(16), (start_pos[2].floor() as i32).div_euclid(16));
            let start_inventory = container::restore(saved.as_ref());
@@ -506,7 +510,7 @@ async fn run(
            let entity=ferrite_entity::allocate_id();
            emit(&outbound,&PlayLogin{entity_id:entity,hardcore:false,dimensions:vec!["minecraft:overworld".into()],max_players:VarInt(max_players as i32),view_distance:VarInt(view_distance as i32),simulation_distance:VarInt(view_distance as i32),reduced_debug:false,respawn_screen:true,limited_crafting:false,dimension_type:VarInt(dimension_type),dimension:"minecraft:overworld".into(),seed,game_mode:VarInt(start_mode),previous_game_mode:VarInt(0),debug:false,flat,death_location:None,portal_cooldown:VarInt(0),sea_level:VarInt(63),online_mode,secure_chat});
            let (actions, _) = mpsc::unbounded_channel();
-           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), state: command_state.clone(), actions }, registry) {
+           if let Some(registry) = &parser_registry && let Ok(tree) = command_tree.serialize_commands(&commands::Source { permission, origin: start_pos, yaw: start_yaw, pitch: start_pitch, uuid: Some(uuid), name: Some(name.clone()), anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions }, registry) {
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet.into()));
            }
            emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
@@ -560,7 +564,7 @@ async fn run(
               let (actions, mut received) = mpsc::unbounded_channel();
               let (origin, yaw, pitch) = online.get(&uuid).map_or(([0.0; 3], 0.0, 0.0), |player| (player.pos, player.yaw, player.pitch));
               let name = command_state.lock().unwrap().players.iter().find(|p| p.uuid == uuid).map(|p| p.name.clone());
-              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: *permissions.get(&uuid).unwrap_or(&0), origin, yaw, pitch, uuid: Some(uuid), name, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
               if let Err(error) = command_tree.execute(command.trim_start_matches('/'), command_source) { emit(outbound, &SystemChat { content:ferrite_protocol::types::PlainText(error.to_string()), overlay:false }); }
               let source_name = online.get(&uuid).map_or_else(|| "Server".to_owned(), |player| player.name.clone());
               let mut runtime = CommandRuntime {
@@ -615,7 +619,7 @@ async fn run(
             if let Some((_,m,_))=mailboxes.get(&uuid).filter(|m| m.0 == session){m.lock().unwrap().push_back(Command::Leave);}},
           GameMessage::Console{command,complete}=>{
               let (actions, mut received) = mpsc::unbounded_channel();
-              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, state: command_state.clone(), actions };
+              let command_source = commands::Source { permission: 4, origin: [0.0; 3], yaw: 0.0, pitch: 0.0, uuid: None, name: None, anchor: ferrite_command::EntityAnchor::Feet, world: source.clone(), state: command_state.clone(), actions };
               let result = command_tree.execute(command.trim().trim_start_matches('/'), command_source).map_err(|e| e.to_string());
               let mut stop = false;
               let mut runtime = CommandRuntime {
@@ -687,7 +691,7 @@ async fn run(
               if scheduler.owner(chunk).is_some(){scheduler.schedule_at_chunk(chunk,move |r|r.schedule_fluid((x,y,z)));}
             }
           },
-          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
+          Signal::Update{uuid,pos,yaw,pitch,ground}=>{if let Some(player)=online.get_mut(&uuid){player.pos=pos;player.yaw=yaw;player.pitch=pitch;}command_state.lock().unwrap().set_position(uuid,pos,yaw,pitch);scheduler.schedule_global(move |g|g.update(uuid,pos,yaw,pitch,ground));},
           Signal::Transfer{from,to,player}=>{scheduler.add_chunk(to);let id=player.uuid;scheduler.schedule_at_chunk(to,move |r|{r.hold_chunk(to);r.players.insert(id,*player);});defer_release(&scheduler,&signal_tx,from,false);},
           Signal::EntityTransfer{to,entity}=>hand_off(&scheduler, to, entity),
           Signal::Leave{uuid,chunk,held}=>{tracking.lock().unwrap().remove(&uuid);positions.lock().unwrap().remove(&uuid);command_state.lock().unwrap().leave(uuid);permissions.remove(&uuid);online.remove(&uuid);mailboxes.remove(&uuid);for pos in held {release_hold(&scheduler, &mut holds, &signal_tx, pos);}defer_release(&scheduler,&signal_tx,chunk,false);
@@ -890,6 +894,13 @@ impl CommandRuntime<'_> {
             | Action::GameRule(..)
             | Action::World(_)
             | Action::Enchant { .. } => false,
+            Action::Data(command) => {
+                match commands_data::apply_block(self.source.as_deref(), &command) {
+                    Ok(feedback) => self.reply.text(&feedback.text),
+                    Err(message) => self.reply.text(&message),
+                }
+                false
+            }
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
