@@ -5,7 +5,7 @@ use ferrite_region::ChunkPos;
 use std::collections::HashMap;
 
 pub(super) struct RegionFluidWorld<'a> {
-    source: &'a AnvilChunkSource,
+    pub(super) source: &'a AnvilChunkSource,
     held: &'a HashMap<ChunkPos, usize>,
     tracking: &'a Tracking,
 }
@@ -28,7 +28,7 @@ impl<'a> RegionFluidWorld<'a> {
             0
         }
     }
-    fn owns(&self, x: i32, z: i32) -> bool {
+    pub(super) fn owns(&self, x: i32, z: i32) -> bool {
         self.held
             .contains_key(&ChunkPos(x.div_euclid(16), z.div_euclid(16)))
     }

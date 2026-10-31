@@ -2,10 +2,18 @@ use super::{
     PluginEventPolicy,
     chunk::{ChunkSource, FlatGenerator},
     commands::{XpOperation, XpUnit},
+    survival::{
+        DamageKind, EAT_TICKS, Eating, FoodTick, MAX_FOOD, MAX_HEALTH, Survival, SurvivalRules,
+    },
     valid_move,
 };
 use ferrite_entity::{
-    BlockGetter, EntityRecord, EntityStore, Rng, item,
+    BlockGetter, EntityRecord, EntityStore, Rng, ai,
+    effect::{ActiveEffects, Effect, EffectEvent, MobEffectInstance},
+    experience, item,
+    mob::{self, MobKind},
+    potion::PotionContents,
+    spawn::{self, SpawnEnv},
     tracker::{self, Viewer, ViewerKey},
 };
 use ferrite_net::game::{Outbound, OutboundSender, ServerboundPlay, packet};
@@ -42,6 +50,7 @@ pub enum Command {
         item: u16,
         count: i32,
         item_name: String,
+        components: Vec<(u16, ferrite_nbt::Tag)>,
         feedback: Option<OutboundSender>,
     },
     Experience {
@@ -51,6 +60,27 @@ pub enum Command {
         amount: i32,
         unit: XpUnit,
         feedback: Option<OutboundSender>,
+    },
+    /// A plugin's `PlayerInventory#setItem`, applied on the owning region thread.
+    SetInventorySlot {
+        slot: u8,
+        item: Option<ferrite_plugin::ItemSnapshot>,
+    },
+    /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
+    Kill,
+    /// `/effect give`: apply a mob effect on the owning region thread.
+    ApplyEffect {
+        effect: i32,
+        amplifier: i32,
+        duration: i32,
+        /// The world loop already sent `update_mob_effect` in command order.
+        notify: bool,
+    },
+    /// `/effect clear`: remove one effect, or every effect when `effect` is `None`.
+    RemoveEffect {
+        effect: Option<i32>,
+        /// The world loop already sent `remove_mob_effect` in command order.
+        notify: bool,
     },
     Enchant {
         target: Uuid,
@@ -108,12 +138,35 @@ pub struct TickContext {
     pub tracking: Tracking,
     /// World blocks, for entity physics.
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// Live game rules (natural regeneration, keepInventory, death messages, ...).
+    pub rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
+    /// World spawn, where a player without a bed respawns (`ServerPlayer.respawn`).
+    pub spawn: [f64; 3],
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
-struct TickBlocks<'a> {
+pub(super) struct TickBlocks<'a> {
     source: Option<&'a super::anvil::AnvilChunkSource>,
     seen: std::cell::RefCell<HashMap<(i32, i32, i32), Option<u16>>>,
 }
+/// Physics reads through the tick's memoized block getter; placements write through the
+/// region's fluid world, so tracking players get the `block_update`.
+struct FallingAdapter<'a> {
+    read: &'a TickBlocks<'a>,
+    world: super::fluid::RegionFluidWorld<'a>,
+}
+
+impl BlockGetter for FallingAdapter<'_> {
+    fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        self.read.block_state(x, y, z)
+    }
+}
+
+impl ferrite_entity::falling::FallingWorld for FallingAdapter<'_> {
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u16) {
+        ferrite_fluid::FluidWorld::set_block(&mut self.world, x, y, z, u32::from(state));
+    }
+}
+
 impl BlockGetter for TickBlocks<'_> {
     fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let source = self.source?;
@@ -122,6 +175,25 @@ impl BlockGetter for TickBlocks<'_> {
             .borrow_mut()
             .entry((x, y, z))
             .or_insert_with(|| source.block(x, y, z).and_then(|s| u16::try_from(s).ok()))
+    }
+}
+impl SpawnEnv for TickBlocks<'_> {
+    fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if let Some(source) = self.source
+            && let Some(level) = source.brightness(x, y, z)
+        {
+            return level;
+        }
+        // Without stored light (a superflat test world) only open sky counts as daylight.
+        for scan in y..=y.saturating_add(64) {
+            match self.block_state(x, scan, z) {
+                Some(state)
+                    if usize::from(state) < ferrite_data::blocks::STATE_COUNT
+                        && ferrite_data::block_props::get(state).is_air => {}
+                _ => return 0,
+            }
+        }
+        15
     }
 }
 /// How many queued chunks to request ahead of the batch being sent.
@@ -135,6 +207,10 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    /// Blocks this player placed or broke this tick, for neighbor updates.
+    pub changed_blocks: Vec<[i32; 3]>,
+    /// TNT this player primed this tick, with the fuse length; spawned as `PrimedTnt`.
+    pub primed_tnt: Vec<([i32; 3], i32)>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -143,6 +219,8 @@ pub struct Player {
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// Directory this player's state is saved to on leave; `None` keeps nothing (test worlds).
+    pub playerdata: Option<std::path::PathBuf>,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -166,6 +244,17 @@ pub struct Player {
     pub queue: VecDeque<(i32, i32)>,
     pub awaiting_batch: bool,
     pub rate: f32,
+    /// Vanilla `ServerPlayer` survival state: health, absorption, food, air, fire, fall.
+    pub survival: Survival,
+    /// `LivingEntity.activeEffects`: the region owns the authoritative effect store.
+    pub effects: ActiveEffects,
+    /// Dimension type id from `CommonPlayerSpawnInfo`, echoed in `respawn`.
+    pub dimension_type: i32,
+    pub seed: i64,
+    /// `CommonPlayerSpawnInfo.isFlat`, echoed in `respawn`.
+    pub flat: bool,
+    /// Set by `client_command` action 0 (`perform respawn`); the region performs it.
+    pub respawn_requested: bool,
 }
 #[derive(Default)]
 pub struct Region {
@@ -174,6 +263,9 @@ pub struct Region {
     generator: FlatGenerator,
     fluid_ticks: ferrite_fluid::FluidTicks,
     random_ticks: super::random_tick::RandomTicks,
+    updates: super::neighbors::Updates,
+    gravity: super::gravity::Gravity,
+    redstone: super::redstone::Redstone,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -189,6 +281,8 @@ impl RegionData for Region {
         for (chunk, count) in other.held_chunks {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
+        self.gravity.merge(other.gravity);
+        self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -209,6 +303,13 @@ impl RegionData for Region {
             generator: self.generator.split(sections),
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
             random_ticks: super::random_tick::RandomTicks::default(),
+            updates: super::neighbors::Updates::default(),
+            gravity: self.gravity.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            redstone: self.redstone.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -491,8 +592,20 @@ impl Player {
                 }
             }
         }
+        // Vanilla gives levers and buttons an outline shape; the generated block-state report
+        // only models collision, so hand-activated components would be unselectable. Give them
+        // a full-cell outline, but still let a nearer collision block occlude the ray.
+        let outline = source
+            .block(target.x, target.y, target.z)
+            .and_then(|v| u16::try_from(v).ok())
+            .is_some_and(|state| super::redstone::use_block(state).is_some());
+        let outline_box = [AABB::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)];
         raycast(eye, look, distance, |p| {
-            shapes.get(&(p.x, p.y, p.z)).map(Vec::as_slice)
+            if outline && (p.x, p.y, p.z) == (target.x, target.y, target.z) {
+                Some(&outline_box[..])
+            } else {
+                shapes.get(&(p.x, p.y, p.z)).map(Vec::as_slice)
+            }
         })
         .filter(|hit| (hit.pos.x, hit.pos.y, hit.pos.z) == (target.x, target.y, target.z))
     }
@@ -549,9 +662,10 @@ impl Player {
         if !self.change_block(location, Some(state), 0) {
             return false;
         }
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        let pos = [pos.x, pos.y, pos.z];
+        self.changed_blocks.push(pos);
         if let Some(source) = &self.source {
-            let pos = ferrite_protocol::types::BlockPos::unpack(location);
-            let pos = [pos.x, pos.y, pos.z];
             for stack in super::block_container::take_contents(source, pos, state) {
                 self.menus.spilled.push((pos, stack));
             }
@@ -583,6 +697,27 @@ impl Player {
         else {
             return;
         };
+        // Vanilla `LeverBlock.use` / `ButtonBlock.use`: a right-click toggles the component
+        // instead of placing the held item.
+        if let Some(next) = super::redstone::use_block(clicked_state) {
+            if self.change_block(p.location, Some(u32::from(clicked_state)), u32::from(next)) {
+                self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+            }
+            return;
+        }
+        // Vanilla `FlintAndSteelItem.useOn` on TNT: prime it instead of placing the held item.
+        let held = self.inventory.get(self.hand_slot(p.hand.0)).clone();
+        if held.name() == Some("minecraft:flint_and_steel")
+            && ferrite_data::blocks::state(clicked_state)
+                .is_some_and(|(name, _)| name == "minecraft:tnt")
+        {
+            if self.change_block(p.location, Some(u32::from(clicked_state)), 0) {
+                self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+                self.primed_tnt
+                    .push(([clicked.x, clicked.y, clicked.z], ferrite_entity::tnt::FUSE));
+            }
+            return;
+        }
         let face = ferrite_math::Direction::ALL[p.face.0 as usize];
         let (dx, dy, dz) = if ferrite_data::block_props::get(clicked_state).replaceable {
             (0, 0, 0)
@@ -617,6 +752,11 @@ impl Player {
             };
             state
         };
+        // Vanilla `BlockItem.place` -> `BlockPlaceContext.canPlace` -> `canSurvive`.
+        if !super::neighbors::can_survive(state, [target.x, target.y, target.z], source.as_ref()) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         if !self.plugin_allows(|plugins| {
             plugins.block_placed(
                 self.uuid,
@@ -658,6 +798,9 @@ impl Player {
         }
         let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
+        if placed {
+            self.changed_blocks.push([target.x, target.y, target.z]);
+        }
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
@@ -743,18 +886,49 @@ impl Player {
             format!("Removed {removed} items from {target_name}"),
         );
     }
+    /// A plugin's `PlayerInventory#setItem`: replaces one slot and syncs it to the client.
+    fn set_inventory_slot(&mut self, slot: u8, item: Option<ferrite_plugin::ItemSnapshot>) {
+        let slot = usize::from(slot);
+        if slot >= ferrite_inventory::SIZE {
+            return;
+        }
+        let stack = match item {
+            None => ferrite_item::ItemStack::empty(),
+            Some(item) => {
+                let Some(id) = ferrite_item::item_id(&item.material) else {
+                    tracing::warn!(material = %item.material, "plugin set an unknown item");
+                    return;
+                };
+                ferrite_item::ItemStack::with_count(id, i32::from(item.amount))
+            }
+        };
+        self.inventory.set(slot, stack.clone());
+        send(
+            self,
+            &SetPlayerInventory {
+                slot: VarInt(slot as i32),
+                item: stack,
+            },
+        );
+        self.sync_containers();
+    }
     /// `/give`: places the stack back in the inventory, dropping what does not fit.
     fn give_items(
         &mut self,
         item: u16,
         count: i32,
+        components: &[(u16, ferrite_nbt::Tag)],
         item_name: &str,
         target_name: &str,
         feedback: Option<&OutboundSender>,
     ) {
-        let leftover = self
-            .inventory
-            .place_back(ferrite_item::ItemStack::with_count(item, count));
+        let mut stack = ferrite_item::ItemStack::with_count(item, count);
+        for (id, tag) in components {
+            stack
+                .components
+                .insert(*id, ferrite_item::Component::from_nbt(*id, tag));
+        }
+        let leftover = self.inventory.place_back(stack);
         let given = count - leftover.as_ref().map_or(0, |stack| stack.count);
         if let Some(leftover) = leftover {
             self.menus.thrown.push(leftover);
@@ -897,6 +1071,502 @@ impl Player {
         };
         self.feedback(feedback, text);
     }
+    /// Applies damage through the vanilla `LivingEntity.hurt` rules, with the game-mode
+    /// immunity checks of `Player.isInvulnerableTo`.
+    pub(crate) fn hurt(&mut self, kind: DamageKind, amount: f32) -> bool {
+        if self.gamemode == 3 || (self.gamemode == 1 && kind.ignores_creative()) {
+            return false;
+        }
+        // `FireResistanceMobEffect`: immune to fire and lava, and the fire goes out.
+        if self.effects.fire_resistance() && matches!(kind, DamageKind::Lava | DamageKind::Fire) {
+            self.survival.fire_ticks = 0;
+            return false;
+        }
+        // `LivingEntity.getDamageAfterArmorAbsorb` includes the resistance attribute.
+        let reduction = self.effects.attributes().damage_reduction as f32;
+        let amount = (amount * (1.0 - reduction)).max(0.0);
+        if !self.survival.damage(kind, amount) {
+            return false;
+        }
+        // `Player.hurt` -> `causeFoodExhaustion(source.getFoodExhaustion())`.
+        self.survival.food.add_exhaustion(0.1);
+        self.breaking = None;
+        self.survival.eating = None;
+        // `Player.checkTotemDeathProtection`: the totem revives before `ServerPlayer.die`.
+        if self.survival.dead && self.try_totem() {
+            self.sync_health();
+            return true;
+        }
+        // Vanilla `ServerPlayer.die` sends the combat-kill packet before the zero-health update,
+        // so fatal damage is synced by the region's death processing instead.
+        if !self.survival.dead {
+            self.sync_health();
+        }
+        true
+    }
+
+    /// Applies one effect instance and, when it is not instantaneous, sends
+    /// `ClientboundUpdateMobEffectPacket` (unless a stronger instance kept the slot).
+    fn apply_effect(&mut self, instance: MobEffectInstance) {
+        let kind = instance.kind();
+        let instant = kind.is_instant();
+        self.apply_effect_quiet(instance);
+        if !instant
+            && self
+                .effects
+                .get(kind)
+                .is_some_and(|current| *current == instance)
+        {
+            send(
+                self,
+                &UpdateMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(instance.effect),
+                    amplifier: VarInt(instance.amplifier),
+                    duration: VarInt(instance.duration),
+                    flags: instance.flags(),
+                },
+            );
+        }
+    }
+
+    /// Stores the effect without a packet (the world loop already announced it).
+    fn apply_effect_quiet(&mut self, instance: MobEffectInstance) {
+        let events = self.effects.add(instance);
+        self.apply_effect_events(events);
+        self.refresh_attributes();
+    }
+
+    /// `LivingEntity.tickEffects`: ticks the store and sends removals for expired effects.
+    fn tick_effects(&mut self) {
+        let ticks = self.effects.tick();
+        for expired in &ticks.expired {
+            send(
+                self,
+                &RemoveMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(expired.effect),
+                },
+            );
+        }
+        self.apply_effect_events(ticks.events);
+        self.refresh_attributes();
+    }
+
+    /// Milk and respawn: remove every effect, telling the client about each one.
+    fn clear_effects(&mut self) {
+        let (removed, events) = self.effects.clear();
+        for instance in removed {
+            send(
+                self,
+                &RemoveMobEffect {
+                    entity_id: VarInt(self.entity),
+                    effect: VarInt(instance.effect),
+                },
+            );
+        }
+        self.apply_effect_events(events);
+        self.refresh_attributes();
+    }
+
+    /// Applies the health, food and absorption side of the ticked effects.
+    fn apply_effect_events(&mut self, events: Vec<EffectEvent>) {
+        for event in events {
+            match event {
+                EffectEvent::Heal(amount) => {
+                    self.survival.heal(amount);
+                }
+                EffectEvent::Damage {
+                    amount,
+                    can_kill,
+                    wither,
+                } => {
+                    // `PoisonMobEffect` cannot take the last health point.
+                    let allowed = if can_kill {
+                        amount
+                    } else {
+                        (self.survival.health - 1.0).max(0.0).min(amount)
+                    };
+                    if allowed > 0.0 {
+                        self.hurt(
+                            if wither {
+                                DamageKind::Wither
+                            } else {
+                                DamageKind::Magic
+                            },
+                            allowed,
+                        );
+                    }
+                }
+                EffectEvent::Exhaustion(amount) => self.survival.food.add_exhaustion(amount),
+                EffectEvent::Food => {
+                    self.survival.food.food = (self.survival.food.food + 1).min(MAX_FOOD);
+                    self.survival.food.saturation =
+                        (self.survival.food.saturation + 1.0).min(self.survival.food.food as f32);
+                }
+                EffectEvent::Absorb(amount) => self.survival.absorption += amount,
+                EffectEvent::RemoveAbsorb(amount) => {
+                    self.survival.absorption = (self.survival.absorption - amount).max(0.0);
+                }
+            }
+        }
+    }
+
+    /// Feeds `Attributes.MAX_HEALTH` (health boost) into the survival state.
+    fn refresh_attributes(&mut self) {
+        let bonus = self.effects.attributes().max_health_bonus;
+        self.survival.set_max_health(MAX_HEALTH + bonus);
+    }
+
+    /// `Player.checkTotemDeathProtection`: consume a totem and revive with the vanilla buffs.
+    fn try_totem(&mut self) -> bool {
+        let Some(slot) = (0..ferrite_inventory::SIZE).find(|&slot| {
+            matches!(
+                self.inventory.get(slot).name(),
+                Some("minecraft:totem_of_undying")
+            )
+        }) else {
+            return false;
+        };
+        if !matches!(self.gamemode, 1 | 3) {
+            self.inventory.remove(slot, 1);
+        }
+        self.survival.health = 1.0;
+        self.survival.dead = false;
+        self.survival.death_cause = None;
+        self.survival.death_processed = false;
+        self.survival.absorption = 4.0;
+        self.apply_effect(MobEffectInstance::new(Effect::Regeneration.id(), 900, 1));
+        self.apply_effect(MobEffectInstance::new(Effect::Absorption.id(), 100, 1));
+        self.apply_effect(MobEffectInstance::new(Effect::FireResistance.id(), 800, 0));
+        true
+    }
+
+    /// `ClientboundSetHealthPacket`, sent only when the client's bar is stale.
+    pub(crate) fn sync_health(&mut self) {
+        if !self.survival.needs_sync() {
+            return;
+        }
+        send(
+            self,
+            &SetHealth {
+                health: self.survival.health,
+                food: VarInt(self.survival.food.food),
+                saturation: self.survival.food.saturation,
+            },
+        );
+        self.survival.mark_synced();
+    }
+
+    /// One `Player.tick` of survival mechanics: environment hazards, food/regeneration and
+    /// eating progress. Called once per region tick, after the player's input was applied.
+    pub(crate) fn survival_tick(&mut self, blocks: &TickBlocks, rules: &SurvivalRules) {
+        if self.survival.dead {
+            // A dead player's zero health is synced by the death processing, after the combat
+            // kill packet (`ServerPlayer.die` order).
+            if self.survival.death_processed {
+                self.sync_health();
+            }
+            return;
+        }
+        let feet = [
+            self.pos[0].floor() as i32,
+            self.pos[1].floor() as i32,
+            self.pos[2].floor() as i32,
+        ];
+        let eye_y = (self.pos[1] + 1.62).floor() as i32;
+        let feet_state = blocks.block_state(feet[0], feet[1], feet[2]).unwrap_or(0);
+        let eye_state = blocks.block_state(feet[0], eye_y, feet[2]).unwrap_or(0);
+        let feet_fluid = ferrite_fluid::fluid_state(u32::from(feet_state)).kind;
+        let eye_fluid = ferrite_fluid::fluid_state(u32::from(eye_state)).kind;
+        let fire =
+            super::survival::is_fire_block(feet_state) || super::survival::is_fire_block(eye_state);
+        let fire_resistance = self.effects.fire_resistance();
+        let water_breathing = self.effects.water_breathing();
+        let slow_falling = self.effects.slow_falling();
+        if fire_resistance {
+            self.survival.fire_ticks = 0;
+        }
+        if water_breathing {
+            self.survival.air = super::survival::MAX_AIR;
+        }
+        let damage = self.survival.environment_tick(
+            self.pos,
+            self.ground,
+            eye_fluid == ferrite_fluid::FluidKind::Water,
+            feet_fluid == ferrite_fluid::FluidKind::Lava,
+            fire,
+            self.gamemode,
+            self.survival.sprinting,
+        );
+        for (kind, amount) in damage.into_iter().flatten() {
+            if (fire_resistance && matches!(kind, DamageKind::Lava | DamageKind::Fire))
+                || (water_breathing && kind == DamageKind::Drown)
+                || (slow_falling && kind == DamageKind::Fall)
+            {
+                continue;
+            }
+            self.hurt(kind, amount);
+        }
+        if !self.survival.dead {
+            match self.survival.food_tick(
+                rules.natural_regeneration,
+                self.gamemode,
+                rules.hard_difficulty,
+            ) {
+                FoodTick::Heal(amount) => {
+                    self.survival.heal(amount);
+                }
+                FoodTick::Starve => {
+                    self.hurt(DamageKind::Starve, 1.0);
+                }
+                FoodTick::None => {}
+            }
+            self.tick_effects();
+            self.tick_eating();
+        }
+        if !self.survival.dead {
+            self.sync_health();
+        }
+    }
+
+    /// `ServerboundUseItemPacket` for food: vanilla `Item.use` starts `useItem` when the player
+    /// can eat the stack. The item is consumed by [`Player::tick_eating`] after
+    /// `minecraft:consumable`'s 1.6 s.
+    fn use_item(&mut self, p: &ferrite_protocol::packets::play::ServerboundUseItem) {
+        send(
+            self,
+            &AcknowledgeBlockChange {
+                sequence: p.sequence,
+            },
+        );
+        if self.survival.dead || !(0..=1).contains(&p.hand.0) {
+            return;
+        }
+        let slot = self.hand_slot(p.hand.0);
+        let stack = self.inventory.get(slot).clone();
+        // Milk bucket: `MilkBucketItem.finishUsingItem` removes every effect and leaves a bucket.
+        if matches!(stack.name(), Some("minecraft:milk_bucket")) {
+            self.clear_effects();
+            if !matches!(self.gamemode, 1 | 3)
+                && let Some(bucket) = ferrite_item::ItemStack::from_name("bucket")
+            {
+                self.inventory.set(slot, bucket.clone());
+                send(
+                    self,
+                    &SetPlayerInventory {
+                        slot: VarInt(slot as i32),
+                        item: ItemStack {
+                            count: bucket.count,
+                            item_id: i32::from(bucket.item),
+                        },
+                    },
+                );
+            }
+            return;
+        }
+        if self.use_potion(slot) {
+            return;
+        }
+        let Some(ferrite_item::Component::Food(food)) =
+            stack.effective_component(ferrite_item::component_ids::FOOD)
+        else {
+            return;
+        };
+        if self.survival.food.food >= MAX_FOOD && !food.can_always_eat {
+            return;
+        }
+        self.survival.eating = Some(Eating {
+            slot,
+            remaining: EAT_TICKS,
+        });
+    }
+
+    /// `PotionItem.use`: potions have `minecraft:consumable`, not `minecraft:food`, so they
+    /// start the same use duration and finish through [`Player::tick_eating`].
+    fn use_potion(&mut self, slot: usize) -> bool {
+        let stack = self.inventory.get(slot);
+        if stack
+            .effective_component(ferrite_item::component_ids::POTION_CONTENTS)
+            .is_none()
+        {
+            return false;
+        }
+        if self.survival.eating.is_none() {
+            self.survival.eating = Some(Eating {
+                slot,
+                remaining: EAT_TICKS,
+            });
+        }
+        true
+    }
+
+    /// `LivingEntity.updateUsingItem`/`ItemStack.finishUsingItem`: count the use ticks down,
+    /// then apply the food component (`FoodData.eat`) and shrink the stack in survival.
+    fn tick_eating(&mut self) {
+        let Some(mut eating) = self.survival.eating else {
+            return;
+        };
+        if self.survival.dead {
+            self.survival.eating = None;
+            return;
+        }
+        let stack = self.inventory.get(eating.slot).clone();
+        let food = match stack.effective_component(ferrite_item::component_ids::FOOD) {
+            Some(ferrite_item::Component::Food(food)) => Some(food),
+            _ => None,
+        };
+        let potion = match stack.effective_component(ferrite_item::component_ids::POTION_CONTENTS) {
+            Some(ferrite_item::Component::PotionContents(contents)) => {
+                Some(ferrite_entity::potion::effects_from_component(&contents))
+            }
+            Some(ferrite_item::Component::Opaque(tag)) => {
+                PotionContents::from_tag(&tag).map(|contents| contents.all_effects())
+            }
+            _ => None,
+        };
+        if food.is_none() && potion.is_none() {
+            self.survival.eating = None;
+            return;
+        }
+        eating.remaining -= 1;
+        if eating.remaining > 0 {
+            self.survival.eating = Some(eating);
+            return;
+        }
+        if let Some(food) = food {
+            self.survival.food.eat(food.nutrition, food.saturation);
+        } else if let Some(effects) = potion {
+            // `PotionContents.applyToLivingEntity`: instant effects act immediately, the rest
+            // enter the normal effect store and tick down.
+            for instance in effects {
+                self.apply_effect(instance);
+            }
+        }
+        // `Player.hasInfiniteMaterials`: creative does not use the item up.
+        if !matches!(self.gamemode, 1 | 3) {
+            let remainder = stack.effective_component(ferrite_item::component_ids::USE_REMAINDER);
+            self.inventory.remove(eating.slot, 1);
+            if self.inventory.get(eating.slot).is_empty()
+                && let Some(ferrite_item::Component::Opaque(ferrite_nbt::Tag::Compound(compound))) =
+                    remainder
+                && let Some(ferrite_nbt::Tag::String(name)) = compound.get("id")
+                && let Some(item) = ferrite_item::ItemStack::from_name(name)
+            {
+                self.inventory.set(eating.slot, item);
+            }
+        }
+        send(
+            self,
+            &SetPlayerInventory {
+                slot: VarInt(eating.slot as i32),
+                item: self.inventory.get(eating.slot).clone(),
+            },
+        );
+        self.survival.eating = None;
+        self.sync_health();
+    }
+
+    /// Vanilla `ServerPlayer.respawn`: a fresh survival state at the world spawn. The client
+    /// discards every chunk on `respawn`, so the loaded set is released and re-queued.
+    pub(crate) fn respawn(&mut self, spawn: [f64; 3]) {
+        let old_loaded = std::mem::take(&mut self.loaded);
+        for (x, z) in old_loaded {
+            let _ = self.signals.send(Signal::Hold {
+                chunk: ChunkPos(x, z),
+                add: false,
+            });
+        }
+        if let Some((loaded, _)) = self.tracking.lock().unwrap().get_mut(&self.uuid) {
+            loaded.clear();
+        }
+        self.clear_effects();
+        self.survival = Survival::new();
+        self.survival.last_pos = spawn;
+        self.respawn_requested = false;
+        self.breaking = None;
+        self.pos = spawn;
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.ground = true;
+        // Keep the old chunk here so the tick loop notices `next != chunk`, refreshes the
+        // window and hands the player to the region owning the spawn chunk (Folia ownership).
+        let spawn_chunk = ChunkPos(
+            (spawn[0].floor() as i32).div_euclid(16),
+            (spawn[2].floor() as i32).div_euclid(16),
+        );
+        send(
+            self,
+            &Respawn {
+                dimension_type: VarInt(self.dimension_type),
+                dimension: "minecraft:overworld".into(),
+                seed: self.seed,
+                game_mode: VarInt(self.gamemode),
+                previous_game_mode: VarInt(0),
+                debug: false,
+                flat: self.flat,
+                death_location: None,
+                portal_cooldown: VarInt(0),
+                sea_level: VarInt(63),
+                data_to_keep: 3,
+            },
+        );
+        send(
+            self,
+            &SetHealth {
+                health: MAX_HEALTH,
+                food: VarInt(MAX_FOOD),
+                saturation: 5.0,
+            },
+        );
+        self.survival.mark_synced();
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+        self.init_inventory_menu();
+        let id = self.next_teleport;
+        self.next_teleport += 1;
+        self.pending_teleport = Some(id);
+        send(
+            self,
+            &PositionSync {
+                teleport_id: VarInt(id),
+                x: spawn[0],
+                y: spawn[1],
+                z: spawn[2],
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                flags: 0,
+            },
+        );
+        send(
+            self,
+            &CenterChunk {
+                x: VarInt(spawn_chunk.0),
+                z: VarInt(spawn_chunk.1),
+            },
+        );
+        let (_, new) = chunk_window((spawn_chunk.0, spawn_chunk.1), self.view, &self.loaded);
+        self.queue = new.into();
+        self.awaiting_batch = false;
+        self.positions.lock().unwrap().insert(self.uuid, spawn);
+        let _ = self.signals.send(Signal::Update {
+            uuid: self.uuid,
+            pos: spawn,
+            yaw: 0.0,
+            pitch: 0.0,
+            ground: true,
+        });
+    }
+
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
@@ -924,16 +1594,21 @@ impl Player {
             let msg = match command {
                 Command::Leave => {
                     self.close_container();
-                    super::playerdata::save(
-                        &self.uuid,
-                        &super::playerdata::Saved::capture(
-                            self.pos,
-                            self.yaw,
-                            self.pitch,
-                            self.gamemode,
-                            &self.inventory,
-                        ),
-                    );
+                    if let Some(dir) = &self.playerdata
+                        && let Err(error) = super::playerdata::save_to(
+                            dir,
+                            &self.uuid,
+                            &super::playerdata::Saved::capture(
+                                self.pos,
+                                self.yaw,
+                                self.pitch,
+                                self.gamemode,
+                                &self.inventory,
+                            ),
+                        )
+                    {
+                        tracing::error!(%error, "failed to save player data");
+                    }
                     return false;
                 }
                 Command::SetMode(mode) => {
@@ -983,10 +1658,18 @@ impl Player {
                     item,
                     count,
                     item_name,
+                    components,
                     feedback,
                 } => {
                     if target == self.uuid {
-                        self.give_items(item, count, &item_name, &target_name, feedback.as_ref());
+                        self.give_items(
+                            item,
+                            count,
+                            &components,
+                            &item_name,
+                            &target_name,
+                            feedback.as_ref(),
+                        );
                     }
                     continue;
                 }
@@ -1006,6 +1689,61 @@ impl Player {
                             &target_name,
                             feedback.as_ref(),
                         );
+                    }
+                    continue;
+                }
+                Command::SetInventorySlot { slot, item } => {
+                    self.set_inventory_slot(slot, item);
+                    continue;
+                }
+                Command::Kill => {
+                    // Vanilla `/kill` uses `damageSources().genericKill()`: it bypasses
+                    // invulnerability and creative mode, but absorption still absorbs first.
+                    self.hurt(DamageKind::GenericKill, f32::MAX);
+                    continue;
+                }
+                Command::ApplyEffect {
+                    effect,
+                    amplifier,
+                    duration,
+                    notify,
+                } => {
+                    let instance = MobEffectInstance::new(effect, duration, amplifier);
+                    if notify {
+                        self.apply_effect(instance);
+                    } else {
+                        self.apply_effect_quiet(instance);
+                    }
+                    continue;
+                }
+                Command::RemoveEffect { effect, notify } => {
+                    match effect {
+                        Some(effect) => {
+                            let kind = Effect::from_id(effect);
+                            if self.effects.has(kind) {
+                                let events = self.effects.remove(kind);
+                                if notify {
+                                    send(
+                                        self,
+                                        &RemoveMobEffect {
+                                            entity_id: VarInt(self.entity),
+                                            effect: VarInt(effect),
+                                        },
+                                    );
+                                }
+                                self.apply_effect_events(events);
+                                self.refresh_attributes();
+                            }
+                        }
+                        None => {
+                            if notify {
+                                self.clear_effects();
+                            } else {
+                                let (_, events) = self.effects.clear();
+                                self.apply_effect_events(events);
+                                self.refresh_attributes();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1086,6 +1824,9 @@ impl Player {
                                         }) && self.break_block(p.location, state)
                                         {
                                             self.broken.push((pos, state));
+                                            // `ServerGamePacketListenerImpl`: breaking a block
+                                            // costs 0.005 exhaustion in survival.
+                                            self.survival.food.add_exhaustion(0.005);
                                         }
                                     } else {
                                         self.breaking = Some((p.location, state, 0));
@@ -1117,6 +1858,8 @@ impl Player {
                                 && self.break_block(location, state)
                             {
                                 self.broken.push((pos, state));
+                                // `ServerGamePacketListenerImpl`: 0.005 exhaustion per broken block.
+                                self.survival.food.add_exhaustion(0.005);
                             }
                         }
                         _ => {}
@@ -1270,6 +2013,22 @@ impl Player {
                 ServerboundPlay::Flags(p) => {
                     self.ground = p.flags & 1 != 0;
                 }
+                ServerboundPlay::UseItem(p) => self.use_item(&p),
+                ServerboundPlay::ClientCommand(p) => {
+                    // `ServerboundClientCommandPacket.Action.PERFORM_RESPAWN`.
+                    if p.action.0 == 0 && self.survival.dead {
+                        self.respawn_requested = true;
+                    }
+                }
+                // `ServerboundPlayerCommandPacket.Action.START_SPRINTING/STOP_SPRINTING`.
+                ServerboundPlay::PlayerCommand(p) if p.entity_id.0 == self.entity => {
+                    match p.action.0 {
+                        3 => self.survival.sprinting = true,
+                        4 => self.survival.sprinting = false,
+                        _ => {}
+                    }
+                }
+                ServerboundPlay::PlayerCommand(_) => {}
                 _ => {}
             }
         }
@@ -1338,6 +2097,182 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
+    /// Creates a mob at an absolute position (`/summon`).
+    pub fn summon(&mut self, kind: MobKind, pos: [f64; 3]) -> bool {
+        if !pos
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= 30_000_000.0)
+        {
+            return false;
+        }
+        let record = mob::new_mob(
+            kind,
+            ferrite_math::Vec3::new(pos[0], pos[1], pos[2]),
+            &mut self.rng,
+        );
+        self.entities.insert(record);
+        true
+    }
+    /// Ticks the modelled mobs: goals, movement, fall damage, despawn, natural spawning and
+    /// death loot.
+    fn tick_mobs(&mut self, blocks: &TickBlocks<'_>) {
+        let players: Vec<_> = self
+            .players
+            .values()
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        ai::tick(&mut self.entities, blocks, &players, &mut self.rng);
+        for record in spawn::natural_spawn(&self.entities, blocks, &players, &mut self.rng, 1) {
+            self.entities.insert(record);
+        }
+        // Mobs that died this tick drop their entity loot table once (vanilla
+        // `LivingEntity.dropFromLootTable`). The entity itself stays in the store until the
+        // tracker has sent `remove_entities` and `sweep_removed` drops the record.
+        let dead: Vec<_> = self
+            .entities
+            .keys()
+            .iter()
+            .filter_map(|&key| {
+                let data = self.entities.data(key)?;
+                let mob = data.mob?;
+                if !mob.is_dead() || mob.loot_dropped {
+                    return None;
+                }
+                Some((key, mob.kind, self.entities.pos(key)?))
+            })
+            .collect();
+        for (key, kind, pos) in dead {
+            if let Some(mob) = mob::state_mut(&mut self.entities, key) {
+                mob.loot_dropped = true;
+            }
+            for stack in super::drops::mob_drops(kind, &mut self.rng) {
+                let block = [
+                    pos.x.floor() as i32,
+                    pos.y.floor() as i32,
+                    pos.z.floor() as i32,
+                ];
+                let record = item::pop_resource(block, stack, &mut self.rng);
+                self.entities.insert(record);
+            }
+        }
+    }
+    /// Runs the neighbor updates of this tick's block changes (vanilla
+    /// `Level.markAndNotifyBlock` -> `Block.updateNeighbourShapes`). Unsupported blocks break
+    /// here; their loot drops as item entities through the normal loot tables.
+    fn tick_block_updates(&mut self, ctx: &TickContext) -> Vec<[i32; 3]> {
+        let mut changed = Vec::new();
+        for p in self.players.values_mut() {
+            changed.append(&mut p.changed_blocks);
+        }
+        let Some(source) = ctx.source.as_deref() else {
+            return changed;
+        };
+        for pos in &changed {
+            self.updates.block_changed(*pos);
+        }
+        let mut removed = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut removed);
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+            changed.push(pos);
+        }
+        changed
+    }
+
+    /// Runs the queued shape updates against the region's blocks.
+    fn apply_neighbor_updates(
+        &mut self,
+        source: &super::anvil::AnvilChunkSource,
+        ctx: &TickContext,
+        removed: &mut Vec<([i32; 3], u16)>,
+    ) {
+        let mut world =
+            super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        self.updates.apply(&mut world, removed);
+    }
+
+    /// Drops the loot table of a block broken by a neighbor or gravity update.
+    fn spawn_block_drops(&mut self, pos: [i32; 3], state: u16) {
+        for stack in super::drops::block_drops(state, ItemStack::default(), &mut self.rng) {
+            let record = item::pop_resource(pos, stack, &mut self.rng);
+            self.entities.insert(record);
+        }
+    }
+
+    /// Vanilla `FallingBlock.onPlace`/`neighborChanged`: schedules a free gravity block. The
+    /// changed block and its six neighbors are the blocks vanilla notifies.
+    fn schedule_gravity(&mut self, source: &super::anvil::AnvilChunkSource, changed: &[[i32; 3]]) {
+        for &pos in changed {
+            for (dx, dy, dz) in [
+                (0, 0, 0),
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let target = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                let chunk = ChunkPos(target[0].div_euclid(16), target[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) = source
+                    .block(target[0], target[1], target[2])
+                    .and_then(|s| u16::try_from(s).ok())
+                else {
+                    continue;
+                };
+                if !super::gravity::is_gravity(state) {
+                    continue;
+                }
+                let below = source
+                    .block(target[0], target[1] - 1, target[2])
+                    .and_then(|s| u16::try_from(s).ok());
+                if super::gravity::is_free(below) {
+                    self.gravity.schedule(target);
+                }
+            }
+        }
+    }
+
+    /// Runs due gravity checks, then the neighbor updates of the blocks they removed.
+    fn tick_gravity(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let removed =
+            self.gravity
+                .tick(source, &self.held_chunks, &ctx.tracking, &mut self.entities);
+        if removed.is_empty() {
+            return;
+        }
+        for pos in &removed {
+            self.updates.block_changed(*pos);
+        }
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+
+    /// Ticks the falling block entities against this region's blocks.
+    fn tick_falling(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        let mut adapter = FallingAdapter {
+            read: &blocks,
+            world,
+        };
+        ferrite_entity::falling::tick_falling_blocks(&mut self.entities, &mut adapter, -64, 320);
+    }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
@@ -1377,6 +2312,201 @@ impl Region {
         for (viewer, bytes) in sent {
             deliver(&self.players, ctx, viewer, &bytes);
         }
+    }
+    /// Spawns primed TNT at a block position (vanilla `PrimedTnt` entity).
+    fn spawn_tnt(&mut self, pos: [i32; 3], fuse: i32) {
+        let center = ferrite_math::Vec3::new(
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]),
+            f64::from(pos[2]) + 0.5,
+        );
+        self.entities
+            .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
+    }
+
+    /// Awards the experience orbs each player touches (`ExperienceOrb.playerTouch`) and syncs
+    /// the bar. The take animation packets go out after every player was processed.
+    fn pick_up_experience(&mut self, ctx: &TickContext) {
+        let mut sent = Vec::new();
+        for p in self.players.values_mut() {
+            if p.gamemode == 3 || p.survival.dead {
+                continue;
+            }
+            let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+            let gained = experience::player_touch(
+                &mut self.entities,
+                p.entity,
+                feet,
+                &mut |viewer, bytes| sent.push((viewer, bytes.to_vec())),
+            );
+            if gained > 0 {
+                p.set_experience_total(i64::from(p.experience_total) + i64::from(gained));
+                send(
+                    p,
+                    &SetExperience {
+                        progress: p.experience_progress,
+                        level: VarInt(p.experience_level),
+                        total: VarInt(p.experience_total),
+                    },
+                );
+            }
+        }
+        for (viewer, bytes) in sent {
+            deliver(&self.players, ctx, viewer, &bytes);
+        }
+    }
+    /// Spawns the TNT a player lit (vanilla `PrimedTnt` at the block position).
+    fn spawn_primed_tnt(&mut self, p: &mut Player) {
+        for (pos, fuse) in p.primed_tnt.drain(..) {
+            self.spawn_tnt(pos, fuse);
+        }
+    }
+
+    /// Ticks the region's redstone network after this tick's block changes, mirroring
+    /// `Level.tickBlockEntities` + `Level.tickBlocks` + scheduled block ticks.
+    fn tick_redstone(&mut self, ctx: &TickContext, changed: &[[i32; 3]]) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let players: Vec<[f64; 3]> = self.players.values().map(|p| p.pos).collect();
+        let mut world =
+            super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        self.redstone.blocks_changed(&mut world, changed);
+        self.redstone.tick(&mut world, &players);
+        for (pos, fuse) in self.redstone.take_primed() {
+            self.spawn_tnt(pos, fuse);
+        }
+    }
+    /// Ticks primed TNT and runs its `Explosion` where a fuse ends.
+    fn tick_tnt(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let centers = ferrite_entity::tnt::tick_tnt(&mut self.entities, &blocks);
+        if centers.is_empty() {
+            return;
+        }
+        for center in centers {
+            self.explode(
+                [center.x, center.y, center.z],
+                super::explosion::TNT_POWER,
+                ctx,
+            );
+        }
+        // Vanilla `Explosion.finalizeExplosion` sets blocks with `Block.UPDATE_NEIGHBORS`.
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+    /// Vanilla `Explosion`: entity knockback and exposure first, then the ray cast blocks and
+    /// their loot-table drops.
+    fn explode(&mut self, center: [f64; 3], power: f32, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        // Players are not in the entity store; vanilla pushes them like any other entity.
+        let hits: Vec<(i32, [f64; 3])> = self
+            .players
+            .values()
+            .filter_map(|p| {
+                let bbox = ferrite_math::AABB::new(
+                    p.pos[0] - 0.3,
+                    p.pos[1],
+                    p.pos[2] - 0.3,
+                    p.pos[0] + 0.3,
+                    p.pos[1] + 1.8,
+                    p.pos[2] + 0.3,
+                );
+                let impulse = super::explosion::impulse(
+                    source,
+                    center,
+                    power,
+                    ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                    bbox,
+                )?;
+                Some((p.entity, impulse))
+            })
+            .collect();
+        for (entity, impulse) in hits {
+            if let Some(p) = self.players.values().find(|p| p.entity == entity) {
+                send(
+                    p,
+                    &SetEntityMotion {
+                        id: VarInt(entity),
+                        velocity: ferrite_protocol::types::LpVec3(impulse),
+                    },
+                );
+            }
+        }
+        // Entity push (vanilla `Entity.push`).
+        let radius = f64::from(power) * 2.0;
+        let area = ferrite_math::AABB::new(
+            center[0] - radius,
+            center[1] - radius,
+            center[2] - radius,
+            center[0] + radius,
+            center[1] + radius,
+            center[2] + radius,
+        );
+        for key in self.entities.query_vec(area) {
+            if self
+                .entities
+                .flags(key)
+                .is_some_and(|flags| flags.has(ferrite_entity::Flags::REMOVED))
+            {
+                continue;
+            }
+            let (Some(pos), Some(bbox)) = (self.entities.pos(key), self.entities.bbox(key)) else {
+                continue;
+            };
+            let Some(impulse) = super::explosion::impulse(source, center, power, pos, bbox) else {
+                continue;
+            };
+            let vel = self.entities.vel(key).unwrap_or_default();
+            self.entities.set_vel(
+                key,
+                ferrite_math::Vec3::new(vel.x + impulse[0], vel.y + impulse[1], vel.z + impulse[2]),
+            );
+            if let Some(flags) = self.entities.flags_mut(key) {
+                flags.set(ferrite_entity::Flags::NEEDS_SYNC, true);
+            }
+        }
+        // Destroyed blocks, with the state read before it turns into air.
+        let air = u32::from(ferrite_data::blocks::default_state("air").expect("vanilla air"));
+        let destroyed;
+        let mut removed = Vec::new();
+        {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            destroyed = super::explosion::explode_blocks(&world, center, power, &mut self.rng);
+            for pos in &destroyed {
+                // Never touch another region's blocks.
+                let chunk = ChunkPos(pos[0].div_euclid(16), pos[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) =
+                    super::neighbors::BlockWorld::block(&world, pos[0], pos[1], pos[2])
+                else {
+                    continue;
+                };
+                ferrite_fluid::FluidWorld::set_block(&mut world, pos[0], pos[1], pos[2], air);
+                removed.push((*pos, state));
+            }
+        }
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+        }
+        for pos in &destroyed {
+            self.updates.block_changed(*pos);
+        }
+        self.schedule_gravity(source, &destroyed);
     }
     /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
     /// entities in front of it. Item entities hold plain stacks for now, so components are not
@@ -1418,9 +2548,88 @@ impl Region {
             deliver(players, ctx, viewer, bytes)
         });
     }
+    /// Vanilla `ServerPlayer.die` + `dropAllDeathLoot` + `Player.deathMessage`: drop the
+    /// inventory and experience unless `keepInventory`, send the death screen and announce it.
+    fn process_death(&mut self, p: &mut Player, ctx: &TickContext, rules: &SurvivalRules) {
+        if p.survival.death_processed {
+            return;
+        }
+        p.survival.death_processed = true;
+        p.survival.eating = None;
+        p.breaking = None;
+        p.close_container();
+        let survival_mode = matches!(p.gamemode, 0 | 2);
+        if !rules.keep_inventory && survival_mode {
+            let pos = [
+                p.pos[0].floor() as i32,
+                p.pos[1].floor() as i32,
+                p.pos[2].floor() as i32,
+            ];
+            for slot in 0..ferrite_inventory::SIZE {
+                let stack = p.inventory.get(slot).clone();
+                if stack.is_empty() {
+                    continue;
+                }
+                p.inventory.set(slot, ferrite_item::ItemStack::empty());
+                let plain = ferrite_protocol::packets::play::ItemStack {
+                    count: stack.count,
+                    item_id: i32::from(stack.item),
+                };
+                self.entities
+                    .insert(item::pop_resource(pos, plain, &mut self.rng));
+            }
+            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, split by
+            // `ExperienceOrb.award` and spawned where the player died.
+            let dropped = p.experience_level.saturating_mul(7).min(100);
+            if dropped > 0 {
+                let feet = ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                for record in experience::award(feet, dropped) {
+                    self.entities.insert(record);
+                }
+            }
+            p.experience_level = 0;
+            p.experience_progress = 0.0;
+            p.experience_total = 0;
+            send(
+                p,
+                &SetExperience {
+                    progress: 0.0,
+                    level: VarInt(0),
+                    total: VarInt(0),
+                },
+            );
+            tracing::info!(player = %p.name, dropped, "player died; experience orbs dropped");
+        }
+        let kind = p.survival.death_cause.unwrap_or(DamageKind::GenericKill);
+        let message = kind.death_message(&p.name);
+        send(
+            p,
+            &PlayerCombatKill {
+                player_id: VarInt(p.entity),
+                message: ferrite_protocol::types::PlainText(message.clone()),
+            },
+        );
+        p.sync_health();
+        if rules.show_death_messages {
+            let update = packet(&SystemChat {
+                content: ferrite_protocol::types::PlainText(message),
+                overlay: false,
+            });
+            for (_, outbound) in ctx.tracking.lock().unwrap().values() {
+                let _ = outbound.send(update.clone());
+            }
+        }
+        tracing::info!(player = %p.name, ?kind, "player died");
+    }
+
     pub fn tick(&mut self, ctx: &TickContext) {
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
+        let rules = SurvivalRules::from(&ctx.rules.lock().unwrap());
+        let blocks = TickBlocks {
+            source: ctx.source.as_deref(),
+            seen: Default::default(),
+        };
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in ids {
             let mut p = self.players.remove(&id).unwrap();
@@ -1431,7 +2640,17 @@ impl Region {
                 }
                 None => p.update(),
             };
+            if updated {
+                p.survival_tick(&blocks, &rules);
+                if p.survival.dead {
+                    self.process_death(&mut p, ctx, &rules);
+                    if p.survival.dead && (p.respawn_requested || rules.immediate_respawn) {
+                        p.respawn(ctx.spawn);
+                    }
+                }
+            }
             self.spawn_thrown(&mut p);
+            self.spawn_primed_tnt(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -1467,12 +2686,29 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
+        let changed = self.tick_block_updates(ctx);
+        if let Some(source) = ctx.source.as_deref() {
+            self.schedule_gravity(source, &changed);
+        }
+        self.tick_gravity(ctx);
+        self.tick_redstone(ctx, &changed);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),
         };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
+        self.tick_mobs(&blocks);
+        let alive: Vec<ferrite_math::Vec3> = self
+            .players
+            .values()
+            .filter(|p| p.gamemode != 3 && !p.survival.dead)
+            .map(|p| ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]))
+            .collect();
+        experience::tick_orbs(&mut self.entities, &blocks, &alive, &mut self.rng);
+        self.pick_up_experience(ctx);
         self.pick_up_items(ctx);
+        self.tick_falling(ctx);
+        self.tick_tnt(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
         }
@@ -1515,6 +2751,8 @@ mod tests {
             signals,
             tracking: Default::default(),
             source: None,
+            rules: Default::default(),
+            spawn: [0.0, 65.0, 0.0],
         });
 
         let report = timings.report_all(50.0);

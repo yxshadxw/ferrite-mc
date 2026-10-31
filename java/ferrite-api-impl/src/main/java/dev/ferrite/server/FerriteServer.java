@@ -1,12 +1,30 @@
 package dev.ferrite.server;
 
 public class FerriteServer extends ServerStubs {
-    public record Settings(String motd, int maxPlayers, int port, int viewDistance, boolean whitelist, boolean onlineMode) {}
+    public record Settings(String motd, int maxPlayers, int port, int viewDistance, boolean whitelist, boolean onlineMode, boolean allowFlight, boolean allowNether, boolean allowEnd, boolean generateStructures, int maxWorldSize, int simulationDistance, int spawnRadius, int idleTimeout, int pauseWhenEmptyTime, int connectionThrottle) {
+        public Settings(String motd, int maxPlayers, int port, int viewDistance, boolean whitelist, boolean onlineMode) { this(motd, maxPlayers, port, viewDistance, whitelist, onlineMode, false, true, true, true, 29999984, 10, 10, 0, -1, -1); }
+    }
     private final Settings settings;
+    private volatile String motd;
+    private volatile int maxPlayers;
+    private volatile org.bukkit.GameMode defaultGameMode = org.bukkit.GameMode.SURVIVAL;
+    private volatile boolean whitelistEnforced;
+    private volatile int spawnRadius;
+    private volatile int idleTimeout;
+    private volatile int pauseWhenEmptyTime;
+    private volatile boolean stopping;
+    private volatile String shutdownMessage;
+    volatile String pluginsFolder;
     public FerriteServer() { this(new Settings("Ferrite", 20, 25565, 10, false, true)); }
-    protected FerriteServer(Settings settings) { this.settings = settings; this.whitelistEnabled = settings.whitelist(); facade.paperPluginManager = plugins; }
-    @Override public String getMotd() { return settings.motd(); }
-    @Override public int getMaxPlayers() { return settings.maxPlayers(); }
+    protected FerriteServer(Settings settings) { this.settings = settings; this.whitelistEnabled = settings.whitelist(); this.whitelistEnforced = settings.whitelist(); this.motd = settings.motd(); this.maxPlayers = settings.maxPlayers(); this.spawnRadius = settings.spawnRadius(); this.idleTimeout = settings.idleTimeout(); this.pauseWhenEmptyTime = settings.pauseWhenEmptyTime(); this.shutdownMessage = System.getProperty("ferrite.shutdownMessage"); facade.paperPluginManager = plugins; }
+    /** Marks the server as shutting down so plugins polling {@link #isStopping()} stop work. */
+    void beginShutdown() { stopping = true; }
+    @Override public String getMotd() { return motd; }
+    @Override public void setMotd(String value) { motd = java.util.Objects.requireNonNull(value, "motd"); }
+    @Override public net.kyori.adventure.text.Component motd() { return net.kyori.adventure.text.Component.text(motd); }
+    @Override public void motd(net.kyori.adventure.text.Component value) { motd = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(java.util.Objects.requireNonNull(value, "motd")); }
+    @Override public int getMaxPlayers() { return maxPlayers; }
+    @Override public void setMaxPlayers(int value) { maxPlayers = value; }
     @Override public int getPort() { return settings.port(); }
     @Override public int getViewDistance() { return settings.viewDistance(); }
     @Override public boolean getOnlineMode() { return settings.onlineMode(); }
@@ -171,4 +189,115 @@ public class FerriteServer extends ServerStubs {
     @Override public String getMinecraftVersion() { return "26.3"; }
     @Override public java.util.logging.Logger getLogger() { return java.util.logging.Logger.getLogger("Ferrite"); }
     @Override public java.util.Collection<? extends org.bukkit.entity.Player> getOnlinePlayers() { return java.util.List.copyOf(players.values()); }
+    @Override public org.bukkit.GameMode getDefaultGameMode() { return defaultGameMode; }
+    @Override public void setDefaultGameMode(org.bukkit.GameMode mode) { defaultGameMode = java.util.Objects.requireNonNull(mode, "mode"); }
+    @Override public boolean getAllowFlight() { return settings.allowFlight(); }
+    @Override public boolean getAllowNether() { return settings.allowNether(); }
+    @Override public boolean getAllowEnd() { return settings.allowEnd(); }
+    @Override public boolean getGenerateStructures() { return settings.generateStructures(); }
+    @Override public int getMaxWorldSize() { return settings.maxWorldSize(); }
+    @Override public int getSimulationDistance() { return settings.simulationDistance(); }
+    @Override public int getSpawnRadius() { return spawnRadius; }
+    @Override public void setSpawnRadius(int value) { if (value < 0) throw new IllegalArgumentException("spawn radius must not be negative"); spawnRadius = value; }
+    @Override public int getIdleTimeout() { return idleTimeout; }
+    @Override public void setIdleTimeout(int value) { if (value < 0) throw new IllegalArgumentException("idle timeout must not be negative"); idleTimeout = value; }
+    @Override public int getPauseWhenEmptyTime() { return pauseWhenEmptyTime; }
+    @Override public void setPauseWhenEmptyTime(int value) { if (value < -1) throw new IllegalArgumentException("pause time must be -1 or more"); pauseWhenEmptyTime = value; }
+    @Override public long getConnectionThrottle() { return settings.connectionThrottle(); }
+    @Override public boolean isWhitelistEnforced() { return whitelistEnforced; }
+    @Override public void setWhitelistEnforced(boolean value) { whitelistEnforced = value; }
+    @Override public boolean isStopping() { return stopping; }
+    @Override public String getShutdownMessage() { return shutdownMessage; }
+    @Override public net.kyori.adventure.text.Component shutdownMessage() { return shutdownMessage == null ? null : net.kyori.adventure.text.Component.text(shutdownMessage); }
+    /** Ticks the host scheduler has run, from the shared counter the scheduler tasks use. */
+    @Override public int getCurrentTick() { return (int) Native.currentTick(); }
+    @Override public int broadcast(net.kyori.adventure.text.Component message, String permission) {
+        java.util.Objects.requireNonNull(message, "message");
+        int sent = 0;
+        for (var player : players.values()) {
+            if (permission != null && !player.hasPermission(permission)) continue;
+            player.sendMessage(message);
+            sent++;
+        }
+        return sent;
+    }
+    @Override public java.util.List<org.bukkit.entity.Player> matchPlayer(String name) {
+        java.util.Objects.requireNonNull(name, "name");
+        String prefix = name.toLowerCase(java.util.Locale.ROOT);
+        return players.values().stream().filter(player -> player.getName().toLowerCase(java.util.Locale.ROOT).startsWith(prefix)).toList();
+    }
+    @Override public java.util.UUID getPlayerUniqueId(String name) {
+        var player = getPlayerExact(java.util.Objects.requireNonNull(name, "name"));
+        return player == null ? null : player.getUniqueId();
+    }
+    @Override public org.bukkit.OfflinePlayer getOfflinePlayerIfCached(String name) {
+        java.util.Objects.requireNonNull(name, "name");
+        var player = getPlayerExact(name);
+        if (player != null) return player;
+        var known = offlineIds.get(name.toLowerCase(java.util.Locale.ROOT));
+        return known == null ? null : offline(known, offlineNames.get(known));
+    }
+    /** Only players are bridged; other entity kinds are not tracked by the host yet. */
+    @Override public org.bukkit.entity.Entity getEntity(java.util.UUID id) { return players.get(java.util.Objects.requireNonNull(id, "id")); }
+    @Override public java.io.File getPluginsFolder() { return new java.io.File(pluginsFolder == null ? "plugins" : pluginsFolder); }
+    /** The host does not expose a bind address, matching the empty server-ip default. */
+    @Override public String getIp() { return ""; }
+    /** Hardcore is not a host setting yet. */
+    @Override public boolean isHardcore() { return false; }
+    @Override public boolean isLoggingIPs() { return true; }
+    /** Online mode requires Mojang-signed profiles, so it also enforces secure profiles. */
+    @Override public boolean isEnforcingSecureProfiles() { return settings.onlineMode(); }
+    @Override public boolean isAcceptingTransfers() { return false; }
+    @Override public boolean getHideOnlinePlayers() { return false; }
+    /** Every join is forced onto the default game mode by the host's login packet. */
+    @Override public boolean forcesDefaultGameMode() { return false; }
+    @Override public java.io.File getWorldContainer() { return new java.io.File(".").getAbsoluteFile(); }
+    @Override public java.nio.file.Path getLevelDirectory() { return getWorldContainer().toPath(); }
+    @Override public String getUpdateFolder() { return "update"; }
+    @Override public java.io.File getUpdateFolderFile() { return new java.io.File(getWorldContainer(), getUpdateFolder()); }
+    @Override public org.bukkit.Warning.WarningState getWarningState() { return org.bukkit.Warning.WarningState.DEFAULT; }
+    @Override public boolean isPaused() { return false; }
+    @Override public boolean isTickingWorlds() { return !stopping; }
+    @Override public boolean isGlobalTickThread() { return isPrimaryThread(); }
+    /** The host persists player data on quit and shutdown; there is no separate flush. */
+    @Override public void savePlayers() {}
+    @Override public int getMaxChainedNeighborUpdates() { return 1_000_000; }
+    @Override public java.util.List<String> getInitialEnabledPacks() { return java.util.List.of("vanilla"); }
+    @Override public java.util.List<String> getInitialDisabledPacks() { return java.util.List.of(); }
+    @Override public String getResourcePack() { return null; }
+    @Override public String getResourcePackHash() { return null; }
+    @Override public String getResourcePackPrompt() { return null; }
+    @Override public boolean isResourcePackRequired() { return false; }
+    @Override public org.bukkit.packs.ResourcePack getServerResourcePack() { return null; }
+    @Override public java.util.Iterator<org.bukkit.boss.KeyedBossBar> getBossBars() { return java.util.Collections.emptyIterator(); }
+    @Override public org.bukkit.boss.KeyedBossBar getBossBar(org.bukkit.NamespacedKey key) { java.util.Objects.requireNonNull(key, "key"); return null; }
+    @Override public boolean removeBossBar(org.bukkit.NamespacedKey key) { java.util.Objects.requireNonNull(key, "key"); return false; }
+    private final FerriteRegistryAccess registries = new FerriteRegistryAccess();
+    @Override public <T extends org.bukkit.Keyed> org.bukkit.Registry<T> getRegistry(Class<T> type) { return registries.getRegistry(type); }
+    private final org.bukkit.inventory.ItemFactory itemFactory = new FerriteItemFactory();
+    @Override public org.bukkit.inventory.ItemFactory getItemFactory() { return itemFactory; }
+    @Override public void reloadPermissions() { facade.permissions.values().forEach(plugins::recalculatePermissionDefaults); }
+    // ---- plugin-facing runtime surface kept from the fb4 bridge -----------------------------
+    private final FerriteUnsafe unsafe = new FerriteUnsafe();
+    @Override public org.bukkit.UnsafeValues getUnsafe() { return unsafe; }
+    @Override public org.bukkit.block.data.BlockData createBlockData(String data) { return FerriteBlockData.create(data); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material) { return FerriteBlockData.create(material); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, String data) {
+        java.util.Objects.requireNonNull(material, "material");
+        if (data != null && !data.isEmpty()) throw new UnsupportedOperationException("Ferrite: block-state properties are owned by the Rust server: " + data);
+        return FerriteBlockData.create(material);
+    }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, java.util.function.Consumer<? super org.bukkit.block.data.BlockData> consumer) {
+        var data = FerriteBlockData.create(material);
+        consumer.accept(data);
+        return data;
+    }
+    private static final double[] NOMINAL_TPS = {20.0, 20.0, 20.0};
+    /** Nominal until per-region tick metrics are exposed to the bridge (see docs/BACKLOG.md). */
+    @Override public double[] getTPS() { return NOMINAL_TPS.clone(); }
+    @Override public double getAverageTickTime() { return 50.0; }
+    @Override public long[] getTickTimes() { return new long[100]; }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getWhitelistedPlayers() { return java.util.Set.of(); }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getBannedPlayers() { return java.util.Set.of(); }
+    @Override public String getWorldType() { return "normal"; }
 }

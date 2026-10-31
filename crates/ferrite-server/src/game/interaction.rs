@@ -14,6 +14,20 @@ pub fn break_ticks(state: u16) -> Option<u32> {
     Some((f64::from(props.hardness) * divisor).ceil().max(1.0) as u32)
 }
 
+/// Vanilla `WallTorchBlock` variant of a torch item, when a torch is placed on a horizontal
+/// face (`StandingAndWallBlockItem` picks the wall block for side placement).
+fn wall_torch_name(name: &str) -> Option<&'static str> {
+    let short = name.strip_prefix("minecraft:").unwrap_or(name);
+    let wall = match short {
+        "torch" => "minecraft:wall_torch",
+        "soul_torch" => "minecraft:soul_wall_torch",
+        "redstone_torch" => "minecraft:redstone_wall_torch",
+        "copper_torch" => "minecraft:copper_wall_torch",
+        _ => return None,
+    };
+    ferrite_data::blocks::default_state(wall).map(|_| wall)
+}
+
 pub fn placement_state(
     item_id: i32,
     face: i32,
@@ -24,6 +38,12 @@ pub fn placement_state(
     let name = ferrite_data::registries::entries("minecraft:item")?
         .iter()
         .find(|name| ferrite_data::registries::id("minecraft:item", name) == Some(item_id))?;
+    // Vanilla `BlockItem.getPlacementState`: a torch on a side face becomes its wall variant.
+    let name = if matches!(face, 2..=5) {
+        wall_torch_name(name).unwrap_or(name)
+    } else {
+        name
+    };
     let default = ferrite_data::blocks::default_state(name)?;
     let (_, defaults) = ferrite_data::blocks::state(default)?;
     let mut properties = defaults.to_vec();
@@ -48,10 +68,31 @@ pub fn placement_state(
         2 => "south",
         _ => "west",
     };
+    // Vanilla `HorizontalDirectionalBlock.getStateForPlacement`: the clicked face's direction.
+    let clicked_facing = match face {
+        2 => "north",
+        3 => "south",
+        4 => "west",
+        5 => "east",
+        _ => facing,
+    };
     let upper = face == 0 || (face != 1 && cursor_y > 0.5);
     for (key, value) in &mut properties {
         *value = match *key {
             "axis" => axis,
+            // `ButtonBlock` attach face: floor, ceiling or wall.
+            "face" if name.ends_with("_button") => match face {
+                0 => "ceiling",
+                1 => "floor",
+                _ => "wall",
+            },
+            // Wall torches and wall buttons face the clicked block.
+            "facing"
+                if (name.ends_with("wall_torch") || name.ends_with("_button"))
+                    && ["north", "east", "south", "west"].contains(value) =>
+            {
+                clicked_facing
+            }
             "facing" if ["north", "east", "south", "west"].contains(value) => facing,
             "half" if name.contains("stairs") => {
                 if upper {
@@ -110,5 +151,34 @@ mod tests {
         assert!(props.contains(&("facing", "north")));
         assert!(props.contains(&("half", "top")));
         assert!(props.contains(&("waterlogged", "true")));
+    }
+    #[test]
+    fn torch_on_a_side_face_becomes_the_matching_wall_torch() {
+        let item = ferrite_data::registries::id("minecraft:item", "minecraft:soul_torch").unwrap();
+        let state = placement_state(item, 2, 0.5, 0.0, 0).unwrap();
+        assert_eq!(
+            ferrite_data::blocks::state(state).unwrap().0,
+            "minecraft:soul_wall_torch"
+        );
+        assert!(
+            ferrite_data::blocks::state(state)
+                .unwrap()
+                .1
+                .contains(&("facing", "north"))
+        );
+        let item = ferrite_data::registries::id("minecraft:item", "minecraft:torch").unwrap();
+        let state = placement_state(item, 1, 0.5, 0.0, 0).unwrap();
+        assert_eq!(
+            ferrite_data::blocks::state(state).unwrap().0,
+            "minecraft:torch"
+        );
+    }
+    #[test]
+    fn wall_button_gets_the_clicked_face_and_facing() {
+        let item = ferrite_data::registries::id("minecraft:item", "minecraft:oak_button").unwrap();
+        let state = placement_state(item, 5, 0.5, 0.0, 0).unwrap();
+        let (_, props) = ferrite_data::blocks::state(state).unwrap();
+        assert!(props.contains(&("face", "wall")));
+        assert!(props.contains(&("facing", "east")));
     }
 }

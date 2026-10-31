@@ -35,8 +35,12 @@ fn repo_root() -> PathBuf {
         .to_owned()
 }
 
+/// Gradle builds share one daemon and project directory; serialize the test helpers that invoke it.
+static GRADLE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Build the Java bridge, the test plugin and its dependency with the Gradle wrapper.
 fn build_jars(repo: &Path, java_home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let _guard = GRADLE_LOCK.lock().unwrap();
     let project = repo.join("java").join("ferrite-api-impl");
     let mut command = if cfg!(windows) {
         let mut command = Command::new("cmd");
@@ -115,7 +119,7 @@ fn capture(
                 Ok(0) | Err(_) => break,
                 Ok(read) => target
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|error| error.into_inner())
                     .push_str(&String::from_utf8_lossy(&buffer[..read])),
             }
         }
@@ -464,7 +468,7 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     fs::write(
         dir.path().join("ferrite.toml"),
         format!(
-            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\nmotd = \"Plugin lifecycle\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
+            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\nmotd = \"Plugin lifecycle\"\ngenerator = \"superflat\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
             toml_path(&bridge_jar)
         ),
     )
@@ -654,6 +658,197 @@ fn server_loads_plugins_at_startup_and_disables_them_on_stop() {
     );
     assert!(
         plugins.join("TestPlugin/disabled.txt").exists(),
+        "plugin did not write its disable marker:\n{logs}"
+    );
+}
+
+/// Build the typical-plugin fixture together with the shaded bridge.
+fn build_typical_jar(repo: &Path, java_home: &Path) -> PathBuf {
+    let _guard = GRADLE_LOCK.lock().unwrap();
+    let project = repo.join("java").join("ferrite-api-impl");
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.args([
+            "/C",
+            r".\gradlew.bat",
+            "--console=plain",
+            ":test-plugin-typical:jar",
+            "shadedJar",
+        ]);
+        command
+    } else {
+        let mut command = Command::new("./gradlew");
+        command.args(["--console=plain", ":test-plugin-typical:jar", "shadedJar"]);
+        command
+    };
+    let output = command
+        .current_dir(&project)
+        .env("JAVA_HOME", java_home)
+        .output()
+        .expect("running the Gradle wrapper");
+    assert!(
+        output.status.success(),
+        "gradle typical plugin build failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let jar = repo.join("java/test-plugin-typical/build/libs/test-plugin-typical.jar");
+    assert!(jar.exists(), "missing built jar: {}", jar.display());
+    jar
+}
+
+/// A plugin shaped like a real one: config.yml, a command with tab completion, a join listener
+/// and a repeating task that cancels itself.
+#[test]
+fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
+    let java_home = match ferrite_jvm::find_java_home(None) {
+        Ok(home) => home.root().to_owned(),
+        Err(error) => {
+            eprintln!("Java 25 unavailable; skipping typical plugin test: {error}");
+            return;
+        }
+    };
+    let repo = repo_root();
+    let plugin_jar = build_typical_jar(&repo, &java_home);
+    let bridge_jar = repo.join("java/ferrite-api-impl/build/libs/ferrite-api-impl-all.jar");
+    let dir = tempfile::tempdir().unwrap();
+    let plugins = dir.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    fs::copy(plugin_jar, plugins.join("typical-plugin.jar")).unwrap();
+    let port = free_port();
+    fs::write(
+        dir.path().join("ferrite.toml"),
+        format!(
+            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\nmotd = \"Typical plugin\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
+            toml_path(&bridge_jar)
+        ),
+    )
+    .unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_ferrite-server"))
+            .current_dir(dir.path())
+            .env("JAVA_HOME", &java_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("starting the server"),
+    );
+    let (stdout, stdout_reader) = capture(process.0.stdout.take().unwrap());
+    let (stderr, stderr_reader) = capture(process.0.stderr.take().unwrap());
+    let folder = plugins.join("FerriteTypical");
+    let enabled = folder.join("enabled.txt");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if enabled.exists() {
+            break;
+        }
+        if let Some(status) = process.0.try_wait().unwrap() {
+            panic!(
+                "server exited before the typical plugin enabled ({status}):\n{}\n{}",
+                stdout.lock().unwrap().clone(),
+                stderr.lock().unwrap().clone()
+            );
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "typical plugin did not write {} within 180 seconds:\n{}\n{}",
+                enabled.display(),
+                stdout.lock().unwrap().clone(),
+                stderr.lock().unwrap().clone()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let config = fs::read_to_string(folder.join("config.txt")).unwrap();
+    assert_eq!(
+        config.trim(),
+        "hello from config|2|DIAMOND",
+        "config.yml was not loaded"
+    );
+    let events = folder.join("events.txt");
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut bot = Bot::join(addr, "Typical", &stdout, &stderr);
+    wait_for_prefix(&events, "join Typical", &stdout, &stderr);
+    let joined = fs::read_to_string(&events).unwrap();
+    assert!(
+        joined.contains("join Typical CREATIVE true"),
+        "the plugin.yml default permission was not granted: {joined}"
+    );
+    wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
+    wait_for_line(&events, "task 1", &stdout, &stderr);
+    wait_for_line(&events, "task 3", &stdout, &stderr);
+    assert!(
+        folder.join("task.txt").exists(),
+        "the repeating task never reached tick 3"
+    );
+    wait_for_line(&events, "task 5", &stdout, &stderr);
+    assert!(
+        folder.join("cancelled.txt").exists(),
+        "the repeating task was not cancelled"
+    );
+
+    bot.raw(7, "typical ping");
+    assert_eq!(
+        wait_for_chat(&mut bot, "pong Typical", &stdout, &stderr, &events),
+        "pong Typical"
+    );
+    bot.raw(7, "typical where");
+    let location = wait_for_chat(&mut bot, "where world", &stdout, &stderr, &events);
+    assert!(location.starts_with("where world "), "{location}");
+    bot.raw(7, "typical give");
+    // `PlayerInventory#setItem` goes through `Native.playerInventory`; the game loop routes it
+    // to the region owning the player and syncs the slot back to the Bukkit inventory.
+    assert_eq!(
+        wait_for_chat(
+            &mut bot,
+            "gave minecraft:diamond",
+            &stdout,
+            &stderr,
+            &events
+        ),
+        "gave minecraft:diamond x2"
+    );
+    wait_for_line(&events, "give DIAMOND 2", &stdout, &stderr);
+    bot.raw(7, "typical info");
+    let info = wait_for_chat(&mut bot, "info world", &stdout, &stderr, &events);
+    assert!(
+        info.contains("spawn ") && info.contains("players 1"),
+        "{info}"
+    );
+
+    drop(bot);
+    let mut stdin = process.0.stdin.take().unwrap();
+    stdin.write_all(b"stop\n").unwrap();
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            panic!("server did not stop within 120 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    stdout_reader.join().unwrap();
+    stderr_reader.join().unwrap();
+    let logs = format!(
+        "{}\n{}",
+        stdout.lock().unwrap().clone(),
+        stderr.lock().unwrap().clone()
+    );
+    assert!(status.success(), "server exited with {status}:\n{logs}");
+    assert!(
+        logs.contains("FerriteTypical enabled: hello from config"),
+        "plugin did not read its config:\n{logs}"
+    );
+    assert!(
+        logs.contains("FerriteTypical disabled"),
+        "plugin onDisable did not run:\n{logs}"
+    );
+    assert!(
+        folder.join("disabled.txt").exists(),
         "plugin did not write its disable marker:\n{logs}"
     );
 }

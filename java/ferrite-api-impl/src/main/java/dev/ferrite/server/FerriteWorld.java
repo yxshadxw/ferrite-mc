@@ -26,14 +26,38 @@ final class FerriteWorld implements java.lang.reflect.InvocationHandler {
         handler.blocks.put(new Pos(x, y, z), type);
     }
     private org.bukkit.Location location(Pos pos) { return new org.bukkit.Location(proxy, pos.x(), pos.y(), pos.z()); }
+    private org.bukkit.Material typeAt(Pos pos) {
+        var material = blocks.get(pos);
+        if (material == null) throw new UnsupportedOperationException("Ferrite: no block snapshot at " + pos);
+        return material;
+    }
+    private void setType(Pos pos, org.bukkit.Material material) {
+        if (!Native.worldSetBlock(id.toString(), pos.x(), pos.y(), pos.z(), material.getKey().toString())) throw new IllegalStateException("No world command handler");
+        blocks.put(pos, material);
+        heights.remove(new Column(pos.x(), pos.z()));
+    }
+    private org.bukkit.block.Block relative(Pos pos, org.bukkit.block.BlockFace face) {
+        int x = pos.x(), y = pos.y(), z = pos.z();
+        switch (face) {
+            case UP -> y++; case DOWN -> y--; case NORTH -> z--; case SOUTH -> z++;
+            case EAST -> x++; case WEST -> x--;
+            default -> throw new UnsupportedOperationException("Ferrite: relative block face " + face + " is not implemented");
+        }
+        return block(new Pos(x, y, z));
+    }
     private org.bukkit.block.Block block(Pos pos) {
         return (org.bukkit.block.Block) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.block.Block.class}, (self, method, args) -> switch (method.getName()) {
             case "getX" -> pos.x(); case "getY" -> pos.y(); case "getZ" -> pos.z();
             case "getWorld" -> proxy;
             case "getLocation" -> location(pos);
             case "getChunk" -> chunk(pos.x() >> 4, pos.z() >> 4);
-            case "getType" -> { var material = blocks.get(pos); if (material == null) throw new UnsupportedOperationException("Ferrite: no block snapshot at " + pos); yield material; }
-            case "setType" -> { var material = java.util.Objects.requireNonNull((org.bukkit.Material) args[0]); if (!Native.worldSetBlock(id.toString(), pos.x(), pos.y(), pos.z(), material.getKey().toString())) throw new IllegalStateException("No world command handler"); blocks.put(pos, material); heights.remove(new Column(pos.x(), pos.z())); yield null; }
+            case "getType" -> typeAt(pos);
+            case "setType" -> { setType(pos, java.util.Objects.requireNonNull((org.bukkit.Material) args[0])); yield null; }
+            case "getBlockData" -> FerriteBlockData.create(typeAt(pos));
+            case "setBlockData" -> { setType(pos, ((org.bukkit.block.data.BlockData) args[0]).getMaterial()); yield null; }
+            case "isEmpty" -> typeAt(pos).isAir();
+            case "isLiquid" -> { var type = typeAt(pos); yield type == org.bukkit.Material.WATER || type == org.bukkit.Material.LAVA; }
+            case "getRelative" -> relative(pos, (org.bukkit.block.BlockFace) args[0]);
             case "hashCode" -> java.util.Objects.hash(id, pos);
             case "equals" -> self == args[0];
             case "toString" -> "Block[" + id + ":" + pos + "]";
@@ -57,7 +81,7 @@ final class FerriteWorld implements java.lang.reflect.InvocationHandler {
             case "getHighestBlockYAt" -> { if (args.length > 2 || (args.length == 2 && args[1] instanceof org.bukkit.HeightMap)) throw new UnsupportedOperationException("Ferrite: heightmap-specific snapshots are not implemented"); int x, z; if (args[0] instanceof org.bukkit.Location l) { x = l.getBlockX(); z = l.getBlockZ(); } else { x = (int) args[0]; z = (int) args[1]; } var height = heights.get(new Column(x, z)); if (height == null) throw new UnsupportedOperationException("Ferrite: no height snapshot at " + x + "," + z); yield height; }
             case "getBlockAt" -> { if (args.length == 1 && args[0] instanceof org.bukkit.Location l) yield block(new Pos(l.getBlockX(), l.getBlockY(), l.getBlockZ())); yield block(new Pos((int) args[0], (int) args[1], (int) args[2])); }
             case "getChunkAt" -> { if (args.length == 1 && args[0] instanceof org.bukkit.Location l) yield chunk(l.getBlockX() >> 4, l.getBlockZ() >> 4); yield chunk((int) args[0], (int) args[1]); }
-            case "getPlayers" -> server.getOnlinePlayers().stream().filter(p -> { try { return p.getWorld() == proxy; } catch (UnsupportedOperationException | IllegalStateException e) { return false; } }).toList();
+            case "getPlayers", "getEntities", "getLivingEntities" -> server.getOnlinePlayers().stream().filter(p -> { try { return p.getWorld() == proxy; } catch (UnsupportedOperationException | IllegalStateException e) { return false; } }).toList();
             case "hashCode" -> id.hashCode();
             case "equals" -> self == args[0];
             case "toString" -> "World[" + id + "]";

@@ -114,6 +114,29 @@ pub fn block_drops(state: u16, tool: ItemStack, rng: &mut ferrite_entity::Rng) -
         .collect()
 }
 
+/// Rolls a mob's entity loot table (vanilla `LivingEntity.dropFromLootTable`), for example
+/// leather and beef for a cow.
+pub fn mob_drops(
+    kind: ferrite_entity::mob::MobKind,
+    rng: &mut ferrite_entity::Rng,
+) -> Vec<ItemStack> {
+    let Some(table) = tables().and_then(|tables| tables.get(kind.loot_table())) else {
+        return Vec::new();
+    };
+    let context = LootContext {
+        killed_by_player: true,
+        ..LootContext::default()
+    };
+    table
+        .roll(&context, &mut LootRng(rng))
+        .into_iter()
+        .filter_map(|(item, count)| {
+            let item_id = ferrite_data::registries::id("minecraft:item", &item)?;
+            (count > 0).then_some(ItemStack { count, item_id })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +172,30 @@ mod tests {
             [item("minecraft:raw_iron")]
         );
         assert!(block_drops(0, ItemStack::default(), &mut rng).is_empty());
+    }
+
+    #[test]
+    fn cows_drop_leather_and_beef() {
+        let leather = item("minecraft:leather");
+        let beef = item("minecraft:beef");
+        let mut rng = ferrite_entity::Rng::new(9);
+        let mut saw_leather = false;
+        for _ in 0..64 {
+            let drops = mob_drops(ferrite_entity::mob::MobKind::Cow, &mut rng);
+            assert!(!drops.is_empty(), "a cow always drops beef");
+            assert!(
+                drops
+                    .iter()
+                    .all(|stack| stack.item_id == beef.item_id || stack.item_id == leather.item_id),
+                "unexpected cow drops: {drops:?}"
+            );
+            assert!(
+                drops
+                    .iter()
+                    .any(|stack| stack.item_id == beef.item_id && stack.count >= 1)
+            );
+            saw_leather |= drops.iter().any(|stack| stack.item_id == leather.item_id);
+        }
+        assert!(saw_leather, "leather drops 2/3 of the time");
     }
 }

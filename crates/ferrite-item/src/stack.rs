@@ -549,4 +549,29 @@ mod tests {
         assert_eq!(modifiers[0].attribute, "minecraft:attack_damage");
         assert_eq!(modifiers[0].amount, 6.0);
     }
+
+    #[test]
+    fn potion_contents_components_decode_and_round_trip() {
+        let potion = ItemStack::from_name("potion").expect("potion is an item");
+        assert_eq!(
+            potion.effective_component(ids::POTION_CONTENTS),
+            Some(Component::PotionContents(crate::PotionContents::default()))
+        );
+        let contents = crate::PotionContents {
+            potion: Some("minecraft:swiftness".to_owned()),
+            custom_color: Some(0x1122_3344),
+            custom_effects: vec![crate::PotionEffect {
+                effect: "minecraft:jump_boost".to_owned(),
+                amplifier: 1,
+                duration: 200,
+                ambient: false,
+                visible: true,
+                show_icon: false,
+            }],
+            custom_name: Some("Fast".to_owned()),
+        };
+        let component = Component::PotionContents(contents.clone());
+        let tag = component.to_nbt().unwrap();
+        assert_eq!(Component::from_nbt(ids::POTION_CONTENTS, &tag), component);
+    }
 }

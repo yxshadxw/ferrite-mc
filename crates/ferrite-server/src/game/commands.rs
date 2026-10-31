@@ -9,6 +9,8 @@ use ferrite_command::{
     arguments::{Coordinates, EntityTarget, GameMode, SelectorKind, WorldCoordinate},
     literal,
 };
+use ferrite_entity::mob::MobKind;
+use ferrite_nbt::Tag;
 use ferrite_net::game::OutboundSender;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -51,6 +53,10 @@ pub struct PlayerEntry {
     pub tags: BTreeSet<String>,
     /// `/team join` membership, if any.
     pub team: Option<String>,
+    /// Last known position and rotation (`execute at`, `/data`, `/tp`).
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// A `/scoreboard objectives` entry.
@@ -152,6 +158,8 @@ pub struct GameState {
     pub bossbars: BTreeMap<String, BossBarState>,
     /// Scoreboard teams by name.
     pub teams: BTreeMap<String, TeamState>,
+    /// Command storage (`/data ... storage` and `execute store ... storage`).
+    pub storage: BTreeMap<String, Tag>,
 }
 
 impl GameState {
@@ -175,6 +183,7 @@ impl GameState {
             displays: BTreeMap::new(),
             bossbars: BTreeMap::new(),
             teams: BTreeMap::new(),
+            storage: BTreeMap::new(),
         }
     }
 
@@ -188,8 +197,20 @@ impl GameState {
             effects: BTreeMap::new(),
             tags: BTreeSet::new(),
             team: None,
+            pos: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
         });
         self.max_players = max_players;
+    }
+
+    /// Records a player's last known position for commands that resolve entity state.
+    pub fn set_position(&mut self, uuid: Uuid, pos: [f64; 3], yaw: f32, pitch: f32) {
+        if let Some(player) = self.players.iter_mut().find(|player| player.uuid == uuid) {
+            player.pos = pos;
+            player.yaw = yaw;
+            player.pitch = pitch;
+        }
     }
 
     pub fn leave(&mut self, uuid: Uuid) {
@@ -429,6 +450,8 @@ pub enum Action {
         item: u16,
         count: i32,
         item_name: String,
+        /// Item components from the `item[component={...}]` suffix, as raw NBT.
+        components: Vec<(u16, ferrite_nbt::Tag)>,
     },
     /// `/xp` (vanilla `/experience`): add, set or query points or levels.
     Experience {
@@ -439,6 +462,11 @@ pub enum Action {
     },
     Tps,
     Mspt,
+    /// `/summon`: create a mob at an absolute position.
+    Summon {
+        kind: MobKind,
+        pos: [f64; 3],
+    },
     ProfileStart,
     ProfileStop,
     Plugin {
@@ -469,11 +497,13 @@ pub enum Action {
         enchantment: String,
         level: i32,
     },
+    /// `/data` on a block entity, applied by the game loop against the chunk source.
+    Data(super::commands_data::BlockData),
 }
 
 /// Who ran a command: permission level, position/orientation for relative and local
 /// coordinates, and the channel actions are sent on.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Source {
     pub permission: u8,
     pub origin: [f64; 3],
@@ -481,12 +511,17 @@ pub struct Source {
     pub pitch: f32,
     pub uuid: Option<Uuid>,
     pub name: Option<String>,
+    /// `execute anchored`: `eyes` lifts the source position by the eye height.
+    pub anchor: EntityAnchor,
+    /// Chunk source when the command runs inside a world (block tests, `/data block`).
+    pub world: Option<Arc<super::anvil::AnvilChunkSource>>,
     pub state: Arc<Mutex<GameState>>,
     pub actions: UnboundedSender<Action>,
 }
 
 /// Vanilla's `commands/entity_selectors` permission maps to gamemasters: any `@` selector
-/// in a command argument requires this level, even for commands open to every player.
+/// in a command argument requires this level, even for commands open to every player. It is
+/// enforced once, by the dispatcher's selector requirement in [`dispatcher`].
 pub const SELECTOR_PERMISSION: u8 = 2;
 
 impl Source {
@@ -568,26 +603,13 @@ fn plugin_command_node(literal_name: &str) -> ferrite_command::NodeBuilder<Sourc
         )
 }
 
+/// Reads an entity argument. Selector permissions are not checked here: the dispatcher
+/// rejects `@` selectors while parsing, for every command at once.
 fn entity(ctx: &CommandContext<Source>, name: &str) -> Result<EntityTarget, CommandError> {
-    let target = ctx
-        .argument(name)
+    ctx.argument(name)
         .and_then(ArgumentValue::as_entity)
         .cloned()
-        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))?;
-    check_entity_selector(ctx.source(), &target)?;
-    Ok(target)
-}
-
-/// Vanilla `EntitySelector.checkPermissions`: any selector needs permission level 2.
-fn check_entity_selector(source: &Source, target: &EntityTarget) -> Result<(), CommandError> {
-    if source.permission < 2 && matches!(target, EntityTarget::Selector { .. }) {
-        return Err(syntax_error(
-            "argument.entity.selector.not_allowed",
-            Vec::new(),
-            "Selector not allowed",
-        ));
-    }
-    Ok(())
+        .ok_or_else(|| CommandError::failed(format!("missing entity argument '{name}'")))
 }
 
 pub(crate) fn coordinates(
@@ -817,6 +839,36 @@ fn kill_builder() -> ferrite_command::NodeBuilder<Source> {
                 )
             }),
         )
+}
+
+fn summon_builder() -> ferrite_command::NodeBuilder<Source> {
+    literal::<Source>("summon")
+        .requires(|source| source.permission >= 2)
+        .restricted(true)
+        .then(
+            argument("entity", ArgumentType::ResourceLocation)
+                .executes(|ctx| summon_action(ctx, false))
+                .then(argument("pos", ArgumentType::Vec3).executes(|ctx| summon_action(ctx, true))),
+        )
+}
+
+fn summon_action(ctx: &CommandContext<Source>, with_pos: bool) -> Result<i32, CommandError> {
+    let name = ctx
+        .string("entity")
+        .ok_or_else(|| CommandError::failed("missing entity argument 'entity'"))?;
+    let kind = MobKind::from_name(name).ok_or_else(|| {
+        if ferrite_data::entity_props::by_name(name).is_some() {
+            CommandError::failed(format!("Unable to summon entity {name}"))
+        } else {
+            CommandError::failed(format!("Invalid entity {name}"))
+        }
+    })?;
+    let pos = if with_pos {
+        coordinates(ctx, "pos")?.resolve(ctx.source().origin, ctx.source().yaw, ctx.source().pitch)
+    } else {
+        ctx.source().origin
+    };
+    send(ctx.source(), Action::Summon { kind, pos })
 }
 
 fn admin_targets_command(
@@ -1410,6 +1462,75 @@ pub fn parse_item(raw: &str) -> Result<u16, CommandError> {
         .ok_or_else(|| CommandError::failed(format!("Unknown item '{base}'")))
 }
 
+/// Parses the `[component={...}]` suffix of a `/give` item argument into raw component NBT.
+fn parse_item_components(raw: &str) -> Result<Vec<(u16, ferrite_nbt::Tag)>, CommandError> {
+    let Some(start) = raw.find('[') else {
+        return Ok(Vec::new());
+    };
+    let end = raw
+        .rfind(']')
+        .filter(|end| *end > start)
+        .ok_or_else(|| CommandError::failed("Unclosed item component list"))?;
+    let inner = &raw[start + 1..end];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    // Vanilla spells the list `item[a=1,b=2]`; SNBT needs braces and `:` separators.
+    let text = brigadier_to_snbt(inner);
+    let tag = ferrite_nbt::snbt::parse(&text)
+        .map_err(|error| CommandError::failed(format!("Invalid item components: {error}")))?;
+    let ferrite_nbt::Tag::Compound(compound) = tag else {
+        return Err(CommandError::failed("Invalid item components"));
+    };
+    let mut components = Vec::new();
+    for (name, value) in &compound {
+        let id = ferrite_item::component_id(name)
+            .ok_or_else(|| CommandError::failed(format!("Unknown item component '{name}'")))?;
+        components.push((id, value.clone()));
+    }
+    Ok(components)
+}
+
+/// Rewrites a `/give` component list (`a=1,b={c:"x"}`) as an SNBT compound.
+fn brigadier_to_snbt(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len() + 2);
+    out.push('{');
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in inner.chars() {
+        if quoted {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                quoted = true;
+                out.push(c);
+            }
+            '[' | '{' => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+            }
+            '=' if depth == 0 => out.push(':'),
+            _ => out.push(c),
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// Vanilla's item display name for a stack, e.g. `diamond_sword` -> "Diamond Sword".
 pub fn item_display(id: u16) -> String {
     let name = ferrite_item::item_name(id).unwrap_or("minecraft:air");
@@ -1462,6 +1583,7 @@ fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
         .string("item")
         .ok_or_else(|| CommandError::failed("Missing item"))?;
     let item = parse_item(raw)?;
+    let components = parse_item_components(raw)?;
     let count = ctx.integer("count").unwrap_or(1);
     let max = ferrite_item::item_defaults(item).map_or(64, |defaults| defaults.max_stack_size);
     if count > max {
@@ -1477,6 +1599,7 @@ fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
             item,
             count,
             item_name: item_display(item),
+            components,
         },
     )
 }
@@ -1517,6 +1640,8 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
 
     // ---- entity effects ----
     tree.register(kill_builder());
+    tree.register(summon_builder());
+    tree.register(summon_builder());
 
     // ---- administration ----
     tree.register(admin_targets_command("op", |targets| Action::Op {
@@ -1772,6 +1897,10 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
     super::commands_world::register(&mut tree);
     super::commands_extras::register(&mut tree);
     super::commands_meta::register(&mut tree);
+    super::commands_data::register(&mut tree);
+    // `execute` registers last: its `run` and every modifier redirect back to the root, so
+    // the rest of the tree must already be in place.
+    super::commands_exec::register(&mut tree);
     tree
 }
 
@@ -2044,6 +2173,8 @@ mod tests {
             name: None,
             state: Arc::new(Mutex::new(GameState::default())),
             actions,
+            anchor: ferrite_command::EntityAnchor::Feet,
+            world: None,
         }
     }
 
@@ -2640,6 +2771,8 @@ mod tests {
                 name,
                 state,
                 actions,
+                anchor: ferrite_command::EntityAnchor::Feet,
+                world: None,
             },
             received,
         )
@@ -2892,17 +3025,9 @@ mod tests {
                 "argument.entity.selector.not_allowed",
                 "{selector} must be rejected below permission 2"
             );
-        }
-        // `msg` only accepts player selectors, so cover the entity-only `@e` directly.
-        let (guest, _) = player_source(0, None, state.clone());
-        let all_entities = EntityTarget::Selector {
-            kind: SelectorKind::AllEntities,
-            options: Vec::new(),
-        };
-        assert_eq!(
-            error_key(check_entity_selector(&guest, &all_entities).unwrap_err()),
-            "argument.entity.selector.not_allowed"
-        );
+        } // `msg` only accepts player selectors, and every server command that takes an
+        // entity-only selector already requires gamemasters, so the `@e` case lives in the
+        // dispatcher's own test (`ferrite-command/tests/dispatcher.rs`).
         let (operator, _received) = player_source(2, Some((ALICE, "Alice")), state);
         let result = tree.execute("msg @a hi", operator);
         assert!(result.is_ok(), "{result:?}");
@@ -2927,6 +3052,35 @@ mod tests {
     }
 
     #[test]
+    fn summon_parses_the_vanilla_entity_and_position_arguments() {
+        assert_eq!(
+            only("summon minecraft:cow", 2),
+            Action::Summon {
+                kind: MobKind::Cow,
+                pos: [0.0, 64.0, 0.0],
+            }
+        );
+        assert_eq!(
+            only("summon pig 10 64.5 -3", 2),
+            Action::Summon {
+                kind: MobKind::Pig,
+                pos: [10.5, 64.5, -2.5],
+            }
+        );
+        assert_eq!(
+            only("summon sheep ~ ~2 ~", 2),
+            Action::Summon {
+                kind: MobKind::Sheep,
+                pos: [0.0, 66.0, 0.0],
+            }
+        );
+        // A vanilla entity this server cannot simulate yet, and an unknown id.
+        assert!(run("summon minecraft:zombie", 2).0.is_err());
+        assert!(run("summon not_a_thing", 2).0.is_err());
+        assert!(run("summon minecraft:cow", 1).0.is_err());
+    }
+
+    #[test]
     fn plugin_commands_register_aliases_and_forward_arguments() {
         let mut tree = dispatcher();
         register_plugin_commands(
@@ -2946,6 +3100,8 @@ mod tests {
             pitch: 0.0,
             uuid: None,
             name: None,
+            anchor: EntityAnchor::Feet,
+            world: None,
             state: Arc::new(Mutex::new(GameState::default())),
             actions: tx,
         };
@@ -3012,6 +3168,8 @@ mod tests {
                 name: Some("Alice".into()),
                 state: Arc::new(Mutex::new(state)),
                 actions,
+                anchor: ferrite_command::EntityAnchor::Feet,
+                world: None,
             },
             received,
         )
@@ -3048,7 +3206,8 @@ mod tests {
                 targets: vec![Uuid::from_u128(1)],
                 item: stone,
                 count: 3,
-                item_name: "Stone".into()
+                item_name: "Stone".into(),
+                components: Vec::new(),
             }
         );
         tree.execute("give @p apple", source.clone()).unwrap();
@@ -3069,6 +3228,24 @@ mod tests {
                 .to_string(),
             "Unknown item 'not_an_item'"
         );
+        tree.execute(
+            r#"give @s potion[potion_contents={potion:"minecraft:swiftness"}]"#,
+            source.clone(),
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            Action::Give {
+                item, components, ..
+            } => {
+                assert_eq!(item, ferrite_item::item_id("potion").unwrap());
+                assert_eq!(components.len(), 1);
+                assert_eq!(
+                    components[0].0,
+                    ferrite_item::component_ids::POTION_CONTENTS
+                );
+            }
+            other => panic!("expected give, got {other:?}"),
+        }
         let (guest, mut guest_rx) = inventory_source(1);
         assert!(tree.execute("clear", guest.clone()).is_err());
         assert!(tree.execute("give @s stone", guest).is_err());
