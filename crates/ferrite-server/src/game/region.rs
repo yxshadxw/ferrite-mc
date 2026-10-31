@@ -136,6 +136,8 @@ pub struct Player {
     pub positions: Arc<Mutex<HashMap<Uuid, [f64; 3]>>>,
     pub tracking: Tracking,
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// Directory this player's state is saved to on leave; `None` keeps nothing (test worlds).
+    pub playerdata: Option<std::path::PathBuf>,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -867,16 +869,21 @@ impl Player {
             let msg = match command {
                 Command::Leave => {
                     self.close_container();
-                    super::playerdata::save(
-                        &self.uuid,
-                        &super::playerdata::Saved::capture(
-                            self.pos,
-                            self.yaw,
-                            self.pitch,
-                            self.gamemode,
-                            &self.inventory,
-                        ),
-                    );
+                    if let Some(dir) = &self.playerdata
+                        && let Err(error) = super::playerdata::save_to(
+                            dir,
+                            &self.uuid,
+                            &super::playerdata::Saved::capture(
+                                self.pos,
+                                self.yaw,
+                                self.pitch,
+                                self.gamemode,
+                                &self.inventory,
+                            ),
+                        )
+                    {
+                        tracing::error!(%error, "failed to save player data");
+                    }
                     return false;
                 }
                 Command::SetMode(mode) => {

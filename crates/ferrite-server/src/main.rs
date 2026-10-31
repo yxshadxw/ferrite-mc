@@ -198,13 +198,13 @@ async fn main() -> anyhow::Result<()> {
         },
         admin: Some(admin),
         whitelist: config.whitelist,
+        playerdata: Some(
+            config
+                .world
+                .as_ref()
+                .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
+        ),
     };
-    game::playerdata::init(
-        config
-            .world
-            .as_ref()
-            .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
-    );
     let world = if let Some(path) = config.world {
         let spawn = game::load_spawn(&path).context("reading world spawn")?;
         let registry = ferrite_world::RuntimeRegistry::load("vanilla/26.3/generated")

@@ -86,6 +86,10 @@ pub struct WorldSettings {
     pub admin: Option<Arc<AdminLists>>,
     /// Whether the whitelist starts enabled.
     pub whitelist: bool,
+    /// Where `playerdata/<uuid>.json` lives. `None` keeps no player state, which is what test
+    /// worlds use: one process-wide directory made a bot resume the gamemode and position a
+    /// same-named bot from another test world had saved.
+    pub playerdata: Option<std::path::PathBuf>,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -105,6 +109,7 @@ impl Default for WorldSettings {
             plugin_event_errors: PluginEventPolicy::Allow,
             admin: None,
             whitelist: false,
+            playerdata: None,
         }
     }
 }
@@ -473,7 +478,7 @@ async fn run(
                if let Err(error) = lists.flush() { tracing::warn!(%error, "failed to save admin lists"); }
            }
            // Resume where the player left off; a first join (or unreadable data) uses world spawn.
-           let saved = playerdata::load(&uuid);
+           let saved = settings.playerdata.as_deref().and_then(|dir| playerdata::load_from(dir, &uuid));
            let start_pos = saved.as_ref().map_or(spawn_pos, |s| s.pos);
            let (start_yaw, start_pitch) = saved.as_ref().map_or((0.0, 0.0), |s| (s.yaw, s.pitch));
            let start_mode = saved.as_ref().map_or_else(|| command_state.lock().unwrap().default_gamemode, |s| s.gamemode);
@@ -495,7 +500,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),playerdata:settings.playerdata.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -1487,14 +1492,28 @@ fn release_hold(
 #[cfg(test)]
 mod integration;
 
+/// The fixture world is generated locally (`python tools/make_fixture_world.py`) and gitignored,
+/// so CI has no copy: every test that reads it skips instead of failing.
+#[cfg(test)]
+fn fixture_version_root() -> Option<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let level = root.join("fixture-world/world/level.dat");
+    if !level.exists() {
+        eprintln!("SKIP fixture-world test: {} absent", level.display());
+        return None;
+    }
+    Some(root)
+}
+
 #[cfg(test)]
 mod anvil_tests {
     #[test]
     fn fixture_chunk_encodes_stored_lighting() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let registry =
-            ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
-        let path = root.join("vanilla/26.3/fixture-world/world");
+        let Some(root) = super::fixture_version_root() else {
+            return;
+        };
+        let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+        let path = root.join("fixture-world/world");
         let packet = super::anvil::read_chunk(&path, &registry, 0, 0)
             .unwrap()
             .unwrap();
@@ -1504,22 +1523,26 @@ mod anvil_tests {
 
 #[test]
 fn fixture_spawn_comes_from_level_dat() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vanilla/26.3/fixture-world/world");
-    assert_eq!(anvil::read_spawn(&root).unwrap(), [0, 80, 112]);
+    let Some(root) = fixture_version_root() else {
+        return;
+    };
+    assert_eq!(
+        anvil::read_spawn(&root.join("fixture-world/world")).unwrap(),
+        [0, 80, 112]
+    );
 }
 
 #[tokio::test]
 async fn modified_chunk_is_written_on_flush() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let fixture = root
-        .join("vanilla/26.3/fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca");
+    let Some(root) = fixture_version_root() else {
+        return;
+    };
+    let fixture = root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca");
     let temp = std::env::temp_dir().join(format!("ferrite-save-{}", uuid::Uuid::new_v4()));
     let dir = temp.join("dimensions/minecraft/overworld/region");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(fixture, dir.join("r.0.0.mca")).unwrap();
-    let registry =
-        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
     let region = ferrite_world::RegionFile::open(dir.join("r.0.0.mca"), 0, 0).unwrap();
     let data = region.read_chunk(0, 7).unwrap().unwrap();
     let (_, tag) = ferrite_nbt::binary::read_named(&data).unwrap();
@@ -1564,8 +1587,7 @@ async fn modified_chunk_is_written_on_flush() {
         section.get("BlockLight"),
         Some(&ferrite_nbt::Tag::ByteArray(vec![0x11; 2048]))
     );
-    let registry =
-        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
     let chunk = ferrite_world::chunk_from_nbt(&tag, -64, 384, &registry).unwrap();
     assert_eq!(chunk.block(0, 68, 0), Some(value));
     std::fs::remove_dir_all(temp).unwrap();
