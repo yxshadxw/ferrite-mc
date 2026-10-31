@@ -519,7 +519,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),effects:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -604,7 +604,7 @@ async fn run(
                   commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules, source.as_ref(), &command_speed, &name, value.as_deref()) { Ok(message) => chat(outbound, &message), Err(error) => chat(outbound, &error) },
                   commands::Action::World(command) => { mailbox.lock().unwrap().push_back(Command::World(command)); },
                   commands::Action::Clear { targets, item, max_count } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Clear { target, target_name, item, max_count, feedback: Some(outbound.clone()) }); } } },
-                  commands::Action::Give { targets, item, count, item_name } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), feedback: Some(outbound.clone()) }); } } },
+                  commands::Action::Give { targets, item, count, item_name, components } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), components: components.clone(), feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Experience { operation, targets, amount, unit } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Experience { target, target_name, operation, amount, unit, feedback: Some(outbound.clone()) }); } } },
                   commands::Action::Enchant { targets, enchantment, level } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Enchant { target, target_name, enchantment: enchantment.clone(), level, feedback: Some(outbound.clone()) }); } } },
                   other => { runtime.apply(other).await; }
@@ -663,7 +663,7 @@ async fn run(
                   },
                   commands::Action::GameMode { .. } | commands::Action::PlayerFeedback { .. } => tracing::warn!("command requires a player"),
                   commands::Action::Clear { targets, item, max_count } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Clear { target, target_name, item, max_count, feedback: None }); } } },
-                  commands::Action::Give { targets, item, count, item_name } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), feedback: None }); } } },
+                  commands::Action::Give { targets, item, count, item_name, components } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Give { target, target_name, item, count, item_name: item_name.clone(), components: components.clone(), feedback: None }); } } },
                   commands::Action::Experience { operation, targets, amount, unit } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Experience { target, target_name, operation, amount, unit, feedback: None }); } } },
                   commands::Action::Enchant { targets, enchantment, level } => { for target in targets { if let Some((_, target_mailbox, _)) = mailboxes.get(&target) { let target_name = names.get(&target).cloned().unwrap_or_default(); target_mailbox.lock().unwrap().push_back(Command::Enchant { target, target_name, enchantment: enchantment.clone(), level, feedback: None }); } } },
                   other => { if runtime.apply(other).await { stop = true; } }
@@ -1511,6 +1511,7 @@ impl CommandRuntime<'_> {
                 amplifier,
                 duration,
             } => {
+                // The client packet keeps command order; the region owns the ticking store.
                 for target in targets {
                     if let Some(player) = self.online.get(&target) {
                         let _ = player
@@ -1524,6 +1525,14 @@ impl CommandRuntime<'_> {
                                 flags: 0b110,
                             }));
                     }
+                    if let Some((_, mailbox, _)) = self.mailboxes.get(&target) {
+                        mailbox.lock().unwrap().push_back(Command::ApplyEffect {
+                            effect,
+                            amplifier,
+                            duration,
+                            notify: false,
+                        });
+                    }
                 }
                 false
             }
@@ -1536,6 +1545,12 @@ impl CommandRuntime<'_> {
                                 entity_id: VarInt(player.entity),
                                 effect: VarInt(effect),
                             }));
+                    }
+                    if let Some((_, mailbox, _)) = self.mailboxes.get(&target) {
+                        mailbox.lock().unwrap().push_back(Command::RemoveEffect {
+                            effect: Some(effect),
+                            notify: false,
+                        });
                     }
                 }
                 false

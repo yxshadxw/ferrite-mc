@@ -58,6 +58,10 @@ pub enum DamageKind {
     Void,
     /// `DamageTypes.STARVE`: 1 damage on the starvation timer.
     Starve,
+    /// `DamageTypes.MAGIC`: poison and instant damage.
+    Magic,
+    /// `DamageTypes.WITHER`: the wither effect.
+    Wither,
     /// `DamageTypes.EXPLOSION`: reserved for the explosion crate (bypasses armor, not invulnerability).
     #[allow(dead_code)]
     Explosion,
@@ -86,6 +90,8 @@ impl DamageKind {
             Self::Fire => format!("{name} burned to death"),
             Self::Void => format!("{name} fell out of the world"),
             Self::Starve => format!("{name} starved to death"),
+            Self::Magic => format!("{name} was killed by magic"),
+            Self::Wither => format!("{name} withered away"),
             Self::Explosion => format!("{name} blew up"),
             Self::GenericKill => format!("{name} was killed"),
         }
@@ -201,6 +207,8 @@ fn queue_damage(queue: &mut EnvironmentDamage, kind: DamageKind, amount: f32) {
 #[derive(Debug, Clone)]
 pub struct Survival {
     pub health: f32,
+    /// Vanilla `Attributes.MAX_HEALTH` (health boost raises it above 20).
+    pub max_health: f32,
     /// `LivingEntity.absorptionAmount`.
     pub absorption: f32,
     pub food: FoodData,
@@ -238,6 +246,7 @@ impl Default for Survival {
     fn default() -> Self {
         Self {
             health: MAX_HEALTH,
+            max_health: MAX_HEALTH,
             absorption: 0.0,
             food: FoodData::default(),
             invulnerable: 0,
@@ -261,13 +270,19 @@ impl Survival {
         Self::default()
     }
 
-    /// `LivingEntity.heal`: clamps at the maximum health.
+    /// `LivingEntity.heal`: clamps at the current maximum health.
     pub fn heal(&mut self, amount: f32) -> bool {
-        if self.dead || amount <= 0.0 || self.health >= MAX_HEALTH {
+        if self.dead || amount <= 0.0 || self.health >= self.max_health {
             return false;
         }
-        self.health = (self.health + amount).min(MAX_HEALTH);
+        self.health = (self.health + amount).min(self.max_health);
         true
+    }
+
+    /// `Attributes.MAX_HEALTH` from health boost; clamps the current health down on removal.
+    pub fn set_max_health(&mut self, max: f32) {
+        self.max_health = max.max(1.0);
+        self.health = self.health.min(self.max_health);
     }
 
     /// `LivingEntity.hurt` after damage-type filtering: absorption absorbs first, the rest is

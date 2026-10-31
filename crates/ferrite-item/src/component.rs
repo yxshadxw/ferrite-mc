@@ -418,6 +418,120 @@ impl Food {
     }
 }
 
+/// One `minecraft:potion_contents` custom effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PotionEffect {
+    /// `minecraft:mob_effect` registry name.
+    pub effect: String,
+    pub amplifier: i32,
+    pub duration: i32,
+    pub ambient: bool,
+    /// `show_particles`.
+    pub visible: bool,
+    pub show_icon: bool,
+}
+
+/// The `minecraft:potion_contents` value: a base potion plus custom effects.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PotionContents {
+    /// `minecraft:potion` registry name; `None` means water/empty.
+    pub potion: Option<String>,
+    pub custom_color: Option<i32>,
+    pub custom_effects: Vec<PotionEffect>,
+    pub custom_name: Option<String>,
+}
+
+impl PotionContents {
+    fn to_compound(&self) -> Compound {
+        let mut compound = Compound::new();
+        if let Some(potion) = &self.potion {
+            compound.insert("potion".to_owned(), Tag::String(potion.clone()));
+        }
+        if let Some(color) = self.custom_color {
+            compound.insert("custom_color".to_owned(), Tag::Int(color));
+        }
+        if !self.custom_effects.is_empty() {
+            compound.insert(
+                "custom_effects".to_owned(),
+                Tag::List(List::Compound(
+                    self.custom_effects
+                        .iter()
+                        .map(PotionEffect::to_compound)
+                        .collect(),
+                )),
+            );
+        }
+        if let Some(name) = &self.custom_name {
+            compound.insert("custom_name".to_owned(), Tag::String(name.clone()));
+        }
+        compound
+    }
+
+    fn from_tag(tag: &Tag) -> Option<Self> {
+        let Tag::Compound(fields) = tag else {
+            return None;
+        };
+        let potion = match fields.get("potion") {
+            Some(Tag::String(potion)) => Some(potion.clone()),
+            Some(_) => return None,
+            None => None,
+        };
+        let custom_color = match fields.get("custom_color") {
+            Some(tag) => Some(as_int(tag)?),
+            None => None,
+        };
+        let custom_effects = match fields.get("custom_effects") {
+            Some(Tag::List(List::Compound(effects))) => effects
+                .iter()
+                .map(PotionEffect::from_compound)
+                .collect::<Option<Vec<_>>>()?,
+            Some(_) => return None,
+            None => Vec::new(),
+        };
+        let custom_name = match fields.get("custom_name") {
+            Some(Tag::String(name)) => Some(name.clone()),
+            Some(_) => return None,
+            None => None,
+        };
+        Some(Self {
+            potion,
+            custom_color,
+            custom_effects,
+            custom_name,
+        })
+    }
+}
+
+impl PotionEffect {
+    fn to_compound(&self) -> Compound {
+        let mut compound = Compound::new();
+        compound.insert("id".to_owned(), Tag::String(self.effect.clone()));
+        compound.insert("amplifier".to_owned(), Tag::Int(self.amplifier));
+        compound.insert("duration".to_owned(), Tag::Int(self.duration));
+        compound.insert("ambient".to_owned(), Tag::Byte(i8::from(self.ambient)));
+        compound.insert(
+            "show_particles".to_owned(),
+            Tag::Byte(i8::from(self.visible)),
+        );
+        compound.insert("show_icon".to_owned(), Tag::Byte(i8::from(self.show_icon)));
+        compound
+    }
+
+    fn from_compound(fields: &Compound) -> Option<Self> {
+        Some(Self {
+            effect: match fields.get("id")? {
+                Tag::String(effect) => effect.clone(),
+                _ => return None,
+            },
+            amplifier: fields.get("amplifier").map_or(Some(0), as_int)?,
+            duration: fields.get("duration").map_or(Some(0), as_int)?,
+            ambient: fields.get("ambient").map_or(Some(false), as_bool)?,
+            visible: fields.get("show_particles").map_or(Some(true), as_bool)?,
+            show_icon: fields.get("show_icon").map_or(Some(true), as_bool)?,
+        })
+    }
+}
+
 /// One rule of the `minecraft:tool` component.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolRule {
@@ -604,6 +718,8 @@ pub enum Component {
     AttributeModifiers(Vec<AttributeModifier>),
     /// `minecraft:food`.
     Food(Food),
+    /// `minecraft:potion_contents`.
+    PotionContents(PotionContents),
     /// `minecraft:tool`.
     Tool(Tool),
     /// A component without a typed variant, or a value whose NBT shape did not match its typed
@@ -636,6 +752,7 @@ impl Component {
             Self::CustomData(_) => ids::CUSTOM_DATA,
             Self::AttributeModifiers(_) => ids::ATTRIBUTE_MODIFIERS,
             Self::Food(_) => ids::FOOD,
+            Self::PotionContents(_) => ids::POTION_CONTENTS,
             Self::Tool(_) => ids::TOOL,
             Self::Opaque(_) | Self::Raw(_) => return None,
         })
@@ -660,6 +777,7 @@ impl Component {
             Self::CustomData(_) => "custom_data",
             Self::AttributeModifiers(_) => "attribute_modifiers",
             Self::Food(_) => "food",
+            Self::PotionContents(_) => "potion_contents",
             Self::Tool(_) => "tool",
             Self::Opaque(_) => "opaque",
             Self::Raw(_) => "raw",
@@ -698,6 +816,7 @@ impl Component {
                 )
             }),
             Self::Food(food) => Tag::Compound(food.to_compound()),
+            Self::PotionContents(contents) => Tag::Compound(contents.to_compound()),
             Self::Tool(tool) => Tag::Compound(tool.to_compound()),
             Self::Opaque(tag) => tag.clone(),
             Self::Raw(_) => return Err(Error::NoNbtForm("raw")),
@@ -740,6 +859,7 @@ impl Component {
                 _ => None,
             },
             ids::FOOD => Food::from_tag(tag).map(Self::Food),
+            ids::POTION_CONTENTS => PotionContents::from_tag(tag).map(Self::PotionContents),
             ids::TOOL => Tool::from_tag(tag).map(Self::Tool),
             _ => None,
         };

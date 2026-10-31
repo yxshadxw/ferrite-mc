@@ -686,6 +686,7 @@ dependencies = [
  "ferrite-inventory",
  "ferrite-item",
  "ferrite-math",
+ "ferrite-nbt",
  "ferrite-protocol",
  "uuid",
 ]

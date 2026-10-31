@@ -429,6 +429,8 @@ pub enum Action {
         item: u16,
         count: i32,
         item_name: String,
+        /// Item components from the `item[component={...}]` suffix, as raw NBT.
+        components: Vec<(u16, ferrite_nbt::Tag)>,
     },
     /// `/xp` (vanilla `/experience`): add, set or query points or levels.
     Experience {
@@ -1410,6 +1412,75 @@ pub fn parse_item(raw: &str) -> Result<u16, CommandError> {
         .ok_or_else(|| CommandError::failed(format!("Unknown item '{base}'")))
 }
 
+/// Parses the `[component={...}]` suffix of a `/give` item argument into raw component NBT.
+fn parse_item_components(raw: &str) -> Result<Vec<(u16, ferrite_nbt::Tag)>, CommandError> {
+    let Some(start) = raw.find('[') else {
+        return Ok(Vec::new());
+    };
+    let end = raw
+        .rfind(']')
+        .filter(|end| *end > start)
+        .ok_or_else(|| CommandError::failed("Unclosed item component list"))?;
+    let inner = &raw[start + 1..end];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    // Vanilla spells the list `item[a=1,b=2]`; SNBT needs braces and `:` separators.
+    let text = brigadier_to_snbt(inner);
+    let tag = ferrite_nbt::snbt::parse(&text)
+        .map_err(|error| CommandError::failed(format!("Invalid item components: {error}")))?;
+    let ferrite_nbt::Tag::Compound(compound) = tag else {
+        return Err(CommandError::failed("Invalid item components"));
+    };
+    let mut components = Vec::new();
+    for (name, value) in &compound {
+        let id = ferrite_item::component_id(name)
+            .ok_or_else(|| CommandError::failed(format!("Unknown item component '{name}'")))?;
+        components.push((id, value.clone()));
+    }
+    Ok(components)
+}
+
+/// Rewrites a `/give` component list (`a=1,b={c:"x"}`) as an SNBT compound.
+fn brigadier_to_snbt(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len() + 2);
+    out.push('{');
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in inner.chars() {
+        if quoted {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                quoted = true;
+                out.push(c);
+            }
+            '[' | '{' => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+            }
+            '=' if depth == 0 => out.push(':'),
+            _ => out.push(c),
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// Vanilla's item display name for a stack, e.g. `diamond_sword` -> "Diamond Sword".
 pub fn item_display(id: u16) -> String {
     let name = ferrite_item::item_name(id).unwrap_or("minecraft:air");
@@ -1462,6 +1533,7 @@ fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
         .string("item")
         .ok_or_else(|| CommandError::failed("Missing item"))?;
     let item = parse_item(raw)?;
+    let components = parse_item_components(raw)?;
     let count = ctx.integer("count").unwrap_or(1);
     let max = ferrite_item::item_defaults(item).map_or(64, |defaults| defaults.max_stack_size);
     if count > max {
@@ -1477,6 +1549,7 @@ fn give_action(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
             item,
             count,
             item_name: item_display(item),
+            components,
         },
     )
 }
@@ -3048,7 +3121,8 @@ mod tests {
                 targets: vec![Uuid::from_u128(1)],
                 item: stone,
                 count: 3,
-                item_name: "Stone".into()
+                item_name: "Stone".into(),
+                components: Vec::new(),
             }
         );
         tree.execute("give @p apple", source.clone()).unwrap();
@@ -3069,6 +3143,24 @@ mod tests {
                 .to_string(),
             "Unknown item 'not_an_item'"
         );
+        tree.execute(
+            r#"give @s potion[potion_contents={potion:"minecraft:swiftness"}]"#,
+            source.clone(),
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            Action::Give {
+                item, components, ..
+            } => {
+                assert_eq!(item, ferrite_item::item_id("potion").unwrap());
+                assert_eq!(components.len(), 1);
+                assert_eq!(
+                    components[0].0,
+                    ferrite_item::component_ids::POTION_CONTENTS
+                );
+            }
+            other => panic!("expected give, got {other:?}"),
+        }
         let (guest, mut guest_rx) = inventory_source(1);
         assert!(tree.execute("clear", guest.clone()).is_err());
         assert!(tree.execute("give @s stone", guest).is_err());

@@ -9,6 +9,7 @@
 //! - [`item`]: item entities (vanilla physics against block shapes, merging, pickup into a
 //!   player inventory, despawning), with [`physics`] underneath.
 //! - [`experience`]: experience orbs (award split, merge scan, attraction to players, pickup).
+//! - [`effect`]: mob effects (instances, vanilla tick timings, attribute modifiers).
 //! - [`allocate_id`] / [`random_uuid`]: the process-wide network id counter (shared with
 //!   players) and entity UUIDs.
 //!
@@ -17,6 +18,7 @@
 //! section leaves its store by value ([`EntityStore::take_crossing`]) to be handed to the new
 //! owner through that region's task queue.
 
+pub mod effect;
 pub mod experience;
 pub mod falling;
 mod id;
@@ -24,6 +26,7 @@ mod index;
 pub mod item;
 pub mod metadata;
 pub mod physics;
+pub mod potion;
 mod rng;
 mod store;
 pub mod tnt;

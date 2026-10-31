@@ -15,6 +15,7 @@
 //! follow the regionizer, and [`EntityStore::take_crossing`] removes entities that walked into
 //! another region section so the caller can hand them to the owner of their new chunk.
 
+use crate::effect::ActiveEffects;
 use crate::experience::OrbState;
 use crate::id::EntityKey;
 use crate::index::{Cell, SectionIndex};
@@ -82,6 +83,8 @@ pub struct EntityData {
     pub item: Option<ItemState>,
     /// Experience-orb state, for `minecraft:experience_orb`.
     pub orb: Option<OrbState>,
+    /// Active mob effects (`LivingEntity.activeEffects`), one per effect id.
+    pub effects: ActiveEffects,
     /// Block state carried by a falling block (vanilla `FallingBlockEntity.blockState`).
     pub block_state: Option<u16>,
     /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
@@ -109,6 +112,7 @@ impl EntityData {
             tracker: TrackerState::default(),
             item: None,
             orb: None,
+            effects: ActiveEffects::default(),
             block_state: None,
             fuse: None,
             cell: Cell::new(0, 0, 0),
