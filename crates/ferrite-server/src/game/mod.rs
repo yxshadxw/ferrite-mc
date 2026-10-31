@@ -106,6 +106,7 @@ pub struct World {
     random_tick_speed: Arc<AtomicU32>,
     source: Arc<anvil::AnvilChunkSource>,
     stop: tokio::sync::watch::Receiver<bool>,
+    game_rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
 }
 impl World {
     pub fn start() -> Self {
@@ -137,8 +138,13 @@ impl World {
         let (stop_tx, stop) = tokio::sync::watch::channel(false);
         let tick_samples = Arc::new(Mutex::new(Vec::new()));
         let profiler = Arc::new(profile::Profiler::new());
-        let random_tick_speed = Arc::new(AtomicU32::new(3));
+        let rules = source.load_game_rules().unwrap_or_default();
+        let random_tick_speed = Arc::new(AtomicU32::new(
+            rules.get_integer("random_tick_speed").unwrap_or(3).max(0) as u32,
+        ));
+        let game_rules = Arc::new(Mutex::new(rules));
         let metrics = LoopMetrics {
+            game_rules: Arc::clone(&game_rules),
             random_tick_speed: Arc::clone(&random_tick_speed),
             tick_samples: tick_samples.clone(),
             profiler: Arc::clone(&profiler),
@@ -166,10 +172,19 @@ impl World {
             random_tick_speed,
             source,
             stop,
+            game_rules,
         }
     }
     pub fn set_random_tick_speed(&self, speed: u32) {
-        self.random_tick_speed.store(speed, Ordering::Relaxed);
+        if let Err(error) = apply_game_rule(
+            &self.game_rules,
+            Some(&self.source),
+            &self.random_tick_speed,
+            "random_tick_speed",
+            Some(&speed.to_string()),
+        ) {
+            tracing::warn!(%error, "setting random tick speed failed");
+        }
     }
 
     /// A signal that becomes `true` once `/stop` (or shutdown) was requested.
@@ -205,6 +220,38 @@ impl World {
         self.task.await?;
         result
     }
+}
+fn apply_game_rule(
+    rules: &Mutex<ferrite_command::gamerule::GameRules>,
+    source: Option<&Arc<anvil::AnvilChunkSource>>,
+    speed: &AtomicU32,
+    name: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
+    use ferrite_command::gamerule::RuleValue;
+    let name = ferrite_command::gamerule::canonical_name(name);
+    let mut rules = rules.lock().map_err(|error| error.to_string())?;
+    let result = if let Some(value) = value {
+        let mut updated = rules.clone();
+        let result = updated.set(&name, value)?;
+        if let Some(source) = source {
+            source
+                .save_game_rules(&updated)
+                .map_err(|error| format!("failed to save game rules: {error:#}"))?;
+        }
+        *rules = updated;
+        if name == "random_tick_speed"
+            && let RuleValue::Integer(value) = result
+        {
+            speed.store(value.max(0) as u32, Ordering::Relaxed);
+        }
+        result
+    } else {
+        rules
+            .get(&name)
+            .ok_or_else(|| format!("Unknown game rule: {name}"))?
+    };
+    Ok(format!("{name} = {}", result.text()))
 }
 fn emit<P: ferrite_protocol::Packet>(tx: &mpsc::UnboundedSender<Outbound>, p: &P) {
     let _ = tx.send(game::packet(p));
@@ -259,6 +306,7 @@ fn chat(tx: &mpsc::UnboundedSender<Outbound>, text: &str) {
 }
 /// Per-tick measurements owned by the game loop's instrumentation.
 struct LoopMetrics {
+    game_rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
     random_tick_speed: Arc<AtomicU32>,
     /// Raw region tick durations consumed by the load-test example.
     tick_samples: Arc<Mutex<Vec<f64>>>,
@@ -294,11 +342,13 @@ async fn run(
         source: source.clone(),
     };
     let LoopMetrics {
+        game_rules,
         random_tick_speed,
         tick_samples,
         profiler,
         stop: stop_tx,
     } = metrics;
+    let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
     let fluid_tracking = tracking.clone();
     let fluid_source = source.clone();
@@ -515,6 +565,7 @@ async fn run(
                           }
                       }
                   },
+                  commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules, source.as_ref(), &command_speed, &name, value.as_deref()) { Ok(message) => chat(outbound, &message), Err(error) => chat(outbound, &error) },
                   other => { runtime.apply(other).await; }
               }}
           }},
@@ -551,6 +602,7 @@ async fn run(
                   commands::Action::Weather { kind, duration } => tracing::info!(?kind, ?duration, "weather changed"),
                   commands::Action::Feedback(feedback) => tracing::info!("{}", feedback.text),
                   commands::Action::Broadcast(feedback) => { let text = feedback.text; scheduler.schedule_global(move |g| g.broadcast_text(&text)); },
+                  commands::Action::GameRule(name, value) => match apply_game_rule(&game_rules, source.as_ref(), &command_speed, &name, value.as_deref()) { Ok(message) => tracing::info!("{message}"), Err(error) => tracing::warn!("{error}") },
                   commands::Action::Stop => stop = true,
                   commands::Action::Tps => for line in profiler.tps_lines_plain() { tracing::info!("{line}"); },
                   commands::Action::Mspt => for line in profiler.mspt_lines_plain() { tracing::info!("{line}"); },
@@ -598,7 +650,10 @@ async fn run(
             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_left(uuid, &name) { tracing::warn!(%error, "player quit event failed"); }
             scheduler.schedule_global(move |g|g.leave(uuid));if let Some(join)=pending.remove(&uuid){let _=event_tx.send(join);}}
          }},
-         _tick = clock.tick() => { command_state.lock().unwrap().tick(); }
+         _tick = clock.tick() => {
+             let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
+             command_state.lock().unwrap().tick(advance_time);
+         }
         }
     }
 }
@@ -783,7 +838,8 @@ impl CommandRuntime<'_> {
             | Action::Weather { .. }
             | Action::Feedback(_)
             | Action::PlayerFeedback { .. }
-            | Action::Broadcast(_) => false,
+            | Action::Broadcast(_)
+            | Action::GameRule(..) => false,
             // Plugin commands run in the dispatch loops, which own the plugin hooks.
             Action::Plugin { .. } => false,
             Action::Teleport {
@@ -1517,4 +1573,33 @@ async fn memory_chunk_block_mutation_is_visible() {
     assert_ne!(before, 0);
     source.set_block(0, 64, 0, 0).unwrap();
     assert_eq!(source.block(0, 64, 0), Some(0));
+}
+
+#[tokio::test]
+async fn gamerules_persist_across_world_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3/generated");
+    let source = anvil::AnvilChunkSource::new(
+        dir.path().to_path_buf(),
+        ferrite_world::RuntimeRegistry::load(root).unwrap(),
+    );
+    let world = World::start_with(Some(source.clone()), [0, 65, 0]);
+    world
+        .console_command("gamerule random_tick_speed 0".into())
+        .await
+        .unwrap();
+    world
+        .console_command("gamerule spawn_mobs false".into())
+        .await
+        .unwrap();
+    world.shutdown().await.unwrap();
+    assert!(dir.path().join("data/minecraft/game_rules.dat").exists());
+    let reloaded = World::start_with(Some(source), [0, 65, 0]);
+    assert_eq!(reloaded.random_tick_speed.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        reloaded.game_rules.lock().unwrap().get("spawn_mobs"),
+        Some(ferrite_command::gamerule::RuleValue::Boolean(false))
+    );
+    reloaded.shutdown().await.unwrap();
 }

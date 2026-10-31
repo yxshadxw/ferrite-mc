@@ -92,9 +92,13 @@ impl GameState {
         self.players.retain(|player| player.uuid != uuid);
     }
 
-    pub fn tick(&mut self) {
-        self.clock_time += 1;
+    /// Advances the world tick. The overworld clock only moves while
+    /// `advance_time` (vanilla `doDaylightCycle`) is enabled.
+    pub fn tick(&mut self, advance_time: bool) {
         self.game_time += 1;
+        if advance_time {
+            self.clock_time += 1;
+        }
     }
 }
 
@@ -270,6 +274,7 @@ pub enum Action {
     },
     SaveOn,
     SaveOff,
+    GameRule(String, Option<String>),
     GameMode {
         mode: i32,
         targets: Vec<Uuid>,
@@ -1179,6 +1184,55 @@ fn me(ctx: &CommandContext<Source>) -> Result<i32, CommandError> {
     Ok(1)
 }
 
+/// `gamerule <rule> [value]` for one rule, using the type and bounds from the 26.3
+/// generated command tree.
+fn gamerule_node(
+    label: impl Into<String>,
+    spec: &'static ferrite_command::gamerule::RuleSpec,
+) -> ferrite_command::NodeBuilder<Source> {
+    use ferrite_command::gamerule::RuleKind;
+    let query_name = spec.name.to_owned();
+    let set_name = spec.name.to_owned();
+    let kind = spec.kind;
+    let value = match kind {
+        RuleKind::Boolean => ArgumentType::bool(),
+        RuleKind::Integer { min, max } => ArgumentType::integer_range(min, max),
+    };
+    literal::<Source>(label)
+        .executes(move |ctx| send(ctx.source(), Action::GameRule(query_name.clone(), None)))
+        .then(argument::<Source>("value", value).executes(move |ctx| {
+            let value = match kind {
+                RuleKind::Boolean => ctx
+                    .argument("value")
+                    .and_then(|value| value.as_bool())
+                    .map(|value| value.to_string()),
+                RuleKind::Integer { .. } => ctx.integer("value").map(|value| value.to_string()),
+            }
+            .ok_or_else(|| CommandError::failed("invalid game rule value"))?;
+            send(
+                ctx.source(),
+                Action::GameRule(set_name.clone(), Some(value)),
+            )
+        }))
+}
+
+/// `random_tick_speed` -> `randomTickSpeed`, the pre-26.3 spelling players know.
+fn camel_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            upper = true;
+        } else if upper {
+            out.push(ch.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn dispatcher() -> CommandDispatcher<Source> {
     let mut tree = CommandDispatcher::new();
     tree.set_selector_requirement(|source: &Source| source.permission >= SELECTOR_PERMISSION);
@@ -1237,6 +1291,22 @@ pub fn dispatcher() -> CommandDispatcher<Source> {
             .restricted(true)
             .executes(|ctx| send(ctx.source(), Action::SaveOff)),
     );
+
+    // ---- gamerule: one literal per rule in the generated 26.3 command tree ----
+    let mut gamerule = literal::<Source>("gamerule")
+        .requires(|source| source.permission >= 2)
+        .restricted(true);
+    for spec in ferrite_command::gamerule::specs() {
+        gamerule = gamerule.then(gamerule_node(spec.name, spec));
+        gamerule = gamerule.then(gamerule_node(format!("minecraft:{}", spec.name), spec));
+        gamerule = gamerule.then(gamerule_node(camel_case(spec.name), spec));
+    }
+    for (alias, canonical) in ferrite_command::gamerule::aliases() {
+        if let Some(spec) = ferrite_command::gamerule::spec(canonical) {
+            gamerule = gamerule.then(gamerule_node(*alias, spec));
+        }
+    }
+    tree.register(gamerule);
 
     // ---- gamemode (owned by the gamemode worker) ----
     tree.register(
@@ -2530,5 +2600,43 @@ mod tests {
                 args: vec!["one".into(), "two".into()]
             }
         );
+    }
+
+    #[test]
+    fn gamerule_commands_use_vanilla_names_types_and_bounds() {
+        assert_eq!(
+            only("gamerule random_tick_speed 0", 2),
+            Action::GameRule("random_tick_speed".into(), Some("0".into()))
+        );
+        assert_eq!(
+            only("gamerule minecraft:random_tick_speed 1", 2),
+            Action::GameRule("random_tick_speed".into(), Some("1".into()))
+        );
+        assert_eq!(
+            only("gamerule keep_inventory", 2),
+            Action::GameRule("keep_inventory".into(), None)
+        );
+        // Pre-26.3 spellings map onto the renamed rules.
+        assert_eq!(
+            only("gamerule doDaylightCycle false", 2),
+            Action::GameRule("advance_time".into(), Some("false".into()))
+        );
+        assert_eq!(
+            only("gamerule randomTickSpeed 0", 2),
+            Action::GameRule("random_tick_speed".into(), Some("0".into()))
+        );
+        // The generated parsers reject the wrong type and out-of-range integers.
+        assert!(run("gamerule random_tick_speed -1", 2).0.is_err());
+        assert!(run("gamerule keep_inventory 42", 2).0.is_err());
+        assert!(run("gamerule does_not_exist", 2).0.is_err());
+    }
+
+    #[test]
+    fn advance_time_only_stops_the_clock() {
+        let mut state = GameState::default();
+        state.tick(true);
+        state.tick(false);
+        assert_eq!(state.clock_time, 1);
+        assert_eq!(state.game_time, 2);
     }
 }
