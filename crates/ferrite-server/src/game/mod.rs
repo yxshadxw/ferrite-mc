@@ -505,6 +505,31 @@ async fn run(
            let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),playerdata:settings.playerdata.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
+           if let Some(plugins) = &settings.plugins {
+               let snapshot = ferrite_plugin::PlayerSnapshot {
+                   id: uuid,
+                   name: name.clone(),
+                   operator: permission > 0,
+                   health: 20.0,
+                   food: 20,
+                   mode: match start_mode {
+                       1 => ferrite_plugin::GameMode::Creative,
+                       2 => ferrite_plugin::GameMode::Adventure,
+                       3 => ferrite_plugin::GameMode::Spectator,
+                       _ => ferrite_plugin::GameMode::Survival,
+                   },
+                   location: ferrite_plugin::PlayerLocation {
+                       world: ferrite_plugin::default_world_id(),
+                       x: start_pos[0],
+                       y: start_pos[1],
+                       z: start_pos[2],
+                       yaw: start_yaw,
+                       pitch: start_pitch,
+                   },
+                   inventory: vec![None; 41],
+               };
+               if let Err(error) = plugins.register_player(&snapshot) { tracing::warn!(%error, "registering player with plugins failed"); }
+           }
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
            let mode = start_mode; scheduler.schedule_global(move |g|{let mut player = GlobalPlayer::new(uuid,entity,name,properties,outbound,secure_chat,chat_type,chat_visibility); player.pos = start_pos; player.game_mode = mode; g.join(player)});tracing::info!(%uuid,"player joined");
           },
@@ -681,6 +706,7 @@ async fn run(
          _tick = clock.tick() => {
              let advance_time = game_rules.lock().unwrap().get_bool("advance_time").unwrap_or(true);
              command_state.lock().unwrap().tick(advance_time);
+             if let Some(plugins) = &settings.plugins && let Err(error) = plugins.tick() { tracing::warn!(%error, "plugin tick failed"); }
          }
         }
     }

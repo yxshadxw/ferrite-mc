@@ -168,6 +168,11 @@ async fn main() -> anyhow::Result<()> {
         .context("binding server listener")?;
     tracing::info!(address = %listener.local_addr()?, online_mode = config.online_mode, view_distance = config.view_distance, "Ferrite listener started");
 
+    let spawn = if let Some(path) = &config.world {
+        game::load_spawn(path).context("reading world spawn")?
+    } else {
+        [0, 65, 0]
+    };
     let plugin_bridge =
         ferrite_server::plugins::PluginBridge::start(ferrite_server::plugins::Settings {
             directory: config.plugins_dir.unwrap_or_else(|| "plugins".into()),
@@ -180,6 +185,18 @@ async fn main() -> anyhow::Result<()> {
             view_distance: config.view_distance,
             online_mode: config.online_mode,
             whitelist: false,
+            world: ferrite_plugin::WorldSnapshot {
+                id: ferrite_plugin::default_world_id(),
+                name: "world".into(),
+                time: 0,
+                spawn: ferrite_plugin::BlockPosition {
+                    x: spawn[0],
+                    y: spawn[1],
+                    z: spawn[2],
+                },
+                blocks: Vec::new(),
+                heights: Vec::new(),
+            },
         })
         .context("starting plugins")?;
     let settings = game::WorldSettings {
@@ -206,13 +223,12 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
     let world = if let Some(path) = config.world {
-        let spawn = game::load_spawn(&path).context("reading world spawn")?;
         let registry = ferrite_world::RuntimeRegistry::load("vanilla/26.3/generated")
             .context("loading vanilla registry")?;
         let source = game::new_anvil_source(path, registry);
         game::World::start_configured(Some(source), spawn, settings)
     } else {
-        game::World::start_configured(None, [0, 65, 0], settings)
+        game::World::start_configured(None, spawn, settings)
     };
     let mut server = tokio::spawn(ferrite_net::serve(
         listener,

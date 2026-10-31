@@ -770,10 +770,18 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Typical", &stdout, &stderr);
     wait_for_prefix(&events, "join Typical", &stdout, &stderr);
-    // The plugin also schedules a repeating task; the live server does not tick Bukkit scheduler
-    // tasks yet (docs/BACKLOG.md, plugin family), so only the enable-time registration is covered
-    // here. BootstrapTest exercises runTaskTimer's scheduling in the Java fallback.
     wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
+    wait_for_line(&events, "task 1", &stdout, &stderr);
+    wait_for_line(&events, "task 3", &stdout, &stderr);
+    assert!(
+        folder.join("task.txt").exists(),
+        "the repeating task never reached tick 3"
+    );
+    wait_for_line(&events, "task 5", &stdout, &stderr);
+    assert!(
+        folder.join("cancelled.txt").exists(),
+        "the repeating task was not cancelled"
+    );
 
     bot.raw(7, "typical ping");
     assert_eq!(
@@ -781,10 +789,8 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
         "pong Typical"
     );
     bot.raw(7, "typical where");
-    // The live bridge does not register world/player snapshots yet (docs/BACKLOG.md), so the
-    // fixture reports the unavailable branch instead of inventing coordinates.
-    let location = wait_for_chat(&mut bot, "where unavailable", &stdout, &stderr, &events);
-    assert_eq!(location, "where unavailable");
+    let location = wait_for_chat(&mut bot, "where world", &stdout, &stderr, &events);
+    assert!(location.starts_with("where world "), "{location}");
     bot.raw(7, "typical give");
     // Inventory writes need the host's player-inventory hook, which the live bridge does not
     // register yet; the fixture reports it instead of swallowing the failure.
@@ -793,8 +799,11 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
         "give unavailable"
     );
     bot.raw(7, "typical info");
-    let info = wait_for_chat(&mut bot, "info unavailable", &stdout, &stderr, &events);
-    assert_eq!(info, "info unavailable");
+    let info = wait_for_chat(&mut bot, "info world", &stdout, &stderr, &events);
+    assert!(
+        info.contains("spawn ") && info.contains("players 1"),
+        "{info}"
+    );
 
     drop(bot);
     let mut stdin = process.0.stdin.take().unwrap();
