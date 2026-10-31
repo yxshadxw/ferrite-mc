@@ -43,6 +43,8 @@ pub enum OpenAt {
     Furnace([i32; 3]),
     /// An anvil, which has no block entity.
     Anvil([i32; 3]),
+    /// Any other station block: the position and the block name it must still be.
+    Block([i32; 3], &'static str),
 }
 
 /// The block name at a position (vanilla `Level.getBlockState`).
@@ -193,6 +195,9 @@ impl Player {
                 block_name(source, [*x, *y, *z]) == Some("minecraft:anvil")
                     && self.within_reach([*x, *y, *z])
             }
+            Some(OpenAt::Block([x, y, z], block)) => {
+                block_name(source, [*x, *y, *z]) == Some(*block) && self.within_reach([*x, *y, *z])
+            }
         }
     }
 
@@ -327,7 +332,21 @@ impl Player {
         else {
             return;
         };
-        menu.button_click(p.button.0);
+        // Vanilla `EnchantmentMenu.doClick` refuses a choice the player cannot pay for.
+        if self.gamemode != 1 {
+            let cost = menu.enchant_cost(p.button.0);
+            if cost > self.experience_level {
+                let full = menu.broadcast_full_state(&self.inventory);
+                emit(self, vec![full]);
+                return;
+            }
+        }
+        let spent = menu.button_click(p.button.0);
+        let out = menu.broadcast_changes(&self.inventory);
+        emit(self, out);
+        if let Some(spent) = spent {
+            self.spend_levels(spent);
+        }
     }
 
     /// Writes an open station menu's items and timers back to its block entity.
@@ -429,6 +448,42 @@ impl Player {
                 Menu::crafting,
                 "container.crafting",
                 Some(OpenAt::Table([pos.x, pos.y, pos.z])),
+            );
+            return true;
+        }
+        let station = match block_name(&source, [pos.x, pos.y, pos.z]) {
+            Some("minecraft:enchanting_table") => Some((
+                Menu::enchanting as fn(i32) -> Menu,
+                "container.enchant",
+                "minecraft:enchanting_table",
+            )),
+            Some("minecraft:grindstone") => Some((
+                Menu::grindstone as fn(i32) -> Menu,
+                "container.grindstone_title",
+                "minecraft:grindstone",
+            )),
+            Some("minecraft:stonecutter") => Some((
+                Menu::stonecutter as fn(i32) -> Menu,
+                "container.stonecutter",
+                "minecraft:stonecutter",
+            )),
+            Some("minecraft:smithing_table") => Some((
+                Menu::smithing as fn(i32) -> Menu,
+                "container.upgrade",
+                "minecraft:smithing_table",
+            )),
+            Some("minecraft:loom") => Some((
+                Menu::loom as fn(i32) -> Menu,
+                "container.loom",
+                "minecraft:loom",
+            )),
+            _ => None,
+        };
+        if let Some((make, title, block)) = station {
+            self.open_menu(
+                make,
+                title,
+                Some(OpenAt::Block([pos.x, pos.y, pos.z], block)),
             );
             return true;
         }

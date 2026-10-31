@@ -1,6 +1,6 @@
 //! Container menus and `container_click` semantics (vanilla `AbstractContainerMenu`).
 
-use ferrite_item::{Component, HashedSlot, ItemStack, component_ids as ids};
+use ferrite_item::{Component, Enchantments, HashedSlot, ItemStack, component_ids as ids};
 use ferrite_nbt::Tag;
 
 use crate::inventory::{
@@ -133,6 +133,16 @@ pub enum MenuKind {
     Furnace(FurnaceKind),
     /// An anvil (vanilla `AnvilMenu`).
     Anvil,
+    /// An enchanting table (vanilla `EnchantmentMenu`).
+    Enchanting,
+    /// A grindstone (vanilla `GrindstoneMenu`).
+    Grindstone,
+    /// A stonecutter (vanilla `StonecutterMenu`).
+    Stonecutter,
+    /// A smithing table (vanilla `SmithingMenu`).
+    Smithing,
+    /// A loom (vanilla `LoomMenu`).
+    Loom,
 }
 
 impl MenuKind {
@@ -144,6 +154,11 @@ impl MenuKind {
             Self::Generic { rows } => Some(format!("minecraft:generic_9x{rows}")),
             Self::Furnace(kind) => Some(kind.menu_type().into()),
             Self::Anvil => Some("minecraft:anvil".into()),
+            Self::Enchanting => Some("minecraft:enchantment".into()),
+            Self::Grindstone => Some("minecraft:grindstone".into()),
+            Self::Stonecutter => Some("minecraft:stonecutter".into()),
+            Self::Smithing => Some("minecraft:smithing".into()),
+            Self::Loom => Some("minecraft:loom".into()),
         }
     }
 }
@@ -161,6 +176,21 @@ pub trait Crafter {
     /// Burn ticks of a fuel item (vanilla `FuelValues.burnDuration`), or 0 when it is no fuel.
     fn burn_time(&self, _item: &ItemStack) -> i32 {
         0
+    }
+
+    /// The stonecutter results for `input` (vanilla `StonecutterMenu.getResults`).
+    fn stonecutting(&self, _input: &ItemStack) -> Vec<ItemStack> {
+        Vec::new()
+    }
+
+    /// The result of a smithing-table template/base/addition (vanilla `SmithingMenu.createResult`).
+    fn smithing(
+        &self,
+        _template: &ItemStack,
+        _base: &ItemStack,
+        _addition: &ItemStack,
+    ) -> Option<ItemStack> {
+        None
     }
 }
 
@@ -273,6 +303,16 @@ enum Rule {
     /// A menu output slot: may not be placed into, and taking from it awards experience or
     /// consumes the menu's ingredients (vanilla `ResultSlot` for stations).
     Output,
+    /// An enchanting table's item slot (vanilla `EnchantmentMenu` slot 0).
+    EnchantItem,
+    /// An enchanting table's lapis slot.
+    Lapis,
+    /// A loom banner slot.
+    Banner,
+    /// A loom dye slot.
+    Dye,
+    /// A loom banner-pattern slot.
+    BannerPattern,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -341,6 +381,13 @@ pub struct Menu {
     rename: String,
     /// Vanilla `AnvilMenu.cost`: experience levels taking the result costs.
     anvil_cost: i32,
+    /// Vanilla `StonecutterMenu.recipes` and `selectedRecipeIndex`.
+    stonecutting: Vec<ItemStack>,
+    stonecutting_index: usize,
+    /// Vanilla `LoomMenu.selectedPattern` (the pattern list itself is not modelled yet).
+    loom_pattern: usize,
+    /// Experience a grindstone take awards.
+    station_xp: f32,
     carried: ItemStack,
     state_id: i32,
     quickcraft_status: i32,
@@ -365,18 +412,28 @@ impl Menu {
         let grid_width = match kind {
             MenuKind::Inventory => 2,
             MenuKind::Crafting => 3,
-            MenuKind::Generic { .. } | MenuKind::Furnace(_) => 0,
-            MenuKind::Anvil => 0,
+            MenuKind::Generic { .. } | MenuKind::Furnace(_) | MenuKind::Anvil => 0,
+            MenuKind::Enchanting
+            | MenuKind::Grindstone
+            | MenuKind::Stonecutter
+            | MenuKind::Smithing
+            | MenuKind::Loom => 0,
         };
         let container = match kind {
             MenuKind::Generic { rows } => vec![ItemStack::empty(); usize::from(rows) * 9],
             MenuKind::Furnace(_) => vec![ItemStack::empty(); 3],
             MenuKind::Anvil => vec![ItemStack::empty(); 2],
+            MenuKind::Enchanting => vec![ItemStack::empty(); 2],
+            MenuKind::Grindstone => vec![ItemStack::empty(); 2],
+            MenuKind::Stonecutter => vec![ItemStack::empty(); 1],
+            MenuKind::Smithing | MenuKind::Loom => vec![ItemStack::empty(); 3],
             _ => Vec::new(),
         };
         let data_len = match kind {
             MenuKind::Furnace(_) => FURNACE_DATA_SLOTS,
             MenuKind::Anvil => 1,
+            MenuKind::Enchanting => 4,
+            MenuKind::Stonecutter | MenuKind::Loom => 1,
             _ => 0,
         };
         let remote = vec![Remote::empty(); slots.len()];
@@ -393,6 +450,10 @@ impl Menu {
             furnace: matches!(kind, MenuKind::Furnace(_)).then(FurnaceState::default),
             rename: String::new(),
             anvil_cost: 0,
+            stonecutting: Vec::new(),
+            stonecutting_index: 0,
+            loom_pattern: 0,
+            station_xp: 0.0,
             carried: ItemStack::empty(),
             state_id: 0,
             quickcraft_status: 0,
@@ -505,6 +566,99 @@ impl Menu {
         Self::with_slots(container_id, MenuKind::Anvil, slots)
     }
 
+    /// An enchanting table (vanilla `EnchantmentMenu`): 0 item, 1 lapis, 2..38 inventory.
+    pub fn enchanting(container_id: i32) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::EnchantItem,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::Lapis,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Enchanting, slots)
+    }
+
+    /// A grindstone (vanilla `GrindstoneMenu`): 0 and 1 inputs, 2 result, 3..39 inventory.
+    pub fn grindstone(container_id: i32) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::Plain,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::Plain,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::Output,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Grindstone, slots)
+    }
+
+    /// A stonecutter (vanilla `StonecutterMenu`): 0 input, 1 result, 2..38 inventory.
+    pub fn stonecutter(container_id: i32) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::Plain,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::Output,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Stonecutter, slots)
+    }
+
+    /// A smithing table (vanilla `SmithingMenu`): 0 template, 1 base, 2 addition, 3 result,
+    /// 4..40 inventory.
+    pub fn smithing(container_id: i32) -> Self {
+        let mut slots: Vec<SlotDef> = (0..3)
+            .map(|i| SlotDef {
+                store: Store::Container(i),
+                rule: Rule::Plain,
+            })
+            .collect();
+        slots.push(SlotDef {
+            store: Store::Result,
+            rule: Rule::Output,
+        });
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Smithing, slots)
+    }
+
+    /// A loom (vanilla `LoomMenu`): 0 banner, 1 dye, 2 pattern, 3 result, 4..40 inventory.
+    pub fn loom(container_id: i32) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::Banner,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::Dye,
+            },
+            SlotDef {
+                store: Store::Container(2),
+                rule: Rule::BannerPattern,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::Output,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Loom, slots)
+    }
+
     pub fn container_id(&self) -> i32 {
         self.container_id
     }
@@ -606,6 +760,33 @@ impl Menu {
                 }
                 self.data[0] = self.anvil_cost;
             }
+            MenuKind::Enchanting => {
+                if self.data.len() < 4 {
+                    self.data.resize(4, 0);
+                    self.remote_data.resize(4, i32::MIN);
+                }
+                let costs = if self.container[0].is_empty() {
+                    [0, 0, 0]
+                } else {
+                    [1, 2, 3]
+                };
+                self.data[..3].copy_from_slice(&costs);
+                self.data[3] = 0;
+            }
+            MenuKind::Stonecutter => {
+                if self.data.is_empty() {
+                    self.data.resize(1, 0);
+                    self.remote_data.resize(1, i32::MIN);
+                }
+                self.data[0] = self.stonecutting_index as i32;
+            }
+            MenuKind::Loom => {
+                if self.data.is_empty() {
+                    self.data.resize(1, 0);
+                    self.remote_data.resize(1, i32::MIN);
+                }
+                self.data[0] = self.loom_pattern as i32;
+            }
             _ => {}
         }
     }
@@ -617,10 +798,151 @@ impl Menu {
 
     /// Recomputes a station menu's result from its inputs. Crafting result slots are refreshed
     /// by [`Menu::update_result`] instead.
-    fn refresh_station_result(&mut self, _crafter: &dyn Crafter) {
-        if self.kind == MenuKind::Anvil {
-            self.update_anvil();
+    fn refresh_station_result(&mut self, crafter: &dyn Crafter) {
+        match self.kind {
+            MenuKind::Anvil => self.update_anvil(),
+            MenuKind::Grindstone => self.update_grindstone(),
+            MenuKind::Stonecutter => {
+                self.stonecutting = if self.container[0].is_empty() {
+                    Vec::new()
+                } else {
+                    crafter.stonecutting(&self.container[0])
+                };
+                if self.stonecutting_index >= self.stonecutting.len() {
+                    self.stonecutting_index = 0;
+                }
+                self.result = self
+                    .stonecutting
+                    .get(self.stonecutting_index)
+                    .cloned()
+                    .unwrap_or_default();
+                self.sync_data();
+            }
+            MenuKind::Smithing => {
+                self.result = crafter
+                    .smithing(&self.container[0], &self.container[1], &self.container[2])
+                    .unwrap_or_default();
+                self.sync_data();
+            }
+            MenuKind::Loom => self.update_loom(),
+            _ => {}
         }
+    }
+
+    fn update_grindstone(&mut self) {
+        let left = self.container[0].clone();
+        let right = self.container[1].clone();
+        self.result = ItemStack::empty();
+        self.station_xp = 0.0;
+        if left.is_empty() && right.is_empty() {
+            self.sync_data();
+            return;
+        }
+        if !left.is_empty() && !right.is_empty() && !left.is_same_item(&right) {
+            self.sync_data();
+            return;
+        }
+        let mut out = if left.is_empty() {
+            right.clone()
+        } else {
+            left.clone()
+        };
+        let mut xp = 0.0;
+        for stack in [&left, &right] {
+            if stack.effective_component(ids::ENCHANTMENTS).is_some()
+                || stack
+                    .effective_component(ids::STORED_ENCHANTMENTS)
+                    .is_some()
+            {
+                xp += 2.0;
+            }
+        }
+        out.components.remove(ids::ENCHANTMENTS);
+        out.components.remove(ids::STORED_ENCHANTMENTS);
+        if !left.is_empty() && !right.is_empty() && left.is_damageable() {
+            let max = left.max_damage().unwrap_or(0);
+            let total = ((max - left.damage()) + (max - right.damage())).min(max);
+            out.components
+                .insert(ids::DAMAGE, Component::Damage(max - total));
+        }
+        out.count = 1;
+        self.station_xp = xp;
+        self.result = out;
+        self.sync_data();
+    }
+
+    fn update_loom(&mut self) {
+        self.result = ItemStack::empty();
+        let banner = &self.container[0];
+        let dye = &self.container[1];
+        if !banner.is_empty() && !dye.is_empty() {
+            let color = dye.name().and_then(|name| {
+                name.strip_prefix("minecraft:")
+                    .and_then(|name| name.strip_suffix("_dye"))
+            });
+            if let Some(color) = color {
+                let target = format!("minecraft:{color}_banner");
+                if banner.name() != Some(target.as_str())
+                    && let Some(mut out) = ItemStack::from_name(&target)
+                {
+                    out.components = banner.components.clone();
+                    self.result = out;
+                }
+            }
+        }
+        self.sync_data();
+    }
+
+    /// Vanilla `EnchantmentMenu.clickMenuButton`: applies the chosen enchantment and consumes
+    /// its lapis. Returns the experience levels the server should spend.
+    fn enchant(&mut self, choice: i32) -> Option<i32> {
+        if !(0..3).contains(&choice) {
+            return None;
+        }
+        let item = self.container[0].clone();
+        if item.is_empty() {
+            return None;
+        }
+        let cost = choice + 1;
+        if self.container[1].count < cost {
+            return None;
+        }
+        let name = item.name()?.strip_prefix("minecraft:").unwrap_or_default();
+        let enchantment = if name.ends_with("_sword") {
+            "minecraft:sharpness"
+        } else if name.ends_with("_pickaxe")
+            || name.ends_with("_axe")
+            || name.ends_with("_shovel")
+            || name.ends_with("_hoe")
+        {
+            "minecraft:efficiency"
+        } else if name.ends_with("_helmet")
+            || name.ends_with("_chestplate")
+            || name.ends_with("_leggings")
+            || name.ends_with("_boots")
+        {
+            "minecraft:protection"
+        } else if name == "bow" {
+            "minecraft:power"
+        } else if name == "fishing_rod" {
+            "minecraft:luck_of_the_sea"
+        } else {
+            "minecraft:unbreaking"
+        };
+        let mut enchantments = match item.effective_component(ids::ENCHANTMENTS) {
+            Some(Component::Enchantments(enchantments)) => enchantments,
+            _ => Enchantments::new(),
+        };
+        enchantments.set(enchantment, cost);
+        let mut out = item;
+        out.components
+            .insert(ids::ENCHANTMENTS, Component::Enchantments(enchantments));
+        self.container[0] = out;
+        let mut lapis = self.container[1].clone();
+        lapis.count -= cost;
+        self.container[1] = normalize(lapis);
+        self.sync_data();
+        Some(cost)
     }
 
     /// Vanilla `AnvilMenu.createResult`: renames, combines two damaged copies of one item, or
@@ -852,6 +1174,13 @@ impl Menu {
             // Vanilla furnace input and fuel slots accept any stack; the recipe and fuel checks
             // happen when the block ticks, as in `AbstractFurnaceBlockEntity`.
             Rule::FurnaceInput | Rule::Fuel => true,
+            Rule::EnchantItem => stack.max_stack_size() == 1,
+            Rule::Lapis => stack.name() == Some("minecraft:lapis_lazuli"),
+            Rule::Banner => stack.name().is_some_and(|name| name.ends_with("_banner")),
+            Rule::Dye => stack.name().is_some_and(|name| name.ends_with("_dye")),
+            Rule::BannerPattern => stack
+                .name()
+                .is_some_and(|name| name.ends_with("_banner_pattern")),
         }
     }
 
@@ -982,6 +1311,30 @@ impl Menu {
                     }
                     self.result = ItemStack::empty();
                     self.anvil_cost = 0;
+                }
+                MenuKind::Grindstone => {
+                    for cell in 0..2 {
+                        let mut left = self.container[cell].clone();
+                        left.count -= 1;
+                        self.container[cell] = normalize(left);
+                    }
+                    self.result = ItemStack::empty();
+                    p.xp += self.station_xp;
+                    self.station_xp = 0.0;
+                }
+                MenuKind::Stonecutter => {
+                    let mut left = self.container[0].clone();
+                    left.count -= 1;
+                    self.container[0] = normalize(left);
+                    self.result = ItemStack::empty();
+                }
+                MenuKind::Smithing | MenuKind::Loom => {
+                    for cell in 0..3 {
+                        let mut left = self.container[cell].clone();
+                        left.count -= 1;
+                        self.container[cell] = normalize(left);
+                    }
+                    self.result = ItemStack::empty();
                 }
                 _ => {}
             }
@@ -1410,6 +1763,38 @@ impl Menu {
                         || self.move_item_stack_to(p, &mut stack, 1, 2, false)
                 }
             }
+            MenuKind::Enchanting => {
+                if i < 2 {
+                    self.move_item_stack_to(p, &mut stack, 2, 38, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                        || self.move_item_stack_to(p, &mut stack, 1, 2, false)
+                }
+            }
+            MenuKind::Stonecutter => {
+                if i < 2 {
+                    self.move_item_stack_to(p, &mut stack, 2, 38, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                }
+            }
+            MenuKind::Grindstone => {
+                if i < 3 {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                        || self.move_item_stack_to(p, &mut stack, 1, 2, false)
+                }
+            }
+            MenuKind::Smithing | MenuKind::Loom => {
+                if i < 4 {
+                    self.move_item_stack_to(p, &mut stack, 4, 40, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                        || self.move_item_stack_to(p, &mut stack, 1, 2, false)
+                        || self.move_item_stack_to(p, &mut stack, 2, 3, false)
+                }
+            }
             MenuKind::Furnace(kind) => {
                 if i == 2 {
                     self.move_item_stack_to(p, &mut stack, 3, 39, true)
@@ -1560,16 +1945,46 @@ impl Menu {
             return;
         }
         self.rename = name;
-        self.refresh_station_result(&NoCrafting);
+        self.update_anvil();
     }
 
     /// Vanilla `AbstractContainerMenu.clickMenuButton`: an enchant choice, stonecutter recipe or
-    /// loom pattern. Only the menus that have buttons react.
-    pub fn button_click(&mut self, _button: i32) {}
+    /// loom pattern. Returns the experience levels the click spends.
+    pub fn button_click(&mut self, button: i32) -> Option<i32> {
+        match self.kind {
+            MenuKind::Enchanting => self.enchant(button),
+            MenuKind::Stonecutter => {
+                if button >= 0 && (button as usize) < self.stonecutting.len() {
+                    self.stonecutting_index = button as usize;
+                    self.result = self.stonecutting[self.stonecutting_index].clone();
+                    self.sync_data();
+                }
+                None
+            }
+            MenuKind::Loom => {
+                self.loom_pattern = if button < 0 { 0 } else { button as usize };
+                self.update_loom();
+                None
+            }
+            _ => None,
+        }
+    }
 
     /// The name the player typed into an anvil (vanilla `AnvilMenu.itemName`).
     pub fn rename_text(&self) -> &str {
         &self.rename
+    }
+
+    /// The level cost of an enchanting-table choice (vanilla `EnchantmentMenu.getEnchantmentLevel`).
+    pub fn enchant_cost(&self, choice: i32) -> i32 {
+        if self.kind != MenuKind::Enchanting || !(0..3).contains(&choice) {
+            return 0;
+        }
+        if self.container[0].is_empty() {
+            0
+        } else {
+            choice + 1
+        }
     }
 
     /// Vanilla `transferState`: adopts what the client was last sent for the inventory slots

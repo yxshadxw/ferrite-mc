@@ -211,6 +211,110 @@ fn anvil_repairs_renames_and_charges_levels() {
     assert_eq!(f.menu.anvil_cost(), 2);
 }
 
+/// Station recipes for the non-furnace crafting stations.
+struct StationCrafter;
+
+impl Crafter for StationCrafter {
+    fn craft(&self, _: &[ItemStack], _: usize) -> ItemStack {
+        empty()
+    }
+
+    fn stonecutting(&self, input: &ItemStack) -> Vec<ItemStack> {
+        if input.name() == Some("minecraft:stone") {
+            vec![item("stone_slab", 2)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn smithing(
+        &self,
+        template: &ItemStack,
+        base: &ItemStack,
+        addition: &ItemStack,
+    ) -> Option<ItemStack> {
+        (template.name() == Some("minecraft:netherite_upgrade_smithing_template")
+            && base.name() == Some("minecraft:diamond_sword")
+            && addition.name() == Some("minecraft:netherite_ingot"))
+        .then(|| item("netherite_sword", 1))
+    }
+}
+
+#[test]
+fn stonecutter_grindstone_enchanting_smithing_and_loom_work() {
+    let mut f = Fixture::new(Menu::stonecutter(3));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("stone", 3));
+    assert_eq!(f.menu.kind(), crate::MenuKind::Stonecutter);
+    assert_eq!(f.slot(1), item("stone_slab", 2));
+    let mut p = Clicker::new(&mut f.inv, false, &StationCrafter);
+    f.menu.clicked(&mut p, 1, 0, Pickup);
+    assert_eq!(f.menu.carried(), &item("stone_slab", 2));
+    assert_eq!(f.slot(0), item("stone", 2));
+
+    // A grindstone strips enchantments and combines the durability of two copies.
+    let mut f = Fixture::new(Menu::grindstone(4));
+    let mut left = item("iron_sword", 1);
+    left.components
+        .insert(component_ids::DAMAGE, Component::Damage(50));
+    let mut enchantments = Enchantments::new();
+    enchantments.set("minecraft:sharpness", 2);
+    left.components.insert(
+        component_ids::ENCHANTMENTS,
+        Component::Enchantments(enchantments),
+    );
+    f.menu.set_slot(&mut f.inv, &StationCrafter, 0, left);
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("iron_sword", 1));
+    assert_eq!(f.slot(2).damage(), 0);
+    assert!(
+        f.slot(2)
+            .effective_component(component_ids::ENCHANTMENTS)
+            .is_none()
+    );
+    let mut p = Clicker::new(&mut f.inv, false, &StationCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert!(p.xp >= 2.0);
+    assert_eq!(f.slot(0), empty());
+
+    // Enchanting costs one lapis and one level per choice.
+    let mut f = Fixture::new(Menu::enchanting(5));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("diamond_sword", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("lapis_lazuli", 3));
+    assert_eq!(f.menu.enchant_cost(1), 2);
+    assert_eq!(f.menu.button_click(1), Some(2));
+    assert_eq!(f.menu.data_value(0), 1);
+    match f.slot(0).effective_component(component_ids::ENCHANTMENTS) {
+        Some(Component::Enchantments(enchantments)) => {
+            assert_eq!(enchantments.level("minecraft:sharpness"), Some(2))
+        }
+        other => panic!("no enchantments: {other:?}"),
+    }
+    assert_eq!(f.slot(1), item("lapis_lazuli", 1));
+
+    let mut f = Fixture::new(Menu::smithing(6));
+    f.menu.set_slot(
+        &mut f.inv,
+        &StationCrafter,
+        0,
+        item("netherite_upgrade_smithing_template", 1),
+    );
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("diamond_sword", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 2, item("netherite_ingot", 1));
+    assert_eq!(f.slot(3), item("netherite_sword", 1));
+
+    let mut f = Fixture::new(Menu::loom(7));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 0, item("white_banner", 1));
+    f.menu
+        .set_slot(&mut f.inv, &StationCrafter, 1, item("red_dye", 1));
+    assert_eq!(f.slot(3).name(), Some("minecraft:red_banner"));
+}
+
 #[test]
 fn inventory_menu_maps_vanilla_slots() {
     let mut f = Fixture::inventory();

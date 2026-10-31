@@ -63,6 +63,50 @@ impl Crafter for RecipeCrafter {
     fn burn_time(&self, item: &ItemStack) -> i32 {
         item.name().map_or(0, fuel_burn_time)
     }
+
+    fn stonecutting(&self, input: &ItemStack) -> Vec<ItemStack> {
+        let Some(name) = input.name() else {
+            return Vec::new();
+        };
+        self.0
+            .stonecutting_options(name)
+            .into_iter()
+            .filter_map(|recipe| recipe.result())
+            .filter_map(|result| {
+                let count = i32::try_from(result.count).ok()?;
+                ItemStack::from_name(&result.item).map(|stack| stack.copy_with_count(count))
+            })
+            .collect()
+    }
+
+    fn smithing(
+        &self,
+        template: &ItemStack,
+        base: &ItemStack,
+        addition: &ItemStack,
+    ) -> Option<ItemStack> {
+        let (Some(template), Some(base), Some(addition)) =
+            (template.name(), base.name(), addition.name())
+        else {
+            return None;
+        };
+        let tags = self.0.tags();
+        for recipe in self.0.recipes() {
+            let RecipeKind::SmithingTransform(transform) = &recipe.kind else {
+                continue;
+            };
+            if !transform.template.matches(template, tags)
+                || !transform.base.matches(base, tags)
+                || !transform.addition.matches(addition, tags)
+            {
+                continue;
+            }
+            let count = i32::try_from(transform.result.count).ok()?;
+            return ItemStack::from_name(&transform.result.item)
+                .map(|stack| stack.copy_with_count(count));
+        }
+        None
+    }
 }
 
 /// Vanilla `FuelValues.burnDuration` for the 26.3 fuels this server knows (the generated data
