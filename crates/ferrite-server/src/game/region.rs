@@ -164,6 +164,18 @@ pub struct Player {
     pub primed_tnt: Vec<([i32; 3], i32)>,
     /// Fire this player lit this tick; the region schedules `FireBlock` ticks for it.
     pub ignited: Vec<[i32; 3]>,
+    /// The dimension this player is in; beds explode outside the overworld.
+    pub dimension: super::Dimension,
+    /// The bed this player is sleeping in, if any.
+    pub sleeping: Option<[i32; 3]>,
+    /// The respawn point a bed set, if any.
+    pub spawn: Option<[i32; 3]>,
+    /// Bed explosions to run this tick: center, power, whether fire is left behind.
+    pub explosions: Vec<([f64; 3], f32, bool)>,
+    /// Buttons pressed this tick, with their press duration.
+    pub button_press: Vec<([i32; 3], u32)>,
+    /// The sign this player may edit.
+    pub editing_sign: Option<([i32; 3], bool)>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -206,6 +218,7 @@ pub struct Region {
     updates: super::neighbors::Updates,
     gravity: super::gravity::Gravity,
     fire: super::fire::FireTicks,
+    buttons: super::blocks::ButtonTicks,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -223,6 +236,7 @@ impl RegionData for Region {
         }
         self.gravity.merge(other.gravity);
         self.fire.merge(other.fire);
+        self.buttons.merge(other.buttons);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -248,6 +262,9 @@ impl RegionData for Region {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             fire: self.fire.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            buttons: self.buttons.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             held_chunks: HashMap::new(),
@@ -520,10 +537,22 @@ impl Player {
                         .and_then(|v| u16::try_from(v).ok())
                         .filter(|v| usize::from(*v) < ferrite_data::blocks::STATE_COUNT)
                     {
-                        Some(state) => ferrite_data::block_props::collision_shape(state)
-                            .iter()
-                            .map(|b| AABB::new(b[0], b[1], b[2], b[3], b[4], b[5]))
-                            .collect(),
+                        Some(state) => {
+                            let props = ferrite_data::block_props::get(state);
+                            let shapes: Vec<_> = ferrite_data::block_props::collision_shape(state)
+                                .iter()
+                                .map(|b| AABB::new(b[0], b[1], b[2], b[3], b[4], b[5]))
+                                .collect();
+                            // Vanilla `ClipContext.Fluid.SOURCE_ONLY`: fluids are
+                            // clickable even without a collision shape (buckets).
+                            if shapes.is_empty() && !props.is_air {
+                                // Fluids and interaction blocks without a collision shape
+                                // (doors, signs) still have to be clickable.
+                                vec![AABB::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]
+                            } else {
+                                shapes
+                            }
+                        }
                         None => vec![AABB::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
                     };
                     if !boxes.is_empty() {
@@ -705,9 +734,14 @@ impl Player {
             return;
         }
         let item_id = i32::from(item.item);
-        let water_bucket = item.name() == Some("minecraft:water_bucket");
-        let state = if water_bucket {
-            ferrite_data::blocks::default_state("water").expect("vanilla water")
+        // Vanilla `BucketItem.place`: water and lava buckets place their fluid block.
+        let bucket_name = match item.name() {
+            Some("minecraft:water_bucket") => Some("water"),
+            Some("minecraft:lava_bucket") => Some("lava"),
+            _ => None,
+        };
+        let state = if let Some(fluid) = bucket_name {
+            ferrite_data::blocks::default_state(fluid).expect("vanilla fluid")
         } else {
             let Some(state) =
                 super::interaction::placement_state(item_id, p.face.0, p.cursor_y, self.yaw, old)
@@ -768,7 +802,7 @@ impl Player {
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
-            if water_bucket {
+            if bucket_name.is_some() {
                 self.inventory.set(
                     slot,
                     ferrite_item::ItemStack::from_name("bucket").expect("vanilla bucket"),
@@ -1257,8 +1291,9 @@ impl Player {
                         )
                     });
                     if allowed {
+                        let hit = self.hit(clicked);
                         let used = (0..=1).contains(&p.hand.0)
-                            && self.hit(clicked).is_some()
+                            && hit.is_some()
                             && self.use_block(p.location);
                         if !used {
                             self.place(&p);
@@ -1289,6 +1324,13 @@ impl Player {
                         },
                     );
                 }
+                ServerboundPlay::PlayerCommand(p) => {
+                    // Vanilla `ServerboundPlayerCommandPacket.Action.STOP_SLEEPING` (2).
+                    if p.action.0 == 2 {
+                        super::blocks::wake(self);
+                    }
+                }
+                ServerboundPlay::SignUpdate(p) => super::blocks::edit_sign(self, &p),
                 ServerboundPlay::SetHeldItem(p) => {
                     // Vanilla `handleSetCarriedItem` ignores slots outside the hotbar.
                     if (0..=8).contains(&p.slot) {
@@ -1482,7 +1524,8 @@ impl Region {
 
     /// Drops the loot table of a block broken by a neighbor or gravity update.
     fn spawn_block_drops(&mut self, pos: [i32; 3], state: u16) {
-        for stack in super::drops::block_drops(state, ItemStack::default(), &mut self.rng) {
+        let empty = ferrite_item::ItemStack::empty();
+        for stack in super::drops::block_drops(state, &empty, &mut self.rng) {
             let record = item::pop_resource(pos, stack, &mut self.rng);
             self.entities.insert(record);
         }
@@ -1565,15 +1608,11 @@ impl Region {
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
-        let tool = ItemStack {
-            count: held.count.max(0),
-            item_id: i32::from(held.item),
-        };
         for (pos, state) in p.broken.drain(..) {
             let Ok(state) = u16::try_from(state) else {
                 continue;
             };
-            for stack in super::drops::block_drops(state, tool, &mut self.rng) {
+            for stack in super::drops::block_drops(state, held, &mut self.rng) {
                 let record = item::pop_resource([pos.x, pos.y, pos.z], stack, &mut self.rng);
                 self.entities.insert(record);
             }
@@ -1789,6 +1828,7 @@ impl Region {
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
         let ids: Vec<_> = self.players.keys().copied().collect();
+        let mut explosions = Vec::new();
         for id in ids {
             let mut p = self.players.remove(&id).unwrap();
             let updated = match &timings {
@@ -1800,6 +1840,10 @@ impl Region {
             };
             self.spawn_thrown(&mut p);
             self.spawn_primed_tnt(&mut p);
+            explosions.append(&mut p.explosions);
+            for (pos, delay) in p.button_press.drain(..) {
+                self.buttons.schedule(pos, delay);
+            }
             for pos in p.ignited.drain(..) {
                 let delay = super::fire::tick_delay(&mut self.rng);
                 self.fire.schedule(pos, delay);
@@ -1839,7 +1883,41 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
+        // Vanilla `BedBlock.explodeBed` runs the ordinary `Explosion` and leaves fire behind.
+        for (center, power, fire) in explosions {
+            self.explode(center, power, ctx);
+            if fire && let Some(source) = ctx.source.as_deref() {
+                let pos = [
+                    center[0].floor() as i32,
+                    center[1].floor() as i32,
+                    center[2].floor() as i32,
+                ];
+                let mut world =
+                    super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+                if let Some(state) = super::fire::placement_state(&world, pos) {
+                    ferrite_fluid::FluidWorld::set_block(
+                        &mut world,
+                        pos[0],
+                        pos[1],
+                        pos[2],
+                        u32::from(state),
+                    );
+                    self.updates.block_changed(pos);
+                }
+            }
+        }
+        // Vanilla `ButtonBlock` scheduled release ticks.
+        let mut button_changed = Vec::new();
+        if let Some(source) = ctx.source.as_deref() {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            self.buttons.tick(&mut world, &mut button_changed);
+        }
+        for pos in &button_changed {
+            self.updates.block_changed(*pos);
+        }
         let mut changed = self.tick_block_updates(ctx);
+        changed.extend(button_changed);
         // Vanilla `FireBlock.tick` runs on scheduled ticks and changes blocks through the same
         // neighbor-update path as any other block change.
         let mut fire_changed = Vec::new();

@@ -1,5 +1,8 @@
 mod anvil;
 pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
+#[cfg(test)]
+mod block_tests;
+mod blocks;
 pub mod playerdata;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
@@ -91,6 +94,11 @@ pub enum Dimension {
 }
 
 impl Dimension {
+    /// Vanilla `DimensionType.bedWorks`: beds explode in the nether and the end.
+    pub fn bed_works(self) -> bool {
+        matches!(self, Self::Overworld)
+    }
+
     /// Vanilla `DimensionType.infiniburn`.
     pub fn infiniburn_tag(self) -> &'static str {
         match self {
@@ -531,7 +539,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),ignited:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),ignited:Vec::new(),dimension:settings.dimension,sleeping:None,spawn:None,explosions:Vec::new(),button_press:Vec::new(),editing_sign:None,tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }

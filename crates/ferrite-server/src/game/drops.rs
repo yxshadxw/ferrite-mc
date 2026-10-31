@@ -41,11 +41,8 @@ impl ferrite_loot::Rng for LootRng<'_> {
 }
 
 /// Vanilla `Tool.isCorrectForDrops`: the first rule that names the block and decides drops.
-fn tool_is_correct(item_id: i32, block: &str) -> bool {
-    let Some(defaults) = u16::try_from(item_id)
-        .ok()
-        .and_then(ferrite_item::item_defaults)
-    else {
+fn tool_is_correct(item_id: u16, block: &str) -> bool {
+    let Some(defaults) = ferrite_item::item_defaults(item_id) else {
         return false;
     };
     let tool_id = ferrite_item::component_ids::TOOL;
@@ -71,7 +68,11 @@ fn tool_is_correct(item_id: i32, block: &str) -> bool {
 
 /// What breaking `state` with `tool` drops (vanilla `Block.getDrops`, only when the player
 /// `hasCorrectToolForDrops`).
-pub fn block_drops(state: u16, tool: ItemStack, rng: &mut ferrite_entity::Rng) -> Vec<ItemStack> {
+pub fn block_drops(
+    state: u16,
+    tool: &ferrite_item::ItemStack,
+    rng: &mut ferrite_entity::Rng,
+) -> Vec<ItemStack> {
     if usize::from(state) >= ferrite_data::blocks::STATE_COUNT {
         return Vec::new();
     }
@@ -79,7 +80,7 @@ pub fn block_drops(state: u16, tool: ItemStack, rng: &mut ferrite_entity::Rng) -
         return Vec::new();
     };
     if ferrite_data::block_props::get(state).requires_correct_tool
-        && (tool.count <= 0 || !tool_is_correct(tool.item_id, name))
+        && (tool.count <= 0 || !tool_is_correct(tool.item, name))
     {
         return Vec::new();
     }
@@ -91,12 +92,26 @@ pub fn block_drops(state: u16, tool: ItemStack, rng: &mut ferrite_entity::Rng) -
     }) else {
         return Vec::new();
     };
+    // Vanilla `LootContextParams.TOOL`: the item's enchantments feed `match_tool` predicates
+    // (silk touch) and `apply_bonus` (fortune).
+    let mut tool_enchantments = std::collections::BTreeMap::new();
+    let mut fortune = 0;
+    if let Some(ferrite_item::Component::Enchantments(enchantments)) = tool
+        .components
+        .get(ferrite_item::component_ids::ENCHANTMENTS)
+    {
+        for (name, level) in &enchantments.levels {
+            tool_enchantments.insert(name.clone(), *level);
+        }
+        fortune = enchantments.level("minecraft:fortune").unwrap_or(0);
+    }
     let context = LootContext {
         tool: (tool.count > 0)
-            .then(|| u16::try_from(tool.item_id).ok())
+            .then(|| ferrite_item::item_name(tool.item))
             .flatten()
-            .and_then(ferrite_item::item_name)
             .map(str::to_owned),
+        tool_enchantments,
+        fortune,
         block: Some(name.to_owned()),
         block_state: props
             .iter()
@@ -118,7 +133,11 @@ pub fn block_drops(state: u16, tool: ItemStack, rng: &mut ferrite_entity::Rng) -
 mod tests {
     use super::*;
 
-    fn item(name: &str) -> ItemStack {
+    fn tool(name: &str) -> ferrite_item::ItemStack {
+        ferrite_item::ItemStack::from_name(name).unwrap()
+    }
+
+    fn drop_stack(name: &str) -> ItemStack {
         ItemStack {
             count: 1,
             item_id: ferrite_data::registries::id("minecraft:item", name).unwrap(),
@@ -128,26 +147,44 @@ mod tests {
     #[test]
     fn blocks_drop_their_loot_with_the_right_tool() {
         let mut rng = ferrite_entity::Rng::new(4);
+        let empty = ferrite_item::ItemStack::empty();
         let grass = ferrite_data::blocks::default_state("grass_block").unwrap();
         assert_eq!(
-            block_drops(grass, ItemStack::default(), &mut rng),
-            [item("minecraft:dirt")]
+            block_drops(grass, &empty, &mut rng),
+            [drop_stack("minecraft:dirt")]
         );
         let stone = ferrite_data::blocks::default_state("stone").unwrap();
         // Stone needs a pickaxe.
-        assert!(block_drops(stone, ItemStack::default(), &mut rng).is_empty());
-        assert!(block_drops(stone, item("minecraft:wooden_shovel"), &mut rng).is_empty());
+        assert!(block_drops(stone, &empty, &mut rng).is_empty());
+        assert!(block_drops(stone, &tool("minecraft:wooden_shovel"), &mut rng).is_empty());
         assert_eq!(
-            block_drops(stone, item("minecraft:wooden_pickaxe"), &mut rng),
-            [item("minecraft:cobblestone")]
+            block_drops(stone, &tool("minecraft:wooden_pickaxe"), &mut rng),
+            [drop_stack("minecraft:cobblestone")]
         );
         // Iron ore needs at least a stone pickaxe.
         let ore = ferrite_data::blocks::default_state("iron_ore").unwrap();
-        assert!(block_drops(ore, item("minecraft:wooden_pickaxe"), &mut rng).is_empty());
+        assert!(block_drops(ore, &tool("minecraft:wooden_pickaxe"), &mut rng).is_empty());
         assert_eq!(
-            block_drops(ore, item("minecraft:stone_pickaxe"), &mut rng),
-            [item("minecraft:raw_iron")]
+            block_drops(ore, &tool("minecraft:stone_pickaxe"), &mut rng),
+            [drop_stack("minecraft:raw_iron")]
         );
-        assert!(block_drops(0, ItemStack::default(), &mut rng).is_empty());
+        // Enchantment-free silk touch: the loot table's `match_tool` sees the tool's
+        // `minecraft:silk_touch` component and keeps the block itself.
+        let mut silk = tool("minecraft:stone_pickaxe");
+        let mut enchantments = ferrite_item::Enchantments::new();
+        enchantments.set("minecraft:silk_touch", 1);
+        silk.components.insert(
+            ferrite_item::component_ids::ENCHANTMENTS,
+            ferrite_item::Component::Enchantments(enchantments),
+        );
+        assert_eq!(
+            block_drops(ore, &silk, &mut rng),
+            [drop_stack("minecraft:iron_ore")]
+        );
+        assert_eq!(
+            block_drops(stone, &silk, &mut rng),
+            [drop_stack("minecraft:stone")]
+        );
+        assert!(block_drops(0, &empty, &mut rng).is_empty());
     }
 }
