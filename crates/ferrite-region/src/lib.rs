@@ -86,7 +86,7 @@ pub trait RegionData: Default + Send + 'static {
 
 struct Region<D> {
     state: RegionState,
-    merge_target: Option<RegionId>,
+    merge_targets: HashSet<RegionId>,
     merge_from: HashSet<RegionId>,
     sections: HashSet<SectionPos>,
     data: Option<D>,
@@ -103,7 +103,7 @@ impl<D> Region<D> {
     fn new(sections: HashSet<SectionPos>, data: D) -> Self {
         Self {
             state: RegionState::Ready,
-            merge_target: None,
+            merge_targets: HashSet::new(),
             merge_from: HashSet::new(),
             sections,
             data: Some(data),
@@ -263,8 +263,8 @@ impl<D: RegionData> Regionizer<D> {
             for neighbor in self.neighborhood(*section) {
                 if let Some(&(_, other)) = self.sections.get(&neighbor)
                     && other != id
-                    && self.regions[&id].merge_target != Some(other)
-                    && self.regions[&other].merge_target != Some(id)
+                    && !self.regions[&id].merge_targets.contains(&other)
+                    && !self.regions[&other].merge_targets.contains(&id)
                 {
                     return Err(format!(
                         "{section:?} (region {id}) and {neighbor:?} (region {other}) are \
@@ -749,27 +749,30 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
         return;
     }
     // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: a new
-    // section beside one ticking region receives a transient owner immediately.
+    // section adjacent only to ticking regions receives a transient owner.
     if matches!(mutation, Mutation::Add(_))
         && !s.topology.sections.contains_key(&section)
         && nearby(s, section).is_empty()
-        && affected.len() == 1
-        && let Some(&target) = affected.iter().next()
-        && s.topology.regions[&target].state == RegionState::Ticking
-        && s.topology.regions[&target].mutations.is_empty()
+        && !affected.is_empty()
+        && affected.iter().all(|id| {
+            s.topology.regions[id].state == RegionState::Ticking
+                && s.topology.regions[id].mutations.is_empty()
+        })
     {
         let id = s.topology.next_id;
         s.topology.next_id += 1;
         let mut region = Region::new(HashSet::from([section]), D::default());
         region.state = RegionState::Transient;
-        region.merge_target = Some(target);
+        region.merge_targets = affected.clone();
         s.topology.regions.insert(id, region);
-        s.topology
-            .regions
-            .get_mut(&target)
-            .unwrap()
-            .merge_from
-            .insert(id);
+        for &target in &affected {
+            s.topology
+                .regions
+                .get_mut(&target)
+                .unwrap()
+                .merge_from
+                .insert(id);
+        }
         s.topology.sections.insert(section, (1, id));
         *s.topology.chunks.entry(chunk).or_default() += 1;
         if let Some(tasks) = s.parked.remove(&section) {
@@ -982,6 +985,17 @@ fn worker<D: RegionData, G: Send + 'static>(
                 let incoming = std::mem::take(&mut r.merge_from);
                 for source in incoming {
                     let mut old = s.topology.regions.remove(&source).unwrap();
+                    old.merge_targets.remove(&id);
+                    for target in &old.merge_targets {
+                        let ticking = s.topology.regions.get_mut(target).unwrap();
+                        ticking.merge_from.remove(&source);
+                        ticking.merge_from.insert(id);
+                    }
+                    if !old.merge_targets.is_empty() {
+                        let destination = s.topology.regions.get_mut(&id).unwrap();
+                        destination.state = RegionState::Transient;
+                        destination.merge_targets.extend(old.merge_targets.drain());
+                    }
                     // Pending removals may have reserved this transient owner.
                     // Transfer their reservation before refreshing their topology.
                     for mutation in &old.mutations {

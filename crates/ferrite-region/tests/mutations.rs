@@ -419,3 +419,38 @@ fn added_section_beside_ticking_region_is_transient_until_merge() {
     );
     assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
+#[test]
+fn transient_bridge_waits_for_both_ticking_regions() {
+    use ferrite_region::RegionState;
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    topology.add_chunk(ChunkPos(2, 0));
+    let scheduler = Scheduler::new(topology, (), 3, |_| {}, |_| {});
+    let left = block_region(&scheduler, ChunkPos(0, 0));
+    let right = block_region(&scheduler, ChunkPos(2, 0));
+    scheduler.add_chunk(ChunkPos(1, 0));
+    let bridge = scheduler
+        .owner(ChunkPos(1, 0))
+        .expect("bridge is owned immediately");
+    assert_eq!(scheduler.region_state(bridge), Some(RegionState::Transient));
+    let (tx, rx) = mpsc::channel();
+    scheduler.schedule_at_chunk(ChunkPos(1, 0), move |_| tx.send(()).unwrap());
+    left.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while scheduler.owner(ChunkPos(0, 0)) != scheduler.owner(ChunkPos(1, 0)) {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert_eq!(
+        scheduler.region_state(scheduler.owner(ChunkPos(1, 0)).unwrap()),
+        Some(RegionState::Transient)
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+    right.send(()).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        scheduler.owner(ChunkPos(0, 0)),
+        scheduler.owner(ChunkPos(2, 0))
+    );
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
