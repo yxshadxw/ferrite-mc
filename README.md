@@ -5,7 +5,7 @@
 > Bukkit/Spigot/Paper/Folia plugins, with multiple Minecraft versions supported later.
 > Target: Minecraft Java 26.3, protocol 777. Current status: **playable survival basics on
 > bot-verified worlds** — login/encryption, signed chat, server-list ping (players, favicon),
-> block break/place with drops, inventory/crafting/chests, item entities, survival (health,
+> block break/place with drops, inventory/crafting/chests, furnace and anvil menus, item entities, survival (health,
 > hunger, death, XP), redstone, falling blocks and explosions, passive mobs, random ticks, fluids,
 > ~70 vanilla commands (including execute and data), plugin events, multi-version client
 > translation, a Folia-style regionizer and Starlight-style lighting (0 mismatches vs vanilla).
@@ -45,6 +45,10 @@ Rust로 작성된 Minecraft Java 서버입니다. Folia 스타일의 리전(regi
   랜덤 틱(잔디 번짐·나뭇잎 소멸), 유체(물/용암)
 - **게임플레이** — 블록 캐기/설치와 드롭, 아이템 엔티티와 줍기, 인벤토리 클릭, 2x2/작업대
   크래프팅, 상자·통 메뉴, 게임룰 59종과 저장
+- **제작대·용광로** — 용광로·용해로·훈연기 제련(바닐라 연료 연소 시간, 조리 진행도, 켜짐/꺼짐
+  상태 동기화, 꺼낼 때 경험치), 모루 수리·이름 변경·레벨 비용(내구도 5% 보너스, 선행 작업
+  패널티, 40레벨 상한), 마법 부여대, 숫돌, 석재 절단기, 대장장이 작업대, 베틀 메뉴와
+  슬롯 검증
 - **생존** — 체력·피해(낙하/익사/용암/불/공허), 허기와 포화도, 음식 먹기, 사망·리스폰
   (`keepInventory` 반영), 경험치 오브와 사망 시 경험치 드롭
 - **블록 변화** — 이웃 업데이트와 `canSurvive` 규칙, 낙하 블록(모래·자갈·콘크리트 가루·모루),
