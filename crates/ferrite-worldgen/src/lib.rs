@@ -36,6 +36,7 @@ mod carver;
 mod density;
 mod dimension;
 mod evaluator;
+mod feature;
 mod id;
 mod loader;
 mod material;
@@ -63,6 +64,10 @@ pub use dimension::{
     WorldPreset,
 };
 pub use evaluator::FunctionContext;
+pub use feature::{
+    BlockStateProvider, BlockTag, ConfiguredFeature, FeatureError, FeatureGenerator, PlacedFeature,
+    WorldgenRandom, decoration_seed, feature_seed,
+};
 pub use id::{InvalidResourceId, ResourceId};
 pub use loader::LoadError;
 pub use material::{
@@ -94,6 +99,10 @@ pub struct WorldgenData {
     pub biomes: BTreeMap<ResourceId, Biome>,
     pub material_conditions: BTreeMap<ResourceId, MaterialCondition>,
     pub material_rules: BTreeMap<ResourceId, MaterialRule>,
+    pub configured_features: BTreeMap<ResourceId, ConfiguredFeature>,
+    pub placed_features: BTreeMap<ResourceId, PlacedFeature>,
+    pub block_state_providers: BTreeMap<ResourceId, BlockStateProvider>,
+    pub block_tags: BTreeMap<ResourceId, BlockTag>,
     pub dimension_types: BTreeMap<ResourceId, DimensionType>,
     pub dimensions: BTreeMap<ResourceId, Dimension>,
     pub world_presets: BTreeMap<ResourceId, WorldPreset>,
@@ -127,6 +136,10 @@ impl WorldgenData {
             biomes: self.biomes.len(),
             material_conditions: self.material_conditions.len(),
             material_rules: self.material_rules.len(),
+            configured_features: self.configured_features.len(),
+            placed_features: self.placed_features.len(),
+            block_state_providers: self.block_state_providers.len(),
+            block_tags: self.block_tags.len(),
             dimension_types: self.dimension_types.len(),
             dimensions: self.dimensions.len(),
             dimension_definitions: self
@@ -170,6 +183,26 @@ impl WorldgenData {
         lookup(&self.material_rules, id)
     }
 
+    /// Configured feature by id.
+    pub fn configured_feature(&self, id: &ResourceId) -> Option<&ConfiguredFeature> {
+        self.configured_features.get(id)
+    }
+
+    /// Placed feature by id.
+    pub fn placed_feature(&self, id: &ResourceId) -> Option<&PlacedFeature> {
+        self.placed_features.get(id)
+    }
+
+    /// Block state provider by id.
+    pub fn block_state_provider(&self, id: &ResourceId) -> Option<&BlockStateProvider> {
+        self.block_state_providers.get(id)
+    }
+
+    /// Block tag by id, accepting it with or without the namespace.
+    pub fn block_tag(&self, id: &str) -> Option<&BlockTag> {
+        lookup(&self.block_tags, id)
+    }
+
     /// Dimension type by id.
     pub fn dimension_type(&self, id: &str) -> Option<&DimensionType> {
         lookup(&self.dimension_types, id)
@@ -205,6 +238,10 @@ pub struct Counts {
     pub biomes: usize,
     pub material_conditions: usize,
     pub material_rules: usize,
+    pub configured_features: usize,
+    pub placed_features: usize,
+    pub block_state_providers: usize,
+    pub block_tags: usize,
     pub dimension_types: usize,
     /// Standalone `dimension/*.json` files. The vanilla 26.3 data generator emits none.
     pub dimensions: usize,

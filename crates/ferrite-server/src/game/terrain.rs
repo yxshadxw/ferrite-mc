@@ -8,7 +8,7 @@
 use ferrite_world::{
     BlockInfo, BlockStateRegistry, Chunk, HeightmapKind, LightData, LightSection, RuntimeRegistry,
 };
-use ferrite_worldgen::{NoiseChunkGenerator, SurfaceGenerator, WorldgenData};
+use ferrite_worldgen::{FeatureGenerator, NoiseChunkGenerator, SurfaceGenerator, WorldgenData};
 use std::{
     path::PathBuf,
     sync::mpsc::{Receiver, Sender, channel},
@@ -161,6 +161,17 @@ fn generate(
         .map_err(|error| format!("carving chunk {x},{z}: {error}"))?;
     fill_biomes(&mut chunk, &surface, registry, x, z)
         .map_err(|error| format!("biomes for chunk {x},{z}: {error}"))?;
+    let mut features =
+        FeatureGenerator::new(data, seed, chunk.min_y(), chunk.height_blocks() as i32);
+    features
+        .decorate(
+            &mut chunk,
+            x,
+            z,
+            &|x, y, z| surface.biome_at(x, y, z),
+            registry,
+        )
+        .map_err(|error| format!("features for chunk {x},{z}: {error}"))?;
     let light = sky_light(&chunk, registry);
     Ok(Generated { chunk, light })
 }
