@@ -1115,6 +1115,23 @@ impl Player {
         );
     }
 
+    /// Spends experience levels, as taking an anvil result does (vanilla
+    /// `Player.giveExperienceLevels(-cost)`).
+    pub fn spend_levels(&mut self, levels: i32) {
+        if levels <= 0 {
+            return;
+        }
+        self.set_experience_level(self.experience_level.saturating_sub(levels));
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+    }
+
     fn set_experience_level(&mut self, level: i32) {
         let level = level.clamp(0, 21_863);
         self.experience_level = level;

@@ -161,6 +161,57 @@ fn furnace_menu_cooks_consumes_fuel_and_syncs_container_data() {
 }
 
 #[test]
+fn anvil_repairs_renames_and_charges_levels() {
+    let mut f = Fixture::new(Menu::anvil(9));
+    let mut first = item("iron_sword", 1);
+    first
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(100));
+    let mut second = first.copy_with_count(1);
+    second
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(100));
+    assert_eq!(first.max_damage(), Some(250));
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, first.clone());
+    assert_eq!(f.menu.anvil_cost(), 0);
+    assert_eq!(f.slot(2), empty());
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 1, second.clone());
+    // Two half-damaged swords plus the 5% combine bonus fully repair the result for 2 levels.
+    assert_eq!(f.menu.anvil_cost(), 2);
+    assert_eq!(f.slot(2).damage(), 0);
+    assert_eq!(f.slot(2).name(), Some("minecraft:iron_sword"));
+
+    let mut p = Clicker::new(&mut f.inv, false, &TestCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert_eq!(p.levels, 2);
+    assert_eq!(f.menu.carried().damage(), 0);
+    assert_eq!((f.slot(0), f.slot(1)), (empty(), empty()));
+    assert_eq!(f.menu.anvil_cost(), 0);
+
+    // A rename alone costs one level and writes the custom name component.
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, first);
+    f.menu.rename("Excalibur".into());
+    assert_eq!(f.menu.anvil_cost(), 1);
+    assert!(matches!(
+        f.menu
+            .result()
+            .effective_component(component_ids::CUSTOM_NAME),
+        Some(Component::Opaque(ferrite_nbt::Tag::String(name))) if name == "Excalibur"
+    ));
+    // A repair material repairs a quarter of the durability per item.
+    let mut damaged = item("iron_sword", 1);
+    damaged
+        .components
+        .insert(component_ids::DAMAGE, Component::Damage(200));
+    f.menu.rename(String::new());
+    f.menu.set_slot(&mut f.inv, &TestCrafter, 0, damaged);
+    f.menu
+        .set_slot(&mut f.inv, &TestCrafter, 1, item("iron_ingot", 2));
+    assert_eq!(f.slot(2).damage(), 200 - 2 * (250 / 4));
+    assert_eq!(f.menu.anvil_cost(), 2);
+}
+
+#[test]
 fn inventory_menu_maps_vanilla_slots() {
     let mut f = Fixture::inventory();
     f.inv.set(0, item("stone", 1));

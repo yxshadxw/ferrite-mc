@@ -1,6 +1,7 @@
 //! Container menus and `container_click` semantics (vanilla `AbstractContainerMenu`).
 
-use ferrite_item::{HashedSlot, ItemStack};
+use ferrite_item::{Component, HashedSlot, ItemStack, component_ids as ids};
+use ferrite_nbt::Tag;
 
 use crate::inventory::{
     CHEST, FEET, HEAD, HOTBAR, ITEMS, LEGS, OFFHAND, PlayerInventory, equipment_slot, is_stackable,
@@ -130,6 +131,8 @@ pub enum MenuKind {
     Generic { rows: u8 },
     /// A furnace, blast furnace or smoker (vanilla `AbstractFurnaceMenu`).
     Furnace(FurnaceKind),
+    /// An anvil (vanilla `AnvilMenu`).
+    Anvil,
 }
 
 impl MenuKind {
@@ -140,6 +143,7 @@ impl MenuKind {
             Self::Crafting => Some("minecraft:crafting".into()),
             Self::Generic { rows } => Some(format!("minecraft:generic_9x{rows}")),
             Self::Furnace(kind) => Some(kind.menu_type().into()),
+            Self::Anvil => Some("minecraft:anvil".into()),
         }
     }
 }
@@ -191,8 +195,10 @@ pub struct Clicker<'a> {
     pub crafter: &'a dyn Crafter,
     /// Stacks the player drops (vanilla `player.drop`), in order.
     pub drops: Vec<ItemStack>,
-    /// Experience points the click awards (furnace output, later grindstone and anvil costs).
+    /// Experience points the click awards (furnace output, later grindstone).
     pub xp: f32,
+    /// Experience levels the click spends (anvil cost).
+    pub levels: i32,
 }
 
 impl<'a> Clicker<'a> {
@@ -207,6 +213,7 @@ impl<'a> Clicker<'a> {
             crafter,
             drops: Vec::new(),
             xp: 0.0,
+            levels: 0,
         }
     }
 
@@ -330,6 +337,10 @@ pub struct Menu {
     data: Vec<i32>,
     remote_data: Vec<i32>,
     furnace: Option<FurnaceState>,
+    /// Vanilla `AnvilMenu.itemName`: the name the player typed.
+    rename: String,
+    /// Vanilla `AnvilMenu.cost`: experience levels taking the result costs.
+    anvil_cost: i32,
     carried: ItemStack,
     state_id: i32,
     quickcraft_status: i32,
@@ -355,14 +366,17 @@ impl Menu {
             MenuKind::Inventory => 2,
             MenuKind::Crafting => 3,
             MenuKind::Generic { .. } | MenuKind::Furnace(_) => 0,
+            MenuKind::Anvil => 0,
         };
         let container = match kind {
             MenuKind::Generic { rows } => vec![ItemStack::empty(); usize::from(rows) * 9],
             MenuKind::Furnace(_) => vec![ItemStack::empty(); 3],
+            MenuKind::Anvil => vec![ItemStack::empty(); 2],
             _ => Vec::new(),
         };
         let data_len = match kind {
             MenuKind::Furnace(_) => FURNACE_DATA_SLOTS,
+            MenuKind::Anvil => 1,
             _ => 0,
         };
         let remote = vec![Remote::empty(); slots.len()];
@@ -377,6 +391,8 @@ impl Menu {
             data: vec![0; data_len],
             remote_data: vec![i32::MIN; data_len],
             furnace: matches!(kind, MenuKind::Furnace(_)).then(FurnaceState::default),
+            rename: String::new(),
+            anvil_cost: 0,
             carried: ItemStack::empty(),
             state_id: 0,
             quickcraft_status: 0,
@@ -468,6 +484,27 @@ impl Menu {
         Self::with_slots(container_id, MenuKind::Furnace(kind), slots)
     }
 
+    /// An anvil menu (vanilla `AnvilMenu`): 0 and 1 inputs, 2 result, 3..39 the player's
+    /// inventory. Container data slot 0 is the level cost.
+    pub fn anvil(container_id: i32) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::Plain,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::Plain,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::Output,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Anvil, slots)
+    }
+
     pub fn container_id(&self) -> i32 {
         self.container_id
     }
@@ -544,21 +581,122 @@ impl Menu {
         self.sync_data();
     }
 
-    /// Copies the timers into the container data slots (vanilla
-    /// `AbstractFurnaceMenu.broadcastChanges` calling `setData`).
+    /// Copies the menu's properties into its container data slots (vanilla
+    /// `AbstractContainerMenu.broadcastChanges` calling `setData`).
     fn sync_data(&mut self) {
-        let Some(furnace) = &self.furnace else {
-            return;
-        };
-        if self.data.len() < FURNACE_DATA_SLOTS {
-            self.data.resize(FURNACE_DATA_SLOTS, 0);
-            self.remote_data.resize(FURNACE_DATA_SLOTS, i32::MIN);
+        match self.kind {
+            MenuKind::Furnace(_) => {
+                let Some(furnace) = &self.furnace else {
+                    return;
+                };
+                if self.data.len() < FURNACE_DATA_SLOTS {
+                    self.data.resize(FURNACE_DATA_SLOTS, 0);
+                    self.remote_data.resize(FURNACE_DATA_SLOTS, i32::MIN);
+                }
+                self.data[FURNACE_LIT] = i32::from(furnace.lit());
+                self.data[FURNACE_COOK_PROGRESS] = furnace.cook;
+                self.data[FURNACE_COOK_TOTAL] = furnace.cook_total;
+                self.data[FURNACE_BURN_LEFT] = furnace.burn;
+                self.data[FURNACE_BURN_TOTAL] = furnace.burn_total;
+            }
+            MenuKind::Anvil => {
+                if self.data.is_empty() {
+                    self.data.resize(1, 0);
+                    self.remote_data.resize(1, i32::MIN);
+                }
+                self.data[0] = self.anvil_cost;
+            }
+            _ => {}
         }
-        self.data[FURNACE_LIT] = i32::from(furnace.lit());
-        self.data[FURNACE_COOK_PROGRESS] = furnace.cook;
-        self.data[FURNACE_COOK_TOTAL] = furnace.cook_total;
-        self.data[FURNACE_BURN_LEFT] = furnace.burn;
-        self.data[FURNACE_BURN_TOTAL] = furnace.burn_total;
+    }
+
+    /// The anvil's experience level cost (vanilla `AnvilMenu.getCost`).
+    pub fn anvil_cost(&self) -> i32 {
+        self.anvil_cost
+    }
+
+    /// Recomputes a station menu's result from its inputs. Crafting result slots are refreshed
+    /// by [`Menu::update_result`] instead.
+    fn refresh_station_result(&mut self, _crafter: &dyn Crafter) {
+        if self.kind == MenuKind::Anvil {
+            self.update_anvil();
+        }
+    }
+
+    /// Vanilla `AnvilMenu.createResult`: renames, combines two damaged copies of one item, or
+    /// repairs with the item's repair material, charging the two prior-work penalties and one
+    /// level per operation. Combining enchantments is not implemented.
+    fn update_anvil(&mut self) {
+        let left = self.container[0].clone();
+        let right = self.container[1].clone();
+        self.result = ItemStack::empty();
+        self.anvil_cost = 0;
+        if left.is_empty() {
+            self.sync_data();
+            return;
+        }
+        let mut result = left.clone();
+        let mut cost = repair_cost(&left) + repair_cost(&right);
+        let mut changed = false;
+
+        let current_name = custom_name(&left).unwrap_or_default();
+        let wanted = self.rename.trim();
+        if wanted != current_name {
+            if wanted.is_empty() {
+                result.components.remove(ids::CUSTOM_NAME);
+            } else {
+                result
+                    .components
+                    .insert_opaque(ids::CUSTOM_NAME, Tag::String(wanted.into()));
+            }
+            cost += 1;
+            changed = true;
+        }
+
+        if !right.is_empty() {
+            if left.is_same_item(&right) && left.is_damageable() && right.is_damageable() {
+                let max = left.max_damage().unwrap_or(0);
+                let left_durability = max - left.damage();
+                let right_durability = max - right.damage();
+                // Vanilla gives a 5% bonus of the maximum durability for a combined repair.
+                let total = (left_durability + right_durability + max / 20).min(max);
+                if total > 0 {
+                    result
+                        .components
+                        .insert(ids::DAMAGE, Component::Damage(max - total));
+                    cost += 2;
+                    changed = true;
+                }
+            } else if repairs_with(&left, &right) {
+                let max = left.max_damage().unwrap_or(0);
+                let per_item = (max / 4).max(1);
+                let used = right.count.min(4);
+                let repaired = (per_item * used).min(left.damage());
+                if repaired > 0 {
+                    result
+                        .components
+                        .insert(ids::DAMAGE, Component::Damage(left.damage() - repaired));
+                    cost += used;
+                    changed = true;
+                }
+            }
+        }
+
+        // Vanilla refuses a result at the 40-level cap.
+        if cost >= 40 {
+            self.anvil_cost = 40;
+            self.sync_data();
+            return;
+        }
+        if changed {
+            let penalty = repair_cost(&left).max(repair_cost(&right));
+            result
+                .components
+                .insert(ids::REPAIR_COST, Component::RepairCost(penalty * 2 + 1));
+            self.anvil_cost = cost.max(1);
+            self.result = result;
+        }
+        self.sync_data();
     }
 
     /// Advances the furnace timers by one tick (vanilla `AbstractFurnaceBlockEntity.serverTick`),
@@ -687,7 +825,10 @@ impl Menu {
                 self.update_result(p);
             }
             Store::Result => self.result = stack,
-            Store::Container(i) => self.container[i] = stack,
+            Store::Container(i) => {
+                self.container[i] = stack;
+                self.refresh_station_result(p.crafter);
+            }
         }
     }
 
@@ -825,10 +966,26 @@ impl Menu {
     /// crafting remainders (vanilla `ResultSlot.onTake`).
     fn on_take(&mut self, p: &mut Clicker, slot: usize) {
         if self.slots[slot].rule == Rule::Output {
-            if let Some(furnace) = &mut self.furnace {
-                p.xp += furnace.pending_experience;
-                furnace.pending_experience = 0.0;
+            match self.kind {
+                MenuKind::Furnace(_) => {
+                    if let Some(furnace) = &mut self.furnace {
+                        p.xp += furnace.pending_experience;
+                        furnace.pending_experience = 0.0;
+                    }
+                }
+                MenuKind::Anvil => {
+                    p.levels += self.anvil_cost;
+                    for cell in 0..self.container.len() {
+                        let mut left = self.container[cell].clone();
+                        left.count -= 1;
+                        self.container[cell] = normalize(left);
+                    }
+                    self.result = ItemStack::empty();
+                    self.anvil_cost = 0;
+                }
+                _ => {}
             }
+            self.sync_data();
             return;
         }
         if self.slots[slot].rule != Rule::Result {
@@ -1243,6 +1400,16 @@ impl Menu {
                     self.move_item_stack_to(p, &mut stack, 0, size, false)
                 }
             }
+            MenuKind::Anvil => {
+                if i == 2 {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, true)
+                } else if i == 0 || i == 1 {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, false)
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 0, 1, false)
+                        || self.move_item_stack_to(p, &mut stack, 1, 2, false)
+                }
+            }
             MenuKind::Furnace(kind) => {
                 if i == 2 {
                     self.move_item_stack_to(p, &mut stack, 3, 39, true)
@@ -1387,12 +1554,23 @@ impl Menu {
         }
     }
 
-    /// Vanilla `AnvilMenu.setItemName`: records a renamed item. Only an anvil menu uses it.
-    pub fn rename(&mut self, _name: String) {}
+    /// Vanilla `AnvilMenu.setItemName`: records the typed name and recomputes the result.
+    pub fn rename(&mut self, name: String) {
+        if self.kind != MenuKind::Anvil {
+            return;
+        }
+        self.rename = name;
+        self.refresh_station_result(&NoCrafting);
+    }
 
     /// Vanilla `AbstractContainerMenu.clickMenuButton`: an enchant choice, stonecutter recipe or
     /// loom pattern. Only the menus that have buttons react.
     pub fn button_click(&mut self, _button: i32) {}
+
+    /// The name the player typed into an anvil (vanilla `AnvilMenu.itemName`).
+    pub fn rename_text(&self) -> &str {
+        &self.rename
+    }
 
     /// Vanilla `transferState`: adopts what the client was last sent for the inventory slots
     /// `other` shares with this menu, so returning to this menu only sends real changes.
@@ -1405,6 +1583,80 @@ impl Menu {
             }
         }
     }
+}
+
+/// Vanilla `ItemStack.getOrDefault(DataComponents.REPAIR_COST, 0)`.
+fn repair_cost(stack: &ItemStack) -> i32 {
+    match stack.effective_component(ids::REPAIR_COST) {
+        Some(Component::RepairCost(value)) => value,
+        _ => 0,
+    }
+}
+
+/// The custom name of a stack, if it has one (vanilla `DataComponents.CUSTOM_NAME`).
+fn custom_name(stack: &ItemStack) -> Option<String> {
+    match stack.effective_component(ids::CUSTOM_NAME) {
+        Some(Component::CustomName(text)) => Some(text.to_plain_text()),
+        Some(Component::Opaque(Tag::String(name))) => Some(name),
+        _ => None,
+    }
+}
+
+/// Whether `material` is the vanilla repair material of `item` (the `minecraft:repairable`
+/// component's item list, approximated by the item family's material).
+fn repairs_with(item: &ItemStack, material: &ItemStack) -> bool {
+    let Some(item) = item.name() else {
+        return false;
+    };
+    let Some(material_name) = material
+        .name()
+        .map(|name| name.strip_prefix("minecraft:").unwrap_or(name))
+    else {
+        return false;
+    };
+    let wanted = match item.strip_prefix("minecraft:").unwrap_or(item) {
+        "leather_helmet" | "leather_chestplate" | "leather_leggings" | "leather_boots" => "leather",
+        "chainmail_helmet" | "chainmail_chestplate" | "chainmail_leggings" | "chainmail_boots" => {
+            "iron_ingot"
+        }
+        "iron_helmet" | "iron_chestplate" | "iron_leggings" | "iron_boots" | "iron_sword"
+        | "iron_pickaxe" | "iron_axe" | "iron_shovel" | "iron_hoe" => "iron_ingot",
+        "golden_helmet" | "golden_chestplate" | "golden_leggings" | "golden_boots"
+        | "golden_sword" | "golden_pickaxe" | "golden_axe" | "golden_shovel" | "golden_hoe" => {
+            "gold_ingot"
+        }
+        "diamond_helmet" | "diamond_chestplate" | "diamond_leggings" | "diamond_boots"
+        | "diamond_sword" | "diamond_pickaxe" | "diamond_axe" | "diamond_shovel"
+        | "diamond_hoe" => "diamond",
+        "netherite_helmet"
+        | "netherite_chestplate"
+        | "netherite_leggings"
+        | "netherite_boots"
+        | "netherite_sword"
+        | "netherite_pickaxe"
+        | "netherite_axe"
+        | "netherite_shovel"
+        | "netherite_hoe" => "netherite_ingot",
+        "turtle_helmet" => "turtle_scute",
+        _ if item.ends_with("_wooden_sword")
+            || item.ends_with("_wooden_pickaxe")
+            || item.ends_with("_wooden_axe")
+            || item.ends_with("_wooden_shovel")
+            || item.ends_with("_wooden_hoe") =>
+        {
+            return material_name.ends_with("_planks");
+        }
+        _ if item.ends_with("_stone_sword")
+            || item.ends_with("_stone_pickaxe")
+            || item.ends_with("_stone_axe")
+            || item.ends_with("_stone_shovel")
+            || item.ends_with("_stone_hoe") =>
+        {
+            return matches!(material_name, "stone" | "cobblestone");
+        }
+        _ => return false,
+    };
+    material_name == wanted
 }
 
 fn normalize(stack: ItemStack) -> ItemStack {

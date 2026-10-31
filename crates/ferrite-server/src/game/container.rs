@@ -41,6 +41,8 @@ pub enum OpenAt {
     Inventory(Opened),
     /// A furnace, blast furnace or smoker, whose items and timers live in its block entity.
     Furnace([i32; 3]),
+    /// An anvil, which has no block entity.
+    Anvil([i32; 3]),
 }
 
 /// The block name at a position (vanilla `Level.getBlockState`).
@@ -187,6 +189,10 @@ impl Player {
                     .is_some()
                     && self.within_reach([*x, *y, *z])
             }
+            Some(OpenAt::Anvil([x, y, z])) => {
+                block_name(source, [*x, *y, *z]) == Some("minecraft:anvil")
+                    && self.within_reach([*x, *y, *z])
+            }
         }
     }
 
@@ -242,6 +248,25 @@ impl Player {
         if !self.container_still_valid() {
             return;
         }
+        // Vanilla `AnvilMenu.stillValid` cost check: a player without enough levels cannot take
+        // the result (creative may).
+        if p.slot == 2
+            && self.gamemode != 1
+            && self.menus.open.as_ref().is_some_and(|menu| {
+                menu.kind() == ferrite_inventory::MenuKind::Anvil
+                    && menu.anvil_cost() > self.experience_level
+            })
+        {
+            let full = self
+                .menus
+                .open
+                .as_mut()
+                .map(|menu| menu.broadcast_full_state(&self.inventory));
+            if let Some(full) = full {
+                emit(self, vec![full]);
+            }
+            return;
+        }
         let menu = self
             .menus
             .open
@@ -270,9 +295,13 @@ impl Player {
         }
         self.menus.thrown.extend(drops);
         let xp = clicker.xp;
+        let levels = clicker.levels;
         emit(self, out);
         if xp > 0.0 {
             self.add_experience(xp);
+        }
+        if levels > 0 {
+            self.spend_levels(levels);
         }
     }
 
@@ -283,6 +312,8 @@ impl Player {
             return;
         };
         menu.rename(name.chars().take(50).collect());
+        let out = self.menus.current().broadcast_changes(&self.inventory);
+        emit(self, out);
     }
 
     /// Vanilla `ServerPlayer.handleContainerButtonClick`: enchant choices, stonecutter recipes
@@ -398,6 +429,14 @@ impl Player {
                 Menu::crafting,
                 "container.crafting",
                 Some(OpenAt::Table([pos.x, pos.y, pos.z])),
+            );
+            return true;
+        }
+        if block_name(&source, [pos.x, pos.y, pos.z]) == Some("minecraft:anvil") {
+            self.open_menu(
+                Menu::anvil,
+                "container.anvil",
+                Some(OpenAt::Anvil([pos.x, pos.y, pos.z])),
             );
             return true;
         }
