@@ -219,6 +219,13 @@ pub enum GameMode {
     Spectator,
 }
 pub type PlayerHandler = std::sync::Arc<dyn Fn(PlayerCommand) + Send + Sync>;
+/// Stable identity for the main world published to plugins.
+///
+/// The Rust game addresses chunks by coordinate, so the Java side needs one id that both
+/// `register_world` and every player location agree on.
+pub fn default_world_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerCommand {
     BanIp {
@@ -359,6 +366,18 @@ pub trait ServerHooks: Send + Sync {
     fn player_command(&self, id: uuid::Uuid, name: &str, message: &str) -> Result<bool, Error>;
     /// Commands declared by enabled plugins.
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error>;
+    /// Runs plugin scheduler tasks and flushes plugin logs for one server tick.
+    fn tick(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Publishes a world's identity, spawn and known blocks before plugins query it.
+    fn register_world(&self, _world: &WorldSnapshot) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Publishes an online player's location and state for plugin lookups.
+    fn register_player(&self, _player: &PlayerSnapshot) -> Result<(), Error> {
+        Ok(())
+    }
     /// Runs a plugin command for `sender`, returning captured `sendMessage` output.
     fn run_plugin_command(
         &self,
@@ -2103,6 +2122,15 @@ impl ServerHooks for PluginHost {
     }
     fn plugin_commands(&self) -> Result<Vec<PluginCommand>, Error> {
         self.declared_commands()
+    }
+    fn tick(&self) -> Result<(), Error> {
+        PluginHost::tick(self)
+    }
+    fn register_world(&self, world: &WorldSnapshot) -> Result<(), Error> {
+        PluginHost::register_world(self, world)
+    }
+    fn register_player(&self, player: &PlayerSnapshot) -> Result<(), Error> {
+        PluginHost::register_player(self, player)
     }
     fn run_plugin_command(
         &self,

@@ -42,8 +42,15 @@ final class FerritePlayer extends org.bukkit.craftbukkit.entity.CraftHumanEntity
     @Override public boolean isOnline() { return server.getPlayer(id) == this; }
     @Override public boolean isOp() { return operator; }
     @Override public void setOp(boolean value) { if (!Native.playerOperator(id.toString(), value)) throw new IllegalStateException("No player command handler"); operator = value; perm.recalculatePermissions(); }
-    @Override public org.bukkit.World getWorld() { if (location == null) throw new IllegalStateException("Player location unavailable"); return location.getWorld(); }
-    @Override public org.bukkit.Location getLocation() { if (location == null) throw new IllegalStateException("Player location unavailable"); return location.clone(); }
+    /** Players registered before their first move fall back to the main world spawn, as CraftBukkit does. */
+    private org.bukkit.Location resolvedLocation() {
+        if (location != null) return location;
+        var worlds = server.getWorlds();
+        if (worlds.isEmpty()) throw new IllegalStateException("Player location unavailable: the server has no world");
+        return worlds.getFirst().getSpawnLocation();
+    }
+    @Override public org.bukkit.World getWorld() { return resolvedLocation().getWorld(); }
+    @Override public org.bukkit.Location getLocation() { return resolvedLocation().clone(); }
     @Override public boolean teleport(org.bukkit.Location destination) { var world = java.util.Objects.requireNonNull(destination.getWorld()); if (!Native.playerTeleport(id.toString(), world.getUID().toString(), destination.getX(), destination.getY(), destination.getZ(), destination.getYaw(), destination.getPitch())) return false; location = destination.clone(); return true; }
     @Override public boolean teleport(org.bukkit.Location destination, org.bukkit.event.player.PlayerTeleportEvent.TeleportCause cause) { return teleport(destination); }
     @Override public java.util.concurrent.CompletableFuture<Boolean> teleportAsync(org.bukkit.Location destination) { return java.util.concurrent.CompletableFuture.completedFuture(teleport(destination)); }

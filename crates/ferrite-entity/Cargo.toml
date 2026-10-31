@@ -8,6 +8,7 @@ license.workspace = true
 ferrite-math = { path = "../ferrite-math" }
 uuid.workspace = true
 ferrite-data.workspace = true
+ferrite-nbt.workspace = true
 ferrite-protocol.workspace = true
 ferrite-item = { path = "../ferrite-item" }
 ferrite-inventory = { path = "../ferrite-inventory" }

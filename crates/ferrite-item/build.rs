@@ -79,6 +79,8 @@ fn main() {
 fn gen_wire_registries(registry: &serde_json::Value, enchantment_dir: &Path) -> String {
     let attributes = registry_entries(registry, "minecraft:attribute");
     let blocks = registry_entries(registry, "minecraft:block");
+    let potions = registry_entries(registry, "minecraft:potion");
+    let effects = registry_entries(registry, "minecraft:mob_effect");
     let mut enchantments: Vec<String> = fs::read_dir(enchantment_dir)
         .unwrap_or_else(|error| panic!("failed to list {}: {error}", enchantment_dir.display()))
         .map(|entry| entry.expect("the directory is readable").file_name())
@@ -96,7 +98,12 @@ fn gen_wire_registries(registry: &serde_json::Value, enchantment_dir: &Path) -> 
     );
 
     let mut out = header("reports/registries.json and data/minecraft/enchantment");
-    for (name, entries) in [("ATTRIBUTES", &attributes), ("BLOCKS", &blocks)] {
+    for (name, entries) in [
+        ("ATTRIBUTES", &attributes),
+        ("BLOCKS", &blocks),
+        ("POTIONS", &potions),
+        ("MOB_EFFECTS", &effects),
+    ] {
         writeln!(
             out,
             "/// `{name}` entries sorted by name: `(name, protocol id)`.\nstatic {name}: &[(&str, u16)] = &["

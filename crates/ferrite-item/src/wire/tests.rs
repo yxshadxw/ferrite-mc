@@ -760,6 +760,36 @@ fn typed_attribute_modifiers_and_tool_round_trip() {
 }
 
 #[test]
+fn potion_contents_round_trip() {
+    let contents = crate::PotionContents {
+        potion: Some("minecraft:swiftness".to_owned()),
+        custom_color: Some(0x1122_3344),
+        custom_effects: vec![crate::PotionEffect {
+            effect: "minecraft:jump_boost".to_owned(),
+            amplifier: 1,
+            duration: 200,
+            ambient: true,
+            visible: false,
+            show_icon: true,
+        }],
+        custom_name: Some("Fast".to_owned()),
+    };
+    let mut stack = ItemStack::new(1);
+    stack.components.insert(
+        ids::POTION_CONTENTS,
+        Component::PotionContents(contents.clone()),
+    );
+    let bytes = stack.encode_network().unwrap();
+    assert_eq!(
+        ItemStack::decode_network(&bytes)
+            .unwrap()
+            .components
+            .get(ids::POTION_CONTENTS),
+        Some(&Component::PotionContents(contents))
+    );
+}
+
+#[test]
 fn opaque_components_cannot_be_encoded() {
     let mut stack = ItemStack::new(1);
     stack

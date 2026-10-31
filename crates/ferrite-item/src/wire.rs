@@ -370,10 +370,56 @@ fn decode_typed(id: u16, payload: &[u8]) -> Option<Component> {
             saturation: reader.f32().ok()?,
             can_always_eat: reader.bool().ok()?,
         }),
+        ids::POTION_CONTENTS => {
+            let potion = reader
+                .optional(Reader::varint)
+                .ok()?
+                .and_then(|id| u16::try_from(id).ok())
+                .and_then(registry_ids::potion_name)
+                .map(str::to_owned);
+            let custom_color = reader.optional(Reader::i32).ok()?;
+            let count = reader.count_len(MAX_LIST).ok()?;
+            let mut custom_effects = Vec::new();
+            for _ in 0..count {
+                custom_effects.push(decode_potion_effect(&mut reader)?);
+            }
+            let custom_name = reader
+                .optional(|reader| reader.string(32767).map(str::to_owned))
+                .ok()?;
+            Component::PotionContents(crate::component::PotionContents {
+                potion,
+                custom_color,
+                custom_effects,
+                custom_name,
+            })
+        }
         ids::TOOL => Component::Tool(decode_tool(&mut reader)?),
         _ => return None,
     };
     (reader.remaining() == 0).then_some(component)
+}
+
+/// One entry of `PotionContents.custom_effects`. A hidden (nested) effect has no NBT form, so
+/// it makes the whole component stay [`Component::Raw`].
+fn decode_potion_effect(reader: &mut Reader<'_>) -> Option<crate::component::PotionEffect> {
+    let effect =
+        registry_ids::mob_effect_name(u16::try_from(reader.varint().ok()?).ok()?)?.to_owned();
+    let amplifier = reader.varint().ok()?;
+    let duration = reader.varint().ok()?;
+    let ambient = reader.bool().ok()?;
+    let visible = reader.bool().ok()?;
+    let show_icon = reader.bool().ok()?;
+    if reader.bool().ok()? {
+        return None;
+    }
+    Some(crate::component::PotionEffect {
+        effect,
+        amplifier,
+        duration,
+        ambient,
+        visible,
+        show_icon,
+    })
 }
 
 fn decode_enchantments(reader: &mut Reader<'_>) -> Option<Enchantments> {
@@ -532,6 +578,47 @@ fn encode_component(component: &Component) -> Result<Vec<u8>, WireError> {
             out.extend_from_slice(&tool.default_mining_speed.to_be_bytes());
             write_varint(tool.damage_per_block, &mut out);
             out.push(u8::from(tool.can_destroy_blocks_in_creative));
+        }
+        Component::PotionContents(contents) => {
+            match &contents.potion {
+                Some(potion) => {
+                    out.push(1);
+                    let id = registry_ids::potion_id(potion).ok_or_else(|| {
+                        WireError::UnknownRegistry {
+                            registry: "potion",
+                            name: potion.clone(),
+                        }
+                    })?;
+                    write_varint(i32::from(id), &mut out);
+                }
+                None => out.push(0),
+            }
+            write_optional(contents.custom_color, &mut out, |color, out| {
+                out.extend_from_slice(&color.to_be_bytes());
+            });
+            write_count(contents.custom_effects.len(), &mut out)?;
+            for effect in &contents.custom_effects {
+                let id = registry_ids::mob_effect_id(&effect.effect).ok_or_else(|| {
+                    WireError::UnknownRegistry {
+                        registry: "mob_effect",
+                        name: effect.effect.clone(),
+                    }
+                })?;
+                write_varint(i32::from(id), &mut out);
+                write_varint(effect.amplifier, &mut out);
+                write_varint(effect.duration, &mut out);
+                out.push(u8::from(effect.ambient));
+                out.push(u8::from(effect.visible));
+                out.push(u8::from(effect.show_icon));
+                out.push(0); // no hidden effect
+            }
+            match &contents.custom_name {
+                Some(name) => {
+                    out.push(1);
+                    write_string(name, &mut out)?;
+                }
+                None => out.push(0),
+            }
         }
         Component::Opaque(_) => return Err(WireError::NotRepresentable(component.kind())),
         Component::Raw(bytes) => out.extend_from_slice(bytes),
@@ -1188,6 +1275,26 @@ pub mod registry_ids {
             .ok()
             .and_then(|index| ENCHANTMENTS.get(index))
             .copied()
+    }
+
+    /// Protocol id of a potion, with or without the `minecraft:` prefix.
+    pub fn potion_id(name: &str) -> Option<u16> {
+        lookup(POTIONS, name)
+    }
+
+    /// Potion name of a protocol id.
+    pub fn potion_name(id: u16) -> Option<&'static str> {
+        POTION_NAMES.get(usize::from(id)).copied()
+    }
+
+    /// Protocol id of a mob effect, with or without the `minecraft:` prefix.
+    pub fn mob_effect_id(name: &str) -> Option<u16> {
+        lookup(MOB_EFFECTS, name)
+    }
+
+    /// Mob effect name of a protocol id.
+    pub fn mob_effect_name(id: u16) -> Option<&'static str> {
+        MOB_EFFECT_NAMES.get(usize::from(id)).copied()
     }
 }
 
