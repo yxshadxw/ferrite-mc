@@ -10,35 +10,10 @@
 //!
 //! # Topology mutation protocol
 //!
-//! A chunk add/remove *involves* the regions owning a section within the merge
-//! radius of the chunk's section (the regions it may merge, split or grow).
-//!
-//! * **Immediate.** If every involved region is idle and unreserved, and no
-//!   pending mutation lies within the merge radius, the mutation is applied at
-//!   once under the metadata lock.
-//! * **Deferred.** Otherwise it receives a sequence number and is recorded on
-//!   each involved region's own queue (`Region::mutations`, ordered by sequence
-//!   number) and in a section index used only for nearby-conflict lookups. A
-//!   region with a non-empty queue is *reserved*: it finishes any in-flight tick
-//!   but starts no new one, so it reaches its post-tick safe point promptly.
-//! * **Apply.** A deferred mutation is applied once all its involved regions are
-//!   idle, it heads every one of their queues, and no lower-numbered pending
-//!   mutation lies within the merge radius. Checks are triggered only locally:
-//!   when an involved region returns from its tick (its queue head is checked),
-//!   when a queue's head changes, or when a nearby mutation is applied. Nothing
-//!   scans a global list, and regions not involved are never paused.
-//! * **Multi-region mutations** (e.g. a bridge merging several regions) reserve
-//!   all their regions at once; idle ones simply wait for the ticking ones.
-//!   Involved regions are recomputed right before applying, so regions renamed
-//!   or created by earlier mutations are picked up (and reserved) correctly.
-//!
-//! Deadlock freedom: sequence numbers totally order pending mutations, so the
-//! lowest-numbered one heads all its queues and has no earlier nearby conflict;
-//! its regions are reserved and therefore become idle after their in-flight
-//! ticks, at which point it applies. Starvation freedom: a mutation only ever
-//! waits for lower-numbered mutations (finitely many) and for in-flight ticks;
-//! newer mutations queue behind it. Mutations on the same chunk, and nearby
-//! mutations in general, apply in submission order.
+//! ThreadedRegionizer.addChunk creates non-ticking transient regions for new
+//! sections near ticking regions. ThreadedRegion.markNotTicking merges them
+//! before permitting another tick. ThreadedRegionizer.removeChunk updates
+//! holder metadata immediately and defers dead-section cleanup to a safe point.
 //!
 //! # Scheduling and fairness
 //!
@@ -58,7 +33,7 @@
 
 use parking_lot::{Condvar, Mutex};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -101,9 +76,6 @@ struct Region<D> {
     ticks: VecDeque<Instant>,
     generation: u64,
     tasks: Vec<(ChunkPos, RegionTask<D>)>,
-    /// Sequence numbers of deferred mutations that need this region idle.
-    /// Non-empty means the region is reserved and starts no new ticks.
-    mutations: BTreeSet<u64>,
 }
 impl<D> Region<D> {
     fn new(sections: HashSet<SectionPos>, data: D) -> Self {
@@ -120,7 +92,6 @@ impl<D> Region<D> {
             ticks: VecDeque::new(),
             generation: 0,
             tasks: Vec::new(),
-            mutations: BTreeSet::new(),
         }
     }
 }
@@ -277,29 +248,6 @@ impl<D: RegionData> Regionizer<D> {
             .filter_map(|s| self.sections.get(&s).map(|entry| entry.1))
             .collect()
     }
-    fn affected_mutation(&self, mutation: Mutation) -> HashSet<RegionId> {
-        let chunk = mutation.chunk();
-        let section = self.section_of(chunk);
-        let mut regions = self.affected(chunk);
-        if matches!(mutation, Mutation::Add(_))
-            && self.sections.get(&section).is_none_or(|entry| entry.0 == 0)
-        {
-            for dx in -self.empty_radius..=self.empty_radius {
-                for dz in -self.empty_radius..=self.empty_radius {
-                    if let (Some(x), Some(z)) =
-                        (section.0.checked_add(dx), section.1.checked_add(dz))
-                    {
-                        regions.extend(
-                            self.neighborhood(SectionPos(x, z))
-                                .into_iter()
-                                .filter_map(|p| self.sections.get(&p).map(|entry| entry.1)),
-                        );
-                    }
-                }
-            }
-        }
-        regions
-    }
     /// Verifies the structural invariants: holder counts match the section
     /// table, every held section is owned by exactly one non-empty region,
     /// sections within the merge radius share a region, and every region is a
@@ -451,7 +399,6 @@ impl<D: RegionData> Regionizer<D> {
         };
         for other in neighbors.into_iter().skip(1) {
             let old = self.regions.remove(&other).unwrap();
-            debug_assert!(old.mutations.is_empty(), "merged a reserved region");
             for s in &old.sections {
                 self.sections.get_mut(s).unwrap().1 = id;
             }
@@ -611,13 +558,6 @@ impl Mutation {
         }
     }
 }
-/// A deferred topology mutation, queued on every region in `regions`.
-struct Pending {
-    mutation: Mutation,
-    section: SectionPos,
-    regions: HashSet<RegionId>,
-    submitted: Instant,
-}
 type Deadline = Reverse<(Instant, u64, Option<RegionId>)>;
 struct State<D: RegionData, G> {
     topology: Regionizer<D>,
@@ -626,10 +566,6 @@ struct State<D: RegionData, G> {
     global_generation: u64,
     global_tasks: Vec<GlobalTask<G>>,
     parked: HashMap<SectionPos, Vec<(ChunkPos, RegionTask<D>)>>,
-    pending: HashMap<u64, Pending>,
-    /// Spatial index of pending mutations, for nearby-conflict lookups only.
-    pending_at: HashMap<SectionPos, BTreeSet<u64>>,
-    next_mutation: u64,
     deadlines: BinaryHeap<Deadline>,
     stopping: bool,
 }
@@ -691,9 +627,6 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
                 global_generation: 0,
                 global_tasks: Vec::new(),
                 parked: HashMap::new(),
-                pending: HashMap::new(),
-                pending_at: HashMap::new(),
-                next_mutation: 0,
                 deadlines,
                 stopping: false,
             }),
@@ -786,44 +719,45 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
             .get(&id)
             .map(|r| r.stats)
     }
-    /// Number of deferred topology mutations not yet applied.
+    /// Holder mutations are applied immediately; dead sections await a tick safe point.
     pub fn pending_mutations(&self) -> usize {
-        self.shared.state.lock().pending.len()
+        0
     }
-    /// Age of the oldest deferred topology mutation, if any.
     pub fn oldest_pending_mutation(&self) -> Option<Duration> {
-        let s = self.shared.state.lock();
-        s.pending.values().map(|p| p.submitted.elapsed()).max()
+        None
     }
-    /// Checks topology invariants (see [`Regionizer::check_invariants`]) and
-    /// the consistency of the per-region mutation queues.
+    /// Checks ownership and the reciprocal merge-later links.
     pub fn check_invariants(&self) -> Result<(), String> {
         let s = self.shared.state.lock();
         s.topology.check_invariants()?;
         for (&id, region) in &s.topology.regions {
-            for m in &region.mutations {
-                if !s.pending.get(m).is_some_and(|p| p.regions.contains(&id)) {
-                    return Err(format!("region {id} queues unknown mutation {m}"));
-                }
+            if region.state == RegionState::Transient && region.merge_targets.is_empty() {
+                return Err(format!("transient region {id} has no merge target"));
             }
-        }
-        for (m, p) in &s.pending {
-            for r in &p.regions {
+            for target in &region.merge_targets {
                 if !s
                     .topology
                     .regions
-                    .get(r)
-                    .is_some_and(|r| r.mutations.contains(m))
+                    .get(target)
+                    .is_some_and(|r| r.state == RegionState::Ticking && r.merge_from.contains(&id))
                 {
-                    return Err(format!("mutation {m} missing from region {r} queue"));
+                    return Err(format!(
+                        "region {id} has inconsistent merge target {target}"
+                    ));
                 }
             }
-            if !s.pending_at.get(&p.section).is_some_and(|i| i.contains(m)) {
-                return Err(format!("mutation {m} missing from section index"));
+            for source in &region.merge_from {
+                if !s
+                    .topology
+                    .regions
+                    .get(source)
+                    .is_some_and(|r| r.merge_targets.contains(&id))
+                {
+                    return Err(format!(
+                        "region {id} has inconsistent merge source {source}"
+                    ));
+                }
             }
-        }
-        if s.pending_at.values().map(BTreeSet::len).sum::<usize>() != s.pending.len() {
-            return Err("section index has stale entries".into());
         }
         Ok(())
     }
@@ -837,10 +771,6 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
             worker.join().expect("region worker panicked");
         }
         let mut s = self.shared.state.lock();
-        // Every region is idle now, so all deferred mutations apply in order.
-        let all = s.pending.keys().copied().collect();
-        pump(&mut s, all);
-        debug_assert!(s.pending.is_empty());
         let mut regions = std::mem::take(&mut s.topology.retired);
         let mut tasks: Vec<_> = std::mem::take(&mut s.parked)
             .into_values()
@@ -877,37 +807,44 @@ fn route<D: RegionData, G>(s: &mut State<D, G>, chunk: ChunkPos, task: RegionTas
 fn enqueue<D: RegionData, G>(s: &mut State<D, G>, id: RegionId) {
     if let Some(r) = s.topology.regions.get_mut(&id) {
         r.generation += 1;
-        if r.data.is_some() && r.mutations.is_empty() && r.state == RegionState::Ready {
+        if r.data.is_some() && r.state == RegionState::Ready {
             s.deadlines
                 .push(Reverse((r.next_tick, r.generation, Some(id))));
         }
     }
 }
-fn is_free<D: RegionData, G>(s: &State<D, G>, id: RegionId) -> bool {
-    s.topology.regions.get(&id).is_some_and(|r| {
-        r.data.is_some() && r.state == RegionState::Ready && r.mutations.is_empty()
-    })
-}
-/// Pending mutations whose section lies within the merge radius of `section`.
-fn nearby<D: RegionData, G>(s: &State<D, G>, section: SectionPos) -> Vec<u64> {
-    s.topology
-        .neighborhood(section)
-        .iter()
-        .filter_map(|n| s.pending_at.get(n))
-        .flatten()
-        .copied()
-        .collect()
-}
 fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
     let chunk = mutation.chunk();
     let section = s.topology.section_of(chunk);
+    if matches!(mutation, Mutation::Remove(_)) {
+        let Some(&(_, owner)) = s.topology.sections.get(&section) else {
+            return;
+        };
+        let Some(holders) = s.topology.chunks.get_mut(&chunk) else {
+            return;
+        };
+        *holders -= 1;
+        if *holders == 0 {
+            s.topology.chunks.remove(&chunk);
+        }
+        let entry = s.topology.sections.get_mut(&section).unwrap();
+        entry.0 -= 1;
+        if entry.0 == 0 {
+            s.topology
+                .regions
+                .get_mut(&owner)
+                .unwrap()
+                .dead_sections
+                .insert(section);
+        }
+        return;
+    }
     let mut create = vec![section];
     let mut affected = s.topology.affected(chunk);
-    if matches!(mutation, Mutation::Add(_))
-        && s.topology
-            .sections
-            .get(&section)
-            .is_none_or(|entry| entry.0 == 0)
+    if s.topology
+        .sections
+        .get(&section)
+        .is_none_or(|entry| entry.0 == 0)
         && s.topology.empty_radius > 0
     {
         create.clear();
@@ -926,242 +863,100 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
             }
         }
     }
-    // Reviving a reserved empty section needs no new region if its full halo
-    // already exists, including when the owner is ticking.
-    if matches!(mutation, Mutation::Add(_))
-        && s.topology.sections.contains_key(&section)
+    if s.topology.sections.contains_key(&section)
         && create
             .iter()
             .all(|pos| s.topology.sections.contains_key(pos))
-        && nearby(s, section).is_empty()
     {
         *s.topology.chunks.entry(chunk).or_default() += 1;
         s.topology.sections.get_mut(&section).unwrap().0 += 1;
         return;
     }
-    // ThreadedRegionizer.removeChunk changes holder metadata immediately even
-    // when the owner is ticking; dead-section cleanup waits for markNotTicking.
-    if matches!(mutation, Mutation::Remove(_))
-        && let Some(&(count, owner)) = s.topology.sections.get(&section)
-        && s.topology.chunks.contains_key(&chunk)
-        && s.topology.regions[&owner].state != RegionState::Ready
-        && nearby(s, section).is_empty()
-    {
-        let holders = s.topology.chunks.get_mut(&chunk).unwrap();
-        *holders -= 1;
-        if *holders == 0 {
-            s.topology.chunks.remove(&chunk);
+    let mut idle: Vec<_> = affected
+        .iter()
+        .copied()
+        .filter(|id| s.topology.regions[id].state != RegionState::Ticking)
+        .collect();
+    idle.sort_unstable();
+    let id = if let Some(id) = idle.first().copied() {
+        id
+    } else {
+        let id = s.topology.next_id;
+        s.topology.next_id += 1;
+        s.topology
+            .regions
+            .insert(id, Region::new(HashSet::new(), D::default()));
+        id
+    };
+    for source in idle.into_iter().filter(|source| *source != id) {
+        let mut old = s.topology.regions.remove(&source).unwrap();
+        for section in &old.sections {
+            s.topology.sections.get_mut(section).unwrap().1 = id;
         }
-        s.topology.sections.get_mut(&section).unwrap().0 = count - 1;
-        if count == 1 {
-            s.topology
-                .regions
-                .get_mut(&owner)
-                .unwrap()
-                .dead_sections
-                .insert(section);
+        for target in &old.merge_targets {
+            let ticking = s.topology.regions.get_mut(target).unwrap();
+            ticking.merge_from.remove(&source);
+            ticking.merge_from.insert(id);
         }
-        return;
+        let destination = s.topology.regions.get_mut(&id).unwrap();
+        destination.sections.extend(old.sections);
+        destination.data.as_mut().unwrap().merge_with_tick_offset(
+            old.data.take().unwrap(),
+            tick_offset(old.tick_count, destination.tick_count),
+        );
+        destination.tasks.append(&mut old.tasks);
+        destination.dead_sections.extend(old.dead_sections);
+        destination.merge_targets.extend(old.merge_targets);
     }
-    // Existing nonempty sections do not expand ownership.
-    if matches!(mutation, Mutation::Add(_))
-        && s.topology
-            .sections
-            .get(&section)
-            .is_some_and(|entry| entry.0 > 0)
-        && nearby(s, section).is_empty()
-    {
-        *s.topology.chunks.entry(chunk).or_default() += 1;
-        s.topology.sections.get_mut(&section).unwrap().0 += 1;
-        return;
+    let ticking: Vec<_> = affected
+        .iter()
+        .copied()
+        .filter(|other| {
+            *other != id
+                && s.topology
+                    .regions
+                    .get(other)
+                    .is_some_and(|r| r.state == RegionState::Ticking)
+        })
+        .collect();
+    for target in ticking {
+        s.topology
+            .regions
+            .get_mut(&target)
+            .unwrap()
+            .merge_from
+            .insert(id);
+        s.topology
+            .regions
+            .get_mut(&id)
+            .unwrap()
+            .merge_targets
+            .insert(target);
     }
-    // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: attach new
-    // sections to a non-ticking region and defer merges into ticking regions.
-    if matches!(mutation, Mutation::Add(_))
-        && nearby(s, section).is_empty()
-        && !affected.is_empty()
-        && affected
-            .iter()
-            .any(|id| s.topology.regions[id].state != RegionState::Ready)
-        && affected
-            .iter()
-            .all(|id| s.topology.regions[id].mutations.is_empty())
-    {
-        let mut idle: Vec<_> = affected
-            .iter()
-            .copied()
-            .filter(|id| s.topology.regions[id].state != RegionState::Ticking)
-            .collect();
-        idle.sort_unstable();
-        let id = if let Some(id) = idle.first().copied() {
-            id
-        } else {
-            let id = s.topology.next_id;
-            s.topology.next_id += 1;
-            s.topology
-                .regions
-                .insert(id, Region::new(HashSet::new(), D::default()));
-            id
-        };
-        for source in idle.into_iter().filter(|source| *source != id) {
-            let mut old = s.topology.regions.remove(&source).unwrap();
-            for section in &old.sections {
-                s.topology.sections.get_mut(section).unwrap().1 = id;
-            }
-            for target in &old.merge_targets {
-                let ticking = s.topology.regions.get_mut(target).unwrap();
-                ticking.merge_from.remove(&source);
-                ticking.merge_from.insert(id);
-            }
-            let destination = s.topology.regions.get_mut(&id).unwrap();
-            destination.sections.extend(old.sections);
-            destination.data.as_mut().unwrap().merge_with_tick_offset(
-                old.data.take().unwrap(),
-                tick_offset(old.tick_count, destination.tick_count),
-            );
-            destination.tasks.append(&mut old.tasks);
-            destination.dead_sections.extend(old.dead_sections);
-            destination.merge_targets.extend(old.merge_targets);
-        }
-        let ticking: Vec<_> = affected
-            .iter()
-            .copied()
-            .filter(|other| {
-                *other != id
-                    && s.topology
-                        .regions
-                        .get(other)
-                        .is_some_and(|r| r.state == RegionState::Ticking)
-            })
-            .collect();
-        for target in ticking {
-            s.topology
-                .regions
-                .get_mut(&target)
-                .unwrap()
-                .merge_from
-                .insert(id);
+    let region = s.topology.regions.get_mut(&id).unwrap();
+    if !region.merge_targets.is_empty() {
+        region.state = RegionState::Transient;
+        region.generation += 1;
+    }
+    for pos in create {
+        if !s.topology.sections.contains_key(&pos) {
             s.topology
                 .regions
                 .get_mut(&id)
                 .unwrap()
-                .merge_targets
-                .insert(target);
-        }
-        let region = s.topology.regions.get_mut(&id).unwrap();
-        if !region.merge_targets.is_empty() {
-            region.state = RegionState::Transient;
-            region.generation += 1;
-        }
-        for pos in create {
-            if !s.topology.sections.contains_key(&pos) {
-                s.topology
-                    .regions
-                    .get_mut(&id)
-                    .unwrap()
-                    .sections
-                    .insert(pos);
-                s.topology.sections.insert(pos, (0, id));
-                if let Some(tasks) = s.parked.remove(&pos) {
-                    s.topology.regions.get_mut(&id).unwrap().tasks.extend(tasks);
-                }
+                .sections
+                .insert(pos);
+            s.topology.sections.insert(pos, (0, id));
+            if let Some(tasks) = s.parked.remove(&pos) {
+                s.topology.regions.get_mut(&id).unwrap().tasks.extend(tasks);
             }
         }
-        s.topology.sections.get_mut(&section).unwrap().0 += 1;
-        *s.topology.chunks.entry(chunk).or_default() += 1;
-        return;
     }
-    if nearby(s, section).is_empty() && affected.iter().all(|&id| is_free(s, id)) {
-        apply_topology(s, mutation, &affected);
-        return;
+    s.topology.sections.get_mut(&section).unwrap().0 += 1;
+    *s.topology.chunks.entry(chunk).or_default() += 1;
+    if s.topology.regions[&id].state == RegionState::Ready {
+        enqueue(s, id);
     }
-    let id = s.next_mutation;
-    s.next_mutation += 1;
-    s.pending.insert(
-        id,
-        Pending {
-            mutation,
-            section,
-            regions: HashSet::new(),
-            submitted: Instant::now(),
-        },
-    );
-    s.pending_at.entry(section).or_default().insert(id);
-    pump(s, BTreeSet::from([id]));
-}
-/// Checks the given pending mutations (lowest sequence number first), applying
-/// each that is ready; applications add newly-unblocked candidates to `work`.
-fn pump<D: RegionData, G>(s: &mut State<D, G>, mut work: BTreeSet<u64>) {
-    while let Some(id) = work.pop_first() {
-        if !s.pending.contains_key(&id) {
-            continue;
-        }
-        refresh(s, id, &mut work);
-        if ready(s, id) {
-            apply_pending(s, id, &mut work);
-        }
-    }
-}
-/// Re-derives the involved regions of a pending mutation from the current
-/// topology, reserving new ones and releasing ones no longer involved.
-fn refresh<D: RegionData, G>(s: &mut State<D, G>, id: u64, work: &mut BTreeSet<u64>) {
-    let wanted = s.topology.affected_mutation(s.pending[&id].mutation);
-    let old = std::mem::take(&mut s.pending.get_mut(&id).unwrap().regions);
-    for &r in old.difference(&wanted) {
-        release(s, r, id, work);
-    }
-    for &r in wanted.difference(&old) {
-        s.topology.regions.get_mut(&r).unwrap().mutations.insert(id);
-    }
-    s.pending.get_mut(&id).unwrap().regions = wanted;
-}
-fn release<D: RegionData, G>(s: &mut State<D, G>, r: RegionId, id: u64, work: &mut BTreeSet<u64>) {
-    let Some(region) = s.topology.regions.get_mut(&r) else {
-        return;
-    };
-    region.mutations.remove(&id);
-    match region.mutations.first() {
-        None => enqueue(s, r),
-        Some(&head) if region.data.is_some() => {
-            work.insert(head);
-        }
-        Some(_) => {}
-    }
-}
-fn ready<D: RegionData, G>(s: &State<D, G>, id: u64) -> bool {
-    let p = &s.pending[&id];
-    p.regions.iter().all(|r| {
-        s.topology.regions.get(r).is_some_and(|r| {
-            r.data.is_some() && r.state == RegionState::Ready && r.mutations.first() == Some(&id)
-        })
-    }) && nearby(s, p.section).into_iter().all(|other| other >= id)
-}
-fn apply_pending<D: RegionData, G>(s: &mut State<D, G>, id: u64, work: &mut BTreeSet<u64>) {
-    let p = s.pending.remove(&id).unwrap();
-    if let Some(index) = s.pending_at.get_mut(&p.section) {
-        index.remove(&id);
-        if index.is_empty() {
-            s.pending_at.remove(&p.section);
-        }
-    }
-    // The involved regions may be merged, split or retired: detach every
-    // mutation queued on them and re-derive its regions afterwards.
-    let mut requeue = BTreeSet::new();
-    for r in &p.regions {
-        let region = s.topology.regions.get_mut(r).unwrap();
-        requeue.extend(std::mem::take(&mut region.mutations));
-    }
-    requeue.remove(&id);
-    for q in &requeue {
-        let pending = s.pending.get_mut(q).unwrap();
-        pending.regions.retain(|r| !p.regions.contains(r));
-    }
-    apply_topology(s, p.mutation, &p.regions);
-    for &r in &p.regions {
-        enqueue(s, r);
-    }
-    work.extend(requeue);
-    work.extend(nearby(s, p.section));
 }
 /// Applies a mutation whose involved regions (`affected`) are all idle.
 fn apply_topology<D: RegionData, G>(
@@ -1238,7 +1033,6 @@ fn worker<D: RegionData, G: Send + 'static>(
                     Some(id) => s.topology.regions.get(&id).is_some_and(|r| {
                         r.generation == generation
                             && r.data.is_some()
-                            && r.mutations.is_empty()
                             && r.state == RegionState::Ready
                     }),
                     None => s.global.is_some() && generation == s.global_generation,
@@ -1311,19 +1105,6 @@ fn worker<D: RegionData, G: Send + 'static>(
                         destination.state = RegionState::Transient;
                         destination.merge_targets.extend(old.merge_targets.drain());
                     }
-                    // Pending removals may have reserved this transient owner.
-                    // Transfer their reservation before refreshing their topology.
-                    for mutation in &old.mutations {
-                        let pending = s.pending.get_mut(mutation).unwrap();
-                        pending.regions.remove(&source);
-                        pending.regions.insert(id);
-                    }
-                    s.topology
-                        .regions
-                        .get_mut(&id)
-                        .unwrap()
-                        .mutations
-                        .append(&mut old.mutations);
                     for section in &old.sections {
                         s.topology.sections.get_mut(section).unwrap().1 = id;
                     }
@@ -1388,14 +1169,10 @@ fn worker<D: RegionData, G: Send + 'static>(
                         apply_topology(&mut s, Mutation::Remove(ghost), &affected);
                     }
                 }
-                let Some(r) = s.topology.regions.get_mut(&id) else {
+                let Some(_) = s.topology.regions.get_mut(&id) else {
                     shared.wake.notify_all();
                     continue;
                 };
-                // Post-tick safe point: apply mutations waiting on this region.
-                if let Some(&head) = r.mutations.first() {
-                    pump(&mut s, BTreeSet::from([head]));
-                }
                 enqueue(&mut s, id);
                 shared.wake.notify_all();
             }
