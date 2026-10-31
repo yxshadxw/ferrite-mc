@@ -146,8 +146,12 @@ fn merge_of_ticking_and_idle_region_applies_right_after_the_tick() {
     scheduler.add_chunk(ChunkPos(1, 0));
     let submitted = Instant::now();
     assert_eq!(scheduler.region_count(), 2, "merge must wait for A's tick");
-    assert_eq!(scheduler.pending_mutations(), 1);
-    // B is reserved by the pending merge: it must not start new ticks.
+    let bridge = scheduler.owner(ChunkPos(1, 0)).unwrap();
+    assert_eq!(
+        scheduler.region_state(bridge),
+        Some(ferrite_region::RegionState::Transient)
+    );
+    // B is part of a transient region: it must not start new ticks.
     thread::sleep(Duration::from_millis(150));
     assert_eq!(scheduler.region_count(), 2);
 
@@ -197,8 +201,8 @@ fn merge_of_ticking_and_idle_region_applies_right_after_the_tick() {
 
 #[test]
 fn pending_merge_chain_across_three_regions_applies_in_order() {
-    // A ticking; B, C idle. Bridges A-B then B-C must both wait for A, and a
-    // remove of the first bridge must apply after its add.
+    // A ticks while the two bridges join B and C into one transient region.
+    // Removing the first bridge remains ordered after its addition.
     let mut topology = Regionizer::<Data>::new(0, 1);
     for x in [0, 2, 4] {
         topology.add_chunk(ChunkPos(x, 0));
@@ -208,7 +212,7 @@ fn pending_merge_chain_across_three_regions_applies_in_order() {
     scheduler.add_chunk(ChunkPos(1, 0));
     scheduler.add_chunk(ChunkPos(3, 0));
     scheduler.remove_chunk(ChunkPos(1, 0));
-    assert_eq!(scheduler.region_count(), 3);
+    assert_eq!(scheduler.region_count(), 2);
     scheduler.check_invariants().unwrap();
     release.send(()).unwrap();
     let start = Instant::now();
@@ -452,5 +456,27 @@ fn transient_bridge_waits_for_both_ticking_regions() {
         scheduler.owner(ChunkPos(0, 0)),
         scheduler.owner(ChunkPos(2, 0))
     );
+    assert!(scheduler.shutdown().pending_tasks.is_empty());
+}
+#[test]
+fn bridge_absorbs_idle_neighbor_while_other_region_ticks() {
+    use ferrite_region::RegionState;
+    let mut topology = Regionizer::<Data>::new(0, 1);
+    topology.add_chunk(ChunkPos(0, 0));
+    topology.add_chunk(ChunkPos(2, 0));
+    let scheduler = Scheduler::new(topology, (), 2, |_| {}, |_| {});
+    let release = block_region(&scheduler, ChunkPos(0, 0));
+    scheduler.add_chunk(ChunkPos(1, 0));
+    let bridge = scheduler
+        .owner(ChunkPos(1, 0))
+        .expect("bridge is owned immediately");
+    assert_eq!(scheduler.region_state(bridge), Some(RegionState::Transient));
+    assert_eq!(scheduler.owner(ChunkPos(2, 0)), Some(bridge));
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while scheduler.owner(ChunkPos(0, 0)) != scheduler.owner(ChunkPos(2, 0)) {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
     assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
