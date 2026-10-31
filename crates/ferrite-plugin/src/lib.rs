@@ -43,6 +43,8 @@ pub struct PluginConfig {
     pub command_handler: Option<CommandHandler>,
     pub region_context: Option<std::sync::Arc<dyn RegionContext>>,
     pub server_snapshot: ServerSnapshot,
+    /// Published before plugins enable, so `onEnable` can query worlds.
+    pub world: Option<WorldSnapshot>,
     pub player_handler: Option<PlayerHandler>,
     pub world_handler: Option<WorldHandler>,
     pub server_handler: Option<ServerHandler>,
@@ -384,6 +386,22 @@ pub trait ServerHooks: Send + Sync {
         sender: CommandSender,
         line: &str,
     ) -> Result<PluginCommandResult, Error>;
+    /// Region-scheduler tasks that became due this tick; the server routes them to the chunk.
+    fn take_region_tasks(&self) -> Vec<RegionTask> {
+        Vec::new()
+    }
+    /// Runs one region-scheduler task on the thread that owns its chunk.
+    fn run_region_task(&self, _task: RegionTask) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Moves the host-side player snapshot with the live player.
+    fn update_player_location(
+        &self,
+        _id: uuid::Uuid,
+        _location: &PlayerLocation,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 }
 pub struct PluginHost {
     jvm: Jvm,
@@ -1396,6 +1414,19 @@ impl PluginHost {
                     &[JValue::Object(address.as_ref())],
                 )?;
             }
+            Ok(())
+        })?;
+        let host = Self {
+            jvm,
+            issued_regions: Mutex::new(Vec::new()),
+            issued_entities: Mutex::new(Vec::new()),
+            region_context: cfg.region_context,
+        };
+        // Publish the main world before `onEnable`, so enabling plugins can query it.
+        if let Some(world) = &cfg.world {
+            host.register_world(world)?;
+        }
+        host.jvm.with_env(|env| {
             let paths: Vec<_> = plan.loaded().collect();
             let array =
                 env.new_object_array(paths.len() as i32, "java/lang/String", JObject::null())?;
@@ -1425,12 +1456,7 @@ impl PluginHost {
             )?;
             Ok(())
         })?;
-        Ok(Self {
-            jvm,
-            issued_regions: Mutex::new(Vec::new()),
-            issued_entities: Mutex::new(Vec::new()),
-            region_context: cfg.region_context,
-        })
+        Ok(host)
     }
     /// Publish known world blocks; unprovided positions remain unavailable.
     pub fn register_world(&self, world: &WorldSnapshot) -> Result<(), Error> {
@@ -1546,6 +1572,41 @@ impl PluginHost {
                     )?;
                 }
             }
+            Ok(())
+        })?;
+        Ok(())
+    }
+    /// Move the host-side player snapshot with the live player, so `getLocation` stays current.
+    pub fn update_player_location(
+        &self,
+        id: uuid::Uuid,
+        location: &PlayerLocation,
+    ) -> Result<(), Error> {
+        if !location.x.is_finite()
+            || !location.y.is_finite()
+            || !location.z.is_finite()
+            || !location.yaw.is_finite()
+            || !location.pitch.is_finite()
+        {
+            return Err(Error::InvalidPlayerSnapshot);
+        }
+        self.jvm.with_env(|env| {
+            let id = env.new_string(id.to_string())?;
+            let world = env.new_string(location.world.to_string())?;
+            env.call_static_method(
+                BOOTSTRAP,
+                "updatePlayerLocation",
+                "(Ljava/lang/String;Ljava/lang/String;DDDFF)V",
+                &[
+                    JValue::Object(id.as_ref()),
+                    JValue::Object(world.as_ref()),
+                    JValue::Double(location.x),
+                    JValue::Double(location.y),
+                    JValue::Double(location.z),
+                    JValue::Float(location.yaw),
+                    JValue::Float(location.pitch),
+                ],
+            )?;
             Ok(())
         })?;
         Ok(())
@@ -2138,6 +2199,19 @@ impl ServerHooks for PluginHost {
         line: &str,
     ) -> Result<PluginCommandResult, Error> {
         self.execute_plugin_command(sender, line)
+    }
+    fn take_region_tasks(&self) -> Vec<RegionTask> {
+        PluginHost::take_region_tasks(self)
+    }
+    fn run_region_task(&self, task: RegionTask) -> Result<(), Error> {
+        PluginHost::run_region_task(self, task)
+    }
+    fn update_player_location(
+        &self,
+        id: uuid::Uuid,
+        location: &PlayerLocation,
+    ) -> Result<(), Error> {
+        PluginHost::update_player_location(self, id, location)
     }
 }
 fn consume_task<T: PartialEq>(issued: &Mutex<Vec<T>>, task: &T) -> Result<(), Error> {
