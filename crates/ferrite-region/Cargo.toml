@@ -8,3 +8,5 @@ license.workspace = true
 parking_lot.workspace = true
 crossbeam.workspace = true
 tracing.workspace = true
+[dev-dependencies]
+proptest = "1"
