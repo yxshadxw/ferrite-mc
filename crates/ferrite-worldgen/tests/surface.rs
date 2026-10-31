@@ -125,6 +125,38 @@ fn floor_stone_depth_changes_only_the_top_layer() {
     assert_eq!(chunk.block(0, 14, 0), Some(stone));
 }
 
+/// The overworld rule tree starts with `minecraft:bedrock_floor`; the vertical gradient must
+/// keep bedrock at the floor and leave stone at and above `above_bottom: 5`.
+#[test]
+fn bedrock_floor_rule_is_applied_at_the_floor() {
+    let path = generated();
+    let mut data = WorldgenData::load(&path).unwrap();
+    let registry = RuntimeRegistry::load(&path).unwrap();
+    let settings = data
+        .noise_settings
+        .get_mut(&ResourceId::parse("overworld").unwrap())
+        .unwrap();
+    settings.noise.min_y = 0;
+    settings.noise.height = 16;
+    settings.aquifers = None;
+    settings.noise_router.final_density = DensityFunction::Constant(1.0);
+    settings.material_rule = ResourceId::parse("bedrock_floor").unwrap();
+    let noise = NoiseChunkGenerator::new(&data, 42).unwrap();
+    let surface = SurfaceGenerator::new(&data, &noise, 42).unwrap();
+    let mut chunk = noise.fill_noise_chunk(0, 0, &registry).unwrap();
+    surface.apply(&mut chunk, 0, 0, &registry).unwrap();
+    let bedrock = registry
+        .block_id("minecraft:bedrock", &Default::default())
+        .unwrap();
+    let stone = registry
+        .block_id("minecraft:stone", &Default::default())
+        .unwrap();
+    assert_eq!(chunk.block(0, 0, 0), Some(bedrock));
+    for y in 5..16 {
+        assert_eq!(chunk.block(0, y, 0), Some(stone), "y={y}");
+    }
+}
+
 #[test]
 fn fixture_top_blocks_match_vanilla_surface() {
     use ferrite_nbt::{
