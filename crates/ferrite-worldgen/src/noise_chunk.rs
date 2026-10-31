@@ -4,7 +4,11 @@ use crate::{
     DensityFunction, FunctionContext, ResolveError, ResourceId, SeededNoise, WorldgenData,
 };
 use ferrite_world::{BlockStateRegistry, Chunk, ChunkError};
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -34,7 +38,30 @@ pub struct NoiseChunkGenerator {
     aquifer: Option<crate::aquifer::AquiferSpec>,
 }
 
-type CellCache = RefCell<HashMap<(usize, i32, i32, i32), f32>>;
+/// FNV-1a: the cell cache is queried eight times per block, so the default SipHash
+/// (designed against collisions from untrusted input) is the wrong tool here. The
+/// keys are node pointers and small coordinates we produce ourselves.
+#[derive(Default)]
+struct FnvHasher(u64);
+
+impl Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        if self.0 == 0 {
+            self.0 = 0xcbf2_9ce4_8422_2325;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type CellCache =
+    RefCell<HashMap<(usize, i32, i32, i32), f32, BuildHasherDefault<FnvHasher>>>;
 struct ChunkContext<'a> {
     parent: crate::SeededContext<'a>,
     cache: &'a CellCache,
@@ -86,6 +113,16 @@ impl NoiseChunkGenerator {
                 .map(|value| crate::aquifer::AquiferSpec::new(value, data))
                 .transpose()?,
         })
+    }
+
+    /// Lowest block y of the generated column.
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    /// Height of the generated column in blocks.
+    pub fn height(&self) -> i32 {
+        self.height
     }
 
     /// Fills the noise terrain, then applies the vanilla carving mask.
