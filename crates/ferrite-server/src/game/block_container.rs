@@ -42,6 +42,62 @@ fn prop<'a>(props: &'a [(&'static str, &'static str)], name: &str) -> Option<&'a
         .map(|(_, value)| *value)
 }
 
+/// The slot count of every block entity inventory a hopper can move items between (vanilla
+/// `WorldlyContainer` implementations), or `None` for other blocks.
+pub fn inventory_slots(name: &str) -> Option<usize> {
+    Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "chest" | "trapped_chest" | "barrel" => SIZE,
+        "hopper" => super::hopper::SIZE,
+        "dropper" | "dispenser" => super::dispenser::SIZE,
+        "furnace" | "blast_furnace" | "smoker" => super::furnace::SLOTS,
+        _ => return None,
+    })
+}
+
+/// The items of any block entity inventory with `Items` in its NBT, sized to its slot count.
+pub fn load_slots(source: &AnvilChunkSource, [x, y, z]: [i32; 3], size: usize) -> Vec<ItemStack> {
+    let mut items = load_items(source.block_entity(x, y, z).as_ref());
+    items.resize(size, ItemStack::empty());
+    items
+}
+
+/// Writes the `Items` list of any block entity inventory, creating the block entity when
+/// needed and keeping the rest of its NBT (timers, custom names) untouched.
+pub fn store_slots(
+    source: &AnvilChunkSource,
+    [x, y, z]: [i32; 3],
+    block: &str,
+    items: &[ItemStack],
+) {
+    let Some(type_id) = ferrite_data::registries::id("minecraft:block_entity_type", block)
+        .and_then(|id| u32::try_from(id).ok())
+    else {
+        return;
+    };
+    let result = source.update_block_entity(x, y, z, |entity| {
+        let entity = entity.get_or_insert_with(|| {
+            let mut data = Compound::new();
+            data.insert("id".into(), Tag::String(block.into()));
+            data.insert("x".into(), Tag::Int(x));
+            data.insert("y".into(), Tag::Int(y));
+            data.insert("z".into(), Tag::Int(z));
+            BlockEntity { type_id, data }
+        });
+        let unchanged =
+            entity.data.get("Items").is_some() && load_items(Some(entity))[..items.len()] == *items;
+        if unchanged {
+            return (false, ());
+        }
+        // Vanilla saves an empty `Items` list too, so an emptied container keeps its
+        // block entity shape across a reload.
+        entity.data.insert("Items".into(), save_items(items));
+        (true, ())
+    });
+    if let Err(error) = result {
+        tracing::warn!(x, y, z, %error, "could not store container items");
+    }
+}
+
 /// One step towards a horizontal direction.
 fn step(direction: &str) -> Option<[i32; 3]> {
     Some(match direction {
@@ -255,10 +311,7 @@ pub fn take_contents(
     else {
         return Vec::new();
     };
-    if !matches!(
-        name,
-        "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel"
-    ) {
+    if inventory_slots(name).is_none() {
         return Vec::new();
     }
     source

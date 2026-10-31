@@ -50,6 +50,12 @@ pub trait RedstoneWorld {
     fn block(&self, pos: [i32; 3]) -> Option<u16>;
     fn set_block(&mut self, pos: [i32; 3], state: u16);
     fn brightness(&self, pos: [i32; 3]) -> u8;
+
+    /// Vanilla `BlockState.getAnalogOutputSignal` for a container (`hasAnalogOutputSignal`),
+    /// which a comparator compares instead of the block's weak power.
+    fn container_signal(&self, _pos: [i32; 3]) -> Option<u8> {
+        None
+    }
 }
 
 impl RedstoneWorld for RegionFluidWorld<'_> {
@@ -68,6 +74,14 @@ impl RedstoneWorld for RegionFluidWorld<'_> {
 
     fn brightness(&self, pos: [i32; 3]) -> u8 {
         RegionFluidWorld::brightness(self, pos[0], pos[1], pos[2])
+    }
+
+    fn container_signal(&self, pos: [i32; 3]) -> Option<u8> {
+        let state = self.block(pos)?;
+        let (name, _) = blocks::state(state)?;
+        let size = super::block_container::inventory_slots(name)?;
+        let items = super::block_container::load_slots(self.source, pos, size);
+        Some(super::hopper::comparator_signal(&items))
     }
 }
 
@@ -297,6 +311,9 @@ fn power_from(
     if is_wire(state) {
         return property_u8(state, "power").unwrap_or(0);
     }
+    if let Some(signal) = world.container_signal(neighbour) {
+        return signal;
+    }
     if is_conductor(state) {
         return strong_block_power(world, neighbour, analog);
     }
@@ -515,6 +532,12 @@ impl Redstone {
 
     pub fn take_primed(&mut self) -> Vec<([i32; 3], i32)> {
         std::mem::take(&mut self.primed)
+    }
+
+    /// The redstone power arriving at a block (`Level.getSignal`), including comparator
+    /// outputs this region computed. Dispensers use it for their rising edge.
+    pub fn power_at(&self, world: &impl RedstoneWorld, pos: [i32; 3]) -> u8 {
+        input_power(world, pos, &self.analog)
     }
 
     pub fn tick(&mut self, world: &mut impl RedstoneWorld, players: &[[f64; 3]]) {
