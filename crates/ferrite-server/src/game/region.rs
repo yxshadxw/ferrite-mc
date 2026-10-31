@@ -301,6 +301,7 @@ pub struct Region {
     gravity: super::gravity::Gravity,
     fire: super::fire::FireTicks,
     buttons: super::blocks::ButtonTicks,
+    hoppers: super::hopper::Hoppers,
     redstone: super::redstone::Redstone,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
@@ -322,6 +323,7 @@ impl RegionData for Region {
         self.gravity.merge(other.gravity);
         self.fire.merge(other.fire);
         self.buttons.merge(other.buttons);
+        self.hoppers.merge(other.hoppers);
         self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
@@ -352,6 +354,9 @@ impl RegionData for Region {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             buttons: self.buttons.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            hoppers: self.hoppers.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             redstone: self.redstone.split(|x, z| {
@@ -735,6 +740,11 @@ impl Player {
                 .map(|(name, _)| name);
             if name.and_then(super::furnace::kind).is_some() {
                 for stack in super::furnace::take_contents(source, pos) {
+                    self.menus.spilled.push((pos, stack));
+                }
+            }
+            if name == Some("minecraft:hopper") {
+                for stack in super::hopper::take_contents(source, pos) {
                     self.menus.spilled.push((pos, stack));
                 }
             }
@@ -3213,6 +3223,18 @@ impl Region {
         }
         let mut changed = self.tick_block_updates(ctx);
         changed.extend(button_changed);
+        // Vanilla `HopperBlockEntity` ticks as a block entity; a region keeps only the
+        // hoppers it has seen and ticks them every game tick (their own cooldown gates moves).
+        if let Some(source) = ctx.source.as_deref() {
+            self.hoppers.blocks_changed(source, &changed);
+            let Self {
+                hoppers,
+                entities,
+                rng,
+                ..
+            } = self;
+            hoppers.tick(source, entities, rng);
+        }
         // Vanilla `FireBlock.tick` runs on scheduled ticks and changes blocks through the same
         // neighbor-update path as any other block change.
         let mut fire_changed = Vec::new();

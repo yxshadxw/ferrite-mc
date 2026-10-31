@@ -67,6 +67,7 @@ mod fluid;
 mod furnace;
 mod global;
 mod gravity;
+mod hopper;
 mod neighbors;
 mod random_tick;
 mod redstone;
