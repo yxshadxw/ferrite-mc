@@ -2,7 +2,8 @@ use ferrite_item::{Component, Enchantments, HashedSlot, ItemStack, component_ids
 
 use crate::{
     ClickInput::{self, *},
-    Clicker, Crafter, Menu, NoCrafting, PlayerInventory, SLOT_OUTSIDE, Sync,
+    Clicker, CookingOutput, Crafter, FurnaceKind, Menu, NoCrafting, PlayerInventory, SLOT_OUTSIDE,
+    Sync,
 };
 
 fn item(name: &str, count: i32) -> ItemStack {
@@ -75,6 +76,88 @@ impl Fixture {
         }
         self.click(SLOT_OUTSIDE, (kind << 2) | 2, QuickCraft);
     }
+}
+
+/// Raw gold smelts into a gold ingot (200 ticks, 1 experience); coal burns for 1600 ticks.
+struct FurnaceCrafter;
+
+impl Crafter for FurnaceCrafter {
+    fn craft(&self, _: &[ItemStack], _: usize) -> ItemStack {
+        empty()
+    }
+
+    fn cook(&self, kind: FurnaceKind, input: &ItemStack) -> Option<CookingOutput> {
+        (kind == FurnaceKind::Furnace && input.name() == Some("minecraft:raw_gold")).then(|| {
+            CookingOutput {
+                result: item("gold_ingot", 1),
+                cook_time: 200,
+                experience: 1.0,
+            }
+        })
+    }
+
+    fn burn_time(&self, item: &ItemStack) -> i32 {
+        if item.name() == Some("minecraft:coal") {
+            1600
+        } else {
+            0
+        }
+    }
+}
+
+#[test]
+fn furnace_menu_cooks_consumes_fuel_and_syncs_container_data() {
+    let mut f = Fixture::new(Menu::furnace(7, FurnaceKind::Furnace));
+    f.menu
+        .set_slot(&mut f.inv, &FurnaceCrafter, 0, item("raw_gold", 1));
+    f.menu
+        .set_slot(&mut f.inv, &FurnaceCrafter, 1, item("coal", 2));
+    assert_eq!(f.menu.len(), 39);
+    assert_eq!(
+        f.menu.kind(),
+        crate::MenuKind::Furnace(FurnaceKind::Furnace)
+    );
+    assert_eq!(f.menu.kind().menu_type(), Some("minecraft:furnace".into()));
+
+    // The first tick lights the furnace, consumes one fuel and starts cooking.
+    f.menu.tick(&FurnaceCrafter);
+    assert_eq!(f.menu.data_value(0), 1);
+    assert_eq!((f.menu.data_value(1), f.menu.data_value(2)), (1, 200));
+    assert_eq!((f.menu.data_value(3), f.menu.data_value(4)), (1600, 1600));
+    assert_eq!(f.slot(1), item("coal", 1));
+    // The first broadcast sends every data slot once, then only changes.
+    let first = f.menu.broadcast_changes(&f.inv);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|sync| matches!(sync, Sync::Data { .. }))
+            .count(),
+        5
+    );
+    assert!(
+        !f.menu
+            .broadcast_changes(&f.inv)
+            .iter()
+            .any(|sync| matches!(sync, Sync::Data { .. }))
+    );
+
+    for _ in 1..200 {
+        f.menu.tick(&FurnaceCrafter);
+    }
+    assert_eq!(f.slot(0), empty());
+    assert_eq!(f.slot(2), item("gold_ingot", 1));
+    assert_eq!(f.menu.data_value(0), 1);
+    assert_eq!(f.menu.data_value(1), 0);
+    assert_eq!(f.menu.furnace_state().unwrap().pending_experience, 1.0);
+
+    // Taking the output awards the experience and leaves the fuel alone.
+    let mut p = Clicker::new(&mut f.inv, false, &FurnaceCrafter);
+    f.menu.clicked(&mut p, 2, 0, Pickup);
+    assert_eq!(p.xp, 1.0);
+    assert_eq!(p.drops, Vec::<ItemStack>::new());
+    assert_eq!(f.menu.carried(), &item("gold_ingot", 1));
+    assert_eq!(f.slot(2), empty());
+    assert_eq!(f.menu.furnace_state().unwrap().pending_experience, 0.0);
 }
 
 #[test]

@@ -709,6 +709,15 @@ impl Player {
             for stack in super::block_container::take_contents(source, pos, state) {
                 self.menus.spilled.push((pos, stack));
             }
+            let name = u16::try_from(state)
+                .ok()
+                .and_then(ferrite_data::blocks::state)
+                .map(|(name, _)| name);
+            if name.and_then(super::furnace::kind).is_some() {
+                for stack in super::furnace::take_contents(source, pos) {
+                    self.menus.spilled.push((pos, stack));
+                }
+            }
         }
         true
     }
@@ -1087,6 +1096,25 @@ impl Player {
         self.experience_level = level;
         self.experience_progress = progress;
     }
+    /// Adds experience points, as taking a furnace result or a grindstone output does (vanilla
+    /// `Player.giveExperiencePoints`). Fractional points are rounded down, like vanilla's
+    /// `Mth.floor` of the accumulated recipe experience.
+    pub fn add_experience(&mut self, points: f32) {
+        let points = points.floor();
+        if !points.is_finite() || points <= 0.0 {
+            return;
+        }
+        self.set_experience_total(i64::from(self.experience_total) + points as i64);
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+    }
+
     fn set_experience_level(&mut self, level: i32) {
         let level = level.clamp(0, 21_863);
         self.experience_level = level;
@@ -1859,6 +1887,8 @@ impl Player {
                     }
                 }
                 ServerboundPlay::ContainerClick(p) => self.handle_container_click(p),
+                ServerboundPlay::ContainerButtonClick(p) => self.handle_container_button(p),
+                ServerboundPlay::RenameItem(p) => self.rename_item(p.name),
                 ServerboundPlay::ContainerClose(_) => self.close_container(),
                 ServerboundPlay::PlayerAction(p) => {
                     let pos = ferrite_protocol::types::BlockPos::unpack(p.location);

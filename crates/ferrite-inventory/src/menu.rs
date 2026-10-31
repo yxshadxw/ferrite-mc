@@ -43,6 +43,82 @@ impl ClickInput {
     }
 }
 
+/// The furnace family (vanilla `AbstractFurnaceMenu` and its three block menus).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FurnaceKind {
+    Furnace,
+    BlastFurnace,
+    Smoker,
+}
+
+impl FurnaceKind {
+    /// The `minecraft:menu` registry name.
+    pub const fn menu_type(self) -> &'static str {
+        match self {
+            Self::Furnace => "minecraft:furnace",
+            Self::BlastFurnace => "minecraft:blast_furnace",
+            Self::Smoker => "minecraft:smoker",
+        }
+    }
+
+    /// The translation key of the screen title.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Furnace => "container.furnace",
+            Self::BlastFurnace => "container.blast_furnace",
+            Self::Smoker => "container.smoker",
+        }
+    }
+
+    /// The block this menu belongs to.
+    pub const fn block(self) -> &'static str {
+        match self {
+            Self::Furnace => "minecraft:furnace",
+            Self::BlastFurnace => "minecraft:blast_furnace",
+            Self::Smoker => "minecraft:smoker",
+        }
+    }
+}
+
+/// Vanilla `AbstractFurnaceMenu` container data slots.
+pub const FURNACE_LIT: usize = 0;
+pub const FURNACE_COOK_PROGRESS: usize = 1;
+pub const FURNACE_COOK_TOTAL: usize = 2;
+pub const FURNACE_BURN_LEFT: usize = 3;
+pub const FURNACE_BURN_TOTAL: usize = 4;
+/// Number of container data slots of a furnace family menu.
+pub const FURNACE_DATA_SLOTS: usize = 5;
+
+/// One furnace-family recipe result, as [`Crafter::cook`] reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CookingOutput {
+    pub result: ItemStack,
+    /// Ticks the recipe takes (vanilla `AbstractCookingRecipe.getCookingTime`).
+    pub cook_time: i32,
+    /// Experience awarded when the result is taken.
+    pub experience: f32,
+}
+
+/// Furnace-family burn and cook timers (vanilla `AbstractFurnaceBlockEntity`'s
+/// `litTimeRemaining`, `litTotalTime`, `cookingProgress` and `cookingTotalTime`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FurnaceState {
+    pub cook: i32,
+    pub cook_total: i32,
+    pub burn: i32,
+    pub burn_total: i32,
+    /// Experience of the recipes completed but not yet taken from the output slot
+    /// (vanilla `AbstractFurnaceBlockEntity.recipesUsed`).
+    pub pending_experience: f32,
+}
+
+impl FurnaceState {
+    /// Vanilla `isLit`.
+    pub fn lit(&self) -> bool {
+        self.burn > 0
+    }
+}
+
 /// The menus this crate implements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKind {
@@ -52,6 +128,8 @@ pub enum MenuKind {
     Crafting,
     /// A chest-like grid of `rows` rows of nine slots (vanilla `ChestMenu`).
     Generic { rows: u8 },
+    /// A furnace, blast furnace or smoker (vanilla `AbstractFurnaceMenu`).
+    Furnace(FurnaceKind),
 }
 
 impl MenuKind {
@@ -61,6 +139,7 @@ impl MenuKind {
             Self::Inventory => None,
             Self::Crafting => Some("minecraft:crafting".into()),
             Self::Generic { rows } => Some(format!("minecraft:generic_9x{rows}")),
+            Self::Furnace(kind) => Some(kind.menu_type().into()),
         }
     }
 }
@@ -69,6 +148,16 @@ impl MenuKind {
 pub trait Crafter {
     /// The result of a row-major grid with `width` columns, or an empty stack.
     fn craft(&self, grid: &[ItemStack], width: usize) -> ItemStack;
+
+    /// The furnace-family recipe for `input`, if one exists (vanilla `RecipeManager.getRecipeFor`).
+    fn cook(&self, _kind: FurnaceKind, _input: &ItemStack) -> Option<CookingOutput> {
+        None
+    }
+
+    /// Burn ticks of a fuel item (vanilla `FuelValues.burnDuration`), or 0 when it is no fuel.
+    fn burn_time(&self, _item: &ItemStack) -> i32 {
+        0
+    }
 }
 
 /// A [`Crafter`] that never crafts anything.
@@ -102,6 +191,8 @@ pub struct Clicker<'a> {
     pub crafter: &'a dyn Crafter,
     /// Stacks the player drops (vanilla `player.drop`), in order.
     pub drops: Vec<ItemStack>,
+    /// Experience points the click awards (furnace output, later grindstone and anvil costs).
+    pub xp: f32,
 }
 
 impl<'a> Clicker<'a> {
@@ -115,6 +206,7 @@ impl<'a> Clicker<'a> {
             infinite_materials,
             crafter,
             drops: Vec::new(),
+            xp: 0.0,
         }
     }
 
@@ -144,6 +236,12 @@ pub enum Sync {
     },
     /// `set_cursor_item`.
     Carried(ItemStack),
+    /// `container_set_data`: a menu property (vanilla `AbstractContainerMenu.setData`).
+    Data {
+        container_id: i32,
+        id: i16,
+        value: i16,
+    },
 }
 
 /// Where a menu slot keeps its stack.
@@ -161,6 +259,13 @@ enum Rule {
     Plain,
     Armor(&'static str),
     Result,
+    /// A furnace input slot (vanilla `AbstractFurnaceMenu` slot 0).
+    FurnaceInput,
+    /// A furnace fuel slot (vanilla `AbstractFurnaceMenu` slot 1, `FuelSlot`).
+    Fuel,
+    /// A menu output slot: may not be placed into, and taking from it awards experience or
+    /// consumes the menu's ingredients (vanilla `ResultSlot` for stations).
+    Output,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +325,11 @@ pub struct Menu {
     grid_width: usize,
     result: ItemStack,
     container: Vec<ItemStack>,
+    /// Container data (vanilla `AbstractContainerMenu.dataSlots`), most recently synced to the
+    /// client through `container_set_data`.
+    data: Vec<i32>,
+    remote_data: Vec<i32>,
+    furnace: Option<FurnaceState>,
     carried: ItemStack,
     state_id: i32,
     quickcraft_status: i32,
@@ -244,11 +354,16 @@ impl Menu {
         let grid_width = match kind {
             MenuKind::Inventory => 2,
             MenuKind::Crafting => 3,
-            MenuKind::Generic { .. } => 0,
+            MenuKind::Generic { .. } | MenuKind::Furnace(_) => 0,
         };
         let container = match kind {
             MenuKind::Generic { rows } => vec![ItemStack::empty(); usize::from(rows) * 9],
+            MenuKind::Furnace(_) => vec![ItemStack::empty(); 3],
             _ => Vec::new(),
+        };
+        let data_len = match kind {
+            MenuKind::Furnace(_) => FURNACE_DATA_SLOTS,
+            _ => 0,
         };
         let remote = vec![Remote::empty(); slots.len()];
         Self {
@@ -259,6 +374,9 @@ impl Menu {
             grid_width,
             result: ItemStack::empty(),
             container,
+            data: vec![0; data_len],
+            remote_data: vec![i32::MIN; data_len],
+            furnace: matches!(kind, MenuKind::Furnace(_)).then(FurnaceState::default),
             carried: ItemStack::empty(),
             state_id: 0,
             quickcraft_status: 0,
@@ -329,6 +447,27 @@ impl Menu {
         Self::with_slots(container_id, MenuKind::Generic { rows }, slots)
     }
 
+    /// A furnace-family menu (vanilla `FurnaceMenu`, `BlastFurnaceMenu`, `SmokerMenu`):
+    /// 0 input, 1 fuel, 2 result, 3..39 the player's inventory.
+    pub fn furnace(container_id: i32, kind: FurnaceKind) -> Self {
+        let mut slots = vec![
+            SlotDef {
+                store: Store::Container(0),
+                rule: Rule::FurnaceInput,
+            },
+            SlotDef {
+                store: Store::Container(1),
+                rule: Rule::Fuel,
+            },
+            SlotDef {
+                store: Store::Result,
+                rule: Rule::Output,
+            },
+        ];
+        standard_inventory_slots(&mut slots);
+        Self::with_slots(container_id, MenuKind::Furnace(kind), slots)
+    }
+
     pub fn container_id(&self) -> i32 {
         self.container_id
     }
@@ -382,6 +521,111 @@ impl Menu {
 
     pub fn container_mut(&mut self) -> &mut [ItemStack] {
         &mut self.container
+    }
+
+    /// The menu's container data (vanilla `AbstractContainerMenu.dataSlots`).
+    pub fn data(&self) -> &[i32] {
+        &self.data
+    }
+
+    /// One container data value, or 0 when the menu has no such slot.
+    pub fn data_value(&self, id: usize) -> i32 {
+        self.data.get(id).copied().unwrap_or(0)
+    }
+
+    /// The furnace timers, for a furnace-family menu.
+    pub fn furnace_state(&self) -> Option<&FurnaceState> {
+        self.furnace.as_ref()
+    }
+
+    /// Restores the furnace timers when the menu is opened from a block entity.
+    pub fn set_furnace_state(&mut self, state: FurnaceState) {
+        self.furnace = Some(state);
+        self.sync_data();
+    }
+
+    /// Copies the timers into the container data slots (vanilla
+    /// `AbstractFurnaceMenu.broadcastChanges` calling `setData`).
+    fn sync_data(&mut self) {
+        let Some(furnace) = &self.furnace else {
+            return;
+        };
+        if self.data.len() < FURNACE_DATA_SLOTS {
+            self.data.resize(FURNACE_DATA_SLOTS, 0);
+            self.remote_data.resize(FURNACE_DATA_SLOTS, i32::MIN);
+        }
+        self.data[FURNACE_LIT] = i32::from(furnace.lit());
+        self.data[FURNACE_COOK_PROGRESS] = furnace.cook;
+        self.data[FURNACE_COOK_TOTAL] = furnace.cook_total;
+        self.data[FURNACE_BURN_LEFT] = furnace.burn;
+        self.data[FURNACE_BURN_TOTAL] = furnace.burn_total;
+    }
+
+    /// Advances the furnace timers by one tick (vanilla `AbstractFurnaceBlockEntity.serverTick`),
+    /// then refreshes the container data. Other menus do nothing.
+    pub fn tick(&mut self, crafter: &dyn Crafter) {
+        if let MenuKind::Furnace(kind) = self.kind {
+            self.tick_furnace(kind, crafter);
+        }
+        self.sync_data();
+    }
+
+    fn tick_furnace(&mut self, kind: FurnaceKind, crafter: &dyn Crafter) {
+        let input = self.container[0].clone();
+        let fuel = self.container[1].clone();
+        let recipe = if input.is_empty() {
+            None
+        } else {
+            crafter.cook(kind, &input)
+        };
+        let can_cook = recipe.as_ref().is_some_and(|recipe| {
+            self.result.is_empty()
+                || (self.result.is_same_item_same_components(&recipe.result)
+                    && self.result.count + recipe.result.count <= self.result.max_stack_size())
+        });
+        let mut state = self.furnace.clone().unwrap_or_default();
+        if state.burn > 0 {
+            state.burn -= 1;
+        }
+        if can_cook {
+            if state.burn == 0 {
+                let burn = crafter.burn_time(&fuel);
+                if burn > 0 {
+                    state.burn = burn;
+                    state.burn_total = burn;
+                    let mut left = fuel;
+                    left.count -= 1;
+                    self.container[1] = normalize(left);
+                }
+            }
+            if state.burn > 0 {
+                let recipe = recipe.expect("can_cook implies a recipe");
+                if state.cook == 0 {
+                    state.cook_total = recipe.cook_time.max(1);
+                }
+                state.cook += 1;
+                if state.cook >= state.cook_total {
+                    if self.result.is_empty() {
+                        self.result = recipe.result.clone();
+                    } else {
+                        self.result.count += recipe.result.count;
+                    }
+                    let mut left = self.container[0].clone();
+                    left.count -= 1;
+                    self.container[0] = normalize(left);
+                    state.pending_experience += recipe.experience;
+                    state.cook = 0;
+                    state.cook_total = 0;
+                }
+            } else {
+                state.cook = 0;
+                state.cook_total = 0;
+            }
+        } else {
+            state.cook = 0;
+            state.cook_total = 0;
+        }
+        self.furnace = Some(state);
     }
 
     /// The stack in a menu slot.
@@ -463,7 +707,10 @@ impl Menu {
         match self.slots[slot].rule {
             Rule::Plain => true,
             Rule::Armor(name) => equipment_slot(stack) == name,
-            Rule::Result => false,
+            Rule::Result | Rule::Output => false,
+            // Vanilla furnace input and fuel slots accept any stack; the recipe and fuel checks
+            // happen when the block ticks, as in `AbstractFurnaceBlockEntity`.
+            Rule::FurnaceInput | Rule::Fuel => true,
         }
     }
 
@@ -498,7 +745,7 @@ impl Menu {
 
     /// `Slot.remove`; a `ResultContainer` always gives up its whole stack.
     fn remove(&mut self, p: &mut Clicker, slot: usize, amount: i32) -> ItemStack {
-        if self.slots[slot].store == Store::Result {
+        if self.slots[slot].rule == Rule::Result {
             return std::mem::take(&mut self.result);
         }
         let mut stack = self.stack(p, slot);
@@ -577,6 +824,13 @@ impl Menu {
     /// `Slot.onTake`; for a `ResultSlot` this consumes one of each ingredient and leaves the
     /// crafting remainders (vanilla `ResultSlot.onTake`).
     fn on_take(&mut self, p: &mut Clicker, slot: usize) {
+        if self.slots[slot].rule == Rule::Output {
+            if let Some(furnace) = &mut self.furnace {
+                p.xp += furnace.pending_experience;
+                furnace.pending_experience = 0.0;
+            }
+            return;
+        }
         if self.slots[slot].rule != Rule::Result {
             return;
         }
@@ -989,6 +1243,20 @@ impl Menu {
                     self.move_item_stack_to(p, &mut stack, 0, size, false)
                 }
             }
+            MenuKind::Furnace(kind) => {
+                if i == 2 {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, true)
+                } else if i >= 3 {
+                    // Vanilla `AbstractFurnaceMenu.quickMoveStack`: input first when the item can
+                    // be smelted, otherwise the fuel slot when it burns.
+                    let cookable = p.crafter.cook(kind, &original).is_some();
+                    let fuel = p.crafter.burn_time(&original) > 0;
+                    (cookable && self.move_item_stack_to(p, &mut stack, 0, 1, false))
+                        || (fuel && self.move_item_stack_to(p, &mut stack, 1, 2, false))
+                } else {
+                    self.move_item_stack_to(p, &mut stack, 3, 39, false)
+                }
+            }
         };
         if !moved {
             return ItemStack::empty();
@@ -1081,6 +1349,20 @@ impl Menu {
             self.remote_carried = Remote::Known(self.carried.clone());
             out.push(Sync::Carried(self.carried.clone()));
         }
+        for (id, &value) in self.data.iter().enumerate() {
+            if self.remote_data.get(id).copied() == Some(value) {
+                continue;
+            }
+            if id >= self.remote_data.len() {
+                self.remote_data.resize(id + 1, i32::MIN);
+            }
+            self.remote_data[id] = value;
+            out.push(Sync::Data {
+                container_id: self.container_id,
+                id: id as i16,
+                value: value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            });
+        }
         out
     }
 
@@ -1104,6 +1386,13 @@ impl Menu {
             *remote = Remote::Known(stack.clone());
         }
     }
+
+    /// Vanilla `AnvilMenu.setItemName`: records a renamed item. Only an anvil menu uses it.
+    pub fn rename(&mut self, _name: String) {}
+
+    /// Vanilla `AbstractContainerMenu.clickMenuButton`: an enchant choice, stonecutter recipe or
+    /// loom pattern. Only the menus that have buttons react.
+    pub fn button_click(&mut self, _button: i32) {}
 
     /// Vanilla `transferState`: adopts what the client was last sent for the inventory slots
     /// `other` shares with this menu, so returning to this menu only sends real changes.

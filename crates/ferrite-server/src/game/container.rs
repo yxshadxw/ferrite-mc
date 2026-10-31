@@ -6,11 +6,13 @@ use ferrite_inventory::{ClickInput, Clicker, Crafter, Menu, PlayerInventory, Syn
 use ferrite_item::{HashedSlot, ItemStack};
 use ferrite_protocol::VarInt;
 use ferrite_protocol::packets::play::{
-    ClientboundContainerClose, ContainerClick, ContainerContent, ContainerSlot, CreativeSlot,
-    OpenScreen, SetCursorItem,
+    ClientboundContainerClose, ContainerButtonClick, ContainerClick, ContainerContent,
+    ContainerSetData, ContainerSlot, CreativeSlot, OpenScreen, SetCursorItem,
 };
 
+use super::anvil::AnvilChunkSource;
 use super::block_container::{self, Opened};
+use super::furnace;
 use super::region::{Player, send};
 
 /// The player's menus: the inventory menu (container 0) and the open container, if any.
@@ -37,6 +39,17 @@ pub enum OpenAt {
     Table([i32; 3]),
     /// A chest, trapped chest or barrel, whose items live in its block entities.
     Inventory(Opened),
+    /// A furnace, blast furnace or smoker, whose items and timers live in its block entity.
+    Furnace([i32; 3]),
+}
+
+/// The block name at a position (vanilla `Level.getBlockState`).
+fn block_name(source: &AnvilChunkSource, [x, y, z]: [i32; 3]) -> Option<&'static str> {
+    source
+        .block(x, y, z)
+        .and_then(|state| u16::try_from(state).ok())
+        .and_then(ferrite_data::blocks::state)
+        .map(|(name, _)| name)
 }
 
 impl Default for Containers {
@@ -103,6 +116,18 @@ fn emit(player: &Player, out: Vec<Sync>) {
                 },
             ),
             Sync::Carried(item) => send(player, &SetCursorItem { item }),
+            Sync::Data {
+                container_id,
+                id,
+                value,
+            } => send(
+                player,
+                &ContainerSetData {
+                    window: VarInt(container_id),
+                    id,
+                    value,
+                },
+            ),
         }
     }
 }
@@ -128,6 +153,9 @@ impl Player {
     /// open menu closes if it is no longer valid.
     pub fn tick_containers(&mut self) {
         self.load_shared_contents();
+        // Vanilla ticks the furnace block entity even without a viewer; this server advances the
+        // open menu, which owns the same items and timers while it is open.
+        self.menus.current().tick(crafter());
         let out = self.menus.current().broadcast_changes(&self.inventory);
         emit(self, out);
         if !self.container_still_valid() {
@@ -152,6 +180,12 @@ impl Player {
             Some(OpenAt::Inventory(opened)) => {
                 block_container::still_there(source, opened)
                     && opened.parts.iter().all(|&pos| self.within_reach(pos))
+            }
+            Some(OpenAt::Furnace([x, y, z])) => {
+                block_name(source, [*x, *y, *z])
+                    .and_then(furnace::kind)
+                    .is_some()
+                    && self.within_reach([*x, *y, *z])
             }
         }
     }
@@ -235,7 +269,53 @@ impl Player {
             block_container::store(source, opened, menu.container());
         }
         self.menus.thrown.extend(drops);
+        let xp = clicker.xp;
         emit(self, out);
+        if xp > 0.0 {
+            self.add_experience(xp);
+        }
+    }
+
+    /// Vanilla `ServerPlayer.handleRenameItem`: only an anvil menu accepts a rename, and the name
+    /// is limited to 50 characters.
+    pub fn rename_item(&mut self, name: String) {
+        let Some(menu) = self.menus.open.as_mut() else {
+            return;
+        };
+        menu.rename(name.chars().take(50).collect());
+    }
+
+    /// Vanilla `ServerPlayer.handleContainerButtonClick`: enchant choices, stonecutter recipes
+    /// and loom patterns all arrive as button clicks on the open menu.
+    pub fn handle_container_button(&mut self, p: ContainerButtonClick) {
+        let Some(menu) = self
+            .menus
+            .open
+            .as_mut()
+            .filter(|menu| menu.container_id() == p.window.0)
+        else {
+            return;
+        };
+        menu.button_click(p.button.0);
+    }
+
+    /// Writes an open station menu's items and timers back to its block entity.
+    fn save_station(&mut self) {
+        let Some(at) = self.menus.open_at.clone() else {
+            return;
+        };
+        let (Some(menu), Some(source)) = (self.menus.open.as_ref(), self.source.as_ref()) else {
+            return;
+        };
+        if let OpenAt::Furnace(pos) = at
+            && let Some(kind) = block_name(source, pos).and_then(furnace::kind)
+        {
+            let data = furnace::FurnaceData {
+                items: menu.container().to_vec(),
+                state: menu.furnace_state().cloned().unwrap_or_default(),
+            };
+            furnace::store(source, pos, kind, &data);
+        }
     }
 
     /// Copies a shared container's current items into the open menu.
@@ -253,6 +333,7 @@ impl Player {
     /// Vanilla `doCloseContainer`: the open menu (or the inventory screen's grid and cursor)
     /// returns its items, and the inventory menu takes over what the client was shown.
     pub fn close_container(&mut self) {
+        self.save_station();
         let infinite = self.infinite_materials();
         let mut clicker = Clicker::new(&mut self.inventory, infinite, crafter());
         self.menus.open_at = None;
@@ -290,9 +371,11 @@ impl Player {
             },
         );
         let full = menu.broadcast_full_state(&self.inventory);
+        // Container data (furnace lit/progress, anvil cost, ...) follows the contents.
+        let data = menu.broadcast_changes(&self.inventory);
         self.menus.open = Some(menu);
         self.menus.open_at = at;
-        emit(self, vec![full]);
+        emit(self, std::iter::once(full).chain(data).collect());
     }
 
     /// Vanilla `useWithoutItem` of blocks with a menu: a crafting table opens `CraftingMenu`
@@ -315,6 +398,21 @@ impl Player {
                 Menu::crafting,
                 "container.crafting",
                 Some(OpenAt::Table([pos.x, pos.y, pos.z])),
+            );
+            return true;
+        }
+        if let Some(kind) = block_name(&source, [pos.x, pos.y, pos.z]).and_then(furnace::kind) {
+            let furnace::FurnaceData { items, state } =
+                furnace::load(&source, [pos.x, pos.y, pos.z]);
+            self.open_menu(
+                |id| {
+                    let mut menu = Menu::furnace(id, kind);
+                    menu.container_mut().clone_from_slice(&items);
+                    menu.set_furnace_state(state);
+                    menu
+                },
+                kind.title(),
+                Some(OpenAt::Furnace([pos.x, pos.y, pos.z])),
             );
             return true;
         }

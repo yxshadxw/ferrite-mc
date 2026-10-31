@@ -62,6 +62,7 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
 }
 mod fire;
 mod fluid;
+mod furnace;
 mod global;
 mod gravity;
 mod neighbors;
