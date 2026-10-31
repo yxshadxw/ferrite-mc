@@ -1,3 +1,4 @@
+use ferrite_command::gamerule::GameRules;
 use ferrite_nbt::{List, Tag, binary};
 use ferrite_world::{
     BlockStateRegistry, Chunk, LightData, LightSection, RegionFile, RuntimeRegistry,
@@ -198,6 +199,61 @@ impl AnvilChunkSource {
             flush_lock: tokio::sync::Mutex::new(()),
             flat: Mutex::new(HashMap::new()),
         })
+    }
+    /// The 26.3 world data file that stores the live game rule values.
+    pub(super) fn game_rules_path(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|path| path.join("data/minecraft/game_rules.dat"))
+    }
+
+    /// Reads the persisted rules, falling back to the pre-26.3 `Data.GameRules`
+    /// compound in `level.dat` for worlds created by older versions.
+    pub(super) fn load_game_rules(&self) -> Option<GameRules> {
+        if let Some(path) = self.game_rules_path()
+            && let Ok(bytes) = std::fs::read(&path)
+            && let Ok((_, tag)) = binary::read_compressed(&bytes, binary::Compression::Gzip)
+            && let Some(rules) = GameRules::from_nbt(&tag)
+        {
+            return Some(rules);
+        }
+        let bytes = std::fs::read(self.path.as_ref()?.join("level.dat")).ok()?;
+        let (_, tag) = binary::read_compressed(&bytes, binary::Compression::Gzip).ok()?;
+        GameRules::from_level_dat(&tag)
+    }
+
+    /// Writes `data/minecraft/game_rules.dat`, stamped with `level.dat`'s `DataVersion`
+    /// like a vanilla save.
+    pub(super) fn save_game_rules(&self, rules: &GameRules) -> anyhow::Result<()> {
+        let Some(path) = self.game_rules_path() else {
+            return Ok(());
+        };
+        let data_version = self
+            .data_version()
+            .unwrap_or(ferrite_command::gamerule::DATA_VERSION);
+        let tag = rules.to_nbt(data_version);
+        let bytes = binary::write_compressed("", &tag, binary::Compression::Gzip)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn data_version(&self) -> Option<i32> {
+        let bytes = std::fs::read(self.path.as_ref()?.join("level.dat")).ok()?;
+        let (_, Tag::Compound(root)) =
+            binary::read_compressed(&bytes, binary::Compression::Gzip).ok()?
+        else {
+            return None;
+        };
+        let Tag::Compound(data) = root.get("Data")? else {
+            return None;
+        };
+        match data.get("DataVersion") {
+            Some(Tag::Int(version)) => Some(*version),
+            _ => None,
+        }
     }
     pub fn modified_packet(&self, x: i32, z: i32) -> Option<Vec<u8>> {
         self.cache
