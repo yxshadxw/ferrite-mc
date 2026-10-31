@@ -58,6 +58,11 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                 return entries.computeIfAbsent(key, k -> (org.bukkit.inventory.ItemType) java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[]{org.bukkit.inventory.ItemType.Typed.class}, (proxy, method, args) -> switch (method.getName()) {
                     case "getKey", "key" -> k;
                     case "typed" -> proxy;
+                    case "asMaterial" -> material;
+                    case "hasBlockType" -> contains("block", k);
+                    case "getBlockType" -> org.bukkit.Registry.BLOCK.get(k);
+                    case "getMaxStackSize" -> 64;
+                    case "getTranslationKey" -> "item." + k.getNamespace() + "." + k.getKey();
                     case "createItemStack" -> new FerriteItemStack(material, args == null || args.length == 0 ? 1 : (int) args[0]);
                     case "hashCode" -> k.hashCode();
                     case "equals" -> proxy == args[0];
@@ -78,6 +83,8 @@ public final class FerriteRegistryAccess implements io.papermc.paper.registry.Re
                     case "getKey", "key" -> key;
                     case "typed" -> proxy;
                     case "asMaterial" -> material;
+                    case "createBlockData" -> FerriteBlockData.create(key.toString());
+                    case "getTranslationKey" -> "block." + key.getNamespace() + "." + key.getKey();
                     case "isAir" -> key.getKey().equals("air") || key.getKey().equals("cave_air") || key.getKey().equals("void_air");
                     case "hasItemType" -> contains("item", key);
                     case "getItemType" -> org.bukkit.Registry.ITEM.get(key);

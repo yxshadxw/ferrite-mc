@@ -171,4 +171,77 @@ public class FerriteServer extends ServerStubs {
     @Override public String getMinecraftVersion() { return "26.3"; }
     @Override public java.util.logging.Logger getLogger() { return java.util.logging.Logger.getLogger("Ferrite"); }
     @Override public java.util.Collection<? extends org.bukkit.entity.Player> getOnlinePlayers() { return java.util.List.copyOf(players.values()); }
+
+    // ---- runtime surface used by plugins at enable time -------------------------------------
+    private final FerriteUnsafe unsafe = new FerriteUnsafe();
+    @Override public org.bukkit.UnsafeValues getUnsafe() { return unsafe; }
+    @SuppressWarnings("unchecked")
+    @Override public <T extends org.bukkit.Keyed> org.bukkit.Registry<T> getRegistry(Class<T> type) {
+        java.util.Objects.requireNonNull(type, "type");
+        var access = io.papermc.paper.registry.RegistryAccess.registryAccess();
+        if (type == org.bukkit.block.BlockType.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.BLOCK);
+        if (type == org.bukkit.inventory.ItemType.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.ITEM);
+        if (type == org.bukkit.enchantments.Enchantment.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.ENCHANTMENT);
+        if (type == org.bukkit.potion.PotionEffectType.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.MOB_EFFECT);
+        if (type == org.bukkit.attribute.Attribute.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.ATTRIBUTE);
+        if (type == org.bukkit.Sound.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.SOUND_EVENT);
+        if (type == org.bukkit.block.Biome.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.BIOME);
+        if (type == org.bukkit.inventory.MenuType.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.MENU);
+        if (type == org.bukkit.entity.EntityType.class) return (org.bukkit.Registry<T>) access.getRegistry(io.papermc.paper.registry.RegistryKey.ENTITY_TYPE);
+        return access.getRegistry(type);
+    }
+    @Override public org.bukkit.block.data.BlockData createBlockData(String data) { return FerriteBlockData.create(data); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material) { return FerriteBlockData.create(material); }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, String data) {
+        java.util.Objects.requireNonNull(material, "material");
+        if (data != null && !data.isEmpty()) throw new UnsupportedOperationException("Ferrite: block-state properties are owned by the Rust server: " + data);
+        return FerriteBlockData.create(material);
+    }
+    @Override public org.bukkit.block.data.BlockData createBlockData(org.bukkit.Material material, java.util.function.Consumer<? super org.bukkit.block.data.BlockData> consumer) {
+        var data = FerriteBlockData.create(material);
+        consumer.accept(data);
+        return data;
+    }
+    @Override public int getCurrentTick() { return (int) Native.currentTick(); }
+    private static final double[] NOMINAL_TPS = {20.0, 20.0, 20.0};
+    /** Nominal until per-region tick metrics are exposed to the bridge (see docs/BACKLOG.md). */
+    @Override public double[] getTPS() { return NOMINAL_TPS.clone(); }
+    @Override public double getAverageTickTime() { return 50.0; }
+    @Override public long[] getTickTimes() { return new long[100]; }
+    private volatile boolean stopping;
+    void markStopping() { stopping = true; }
+    @Override public boolean isStopping() { return stopping; }
+    private org.bukkit.GameMode defaultGameMode = org.bukkit.GameMode.SURVIVAL;
+    @Override public org.bukkit.GameMode getDefaultGameMode() { return defaultGameMode; }
+    @Override public void setDefaultGameMode(org.bukkit.GameMode mode) { defaultGameMode = java.util.Objects.requireNonNull(mode, "mode"); }
+    @Override public org.bukkit.entity.Entity getEntity(java.util.UUID id) { return players.get(id); }
+    @Override public java.util.List<org.bukkit.entity.Player> matchPlayer(String name) {
+        var player = getPlayer(name);
+        return player == null ? java.util.List.of() : java.util.List.of(player);
+    }
+    @Override public String getIp() { return "0.0.0.0"; }
+    @Override public java.io.File getWorldContainer() { return new java.io.File("."); }
+    @Override public java.io.File getPluginsFolder() { return new java.io.File("plugins"); }
+    @Override public String getUpdateFolder() { return "update"; }
+    @Override public java.io.File getUpdateFolderFile() { return new java.io.File("update"); }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getWhitelistedPlayers() { return java.util.Set.of(); }
+    @Override public java.util.Set<org.bukkit.OfflinePlayer> getBannedPlayers() { return java.util.Set.of(); }
+    private int spawnRadius;
+    @Override public int getSpawnRadius() { return spawnRadius; }
+    @Override public void setSpawnRadius(int radius) { if (radius < 0) throw new IllegalArgumentException("radius"); spawnRadius = radius; }
+    @Override public int getSimulationDistance() { return settings.viewDistance(); }
+    @Override public int getMaxWorldSize() { return 29999984; }
+    @Override public boolean getAllowFlight() { return false; }
+    @Override public boolean getAllowNether() { return true; }
+    @Override public boolean getAllowEnd() { return true; }
+    @Override public String getWorldType() { return "normal"; }
+    @Override public boolean getGenerateStructures() { return true; }
+    @Override public boolean isHardcore() { return false; }
+    @Override public java.util.UUID getPlayerUniqueId(String name) { var player = getPlayerExact(name); return player == null ? null : player.getUniqueId(); }
+    @Override public org.bukkit.OfflinePlayer getOfflinePlayerIfCached(String name) {
+        var player = getPlayerExact(name);
+        if (player != null) return player;
+        var id = offlineIds.get(name.toLowerCase(java.util.Locale.ROOT));
+        return id == null ? null : offline(id, name);
+    }
 }
