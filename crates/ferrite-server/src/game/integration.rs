@@ -2780,6 +2780,215 @@ async fn setblock_command_updates_block_for_tracking_player() {
     server.abort();
 }
 
+fn block_state(name: &str, props: &[(&str, &str)]) -> u32 {
+    u32::from(
+        ferrite_data::blocks::state_id(name, props)
+            .unwrap_or_else(|| panic!("vanilla state {name} {props:?}")),
+    )
+}
+
+/// A fixture-world copy with a stone floor at y=63, clear air above it, and the given block
+/// states, served with a creative bot.
+async fn redstone_fixture(
+    states: &[([i32; 3], u32)],
+) -> (
+    World,
+    tempfile::TempDir,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vanilla/26.3");
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        root.join("fixture-world/world/dimensions/minecraft/overworld/region/r.0.0.mca"),
+        dir.join("r.0.0.mca"),
+    )
+    .unwrap();
+    let registry = ferrite_world::RuntimeRegistry::load(root.join("generated")).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(temp.path().to_path_buf(), registry);
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let stone = block_state("minecraft:stone", &[]);
+    let air = block_state("minecraft:air", &[]);
+    // Stay inside chunk (0, 0), the only chunk loaded by the fixture source here.
+    for x in 0..=3 {
+        for z in 0..=2 {
+            source.set_block(x, 63, z, stone).unwrap();
+            for y in 64..=66 {
+                source.set_block(x, y, z, air).unwrap();
+            }
+        }
+    }
+    for (pos, state) in states {
+        source.set_block(pos[0], pos[1], pos[2], *state).unwrap();
+    }
+    let (world, addr, server) = op_world(Some(source), 1, &["RedstoneBot"]).await;
+    (world, temp, addr, server)
+}
+
+async fn click_block(bot: &mut Bot, pos: [i32; 3]) {
+    use ferrite_protocol::{
+        VarInt,
+        packets::play::{MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    bot.send(&MoveRotation {
+        yaw: 0.0,
+        pitch: 90.0,
+        flags: 1,
+    })
+    .await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(pos[0], pos[1], pos[2]).pack(),
+        face: VarInt(1),
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+}
+
+async fn wait_for_lamp(bot: &mut Bot, pos: [i32; 3], next: u32) {
+    use ferrite_protocol::{packets::play::BlockUpdate, types::BlockPos};
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let body = bot.until(8).await;
+            let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+            let found = BlockPos::unpack(update.location);
+            if (found.x, found.y, found.z) == (pos[0], pos[1], pos[2])
+                && update.block_state.0 == i32::try_from(next).unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("expected the lamp block update");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_lever_lights_lamp_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        (
+            [1, 64, 0],
+            block_state("minecraft:redstone_wire", &[("power", "0")]),
+        ),
+        (
+            [2, 64, 0],
+            block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 0],
+        block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+    )
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_repeater_delay_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        (
+            [1, 64, 0],
+            block_state(
+                "minecraft:repeater",
+                &[("facing", "east"), ("delay", "4"), ("powered", "false")],
+            ),
+        ),
+        (
+            [2, 64, 0],
+            block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    let start = std::time::Instant::now();
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 0],
+        block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "repeater switched after {elapsed:?}, before its 8-tick delay"
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redstone_torch_inverter_for_bot_on_fixture_world() {
+    let lever = block_state(
+        "minecraft:lever",
+        &[("face", "floor"), ("facing", "north"), ("powered", "false")],
+    );
+    let (world, temp, addr, server) = redstone_fixture(&[
+        ([0, 64, 0], lever),
+        ([1, 64, 0], block_state("minecraft:stone", &[])),
+        (
+            [2, 64, 0],
+            block_state(
+                "minecraft:redstone_wall_torch",
+                &[("facing", "east"), ("lit", "true")],
+            ),
+        ),
+        (
+            [2, 64, 1],
+            block_state("minecraft:redstone_lamp", &[("lit", "true")]),
+        ),
+    ])
+    .await;
+    let mut bot = Bot::join(addr, "RedstoneBot").await;
+    bot.until(46).await;
+    click_block(&mut bot, [0, 64, 0]).await;
+    wait_for_lamp(
+        &mut bot,
+        [2, 64, 1],
+        block_state("minecraft:redstone_lamp", &[("lit", "false")]),
+    )
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    drop(temp);
+}
+
 /// A bot that stops reading must be disconnected as timed out, and its blocked writer must not
 /// slow down the region ticks or the other players' connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

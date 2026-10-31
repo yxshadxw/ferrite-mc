@@ -217,6 +217,7 @@ pub struct Region {
     random_ticks: super::random_tick::RandomTicks,
     updates: super::neighbors::Updates,
     gravity: super::gravity::Gravity,
+    redstone: super::redstone::Redstone,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -233,6 +234,7 @@ impl RegionData for Region {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
         self.gravity.merge(other.gravity);
+        self.redstone.merge(other.redstone);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -255,6 +257,9 @@ impl RegionData for Region {
             random_ticks: super::random_tick::RandomTicks::default(),
             updates: super::neighbors::Updates::default(),
             gravity: self.gravity.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            redstone: self.redstone.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
             held_chunks: HashMap::new(),
@@ -539,8 +544,20 @@ impl Player {
                 }
             }
         }
+        // Vanilla gives levers and buttons an outline shape; the generated block-state report
+        // only models collision, so hand-activated components would be unselectable. Give them
+        // a full-cell outline, but still let a nearer collision block occlude the ray.
+        let outline = source
+            .block(target.x, target.y, target.z)
+            .and_then(|v| u16::try_from(v).ok())
+            .is_some_and(|state| super::redstone::use_block(state).is_some());
+        let outline_box = [AABB::new(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)];
         raycast(eye, look, distance, |p| {
-            shapes.get(&(p.x, p.y, p.z)).map(Vec::as_slice)
+            if outline && (p.x, p.y, p.z) == (target.x, target.y, target.z) {
+                Some(&outline_box[..])
+            } else {
+                shapes.get(&(p.x, p.y, p.z)).map(Vec::as_slice)
+            }
         })
         .filter(|hit| (hit.pos.x, hit.pos.y, hit.pos.z) == (target.x, target.y, target.z))
     }
@@ -632,6 +649,14 @@ impl Player {
         else {
             return;
         };
+        // Vanilla `LeverBlock.use` / `ButtonBlock.use`: a right-click toggles the component
+        // instead of placing the held item.
+        if let Some(next) = super::redstone::use_block(clicked_state) {
+            if self.change_block(p.location, Some(u32::from(clicked_state)), u32::from(next)) {
+                self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+            }
+            return;
+        }
         // Vanilla `FlintAndSteelItem.useOn` on TNT: prime it instead of placing the held item.
         let held = self.inventory.get(self.hand_slot(p.hand.0)).clone();
         if held.name() == Some("minecraft:flint_and_steel")
@@ -1851,16 +1876,37 @@ impl Region {
             deliver(&self.players, ctx, viewer, &bytes);
         }
     }
+    /// Spawns primed TNT at a block position (vanilla `PrimedTnt` entity).
+    fn spawn_tnt(&mut self, pos: [i32; 3], fuse: i32) {
+        let center = ferrite_math::Vec3::new(
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]),
+            f64::from(pos[2]) + 0.5,
+        );
+        self.entities
+            .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
+    }
+
     /// Spawns the TNT a player lit (vanilla `PrimedTnt` at the block position).
     fn spawn_primed_tnt(&mut self, p: &mut Player) {
         for (pos, fuse) in p.primed_tnt.drain(..) {
-            let center = ferrite_math::Vec3::new(
-                f64::from(pos[0]) + 0.5,
-                f64::from(pos[1]),
-                f64::from(pos[2]) + 0.5,
-            );
-            self.entities
-                .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
+            self.spawn_tnt(pos, fuse);
+        }
+    }
+
+    /// Ticks the region's redstone network after this tick's block changes, mirroring
+    /// `Level.tickBlockEntities` + `Level.tickBlocks` + scheduled block ticks.
+    fn tick_redstone(&mut self, ctx: &TickContext, changed: &[[i32; 3]]) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let players: Vec<[f64; 3]> = self.players.values().map(|p| p.pos).collect();
+        let mut world =
+            super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        self.redstone.blocks_changed(&mut world, changed);
+        self.redstone.tick(&mut world, &players);
+        for (pos, fuse) in self.redstone.take_primed() {
+            self.spawn_tnt(pos, fuse);
         }
     }
     /// Ticks primed TNT and runs its `Explosion` where a fuse ends.
@@ -2172,6 +2218,7 @@ impl Region {
             self.schedule_gravity(source, &changed);
         }
         self.tick_gravity(ctx);
+        self.tick_redstone(ctx, &changed);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),

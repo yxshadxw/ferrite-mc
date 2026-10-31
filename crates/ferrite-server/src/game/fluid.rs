@@ -5,7 +5,7 @@ use ferrite_region::ChunkPos;
 use std::collections::HashMap;
 
 pub(super) struct RegionFluidWorld<'a> {
-    source: &'a AnvilChunkSource,
+    pub(super) source: &'a AnvilChunkSource,
     held: &'a HashMap<ChunkPos, usize>,
     tracking: &'a Tracking,
 }
