@@ -82,6 +82,10 @@ pub struct EntityData {
     pub item: Option<ItemState>,
     /// Experience-orb state, for `minecraft:experience_orb`.
     pub orb: Option<OrbState>,
+    /// Block state carried by a falling block (vanilla `FallingBlockEntity.blockState`).
+    pub block_state: Option<u16>,
+    /// Remaining fuse ticks of a primed TNT entity (vanilla `PrimedTnt.fuse`).
+    pub fuse: Option<i32>,
     /// Section the entity is listed under in the index.
     cell: Cell,
     /// Region section (chunk coordinates shifted by the store's shift) the entity was in when
@@ -105,6 +109,8 @@ impl EntityData {
             tracker: TrackerState::default(),
             item: None,
             orb: None,
+            block_state: None,
+            fuse: None,
             cell: Cell::new(0, 0, 0),
             home: (0, 0),
         }

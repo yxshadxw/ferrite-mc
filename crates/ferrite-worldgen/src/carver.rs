@@ -353,4 +353,112 @@ mod tests {
             assert_eq!((actual_count, actual_hash), (count, hash), "chunk {x},{z}");
         }
     }
+
+    /// Compiles and runs `tests/java/CarverReference.java` against the local 26.3 server jar,
+    /// then compares all 16 sampled chunk masks. Skips when Java or the jar is unavailable.
+    #[test]
+    fn mask_matches_26_3_java_harness() {
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let default = PathBuf::from("C:/Program Files/Eclipse Adoptium/jdk-25.0.5.8-hotspot");
+        let executable = |home: &Path, name: &str| {
+            home.join("bin").join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_owned()
+            })
+        };
+        let home = if executable(&default, "javac").is_file() {
+            default
+        } else {
+            let Some(home) = std::env::var_os("JAVA_HOME") else {
+                eprintln!("skipping carver differential: Java 25 not found");
+                return;
+            };
+            PathBuf::from(home)
+        };
+        let server = root.join("vanilla/26.3/lib/server-26.3.jar");
+        if !server.is_file() {
+            eprintln!("skipping carver differential: vanilla jar missing");
+            return;
+        }
+        let mut dependencies = vec![server];
+        fn jars(directory: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    jars(&path, out);
+                } else if path.extension().is_some_and(|extension| extension == "jar") {
+                    out.push(path);
+                }
+            }
+        }
+        jars(&root.join("vanilla/26.3/lib/libraries"), &mut dependencies);
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let classpath = dependencies
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(separator);
+        let output = root.join("target/ferrite-worldgen-carver");
+        std::fs::create_dir_all(&output).unwrap();
+        let compile = Command::new(executable(&home, "javac"))
+            .args(["-encoding", "UTF-8", "-cp", &classpath, "-d"])
+            .arg(&output)
+            .arg(root.join("crates/ferrite-worldgen/tests/java/CarverReference.java"))
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "javac: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run_classpath = format!("{}{separator}{classpath}", output.display());
+        for (x, z) in [0, 1, 8, 15]
+            .into_iter()
+            .flat_map(|z| [0, 1, 8, 15].into_iter().map(move |x| (x, z)))
+        {
+            let run = Command::new(executable(&home, "java"))
+                .current_dir(&output)
+                .args(["-cp", &run_classpath, "CarverReference"])
+                .args([x.to_string(), z.to_string()])
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "java {x},{z}: {}\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&run.stdout);
+            let line = stdout
+                .lines()
+                .find(|line| line.contains("MASK "))
+                .unwrap_or_else(|| panic!("no MASK line for chunk {x},{z}: {stdout}"));
+            let mut fields = line
+                .split_whitespace()
+                .skip_while(|field| *field != "MASK")
+                .skip(1);
+            let expected_count: usize = fields.next().unwrap().parse().unwrap();
+            let expected_hash: u64 = fields.next().unwrap().parse().unwrap();
+            let mask = CarveMask::new(-540_760_265, x, z, -64, 384);
+            let mut count = 0usize;
+            let mut hash = 0u64;
+            for (index, set) in mask.bits.iter().enumerate() {
+                if *set {
+                    count += 1;
+                    hash = hash.wrapping_mul(31).wrapping_add(index as u64);
+                }
+            }
+            assert_eq!(
+                (count, hash),
+                (expected_count, expected_hash),
+                "chunk {x},{z}"
+            );
+        }
+    }
 }

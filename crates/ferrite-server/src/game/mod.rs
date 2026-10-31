@@ -1,11 +1,23 @@
 mod anvil;
 pub use anvil::{AnvilChunkSource, read_spawn as load_spawn};
+mod terrain;
+pub use terrain::{Generated, TerrainKind, VanillaTerrain};
 pub mod playerdata;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
     registry: ferrite_world::RuntimeRegistry,
 ) -> Arc<AnvilChunkSource> {
     AnvilChunkSource::new(path, registry)
+}
+pub fn new_anvil_source_with(
+    path: std::path::PathBuf,
+    registry: ferrite_world::RuntimeRegistry,
+    terrain: Option<Arc<VanillaTerrain>>,
+) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_with_terrain(path, registry, terrain)
+}
+pub fn new_memory_source(terrain: Option<Arc<VanillaTerrain>>) -> Arc<AnvilChunkSource> {
+    AnvilChunkSource::new_memory_with_terrain(terrain)
 }
 mod block_container;
 mod chat;
@@ -17,6 +29,8 @@ mod commands_world;
 mod container;
 mod crafting;
 mod drops;
+pub use explosion::{CHARGED_CREEPER_POWER, CREEPER_POWER, TNT_POWER};
+mod explosion;
 mod feedback;
 pub mod interaction;
 mod profile;
@@ -41,6 +55,8 @@ fn valid_move(from: [f64; 3], to: [f64; 3]) -> bool {
 }
 mod fluid;
 mod global;
+mod gravity;
+mod neighbors;
 mod random_tick;
 mod region;
 mod survival;
@@ -145,7 +161,7 @@ impl World {
         spawn: [i32; 3],
         settings: WorldSettings,
     ) -> Self {
-        let flat = source.is_none();
+        let flat = source.as_ref().is_none_or(|source| source.is_flat());
         let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
@@ -503,7 +519,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }

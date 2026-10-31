@@ -18,6 +18,7 @@
 //! owner through that region's task queue.
 
 pub mod experience;
+pub mod falling;
 mod id;
 mod index;
 pub mod item;
@@ -25,6 +26,7 @@ pub mod metadata;
 pub mod physics;
 mod rng;
 mod store;
+pub mod tnt;
 pub mod tracker;
 
 pub use id::{EntityKey, allocate_id, random_uuid};

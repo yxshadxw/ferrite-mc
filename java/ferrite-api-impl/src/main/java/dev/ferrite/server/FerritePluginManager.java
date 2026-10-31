@@ -76,8 +76,23 @@ final class FerritePluginManager extends PluginManagerStubs {
     private final List<JavaPlugin> plugins = new ArrayList<>();
     private final Map<String, FerriteClassLoader> loaders = new java.util.concurrent.ConcurrentHashMap<>();
     FerritePluginManager(FerriteServer server) { this.server = server; }
+    @Override public void enablePlugin(Plugin plugin) {
+        java.util.Objects.requireNonNull(plugin, "plugin");
+        if (!(plugin instanceof JavaPlugin javaPlugin) || !plugins.contains(javaPlugin)) throw new IllegalArgumentException("Plugin is not loaded: " + plugin.getName());
+        if (!plugin.isEnabled()) javaPlugin.setEnabled(true);
+    }
+    @Override public void disablePlugin(Plugin plugin) {
+        java.util.Objects.requireNonNull(plugin, "plugin");
+        if (!(plugin instanceof JavaPlugin javaPlugin) || !plugins.contains(javaPlugin)) throw new IllegalArgumentException("Plugin is not loaded: " + plugin.getName());
+        if (!plugin.isEnabled()) return;
+        javaPlugin.setEnabled(false);
+        server.scheduler.cancelTasks(plugin); server.regionScheduler.cancelTasks(plugin); server.asyncScheduler.cancelTasks(plugin); server.entitySchedulers.cancelTasks(plugin);
+    }
+    @Override public void clearPlugins() { disablePlugins(); }
+    @Override public boolean useTimings() { return false; }
     void loadOrdered(String[] files, boolean[] modes) {
         if (modes != null && modes.length != files.length) throw new IllegalArgumentException("Plugin mode count mismatch");
+        if (server.pluginsFolder == null && files.length > 0) server.pluginsFolder = new File(files[0]).getAbsoluteFile().getParent();
         try {
             for (int index = 0; index < files.length; index++) {
                 String path = files[index];

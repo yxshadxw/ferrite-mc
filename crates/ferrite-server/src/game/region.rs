@@ -123,6 +123,25 @@ pub(super) struct TickBlocks<'a> {
     source: Option<&'a super::anvil::AnvilChunkSource>,
     seen: std::cell::RefCell<HashMap<(i32, i32, i32), Option<u16>>>,
 }
+/// Physics reads through the tick's memoized block getter; placements write through the
+/// region's fluid world, so tracking players get the `block_update`.
+struct FallingAdapter<'a> {
+    read: &'a TickBlocks<'a>,
+    world: super::fluid::RegionFluidWorld<'a>,
+}
+
+impl BlockGetter for FallingAdapter<'_> {
+    fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        self.read.block_state(x, y, z)
+    }
+}
+
+impl ferrite_entity::falling::FallingWorld for FallingAdapter<'_> {
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u16) {
+        ferrite_fluid::FluidWorld::set_block(&mut self.world, x, y, z, u32::from(state));
+    }
+}
+
 impl BlockGetter for TickBlocks<'_> {
     fn block_state(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let source = self.source?;
@@ -144,6 +163,10 @@ pub struct Player {
     pub entity: i32,
     /// Blocks this player broke in survival this tick, with their previous state.
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
+    /// Blocks this player placed or broke this tick, for neighbor updates.
+    pub changed_blocks: Vec<[i32; 3]>,
+    /// TNT this player primed this tick, with the fuse length; spawned as `PrimedTnt`.
+    pub primed_tnt: Vec<([i32; 3], i32)>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -192,6 +215,8 @@ pub struct Region {
     generator: FlatGenerator,
     fluid_ticks: ferrite_fluid::FluidTicks,
     random_ticks: super::random_tick::RandomTicks,
+    updates: super::neighbors::Updates,
+    gravity: super::gravity::Gravity,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -207,6 +232,7 @@ impl RegionData for Region {
         for (chunk, count) in other.held_chunks {
             *self.held_chunks.entry(chunk).or_default() += count;
         }
+        self.gravity.merge(other.gravity);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.generator.merge(other.generator);
@@ -227,6 +253,10 @@ impl RegionData for Region {
             generator: self.generator.split(sections),
             fluid_ticks: ferrite_fluid::FluidTicks::default(),
             random_ticks: super::random_tick::RandomTicks::default(),
+            updates: super::neighbors::Updates::default(),
+            gravity: self.gravity.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -567,9 +597,10 @@ impl Player {
         if !self.change_block(location, Some(state), 0) {
             return false;
         }
+        let pos = ferrite_protocol::types::BlockPos::unpack(location);
+        let pos = [pos.x, pos.y, pos.z];
+        self.changed_blocks.push(pos);
         if let Some(source) = &self.source {
-            let pos = ferrite_protocol::types::BlockPos::unpack(location);
-            let pos = [pos.x, pos.y, pos.z];
             for stack in super::block_container::take_contents(source, pos, state) {
                 self.menus.spilled.push((pos, stack));
             }
@@ -601,6 +632,19 @@ impl Player {
         else {
             return;
         };
+        // Vanilla `FlintAndSteelItem.useOn` on TNT: prime it instead of placing the held item.
+        let held = self.inventory.get(self.hand_slot(p.hand.0)).clone();
+        if held.name() == Some("minecraft:flint_and_steel")
+            && ferrite_data::blocks::state(clicked_state)
+                .is_some_and(|(name, _)| name == "minecraft:tnt")
+        {
+            if self.change_block(p.location, Some(u32::from(clicked_state)), 0) {
+                self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+                self.primed_tnt
+                    .push(([clicked.x, clicked.y, clicked.z], ferrite_entity::tnt::FUSE));
+            }
+            return;
+        }
         let face = ferrite_math::Direction::ALL[p.face.0 as usize];
         let (dx, dy, dz) = if ferrite_data::block_props::get(clicked_state).replaceable {
             (0, 0, 0)
@@ -635,6 +679,11 @@ impl Player {
             };
             state
         };
+        // Vanilla `BlockItem.place` -> `BlockPlaceContext.canPlace` -> `canSurvive`.
+        if !super::neighbors::can_survive(state, [target.x, target.y, target.z], source.as_ref()) {
+            self.send_block_snapshot(target.pack());
+            return;
+        }
         if !self.plugin_allows(|plugins| {
             plugins.block_placed(
                 self.uuid,
@@ -676,6 +725,9 @@ impl Player {
         }
         let placed = self.change_block(target.pack(), Some(u32::from(old)), u32::from(state));
         drop(positions);
+        if placed {
+            self.changed_blocks.push([target.x, target.y, target.z]);
+        }
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
         if placed && self.gamemode == 0 {
@@ -1642,6 +1694,123 @@ impl Region {
         let mut world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, tracking);
         self.fluid_ticks.advance(&mut world);
     }
+    /// Runs the neighbor updates of this tick's block changes (vanilla
+    /// `Level.markAndNotifyBlock` -> `Block.updateNeighbourShapes`). Unsupported blocks break
+    /// here; their loot drops as item entities through the normal loot tables.
+    fn tick_block_updates(&mut self, ctx: &TickContext) -> Vec<[i32; 3]> {
+        let mut changed = Vec::new();
+        for p in self.players.values_mut() {
+            changed.append(&mut p.changed_blocks);
+        }
+        let Some(source) = ctx.source.as_deref() else {
+            return changed;
+        };
+        for pos in &changed {
+            self.updates.block_changed(*pos);
+        }
+        let mut removed = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut removed);
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+            changed.push(pos);
+        }
+        changed
+    }
+
+    /// Runs the queued shape updates against the region's blocks.
+    fn apply_neighbor_updates(
+        &mut self,
+        source: &super::anvil::AnvilChunkSource,
+        ctx: &TickContext,
+        removed: &mut Vec<([i32; 3], u16)>,
+    ) {
+        let mut world =
+            super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        self.updates.apply(&mut world, removed);
+    }
+
+    /// Drops the loot table of a block broken by a neighbor or gravity update.
+    fn spawn_block_drops(&mut self, pos: [i32; 3], state: u16) {
+        for stack in super::drops::block_drops(state, ItemStack::default(), &mut self.rng) {
+            let record = item::pop_resource(pos, stack, &mut self.rng);
+            self.entities.insert(record);
+        }
+    }
+
+    /// Vanilla `FallingBlock.onPlace`/`neighborChanged`: schedules a free gravity block. The
+    /// changed block and its six neighbors are the blocks vanilla notifies.
+    fn schedule_gravity(&mut self, source: &super::anvil::AnvilChunkSource, changed: &[[i32; 3]]) {
+        for &pos in changed {
+            for (dx, dy, dz) in [
+                (0, 0, 0),
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let target = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+                let chunk = ChunkPos(target[0].div_euclid(16), target[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) = source
+                    .block(target[0], target[1], target[2])
+                    .and_then(|s| u16::try_from(s).ok())
+                else {
+                    continue;
+                };
+                if !super::gravity::is_gravity(state) {
+                    continue;
+                }
+                let below = source
+                    .block(target[0], target[1] - 1, target[2])
+                    .and_then(|s| u16::try_from(s).ok());
+                if super::gravity::is_free(below) {
+                    self.gravity.schedule(target);
+                }
+            }
+        }
+    }
+
+    /// Runs due gravity checks, then the neighbor updates of the blocks they removed.
+    fn tick_gravity(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let removed =
+            self.gravity
+                .tick(source, &self.held_chunks, &ctx.tracking, &mut self.entities);
+        if removed.is_empty() {
+            return;
+        }
+        for pos in &removed {
+            self.updates.block_changed(*pos);
+        }
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+
+    /// Ticks the falling block entities against this region's blocks.
+    fn tick_falling(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let world = super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+        let mut adapter = FallingAdapter {
+            read: &blocks,
+            world,
+        };
+        ferrite_entity::falling::tick_falling_blocks(&mut self.entities, &mut adapter, -64, 320);
+    }
     /// Spawns the loot of the blocks a player broke in survival as item entities.
     fn drop_broken_blocks(&mut self, p: &mut Player) {
         let held = p.inventory.selected_item();
@@ -1712,6 +1881,149 @@ impl Region {
         for (viewer, bytes) in sent {
             deliver(&self.players, ctx, viewer, &bytes);
         }
+    }
+    /// Spawns the TNT a player lit (vanilla `PrimedTnt` at the block position).
+    fn spawn_primed_tnt(&mut self, p: &mut Player) {
+        for (pos, fuse) in p.primed_tnt.drain(..) {
+            let center = ferrite_math::Vec3::new(
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]),
+                f64::from(pos[2]) + 0.5,
+            );
+            self.entities
+                .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
+        }
+    }
+    /// Ticks primed TNT and runs its `Explosion` where a fuse ends.
+    fn tick_tnt(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let centers = ferrite_entity::tnt::tick_tnt(&mut self.entities, &blocks);
+        if centers.is_empty() {
+            return;
+        }
+        for center in centers {
+            self.explode(
+                [center.x, center.y, center.z],
+                super::explosion::TNT_POWER,
+                ctx,
+            );
+        }
+        // Vanilla `Explosion.finalizeExplosion` sets blocks with `Block.UPDATE_NEIGHBORS`.
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+    /// Vanilla `Explosion`: entity knockback and exposure first, then the ray cast blocks and
+    /// their loot-table drops.
+    fn explode(&mut self, center: [f64; 3], power: f32, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        // Players are not in the entity store; vanilla pushes them like any other entity.
+        let hits: Vec<(i32, [f64; 3])> = self
+            .players
+            .values()
+            .filter_map(|p| {
+                let bbox = ferrite_math::AABB::new(
+                    p.pos[0] - 0.3,
+                    p.pos[1],
+                    p.pos[2] - 0.3,
+                    p.pos[0] + 0.3,
+                    p.pos[1] + 1.8,
+                    p.pos[2] + 0.3,
+                );
+                let impulse = super::explosion::impulse(
+                    source,
+                    center,
+                    power,
+                    ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                    bbox,
+                )?;
+                Some((p.entity, impulse))
+            })
+            .collect();
+        for (entity, impulse) in hits {
+            if let Some(p) = self.players.values().find(|p| p.entity == entity) {
+                send(
+                    p,
+                    &SetEntityMotion {
+                        id: VarInt(entity),
+                        velocity: ferrite_protocol::types::LpVec3(impulse),
+                    },
+                );
+            }
+        }
+        // Entity push (vanilla `Entity.push`).
+        let radius = f64::from(power) * 2.0;
+        let area = ferrite_math::AABB::new(
+            center[0] - radius,
+            center[1] - radius,
+            center[2] - radius,
+            center[0] + radius,
+            center[1] + radius,
+            center[2] + radius,
+        );
+        for key in self.entities.query_vec(area) {
+            if self
+                .entities
+                .flags(key)
+                .is_some_and(|flags| flags.has(ferrite_entity::Flags::REMOVED))
+            {
+                continue;
+            }
+            let (Some(pos), Some(bbox)) = (self.entities.pos(key), self.entities.bbox(key)) else {
+                continue;
+            };
+            let Some(impulse) = super::explosion::impulse(source, center, power, pos, bbox) else {
+                continue;
+            };
+            let vel = self.entities.vel(key).unwrap_or_default();
+            self.entities.set_vel(
+                key,
+                ferrite_math::Vec3::new(vel.x + impulse[0], vel.y + impulse[1], vel.z + impulse[2]),
+            );
+            if let Some(flags) = self.entities.flags_mut(key) {
+                flags.set(ferrite_entity::Flags::NEEDS_SYNC, true);
+            }
+        }
+        // Destroyed blocks, with the state read before it turns into air.
+        let air = u32::from(ferrite_data::blocks::default_state("air").expect("vanilla air"));
+        let destroyed;
+        let mut removed = Vec::new();
+        {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            destroyed = super::explosion::explode_blocks(&world, center, power, &mut self.rng);
+            for pos in &destroyed {
+                // Never touch another region's blocks.
+                let chunk = ChunkPos(pos[0].div_euclid(16), pos[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) =
+                    super::neighbors::BlockWorld::block(&world, pos[0], pos[1], pos[2])
+                else {
+                    continue;
+                };
+                ferrite_fluid::FluidWorld::set_block(&mut world, pos[0], pos[1], pos[2], air);
+                removed.push((*pos, state));
+            }
+        }
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+        }
+        for pos in &destroyed {
+            self.updates.block_changed(*pos);
+        }
+        self.schedule_gravity(source, &destroyed);
     }
     /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
     /// entities in front of it. Item entities hold plain stacks for now, so components are not
@@ -1855,6 +2167,7 @@ impl Region {
                 }
             }
             self.spawn_thrown(&mut p);
+            self.spawn_primed_tnt(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -1890,6 +2203,15 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
+        let changed = self.tick_block_updates(ctx);
+        if let Some(source) = ctx.source.as_deref() {
+            self.schedule_gravity(source, &changed);
+        }
+        self.tick_gravity(ctx);
+        let blocks = TickBlocks {
+            source: ctx.source.as_deref(),
+            seen: Default::default(),
+        };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         let alive: Vec<ferrite_math::Vec3> = self
             .players
@@ -1900,6 +2222,8 @@ impl Region {
         experience::tick_orbs(&mut self.entities, &blocks, &alive, &mut self.rng);
         self.pick_up_experience(ctx);
         self.pick_up_items(ctx);
+        self.tick_falling(ctx);
+        self.tick_tnt(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
         }

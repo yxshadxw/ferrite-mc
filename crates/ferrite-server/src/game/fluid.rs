@@ -28,7 +28,7 @@ impl<'a> RegionFluidWorld<'a> {
             0
         }
     }
-    fn owns(&self, x: i32, z: i32) -> bool {
+    pub(super) fn owns(&self, x: i32, z: i32) -> bool {
         self.held
             .contains_key(&ChunkPos(x.div_euclid(16), z.div_euclid(16)))
     }
