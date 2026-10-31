@@ -69,6 +69,15 @@ pub struct ChunkPos(pub i32, pub i32);
 pub struct SectionPos(pub i32, pub i32);
 pub type RegionId = u64;
 
+/// Lifecycle states of Folia ThreadedRegionizer.ThreadedRegion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionState {
+    Ready,
+    Ticking,
+    Transient,
+    Dead,
+}
+
 /// World-owned state. `split` removes and returns data belonging to `sections`.
 pub trait RegionData: Default + Send + 'static {
     fn merge(&mut self, other: Self);
@@ -76,6 +85,9 @@ pub trait RegionData: Default + Send + 'static {
 }
 
 struct Region<D> {
+    state: RegionState,
+    merge_target: Option<RegionId>,
+    merge_from: HashSet<RegionId>,
     sections: HashSet<SectionPos>,
     data: Option<D>,
     next_tick: Instant,
@@ -90,6 +102,9 @@ struct Region<D> {
 impl<D> Region<D> {
     fn new(sections: HashSet<SectionPos>, data: D) -> Self {
         Self {
+            state: RegionState::Ready,
+            merge_target: None,
+            merge_from: HashSet::new(),
             sections,
             data: Some(data),
             next_tick: Instant::now(),
@@ -248,6 +263,8 @@ impl<D: RegionData> Regionizer<D> {
             for neighbor in self.neighborhood(*section) {
                 if let Some(&(_, other)) = self.sections.get(&neighbor)
                     && other != id
+                    && self.regions[&id].merge_target != Some(other)
+                    && self.regions[&other].merge_target != Some(id)
                 {
                     return Err(format!(
                         "{section:?} (region {id}) and {neighbor:?} (region {other}) are \
@@ -587,6 +604,15 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
     pub fn region_count(&self) -> usize {
         self.shared.state.lock().topology.region_count()
     }
+    pub fn region_state(&self, id: RegionId) -> Option<RegionState> {
+        self.shared
+            .state
+            .lock()
+            .topology
+            .regions
+            .get(&id)
+            .map(|r| r.state)
+    }
     pub fn stats(&self, id: RegionId) -> Option<TickStats> {
         self.shared
             .state
@@ -687,7 +713,7 @@ fn route<D: RegionData, G>(s: &mut State<D, G>, chunk: ChunkPos, task: RegionTas
 fn enqueue<D: RegionData, G>(s: &mut State<D, G>, id: RegionId) {
     if let Some(r) = s.topology.regions.get_mut(&id) {
         r.generation += 1;
-        if r.data.is_some() && r.mutations.is_empty() {
+        if r.data.is_some() && r.mutations.is_empty() && r.state == RegionState::Ready {
             s.deadlines
                 .push(Reverse((r.next_tick, r.generation, Some(id))));
         }
@@ -713,6 +739,44 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
     let chunk = mutation.chunk();
     let section = s.topology.section_of(chunk);
     let affected = s.topology.affected(chunk);
+    // Adding a holder to an already-owned section never expands its region.
+    if matches!(mutation, Mutation::Add(_))
+        && s.topology.sections.contains_key(&section)
+        && nearby(s, section).is_empty()
+    {
+        *s.topology.chunks.entry(chunk).or_default() += 1;
+        s.topology.sections.get_mut(&section).unwrap().0 += 1;
+        return;
+    }
+    // ThreadedRegionizer.addChunk / ThreadedRegion.mergeIntoLater: a new
+    // section beside one ticking region receives a transient owner immediately.
+    if matches!(mutation, Mutation::Add(_))
+        && !s.topology.sections.contains_key(&section)
+        && nearby(s, section).is_empty()
+        && affected.len() == 1
+        && let Some(&target) = affected.iter().next()
+        && s.topology.regions[&target].state == RegionState::Ticking
+        && s.topology.regions[&target].mutations.is_empty()
+    {
+        let id = s.topology.next_id;
+        s.topology.next_id += 1;
+        let mut region = Region::new(HashSet::from([section]), D::default());
+        region.state = RegionState::Transient;
+        region.merge_target = Some(target);
+        s.topology.regions.insert(id, region);
+        s.topology
+            .regions
+            .get_mut(&target)
+            .unwrap()
+            .merge_from
+            .insert(id);
+        s.topology.sections.insert(section, (1, id));
+        *s.topology.chunks.entry(chunk).or_default() += 1;
+        if let Some(tasks) = s.parked.remove(&section) {
+            s.topology.regions.get_mut(&id).unwrap().tasks.extend(tasks);
+        }
+        return;
+    }
     if nearby(s, section).is_empty() && affected.iter().all(|&id| is_free(s, id)) {
         apply_topology(s, mutation, &affected);
         return;
@@ -855,7 +919,10 @@ fn worker<D: RegionData, G: Send + 'static>(
                 };
                 let valid = match id {
                     Some(id) => s.topology.regions.get(&id).is_some_and(|r| {
-                        r.generation == generation && r.data.is_some() && r.mutations.is_empty()
+                        r.generation == generation
+                            && r.data.is_some()
+                            && r.mutations.is_empty()
+                            && r.state == RegionState::Ready
                     }),
                     None => s.global.is_some() && generation == s.global_generation,
                 };
@@ -871,6 +938,7 @@ fn worker<D: RegionData, G: Send + 'static>(
                 s.deadlines.pop();
                 break if let Some(id) = id {
                     let r = s.topology.regions.get_mut(&id).unwrap();
+                    r.state = RegionState::Ticking;
                     r.stats.skipped_ticks += advance(&mut r.next_tick, now, &config);
                     Work::Region(id, r.data.take().unwrap(), std::mem::take(&mut r.tasks))
                 } else {
@@ -893,6 +961,7 @@ fn worker<D: RegionData, G: Send + 'static>(
                 let mut s = shared.state.lock();
                 let r = s.topology.regions.get_mut(&id).unwrap();
                 r.data = Some(data);
+                r.state = RegionState::Ready;
                 r.stats.last_mspt = started.elapsed().as_secs_f64() * 1000.0;
                 r.ticks.push_back(now);
                 while r
@@ -909,6 +978,36 @@ fn worker<D: RegionData, G: Send + 'static>(
                     .count() as f64
                     / 5.0;
                 r.stats.tps_1m = r.ticks.len() as f64 / 60.0;
+                // ThreadedRegion.markNotTicking merges transient sources at the safe point.
+                let incoming = std::mem::take(&mut r.merge_from);
+                for source in incoming {
+                    let mut old = s.topology.regions.remove(&source).unwrap();
+                    // Pending removals may have reserved this transient owner.
+                    // Transfer their reservation before refreshing their topology.
+                    for mutation in &old.mutations {
+                        let pending = s.pending.get_mut(mutation).unwrap();
+                        pending.regions.remove(&source);
+                        pending.regions.insert(id);
+                    }
+                    s.topology
+                        .regions
+                        .get_mut(&id)
+                        .unwrap()
+                        .mutations
+                        .append(&mut old.mutations);
+                    for section in &old.sections {
+                        s.topology.sections.get_mut(section).unwrap().1 = id;
+                    }
+                    let destination = s.topology.regions.get_mut(&id).unwrap();
+                    destination.sections.extend(old.sections);
+                    destination
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .merge(old.data.take().unwrap());
+                    destination.tasks.append(&mut old.tasks);
+                }
+                let r = s.topology.regions.get_mut(&id).unwrap();
                 // Post-tick safe point: apply mutations waiting on this region.
                 if let Some(&head) = r.mutations.first() {
                     pump(&mut s, BTreeSet::from([head]));
