@@ -106,6 +106,14 @@ pub struct TickStats {
     pub skipped_ticks: u64,
 }
 
+/// Section counts exposed by Folia ThreadedRegionizer.RegionStats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegionStats {
+    pub nonempty_sections: usize,
+    pub empty_sections: usize,
+    pub dead_sections: usize,
+}
+
 /// Scheduler tuning; `Default` is 20 TPS with one tick of catch-up on all cores.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
@@ -182,6 +190,7 @@ pub struct Regionizer<D: RegionData> {
     sections: HashMap<SectionPos, (usize, RegionId)>,
     regions: HashMap<RegionId, Region<D>>,
     retired: Vec<D>,
+    dead_regions: HashSet<RegionId>,
     next_id: RegionId,
 }
 impl<D: RegionData> Default for Regionizer<D> {
@@ -216,6 +225,7 @@ impl<D: RegionData> Regionizer<D> {
             sections: HashMap::new(),
             regions: HashMap::new(),
             retired: Vec::new(),
+            dead_regions: HashSet::new(),
             next_id: 0,
         }
     }
@@ -227,6 +237,27 @@ impl<D: RegionData> Regionizer<D> {
     }
     pub fn owner(&self, chunk: ChunkPos) -> Option<RegionId> {
         self.sections.get(&self.section_of(chunk)).map(|s| s.1)
+    }
+    pub fn region_stats(&self, id: RegionId) -> Option<RegionStats> {
+        let region = self.regions.get(&id)?;
+        let mut stats = RegionStats::default();
+        for &section in &region.sections {
+            if self.sections[&section].0 > 0 {
+                stats.nonempty_sections += 1;
+            } else {
+                stats.empty_sections += 1;
+                if self.is_dead_section(section) {
+                    stats.dead_sections += 1;
+                }
+            }
+        }
+        Some(stats)
+    }
+    pub fn region_state(&self, id: RegionId) -> Option<RegionState> {
+        self.regions
+            .get(&id)
+            .map(|r| r.state)
+            .or_else(|| self.dead_regions.contains(&id).then_some(RegionState::Dead))
     }
     pub fn data_mut(&mut self, id: RegionId) -> Option<&mut D> {
         self.regions.get_mut(&id)?.data.as_mut()
@@ -398,7 +429,9 @@ impl<D: RegionData> Regionizer<D> {
             id
         };
         for other in neighbors.into_iter().skip(1) {
-            let old = self.regions.remove(&other).unwrap();
+            let mut old = self.regions.remove(&other).unwrap();
+            old.state = RegionState::Dead;
+            self.dead_regions.insert(other);
             for s in &old.sections {
                 self.sections.get_mut(s).unwrap().1 = id;
             }
@@ -487,8 +520,10 @@ impl<D: RegionData> Regionizer<D> {
         self.sections.remove(&section);
         self.regions.get_mut(&id).unwrap().sections.remove(&section);
         if self.regions[&id].sections.is_empty() {
-            self.retired
-                .push(self.regions.remove(&id).unwrap().data.unwrap());
+            let mut region = self.regions.remove(&id).unwrap();
+            region.state = RegionState::Dead;
+            self.dead_regions.insert(id);
+            self.retired.push(region.data.unwrap());
             return true;
         }
         if self.still_connected(id, section) {
@@ -702,13 +737,10 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
             .unwrap_or(0)
     }
     pub fn region_state(&self, id: RegionId) -> Option<RegionState> {
-        self.shared
-            .state
-            .lock()
-            .topology
-            .regions
-            .get(&id)
-            .map(|r| r.state)
+        self.shared.state.lock().topology.region_state(id)
+    }
+    pub fn region_stats(&self, id: RegionId) -> Option<RegionStats> {
+        self.shared.state.lock().topology.region_stats(id)
     }
     pub fn stats(&self, id: RegionId) -> Option<TickStats> {
         self.shared
@@ -1094,6 +1126,8 @@ fn worker<D: RegionData, G: Send + 'static>(
                 let incoming = std::mem::take(&mut r.merge_from);
                 for source in incoming {
                     let mut old = s.topology.regions.remove(&source).unwrap();
+                    old.state = RegionState::Dead;
+                    s.topology.dead_regions.insert(source);
                     old.merge_targets.remove(&id);
                     for target in &old.merge_targets {
                         let ticking = s.topology.regions.get_mut(target).unwrap();

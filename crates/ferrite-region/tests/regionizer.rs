@@ -365,3 +365,34 @@ fn tasks_parked_in_new_empty_sections_follow_owner() {
     rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(scheduler.shutdown().pending_tasks.is_empty());
 }
+#[test]
+fn merged_region_handle_becomes_dead() {
+    use ferrite_region::RegionState;
+    let mut r = Regionizer::<Data>::new(0, 1);
+    r.add_chunk(ChunkPos(0, 0));
+    r.add_chunk(ChunkPos(2, 0));
+    let first = r.owner(ChunkPos(0, 0)).unwrap();
+    let second = r.owner(ChunkPos(2, 0)).unwrap();
+    r.add_chunk(ChunkPos(1, 0));
+    assert_eq!(r.region_state(first), Some(RegionState::Ready));
+    assert_eq!(r.region_state(second), Some(RegionState::Dead));
+}
+#[test]
+fn region_stats_count_live_empty_and_dead_sections() {
+    use ferrite_region::RegionizerConfig;
+    let mut r = Regionizer::<Data>::with_config(RegionizerConfig {
+        section_shift: 0,
+        merge_radius: 1,
+        empty_section_radius: 1,
+        min_section_recalc_count: 100,
+        max_dead_section_percent: 1.0,
+    });
+    r.add_chunk(ChunkPos(0, 0));
+    r.add_chunk(ChunkPos(2, 0));
+    let id = r.owner(ChunkPos(0, 0)).unwrap();
+    r.remove_chunk(ChunkPos(0, 0));
+    let stats = r.region_stats(id).unwrap();
+    assert_eq!(stats.nonempty_sections, 1);
+    assert!(stats.empty_sections > 0);
+    assert!(stats.dead_sections > 0);
+}
