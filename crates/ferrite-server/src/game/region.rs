@@ -2,6 +2,9 @@ use super::{
     PluginEventPolicy,
     chunk::{ChunkSource, FlatGenerator},
     commands::{XpOperation, XpUnit},
+    survival::{
+        DamageKind, EAT_TICKS, Eating, FoodTick, MAX_FOOD, MAX_HEALTH, Survival, SurvivalRules,
+    },
     valid_move,
 };
 use ferrite_entity::{
@@ -52,6 +55,8 @@ pub enum Command {
         unit: XpUnit,
         feedback: Option<OutboundSender>,
     },
+    /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
+    Kill,
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, OutboundSender)>>>;
@@ -101,9 +106,13 @@ pub struct TickContext {
     pub tracking: Tracking,
     /// World blocks, for entity physics.
     pub source: Option<Arc<super::anvil::AnvilChunkSource>>,
+    /// Live game rules (natural regeneration, keepInventory, death messages, ...).
+    pub rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
+    /// World spawn, where a player without a bed respawns (`ServerPlayer.respawn`).
+    pub spawn: [f64; 3],
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
-struct TickBlocks<'a> {
+pub(super) struct TickBlocks<'a> {
     source: Option<&'a super::anvil::AnvilChunkSource>,
     seen: std::cell::RefCell<HashMap<(i32, i32, i32), Option<u16>>>,
 }
@@ -159,6 +168,15 @@ pub struct Player {
     pub queue: VecDeque<(i32, i32)>,
     pub awaiting_batch: bool,
     pub rate: f32,
+    /// Vanilla `ServerPlayer` survival state: health, absorption, food, air, fire, fall.
+    pub survival: Survival,
+    /// Dimension type id from `CommonPlayerSpawnInfo`, echoed in `respawn`.
+    pub dimension_type: i32,
+    pub seed: i64,
+    /// `CommonPlayerSpawnInfo.isFlat`, echoed in `respawn`.
+    pub flat: bool,
+    /// Set by `client_command` action 0 (`perform respawn`); the region performs it.
+    pub respawn_requested: bool,
 }
 #[derive(Default)]
 pub struct Region {
@@ -840,6 +858,265 @@ impl Player {
         };
         self.feedback(feedback, text);
     }
+    /// Applies damage through the vanilla `LivingEntity.hurt` rules, with the game-mode
+    /// immunity checks of `Player.isInvulnerableTo`.
+    pub(crate) fn hurt(&mut self, kind: DamageKind, amount: f32) -> bool {
+        if self.gamemode == 3 || (self.gamemode == 1 && kind.ignores_creative()) {
+            return false;
+        }
+        if !self.survival.damage(kind, amount) {
+            return false;
+        }
+        // `Player.hurt` -> `causeFoodExhaustion(source.getFoodExhaustion())`.
+        self.survival.food.add_exhaustion(0.1);
+        self.breaking = None;
+        self.survival.eating = None;
+        // Vanilla `ServerPlayer.die` sends the combat-kill packet before the zero-health update,
+        // so fatal damage is synced by the region's death processing instead.
+        if !self.survival.dead {
+            self.sync_health();
+        }
+        true
+    }
+
+    /// `ClientboundSetHealthPacket`, sent only when the client's bar is stale.
+    pub(crate) fn sync_health(&mut self) {
+        if !self.survival.needs_sync() {
+            return;
+        }
+        send(
+            self,
+            &SetHealth {
+                health: self.survival.health,
+                food: VarInt(self.survival.food.food),
+                saturation: self.survival.food.saturation,
+            },
+        );
+        self.survival.mark_synced();
+    }
+
+    /// One `Player.tick` of survival mechanics: environment hazards, food/regeneration and
+    /// eating progress. Called once per region tick, after the player's input was applied.
+    pub(crate) fn survival_tick(&mut self, blocks: &TickBlocks, rules: &SurvivalRules) {
+        if self.survival.dead {
+            // A dead player's zero health is synced by the death processing, after the combat
+            // kill packet (`ServerPlayer.die` order).
+            if self.survival.death_processed {
+                self.sync_health();
+            }
+            return;
+        }
+        let feet = [
+            self.pos[0].floor() as i32,
+            self.pos[1].floor() as i32,
+            self.pos[2].floor() as i32,
+        ];
+        let eye_y = (self.pos[1] + 1.62).floor() as i32;
+        let feet_state = blocks.block_state(feet[0], feet[1], feet[2]).unwrap_or(0);
+        let eye_state = blocks.block_state(feet[0], eye_y, feet[2]).unwrap_or(0);
+        let feet_fluid = ferrite_fluid::fluid_state(u32::from(feet_state)).kind;
+        let eye_fluid = ferrite_fluid::fluid_state(u32::from(eye_state)).kind;
+        let fire =
+            super::survival::is_fire_block(feet_state) || super::survival::is_fire_block(eye_state);
+        let damage = self.survival.environment_tick(
+            self.pos,
+            self.ground,
+            eye_fluid == ferrite_fluid::FluidKind::Water,
+            feet_fluid == ferrite_fluid::FluidKind::Lava,
+            fire,
+            self.gamemode,
+            self.survival.sprinting,
+        );
+        for (kind, amount) in damage.into_iter().flatten() {
+            self.hurt(kind, amount);
+        }
+        if !self.survival.dead {
+            match self.survival.food_tick(
+                rules.natural_regeneration,
+                self.gamemode,
+                rules.hard_difficulty,
+            ) {
+                FoodTick::Heal(amount) => {
+                    self.survival.heal(amount);
+                }
+                FoodTick::Starve => {
+                    self.hurt(DamageKind::Starve, 1.0);
+                }
+                FoodTick::None => {}
+            }
+            self.tick_eating();
+        }
+        if !self.survival.dead {
+            self.sync_health();
+        }
+    }
+
+    /// `ServerboundUseItemPacket` for food: vanilla `Item.use` starts `useItem` when the player
+    /// can eat the stack. The item is consumed by [`Player::tick_eating`] after
+    /// `minecraft:consumable`'s 1.6 s.
+    fn use_item(&mut self, p: &ferrite_protocol::packets::play::ServerboundUseItem) {
+        send(
+            self,
+            &AcknowledgeBlockChange {
+                sequence: p.sequence,
+            },
+        );
+        if self.survival.dead || !(0..=1).contains(&p.hand.0) {
+            return;
+        }
+        let slot = self.hand_slot(p.hand.0);
+        let stack = self.inventory.get(slot).clone();
+        let Some(ferrite_item::Component::Food(food)) =
+            stack.effective_component(ferrite_item::component_ids::FOOD)
+        else {
+            return;
+        };
+        if self.survival.food.food >= MAX_FOOD && !food.can_always_eat {
+            return;
+        }
+        self.survival.eating = Some(Eating {
+            slot,
+            remaining: EAT_TICKS,
+        });
+    }
+
+    /// `LivingEntity.updateUsingItem`/`ItemStack.finishUsingItem`: count the use ticks down,
+    /// then apply the food component (`FoodData.eat`) and shrink the stack in survival.
+    fn tick_eating(&mut self) {
+        let Some(mut eating) = self.survival.eating else {
+            return;
+        };
+        if self.survival.dead {
+            self.survival.eating = None;
+            return;
+        }
+        let stack = self.inventory.get(eating.slot).clone();
+        let Some(ferrite_item::Component::Food(food)) =
+            stack.effective_component(ferrite_item::component_ids::FOOD)
+        else {
+            self.survival.eating = None;
+            return;
+        };
+        eating.remaining -= 1;
+        if eating.remaining > 0 {
+            self.survival.eating = Some(eating);
+            return;
+        }
+        self.survival.food.eat(food.nutrition, food.saturation);
+        // `Player.hasInfiniteMaterials`: creative does not use the item up.
+        if !matches!(self.gamemode, 1 | 3) {
+            self.inventory.remove(eating.slot, 1);
+        }
+        send(
+            self,
+            &SetPlayerInventory {
+                slot: VarInt(eating.slot as i32),
+                item: self.inventory.get(eating.slot).clone(),
+            },
+        );
+        self.survival.eating = None;
+        self.sync_health();
+    }
+
+    /// Vanilla `ServerPlayer.respawn`: a fresh survival state at the world spawn. The client
+    /// discards every chunk on `respawn`, so the loaded set is released and re-queued.
+    pub(crate) fn respawn(&mut self, spawn: [f64; 3]) {
+        let old_loaded = std::mem::take(&mut self.loaded);
+        for (x, z) in old_loaded {
+            let _ = self.signals.send(Signal::Hold {
+                chunk: ChunkPos(x, z),
+                add: false,
+            });
+        }
+        if let Some((loaded, _)) = self.tracking.lock().unwrap().get_mut(&self.uuid) {
+            loaded.clear();
+        }
+        self.survival = Survival::new();
+        self.survival.last_pos = spawn;
+        self.respawn_requested = false;
+        self.breaking = None;
+        self.pos = spawn;
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.ground = true;
+        // Keep the old chunk here so the tick loop notices `next != chunk`, refreshes the
+        // window and hands the player to the region owning the spawn chunk (Folia ownership).
+        let spawn_chunk = ChunkPos(
+            (spawn[0].floor() as i32).div_euclid(16),
+            (spawn[2].floor() as i32).div_euclid(16),
+        );
+        send(
+            self,
+            &Respawn {
+                dimension_type: VarInt(self.dimension_type),
+                dimension: "minecraft:overworld".into(),
+                seed: self.seed,
+                game_mode: VarInt(self.gamemode),
+                previous_game_mode: VarInt(0),
+                debug: false,
+                flat: self.flat,
+                death_location: None,
+                portal_cooldown: VarInt(0),
+                sea_level: VarInt(63),
+                data_to_keep: 3,
+            },
+        );
+        send(
+            self,
+            &SetHealth {
+                health: MAX_HEALTH,
+                food: VarInt(MAX_FOOD),
+                saturation: 5.0,
+            },
+        );
+        self.survival.mark_synced();
+        send(
+            self,
+            &SetExperience {
+                progress: self.experience_progress,
+                level: VarInt(self.experience_level),
+                total: VarInt(self.experience_total),
+            },
+        );
+        self.init_inventory_menu();
+        let id = self.next_teleport;
+        self.next_teleport += 1;
+        self.pending_teleport = Some(id);
+        send(
+            self,
+            &PositionSync {
+                teleport_id: VarInt(id),
+                x: spawn[0],
+                y: spawn[1],
+                z: spawn[2],
+                velocity_x: 0.0,
+                velocity_y: 0.0,
+                velocity_z: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                flags: 0,
+            },
+        );
+        send(
+            self,
+            &CenterChunk {
+                x: VarInt(spawn_chunk.0),
+                z: VarInt(spawn_chunk.1),
+            },
+        );
+        let (_, new) = chunk_window((spawn_chunk.0, spawn_chunk.1), self.view, &self.loaded);
+        self.queue = new.into();
+        self.awaiting_batch = false;
+        self.positions.lock().unwrap().insert(self.uuid, spawn);
+        let _ = self.signals.send(Signal::Update {
+            uuid: self.uuid,
+            pos: spawn,
+            yaw: 0.0,
+            pitch: 0.0,
+            ground: true,
+        });
+    }
+
     fn update(&mut self) -> bool {
         if let Some((_, _, elapsed)) = &mut self.breaking {
             *elapsed = elapsed.saturating_add(1);
@@ -952,6 +1229,12 @@ impl Player {
                     }
                     continue;
                 }
+                Command::Kill => {
+                    // Vanilla `/kill` uses `damageSources().genericKill()`: it bypasses
+                    // invulnerability and creative mode, but absorption still absorbs first.
+                    self.hurt(DamageKind::GenericKill, f32::MAX);
+                    continue;
+                }
                 Command::Input(msg) => msg,
             };
             match msg {
@@ -1017,6 +1300,9 @@ impl Player {
                                         }) && self.break_block(p.location, state)
                                         {
                                             self.broken.push((pos, state));
+                                            // `ServerGamePacketListenerImpl`: breaking a block
+                                            // costs 0.005 exhaustion in survival.
+                                            self.survival.food.add_exhaustion(0.005);
                                         }
                                     } else {
                                         self.breaking = Some((p.location, state, 0));
@@ -1048,6 +1334,8 @@ impl Player {
                                 && self.break_block(location, state)
                             {
                                 self.broken.push((pos, state));
+                                // `ServerGamePacketListenerImpl`: 0.005 exhaustion per broken block.
+                                self.survival.food.add_exhaustion(0.005);
                             }
                         }
                         _ => {}
@@ -1201,6 +1489,22 @@ impl Player {
                 ServerboundPlay::Flags(p) => {
                     self.ground = p.flags & 1 != 0;
                 }
+                ServerboundPlay::UseItem(p) => self.use_item(&p),
+                ServerboundPlay::ClientCommand(p) => {
+                    // `ServerboundClientCommandPacket.Action.PERFORM_RESPAWN`.
+                    if p.action.0 == 0 && self.survival.dead {
+                        self.respawn_requested = true;
+                    }
+                }
+                // `ServerboundPlayerCommandPacket.Action.START_SPRINTING/STOP_SPRINTING`.
+                ServerboundPlay::PlayerCommand(p) if p.entity_id.0 == self.entity => {
+                    match p.action.0 {
+                        3 => self.survival.sprinting = true,
+                        4 => self.survival.sprinting = false,
+                        _ => {}
+                    }
+                }
+                ServerboundPlay::PlayerCommand(_) => {}
                 _ => {}
             }
         }
@@ -1349,9 +1653,83 @@ impl Region {
             deliver(players, ctx, viewer, bytes)
         });
     }
+    /// Vanilla `ServerPlayer.die` + `dropAllDeathLoot` + `Player.deathMessage`: drop the
+    /// inventory and experience unless `keepInventory`, send the death screen and announce it.
+    fn process_death(&mut self, p: &mut Player, ctx: &TickContext, rules: &SurvivalRules) {
+        if p.survival.death_processed {
+            return;
+        }
+        p.survival.death_processed = true;
+        p.survival.eating = None;
+        p.breaking = None;
+        p.close_container();
+        let survival_mode = matches!(p.gamemode, 0 | 2);
+        if !rules.keep_inventory && survival_mode {
+            let pos = [
+                p.pos[0].floor() as i32,
+                p.pos[1].floor() as i32,
+                p.pos[2].floor() as i32,
+            ];
+            for slot in 0..ferrite_inventory::SIZE {
+                let stack = p.inventory.get(slot).clone();
+                if stack.is_empty() {
+                    continue;
+                }
+                p.inventory.set(slot, ferrite_item::ItemStack::empty());
+                let plain = ferrite_protocol::packets::play::ItemStack {
+                    count: stack.count,
+                    item_id: i32::from(stack.item),
+                };
+                self.entities
+                    .insert(item::pop_resource(pos, plain, &mut self.rng));
+            }
+            // `ServerPlayer.dropExperience`: `min(level * 7, 100)` points, then reset the bar.
+            // `ferrite-entity` has no experience-orb entity yet, so the points are lost rather
+            // than spawned as pickupable orbs.
+            let dropped = p.experience_level.saturating_mul(7).min(100);
+            p.experience_level = 0;
+            p.experience_progress = 0.0;
+            p.experience_total = 0;
+            send(
+                p,
+                &SetExperience {
+                    progress: 0.0,
+                    level: VarInt(0),
+                    total: VarInt(0),
+                },
+            );
+            tracing::info!(player = %p.name, dropped, "player died; experience orbs are not modelled yet");
+        }
+        let kind = p.survival.death_cause.unwrap_or(DamageKind::GenericKill);
+        let message = kind.death_message(&p.name);
+        send(
+            p,
+            &PlayerCombatKill {
+                player_id: VarInt(p.entity),
+                message: ferrite_protocol::types::PlainText(message.clone()),
+            },
+        );
+        p.sync_health();
+        if rules.show_death_messages {
+            let update = packet(&SystemChat {
+                content: ferrite_protocol::types::PlainText(message),
+                overlay: false,
+            });
+            for (_, outbound) in ctx.tracking.lock().unwrap().values() {
+                let _ = outbound.send(update.clone());
+            }
+        }
+        tracing::info!(player = %p.name, ?kind, "player died");
+    }
+
     pub fn tick(&mut self, ctx: &TickContext) {
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
+        let rules = SurvivalRules::from(&ctx.rules.lock().unwrap());
+        let blocks = TickBlocks {
+            source: ctx.source.as_deref(),
+            seen: Default::default(),
+        };
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in ids {
             let mut p = self.players.remove(&id).unwrap();
@@ -1362,6 +1740,15 @@ impl Region {
                 }
                 None => p.update(),
             };
+            if updated {
+                p.survival_tick(&blocks, &rules);
+                if p.survival.dead {
+                    self.process_death(&mut p, ctx, &rules);
+                    if p.survival.dead && (p.respawn_requested || rules.immediate_respawn) {
+                        p.respawn(ctx.spawn);
+                    }
+                }
+            }
             self.spawn_thrown(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
@@ -1398,10 +1785,6 @@ impl Region {
             self.drop_broken_blocks(&mut p);
             self.players.insert(id, p);
         }
-        let blocks = TickBlocks {
-            source: ctx.source.as_deref(),
-            seen: Default::default(),
-        };
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
         for p in self.players.values_mut() {
@@ -1446,6 +1829,8 @@ mod tests {
             signals,
             tracking: Default::default(),
             source: None,
+            rules: Default::default(),
+            spawn: [0.0, 65.0, 0.0],
         });
 
         let report = timings.report_all(50.0);

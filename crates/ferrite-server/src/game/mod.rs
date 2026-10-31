@@ -41,6 +41,7 @@ mod fluid;
 mod global;
 mod random_tick;
 mod region;
+mod survival;
 
 use self::{
     global::{GlobalPlayer, GlobalRegion},
@@ -349,11 +350,6 @@ async fn run(
         mut signals,
     } = channels;
     let tracking: region::Tracking = Arc::new(Mutex::new(HashMap::new()));
-    let ctx = TickContext {
-        signals: signal_tx.clone(),
-        tracking: tracking.clone(),
-        source: source.clone(),
-    };
     let LoopMetrics {
         game_rules,
         random_tick_speed,
@@ -361,6 +357,18 @@ async fn run(
         profiler,
         stop: stop_tx,
     } = metrics;
+    let spawn_pos = [
+        spawn[0] as f64 + 0.5,
+        spawn[1] as f64,
+        spawn[2] as f64 + 0.5,
+    ];
+    let ctx = TickContext {
+        signals: signal_tx.clone(),
+        tracking: tracking.clone(),
+        source: source.clone(),
+        rules: Arc::clone(&game_rules),
+        spawn: spawn_pos,
+    };
     let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
     let fluid_tracking = tracking.clone();
@@ -435,11 +443,6 @@ async fn run(
     )));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let spawn_pos = [
-        spawn[0] as f64 + 0.5,
-        spawn[1] as f64,
-        spawn[2] as f64 + 0.5,
-    ];
     loop {
         tokio::select! {
          event=events.recv()=>{let Some(event)=event else {break}; match event {
@@ -489,13 +492,16 @@ async fn run(
                let mut packet = Vec::new(); VarInt(16).encode(&mut packet); packet.extend(tree.body); let _ = outbound.send(Outbound::Packet(packet.into()));
            }
            emit(&outbound, &SetHeldSlot { slot: VarInt(start_inventory.selected_slot() as i32) });
+           // Vanilla sends the health bar and experience right after the join position.
+           emit(&outbound, &SetHealth { health: 20.0, food: VarInt(20), saturation: 5.0 });
+           emit(&outbound, &SetExperience { progress: 0.0, level: VarInt(0), total: VarInt(0) });
            emit(&outbound,&PositionSync{teleport_id:VarInt(1),x:start_pos[0],y:start_pos[1],z:start_pos[2],velocity_x:0.0,velocity_y:0.0,velocity_z:0.0,yaw:start_yaw,pitch:start_pitch,flags:0});
            emit(&outbound,&DefaultSpawn{dimension:"minecraft:overworld".into(),position:ferrite_protocol::types::BlockPos::new(spawn[0],spawn[1],spawn[2]).pack(),yaw:0.0,pitch:0.0});emit(&outbound,&GameEvent{event:13,value:0.0});
            let mailbox=Arc::new(Mutex::new(VecDeque::new()));mailboxes.insert(uuid,(session,mailbox.clone(),outbound.clone()));
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins && let Err(error) = plugins.player_joined(uuid, &name) { tracing::warn!(%error, "player join event failed"); }
@@ -1022,10 +1028,9 @@ impl CommandRuntime<'_> {
                     }
                 };
                 for target in &targets {
-                    if let Some(player) = self.online.get(&target.uuid) {
-                        let _ = player
-                            .outbound
-                            .send(Outbound::Disconnect("You died!".into()));
+                    // `/kill` deals `genericKill` damage on the region that owns the player.
+                    if let Some((_, mailbox, _)) = self.mailboxes.get(&target.uuid) {
+                        mailbox.lock().unwrap().push_back(Command::Kill);
                     }
                 }
                 if targets.len() == 1 {

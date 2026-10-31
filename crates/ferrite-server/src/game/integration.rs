@@ -826,8 +826,10 @@ async fn message_command_reaches_target_and_sender() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_command_disconnects_the_target() {
-    use ferrite_protocol::packets::play::PlayDisconnect;
+async fn kill_command_shows_the_death_screen_even_in_creative() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, Respawn, ServerboundClientCommand, SetHealth,
+    };
 
     let world = World::start_configured(
         None,
@@ -858,9 +860,18 @@ async fn kill_command_disconnects_the_target() {
     bob.until(46).await;
 
     alice.raw(7, "kill Bob").await;
-    let body = bob.until(32).await;
-    let disconnect = PlayDisconnect::decode(&mut body.as_slice()).unwrap();
-    assert_eq!(disconnect.reason.0, "You died!");
+    // `DamageTypes.GENERIC_KILL` is in `bypasses_invulnerability`, so creative mode dies too;
+    // the client gets `ClientboundPlayerCombatKillPacket`, not a disconnect.
+    let body = bob.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(kill.message.0, "Bob was killed");
+    let body = bob.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.health, 0.0);
+    // The connection survives death: a respawn request is answered.
+    bob.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    bob.until(Respawn::ID).await;
     alice.chat_containing("Killed Bob").await;
 
     drop((alice, bob));
@@ -1431,6 +1442,8 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         signals: tx,
         tracking: Default::default(),
         source: None,
+        rules: Default::default(),
+        spawn: [0.0, 65.0, 0.0],
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),
@@ -2609,6 +2622,245 @@ async fn clear_give_and_xp_commands_act_on_a_bot_session() {
     bot.raw(7, "xp query @s levels").await;
     bot.chat_containing("Giver has 2 experience levels").await;
 
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_fall_damage_and_natural_regeneration_with_bot() {
+    use ferrite_protocol::packets::play::{MovePosition, SetHealth};
+    // Survival mode: creative ignores fall damage (`Player.isInvulnerableTo`).
+    let world = World::start_configured(
+        None,
+        [0, 65, 0],
+        super::WorldSettings {
+            gamemode: 0,
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Faller").await;
+    // Superflat ground is y=64; step off at y=70, then land six blocks lower.
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 70.0,
+        z: 0.5,
+        flags: 0,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    bot.send(&MovePosition {
+        x: 0.5,
+        y: 64.0,
+        z: 0.5,
+        flags: 1,
+    })
+    .await;
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    // `Player.causeFallDamage`: ceil(6 - 3) = 3 damage.
+    assert_eq!(health.health, 17.0, "fall damage");
+    assert_eq!((health.food.0, health.saturation), (20, 5.0));
+    // Full food and saturation 5 heal `min(saturation, 6) / 6` after ten ticks (`FoodData.tick`).
+    let body = bot.until(SetHealth::ID).await;
+    let healed = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        (healed.health - (17.0 + 5.0 / 6.0)).abs() < 1e-4,
+        "natural regeneration: {}",
+        healed.health
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_eating_uses_food_component_after_use_duration() {
+    use ferrite_protocol::packets::play::{ServerboundUseItem, SetHealth, SetPlayerInventory};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = root.join("vanilla/26.3/fixture-world/world");
+    let registry =
+        ferrite_world::RuntimeRegistry::load(root.join("vanilla/26.3/generated")).unwrap();
+    let spawn = super::anvil::read_spawn(&path).unwrap();
+    let source = super::anvil::AnvilChunkSource::new(path, registry);
+    let world = World::start_configured(
+        Some(source),
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Eater").await;
+    // Enchanted golden apples have `can_always_eat`, so the full bar does not block eating.
+    world
+        .console_command("give Eater enchanted_golden_apple 2".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&ServerboundUseItem {
+        hand: VarInt(0),
+        sequence: VarInt(1),
+        yaw: 0.0,
+        pitch: 0.0,
+    })
+    .await;
+    // The stack is consumed after `minecraft:consumable`'s 1.6 s; the item update goes first.
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bot.until(SetPlayerInventory::<ferrite_protocol::packets::play::ItemStack>::ID),
+    )
+    .await
+    .expect("food use duration");
+    let slot: SetPlayerInventory<ferrite_protocol::packets::play::ItemStack> =
+        SetPlayerInventory::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(slot.slot.0, 0);
+    assert_eq!(slot.item.count, 1, "survival eats one item");
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.food.0, 20);
+    assert_eq!(health.saturation, 20.0, "saturation capped by the food bar");
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_kill_death_screen_and_keep_inventory_respawn() {
+    use ferrite_protocol::packets::play::{
+        PlayerCombatKill, PositionSync, Respawn, ServerboundClientCommand, SetExperience, SetHealth,
+    };
+    // The in-memory world keeps `gamerule` changes off the read-only fixture world.
+    let spawn = [0, 65, 0];
+    let world = World::start_configured(
+        None,
+        spawn,
+        super::WorldSettings {
+            gamemode: 0,
+            ops: vec![super::Operator {
+                uuid: ferrite_net::offline_uuid("Victim"),
+                level: 4,
+            }],
+            ..Default::default()
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Victim").await;
+    world
+        .console_command("gamerule keep_inventory true".into())
+        .await
+        .unwrap();
+    bot.raw(7, "xp set @s 10 levels").await;
+    let body = bot.until(SetExperience::ID).await;
+    let xp = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(xp.level.0, 10);
+    world.console_command("kill Victim".into()).await.unwrap();
+    // Vanilla `ClientboundPlayerCombatKillPacket` opens the death screen.
+    let body = bot.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        kill.message.0.contains("Victim") && kill.message.0.contains("killed"),
+        "death message: {}",
+        kill.message.0
+    );
+    let body = bot.until(SetHealth::ID).await;
+    let dead = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(dead.health, 0.0);
+    // `ServerboundClientCommandPacket.Action.PERFORM_RESPAWN`.
+    bot.send(&ServerboundClientCommand { action: VarInt(0) })
+        .await;
+    let body = bot.until(Respawn::ID).await;
+    let respawn = Respawn::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(respawn.data_to_keep, 3);
+    assert_eq!(respawn.dimension, "minecraft:overworld");
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        (health.health, health.food.0, health.saturation),
+        (20.0, 20, 5.0)
+    );
+    // keepInventory keeps the level through death and respawn.
+    let body = bot.until(SetExperience::ID).await;
+    let kept = SetExperience::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(kept.level.0, 10);
+    let body = bot.until(PositionSync::ID).await;
+    let pos = PositionSync::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(
+        [pos.x, pos.y, pos.z],
+        [
+            f64::from(spawn[0]) + 0.5,
+            f64::from(spawn[1]),
+            f64::from(spawn[2]) + 0.5
+        ]
+    );
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn survival_void_damage_kills_and_sends_the_death_screen() {
+    use ferrite_protocol::packets::play::{PlayerCombatKill, SetHealth};
+    let world = World::start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "Voider").await;
+    // Below min build height - 64 (`Player.isBelowWorld`): 4 bypassing damage per tick.
+    world
+        .console_command("tp Voider 0 -200 0".into())
+        .await
+        .unwrap();
+    let body = bot.until(PlayerCombatKill::ID).await;
+    let kill = PlayerCombatKill::decode(&mut body.as_slice()).unwrap();
+    assert!(
+        kill.message.0.contains("fell out of the world"),
+        "{}",
+        kill.message.0
+    );
+    let body = bot.until(SetHealth::ID).await;
+    let health = SetHealth::decode(&mut body.as_slice()).unwrap();
+    assert_eq!(health.health, 0.0);
     drop(bot);
     world.shutdown().await.unwrap();
     server.abort();
