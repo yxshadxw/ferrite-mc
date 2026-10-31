@@ -396,3 +396,11 @@ fn region_stats_count_live_empty_and_dead_sections() {
     assert!(stats.empty_sections > 0);
     assert!(stats.dead_sections > 0);
 }
+#[test]
+fn default_regionizer_reserves_empty_sections_within_merge_radius() {
+    let mut topology = Regionizer::<Data>::default();
+    topology.add_chunk(ChunkPos(0, 0));
+    let owner = topology.owner(ChunkPos(0, 0)).unwrap();
+    assert_eq!(topology.owner(ChunkPos(32, 0)), Some(owner));
+    topology.check_invariants().unwrap();
+}
