@@ -88,6 +88,7 @@ struct Region<D> {
     state: RegionState,
     merge_targets: HashSet<RegionId>,
     merge_from: HashSet<RegionId>,
+    dead_sections: HashSet<SectionPos>,
     sections: HashSet<SectionPos>,
     data: Option<D>,
     next_tick: Instant,
@@ -105,6 +106,7 @@ impl<D> Region<D> {
             state: RegionState::Ready,
             merge_targets: HashSet::new(),
             merge_from: HashSet::new(),
+            dead_sections: HashSet::new(),
             sections,
             data: Some(data),
             next_tick: Instant::now(),
@@ -246,11 +248,11 @@ impl<D: RegionData> Regionizer<D> {
             }
             *counts.entry(self.section_of(chunk)).or_default() += n;
         }
-        if counts.len() != self.sections.len() {
+        if counts.len() > self.sections.len() {
             return Err("section table does not match held chunks".into());
         }
         for (section, &(n, id)) in &self.sections {
-            if counts.get(section) != Some(&n) {
+            if counts.get(section).copied().unwrap_or(0) != n {
                 return Err(format!("section {section:?} holder count {n} is wrong"));
             }
             if !self
@@ -608,6 +610,16 @@ impl<D: RegionData, G: Send + 'static> Scheduler<D, G> {
     pub fn region_count(&self) -> usize {
         self.shared.state.lock().topology.region_count()
     }
+    pub fn holder_count(&self, chunk: ChunkPos) -> usize {
+        self.shared
+            .state
+            .lock()
+            .topology
+            .chunks
+            .get(&chunk)
+            .copied()
+            .unwrap_or(0)
+    }
     pub fn region_state(&self, id: RegionId) -> Option<RegionState> {
         self.shared
             .state
@@ -742,6 +754,30 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
     let chunk = mutation.chunk();
     let section = s.topology.section_of(chunk);
     let affected = s.topology.affected(chunk);
+    // ThreadedRegionizer.removeChunk changes holder metadata immediately even
+    // when the owner is ticking; dead-section cleanup waits for markNotTicking.
+    if matches!(mutation, Mutation::Remove(_))
+        && let Some(&(count, owner)) = s.topology.sections.get(&section)
+        && s.topology.chunks.contains_key(&chunk)
+        && s.topology.regions[&owner].state != RegionState::Ready
+        && nearby(s, section).is_empty()
+    {
+        let holders = s.topology.chunks.get_mut(&chunk).unwrap();
+        *holders -= 1;
+        if *holders == 0 {
+            s.topology.chunks.remove(&chunk);
+        }
+        s.topology.sections.get_mut(&section).unwrap().0 = count - 1;
+        if count == 1 {
+            s.topology
+                .regions
+                .get_mut(&owner)
+                .unwrap()
+                .dead_sections
+                .insert(section);
+        }
+        return;
+    }
     // Adding a holder to an already-owned section never expands its region.
     if matches!(mutation, Mutation::Add(_))
         && s.topology.sections.contains_key(&section)
@@ -798,6 +834,7 @@ fn submit<D: RegionData, G>(s: &mut State<D, G>, mutation: Mutation) {
                 .unwrap()
                 .merge(old.data.take().unwrap());
             destination.tasks.append(&mut old.tasks);
+            destination.dead_sections.extend(old.dead_sections);
             destination.merge_targets.extend(old.merge_targets);
         }
         let ticking: Vec<_> = affected
@@ -1077,8 +1114,41 @@ fn worker<D: RegionData, G: Send + 'static>(
                         .unwrap()
                         .merge(old.data.take().unwrap());
                     destination.tasks.append(&mut old.tasks);
+                    destination.dead_sections.extend(old.dead_sections);
                 }
-                let r = s.topology.regions.get_mut(&id).unwrap();
+                let dead = if s.topology.regions[&id].state == RegionState::Ready {
+                    std::mem::take(&mut s.topology.regions.get_mut(&id).unwrap().dead_sections)
+                } else {
+                    HashSet::new()
+                };
+                for section in dead {
+                    let Some(&(count, owner)) = s.topology.sections.get(&section) else {
+                        continue;
+                    };
+                    if count != 0 {
+                        continue;
+                    }
+                    if s.topology.regions[&owner].state != RegionState::Ready {
+                        s.topology
+                            .regions
+                            .get_mut(&owner)
+                            .unwrap()
+                            .dead_sections
+                            .insert(section);
+                        continue;
+                    }
+                    // Reuse the normal split path for an empty section at the safe point.
+                    let ghost =
+                        ChunkPos(section.0 << s.topology.shift, section.1 << s.topology.shift);
+                    s.topology.chunks.insert(ghost, 1);
+                    s.topology.sections.get_mut(&section).unwrap().0 = 1;
+                    let affected = s.topology.affected(ghost);
+                    apply_topology(&mut s, Mutation::Remove(ghost), &affected);
+                }
+                let Some(r) = s.topology.regions.get_mut(&id) else {
+                    shared.wake.notify_all();
+                    continue;
+                };
                 // Post-tick safe point: apply mutations waiting on this region.
                 if let Some(&head) = r.mutations.first() {
                     pump(&mut s, BTreeSet::from([head]));
