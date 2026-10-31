@@ -1860,6 +1860,117 @@ async fn placed_sand_falls_and_lands_for_tracking_bot() {
     assert!(saw_falling, "the bot never saw the falling block entity");
 }
 
+/// TNT: flint and steel primes the block (`PrimedTnt`), the fuse ends in a vanilla `Explosion`,
+/// and the tracking bot sees the entity, the destroyed block and the loot drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tnt_explodes_and_drops_blocks_for_tracking_bot() {
+    use ferrite_protocol::{
+        packets::play::{AddEntity, BlockUpdate, CreativeSlot, ItemStack, MoveRotation, UseItemOn},
+        types::BlockPos,
+    };
+    let source = super::anvil::AnvilChunkSource::new_memory();
+    loop {
+        if let Some(result) = source.get(0, 0, 0) {
+            result.unwrap();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let block = |name| u32::from(ferrite_data::blocks::default_state(name).unwrap());
+    for x in 0..=1 {
+        for z in 0..=1 {
+            source.set_block(x, 63, z, block("dirt")).unwrap();
+            source.set_block(x, 64, z, block("air")).unwrap();
+            source.set_block(x, 65, z, block("air")).unwrap();
+        }
+    }
+    source.set_block(0, 64, 0, block("tnt")).unwrap();
+    let world = World::start_with(Some(source.clone()), [0, 65, 3]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        ServerConfig {
+            online_mode: false,
+            view_distance: 2,
+            game: Some(world.sender.clone()),
+            ..Default::default()
+        },
+    ));
+    let mut bot = Bot::join(addr, "TntTester").await;
+    bot.until(46).await;
+    let flint =
+        ferrite_data::registries::id("minecraft:item", "minecraft:flint_and_steel").unwrap();
+    bot.send(&CreativeSlot {
+        slot: 36,
+        item: ItemStack {
+            count: 1,
+            item_id: flint,
+        },
+    })
+    .await;
+    bot.send(&MoveRotation {
+        yaw: 180.0,
+        pitch: 35.3,
+        flags: 1,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bot.send(&UseItemOn {
+        hand: VarInt(0),
+        location: BlockPos::new(0, 64, 0).pack(),
+        face: VarInt(3),
+        cursor_x: 0.5,
+        cursor_y: 0.5,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: VarInt(1),
+    })
+    .await;
+    let tnt_type = i32::from(ferrite_data::entity_props::by_name("tnt").unwrap().id);
+    let item_type = i32::from(ferrite_data::entity_props::by_name("item").unwrap().id);
+    let mut saw_tnt = false;
+    let mut saw_item = false;
+    let mut saw_blast = false;
+    let blast = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if saw_blast && saw_item {
+                break;
+            }
+            let (id, body) = bot.next_play().await;
+            match id {
+                AddEntity::ID => {
+                    let add = AddEntity::decode(&mut body.as_slice()).unwrap();
+                    saw_tnt |= add.entity_type.0 == tnt_type;
+                    saw_item |= add.entity_type.0 == item_type;
+                }
+                BlockUpdate::ID => {
+                    let update = BlockUpdate::decode(&mut body.as_slice()).unwrap();
+                    if BlockPos::unpack(update.location) == BlockPos::new(0, 63, 0)
+                        && update.block_state.0 == 0
+                    {
+                        saw_blast = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    drop(bot);
+    world.shutdown().await.unwrap();
+    server.abort();
+    assert!(
+        blast.is_ok(),
+        "the TNT never destroyed the floor for the bot"
+    );
+    assert_eq!(source.block(0, 63, 0), Some(0));
+    assert!(saw_tnt, "the bot never saw the primed TNT entity");
+    assert!(saw_blast, "the bot never saw the destroyed floor");
+    assert!(saw_item, "the bot never saw the dirt drop");
+}
+
 /// Vanilla `Level.markAndNotifyBlock` at work: breaking the block under a torch breaks the
 /// torch in the same region tick, and the tracking bot sees both block updates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

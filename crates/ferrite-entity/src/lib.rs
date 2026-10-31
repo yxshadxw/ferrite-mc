@@ -24,6 +24,7 @@ pub mod metadata;
 pub mod physics;
 mod rng;
 mod store;
+pub mod tnt;
 pub mod tracker;
 
 pub use id::{EntityKey, allocate_id, random_uuid};

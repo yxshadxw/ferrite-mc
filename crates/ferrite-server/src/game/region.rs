@@ -149,6 +149,8 @@ pub struct Player {
     pub broken: Vec<(ferrite_protocol::types::BlockPos, u32)>,
     /// Blocks this player placed or broke this tick, for neighbor updates.
     pub changed_blocks: Vec<[i32; 3]>,
+    /// TNT this player primed this tick, with the fuse length; spawned as `PrimedTnt`.
+    pub primed_tnt: Vec<([i32; 3], i32)>,
     pub name: String,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
@@ -605,6 +607,19 @@ impl Player {
         else {
             return;
         };
+        // Vanilla `FlintAndSteelItem.useOn` on TNT: prime it instead of placing the held item.
+        let held = self.inventory.get(self.hand_slot(p.hand.0)).clone();
+        if held.name() == Some("minecraft:flint_and_steel")
+            && ferrite_data::blocks::state(clicked_state)
+                .is_some_and(|(name, _)| name == "minecraft:tnt")
+        {
+            if self.change_block(p.location, Some(u32::from(clicked_state)), 0) {
+                self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+                self.primed_tnt
+                    .push(([clicked.x, clicked.y, clicked.z], ferrite_entity::tnt::FUSE));
+            }
+            return;
+        }
         let face = ferrite_math::Direction::ALL[p.face.0 as usize];
         let (dx, dy, dz) = if ferrite_data::block_props::get(clicked_state).replaceable {
             (0, 0, 0)
@@ -1463,6 +1478,149 @@ impl Region {
             deliver(&self.players, ctx, viewer, &bytes);
         }
     }
+    /// Spawns the TNT a player lit (vanilla `PrimedTnt` at the block position).
+    fn spawn_primed_tnt(&mut self, p: &mut Player) {
+        for (pos, fuse) in p.primed_tnt.drain(..) {
+            let center = ferrite_math::Vec3::new(
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]),
+                f64::from(pos[2]) + 0.5,
+            );
+            self.entities
+                .insert(ferrite_entity::tnt::new_primed_tnt(center, fuse));
+        }
+    }
+    /// Ticks primed TNT and runs its `Explosion` where a fuse ends.
+    fn tick_tnt(&mut self, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let blocks = TickBlocks {
+            source: Some(source),
+            seen: Default::default(),
+        };
+        let centers = ferrite_entity::tnt::tick_tnt(&mut self.entities, &blocks);
+        if centers.is_empty() {
+            return;
+        }
+        for center in centers {
+            self.explode(
+                [center.x, center.y, center.z],
+                super::explosion::TNT_POWER,
+                ctx,
+            );
+        }
+        // Vanilla `Explosion.finalizeExplosion` sets blocks with `Block.UPDATE_NEIGHBORS`.
+        let mut broken = Vec::new();
+        self.apply_neighbor_updates(source, ctx, &mut broken);
+        for (pos, state) in broken {
+            self.spawn_block_drops(pos, state);
+        }
+    }
+    /// Vanilla `Explosion`: entity knockback and exposure first, then the ray cast blocks and
+    /// their loot-table drops.
+    fn explode(&mut self, center: [f64; 3], power: f32, ctx: &TickContext) {
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        // Players are not in the entity store; vanilla pushes them like any other entity.
+        let hits: Vec<(i32, [f64; 3])> = self
+            .players
+            .values()
+            .filter_map(|p| {
+                let bbox = ferrite_math::AABB::new(
+                    p.pos[0] - 0.3,
+                    p.pos[1],
+                    p.pos[2] - 0.3,
+                    p.pos[0] + 0.3,
+                    p.pos[1] + 1.8,
+                    p.pos[2] + 0.3,
+                );
+                let impulse = super::explosion::impulse(
+                    source,
+                    center,
+                    power,
+                    ferrite_math::Vec3::new(p.pos[0], p.pos[1], p.pos[2]),
+                    bbox,
+                )?;
+                Some((p.entity, impulse))
+            })
+            .collect();
+        for (entity, impulse) in hits {
+            if let Some(p) = self.players.values().find(|p| p.entity == entity) {
+                send(
+                    p,
+                    &SetEntityMotion {
+                        id: VarInt(entity),
+                        velocity: ferrite_protocol::types::LpVec3(impulse),
+                    },
+                );
+            }
+        }
+        // Entity push (vanilla `Entity.push`).
+        let radius = f64::from(power) * 2.0;
+        let area = ferrite_math::AABB::new(
+            center[0] - radius,
+            center[1] - radius,
+            center[2] - radius,
+            center[0] + radius,
+            center[1] + radius,
+            center[2] + radius,
+        );
+        for key in self.entities.query_vec(area) {
+            if self
+                .entities
+                .flags(key)
+                .is_some_and(|flags| flags.has(ferrite_entity::Flags::REMOVED))
+            {
+                continue;
+            }
+            let (Some(pos), Some(bbox)) = (self.entities.pos(key), self.entities.bbox(key)) else {
+                continue;
+            };
+            let Some(impulse) = super::explosion::impulse(source, center, power, pos, bbox) else {
+                continue;
+            };
+            let vel = self.entities.vel(key).unwrap_or_default();
+            self.entities.set_vel(
+                key,
+                ferrite_math::Vec3::new(vel.x + impulse[0], vel.y + impulse[1], vel.z + impulse[2]),
+            );
+            if let Some(flags) = self.entities.flags_mut(key) {
+                flags.set(ferrite_entity::Flags::NEEDS_SYNC, true);
+            }
+        }
+        // Destroyed blocks, with the state read before it turns into air.
+        let air = u32::from(ferrite_data::blocks::default_state("air").expect("vanilla air"));
+        let destroyed;
+        let mut removed = Vec::new();
+        {
+            let mut world =
+                super::fluid::RegionFluidWorld::new(source, &self.held_chunks, &ctx.tracking);
+            destroyed = super::explosion::explode_blocks(&world, center, power, &mut self.rng);
+            for pos in &destroyed {
+                // Never touch another region's blocks.
+                let chunk = ChunkPos(pos[0].div_euclid(16), pos[2].div_euclid(16));
+                if !self.held_chunks.contains_key(&chunk) {
+                    continue;
+                }
+                let Some(state) =
+                    super::neighbors::BlockWorld::block(&world, pos[0], pos[1], pos[2])
+                else {
+                    continue;
+                };
+                ferrite_fluid::FluidWorld::set_block(&mut world, pos[0], pos[1], pos[2], air);
+                removed.push((*pos, state));
+            }
+        }
+        for (pos, state) in removed {
+            self.spawn_block_drops(pos, state);
+        }
+        for pos in &destroyed {
+            self.updates.block_changed(*pos);
+        }
+        self.schedule_gravity(source, &destroyed);
+    }
     /// Spawns what a player threw (Q, clicks outside a screen, overflowing crafts) as item
     /// entities in front of it. Item entities hold plain stacks for now, so components are not
     /// carried over.
@@ -1517,6 +1675,7 @@ impl Region {
                 None => p.update(),
             };
             self.spawn_thrown(&mut p);
+            self.spawn_primed_tnt(&mut p);
             if !updated {
                 let held = p.loaded.iter().map(|(x, z)| ChunkPos(*x, *z)).collect();
                 let _ = p.signals.send(Signal::Leave {
@@ -1564,6 +1723,7 @@ impl Region {
         item::tick_items(&mut self.entities, &blocks, &mut self.rng);
         self.pick_up_items(ctx);
         self.tick_falling(ctx);
+        self.tick_tnt(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
         }
