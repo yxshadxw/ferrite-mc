@@ -1,8 +1,8 @@
 //! Vanilla world generation data (Minecraft Java 26.3).
 //!
 //! This crate is the phase-6 foundation: it parses the data generator output under
-//! `vanilla/26.3/generated/` into typed Rust structures. It does not evaluate any density
-//! function yet.
+//! `vanilla/26.3/generated/` into typed Rust structures and evaluates overworld density
+//! functions using seeded noise.
 //!
 //! The 26.3 data format differs from the older schemas that most documentation describes:
 //!
@@ -29,8 +29,10 @@
 //! that contains untagged enums (where `serde_ignored` cannot see dropped fields). The tests
 //! load the complete vanilla data set in strict mode so a new vanilla field fails loudly.
 
+mod aquifer;
 mod biome;
 mod biome_source;
+mod carver;
 mod density;
 mod dimension;
 mod evaluator;
@@ -39,10 +41,12 @@ mod loader;
 mod material;
 mod multi_noise;
 mod noise;
+mod noise_chunk;
 mod noise_settings;
 mod resolve;
 mod seeded_noise;
 mod strict;
+mod surface;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -70,11 +74,13 @@ pub use multi_noise::{
     ParameterRange,
 };
 pub use noise::NoiseParameters;
+pub use noise_chunk::{NoiseChunkError, NoiseChunkGenerator};
 pub use noise_settings::{
     AquiferSettings, DebugFunction, NoiseRouter, NoiseSamplingSettings, NoiseSettings,
 };
 pub use resolve::ResolveError;
 pub use seeded_noise::{SeededContext, SeededNoise};
+pub use surface::{SurfaceError, SurfaceGenerator};
 
 /// All world generation data loaded from one generated data set.
 ///

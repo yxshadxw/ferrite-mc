@@ -1,14 +1,41 @@
 //! Seeded 26.3 normal-noise samplers.
 use crate::{FunctionContext, ResourceId, WorldgenData};
-use ferrite_noise::{Noise, NoiseStack, NormalNoise, RandomSource, XoroshiroRandomSource};
-use std::collections::BTreeMap;
+use ferrite_noise::{
+    BlendedNoise, Noise, NoiseStack, NormalNoise, PositionalRandomFactory, RandomSource,
+    XoroshiroRandomSource,
+};
+use std::{cell::RefCell, collections::BTreeMap};
+
+type BlendedSampler = Box<dyn Fn(i32, i32, i32) -> f32>;
 
 /// The keyed noises derived from a world seed using vanilla's positional factory.
 pub struct SeededNoise {
     noises: BTreeMap<ResourceId, NoiseStack>,
+    factory: Box<dyn PositionalRandomFactory>,
+    blended: RefCell<BTreeMap<[u64; 5], BlendedSampler>>,
 }
 
 impl SeededNoise {
+    pub(crate) fn named_random(&self, name: &str) -> Box<dyn RandomSource> {
+        self.factory.from_hash_of(name)
+    }
+    pub(crate) fn positional_random(
+        &self,
+        name: Option<&str>,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Box<dyn RandomSource> {
+        if let Some(name) = name {
+            self.factory
+                .from_hash_of(name)
+                .fork_positional()
+                .at(x, y, z)
+        } else {
+            self.factory.at(x, y, z)
+        }
+    }
+
     pub fn new(data: &WorldgenData, seed: i64) -> Self {
         let mut source = XoroshiroRandomSource::new(seed);
         let factory = source.fork_positional();
@@ -29,7 +56,11 @@ impl SeededNoise {
                 (id.clone(), builder.build().create(&mut *random))
             })
             .collect();
-        Self { noises }
+        Self {
+            noises,
+            factory,
+            blended: RefCell::new(BTreeMap::new()),
+        }
     }
     pub fn at(&self, x: i32, y: i32, z: i32) -> SeededContext<'_> {
         SeededContext {
@@ -64,5 +95,22 @@ impl FunctionContext for SeededContext<'_> {
             .get(id)
             .unwrap_or_else(|| panic!("unknown noise {id}"))
             .get(x, y, z)
+    }
+    fn sample_blended(&self, settings: [f64; 5], x: i32, y: i32, z: i32) -> f32 {
+        let key = settings.map(f64::to_bits);
+        let mut cache = self.noises.blended.borrow_mut();
+        let sampler = cache.entry(key).or_insert_with(|| {
+            let mut random = self.noises.factory.from_hash_of("minecraft:terrain");
+            let noise = BlendedNoise::new(
+                settings[0],
+                settings[1],
+                settings[2],
+                settings[3],
+                settings[4],
+            );
+            let sampler = noise.compile_sampler(&mut *random);
+            Box::new(move |x, y, z| sampler.sample_value(x, y, z))
+        });
+        sampler(x, y, z)
     }
 }

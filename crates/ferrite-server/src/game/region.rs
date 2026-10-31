@@ -57,6 +57,13 @@ pub enum Command {
     },
     /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
     Kill,
+    Enchant {
+        target: Uuid,
+        target_name: String,
+        enchantment: String,
+        level: i32,
+        feedback: Option<OutboundSender>,
+    },
 }
 pub type Mailbox = Arc<Mutex<VecDeque<Command>>>;
 pub type Tracking = Arc<Mutex<HashMap<Uuid, (HashSet<(i32, i32)>, OutboundSender)>>>;
@@ -778,6 +785,56 @@ impl Player {
             format!("Gave {given} {item_name} to {target_name}"),
         );
     }
+    /// `/enchant`: adds or replaces the enchantment on the main-hand item.
+    fn enchant_item(
+        &mut self,
+        enchantment: &str,
+        level: i32,
+        target_name: &str,
+        feedback: Option<&OutboundSender>,
+    ) {
+        let slot = self.inventory.selected_slot();
+        let mut stack = self.inventory.get(slot).clone();
+        if stack.is_empty() {
+            self.feedback(
+                feedback,
+                super::feedback::render("commands.enchant.failed.itemless", &[target_name]),
+            );
+            return;
+        }
+        let mut enchantments = match stack
+            .components
+            .get(ferrite_item::component_ids::ENCHANTMENTS)
+        {
+            Some(ferrite_item::Component::Enchantments(enchantments)) => enchantments.clone(),
+            _ => ferrite_item::Enchantments::new(),
+        };
+        enchantments.set(enchantment.to_owned(), level);
+        stack.components.insert(
+            ferrite_item::component_ids::ENCHANTMENTS,
+            ferrite_item::Component::Enchantments(enchantments),
+        );
+        self.inventory.set(slot, stack);
+        self.sync_containers();
+        let path = enchantment
+            .strip_prefix("minecraft:")
+            .unwrap_or(enchantment);
+        let name = path
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.feedback(
+            feedback,
+            super::feedback::render("commands.enchant.success.single", &[&name, target_name]),
+        );
+    }
     fn set_experience_total(&mut self, total: i64) {
         let total = total.clamp(0, i64::from(i32::MAX)) as i32;
         let (level, progress) = level_and_progress(total);
@@ -1233,6 +1290,18 @@ impl Player {
                     // Vanilla `/kill` uses `damageSources().genericKill()`: it bypasses
                     // invulnerability and creative mode, but absorption still absorbs first.
                     self.hurt(DamageKind::GenericKill, f32::MAX);
+                    continue;
+                }
+                Command::Enchant {
+                    target,
+                    target_name,
+                    enchantment,
+                    level,
+                    feedback,
+                } => {
+                    if target == self.uuid {
+                        self.enchant_item(&enchantment, level, &target_name, feedback.as_ref());
+                    }
                     continue;
                 }
                 Command::Input(msg) => msg,
