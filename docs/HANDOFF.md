@@ -338,3 +338,39 @@ On this machine a debug server spends about 80 s loading the vanilla registry an
 1,763 recipes before it accepts logins, so the lifecycle test allows 300 s for the first response
 (all plugin assertions keep their 60 s deadlines). If startup regresses further, profile
 `RuntimeRegistry::load` and `crafting::preload` instead of raising the deadline again.
+
+## Day 7 orchestration record (2026-11-01)
+
+`origin/main` = `bf2f8fd`. The whole workspace suite is green (105 test binaries, all passed) and
+`clippy -D warnings` / `fmt --check` are clean; that run was made on the oc8 branch tree, which is
+identical to `main` apart from `README.md`.
+
+Merged this session:
+
+| Merge | Content |
+|---|---|
+| `b8ef576` | oc7 containers: furnace/blast furnace/smoker smelting, anvil repair/rename/cost, enchanting, grindstone, stonecutter, smithing, loom |
+| `ac58ab3` | oc5 hostile mobs (zombie, skeleton, spider, creeper, enderman) with goals and block-grid pathfinding, arrows, player combat (crits, sweep, knockback, shield), monster spawning |
+| `d082d3c` | oc4 plugin bridge: plugin region tasks routed through the region scheduler, world/player snapshots, `Native.playerInventory` |
+| `e94a34c` | oc8 commands: `locate`, `datapack`, `help`, `schedule`, `trigger`, `reload`, entity selectors from the region stores, selector options |
+| `bf2f8fd` | oc8 follow-up: `@e[type=#tag]` resolves through the entity type tags and rejects unknown tags/types |
+
+Two test fixes were needed on the way: `commands_packet_decodes_and_filters_permissions` now
+decodes every parser property and suggestion type (the new `/help` word argument broke the old
+decoder), and the oc5 merge kept both the `RenameItem` and `Attack`/`Interact` packet arms.
+
+`README.md` was rewritten (`d88dc52`) around a done / in-progress / missing status table so the
+state of the project can be read at a glance.
+
+### Still open
+
+- **Worldgen throughput (oc6) is not done.** The worker reported `worker_done` with outcome
+  `failed`: `yxshadxw/oc6` at `6e28734` only adds the benchmark scaffolding (`rayon` in the
+  workspace dependencies, genbench framing); there is no density cache and no parallel chunk pool.
+  `cargo test -p ferrite-worldgen` passed 60/60 on that branch. Next: merge `main`, implement the
+  cache reuse plus a bounded chunk worker pool with byte-identical output, and measure
+  `crates/ferrite-worldgen/examples/genbench.rs` against the 69-chunks-in-30-s baseline before
+  starting tree features. The oc6 terminal is wedged on a 6,334-character input overlay and does
+  not accept new prompts, so it needs a fresh session.
+- **Pistons** (`task_94b5018a1e91`) and **plugin API breadth** (`task_0c86a661ea7c`) are created
+  but not started; the oc7 and oc4 sessions went idle, and oc4 hit its quota.
