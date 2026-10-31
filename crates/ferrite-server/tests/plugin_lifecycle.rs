@@ -177,8 +177,11 @@ impl Bot {
                 Err(error) => panic!("connecting to {addr}: {error}"),
             }
         };
+        // The first response waits for the whole world startup (vanilla registry and
+        // recipe preload), which is minutes in a debug build on a loaded machine. Every
+        // plugin deadline below keeps its own 60 s budget.
         stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
+            .set_read_timeout(Some(Duration::from_secs(300)))
             .unwrap();
         let mut bot = Self {
             stream,
