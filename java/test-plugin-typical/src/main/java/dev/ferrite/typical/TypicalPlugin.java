@@ -38,6 +38,15 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
         getLogger().info("FerriteTypical enabled: " + greeting);
         getServer().getPluginManager().registerEvents(this, this);
 
+        // Paper's region scheduler: the host must route this to the region owning (0, 0).
+        var world = getServer().getWorlds().get(0);
+        getServer().getRegionScheduler().run(this, world, 0, 0, task -> append("region task " + task.isRepeatingTask()));
+
+        // Every Bukkit scheduling entry point the bridge claims: immediate, delayed and async.
+        getServer().getScheduler().runTask(this, () -> append("scheduler task"));
+        getServer().getScheduler().runTaskLater(this, () -> append("later task"), 2);
+        getServer().getScheduler().runTaskAsynchronously(this, () -> append("async task"));
+
         var command = getCommand("typical");
         command.setExecutor((sender, cmd, label, args) -> execute(sender, args));
         command.setTabCompleter((sender, cmd, alias, args) -> java.util.List.of("ping", "where", "info", "give"));
