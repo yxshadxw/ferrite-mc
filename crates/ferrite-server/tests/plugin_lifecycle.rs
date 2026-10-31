@@ -770,6 +770,11 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut bot = Bot::join(addr, "Typical", &stdout, &stderr);
     wait_for_prefix(&events, "join Typical", &stdout, &stderr);
+    let joined = fs::read_to_string(&events).unwrap();
+    assert!(
+        joined.contains("join Typical CREATIVE true"),
+        "the plugin.yml default permission was not granted: {joined}"
+    );
     wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
     wait_for_line(&events, "task 1", &stdout, &stderr);
     wait_for_line(&events, "task 3", &stdout, &stderr);
