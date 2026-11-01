@@ -390,6 +390,7 @@ fn locate_biome_on_worker(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate(
     data: &WorldgenData,
     registry: &RuntimeRegistry,

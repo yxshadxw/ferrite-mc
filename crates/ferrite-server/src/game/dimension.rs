@@ -216,6 +216,38 @@ impl DimensionRegistry {
         Arc::new(Self { sources, spawns })
     }
 
+    /// Builds the registry around an already-open overworld source, so the game loop and the
+    /// registry share one chunk cache. Integration worlds (fixture generators, prefilled
+    /// chunks) must keep using the source they were created from.
+    pub fn with_overworld(overworld: Arc<AnvilChunkSource>, spawn: [i32; 3]) -> Arc<Self> {
+        let mut sources = HashMap::new();
+        for dimension in [Dimension::Nether, Dimension::End] {
+            let source = match overworld.path() {
+                Some(path) => AnvilChunkSource::with_dimension(
+                    path.to_path_buf(),
+                    overworld.registry(),
+                    overworld.terrain(),
+                    dimension,
+                ),
+                None => AnvilChunkSource::new_memory_dimension(overworld.terrain(), dimension),
+            };
+            sources.insert(dimension, source);
+        }
+        sources.insert(Dimension::Overworld, overworld);
+        let nether_height = sources[&Dimension::Nether]
+            .spawn_height(0, 0)
+            .unwrap_or(Dimension::Nether.default_spawn()[1]);
+        let spawns = HashMap::from([
+            (Dimension::Overworld, spawn),
+            (
+                Dimension::Nether,
+                [0, nether_height.max(Dimension::Nether.min_y() + 16), 0],
+            ),
+            (Dimension::End, Dimension::End.default_spawn()),
+        ]);
+        Arc::new(Self { sources, spawns })
+    }
+
     pub fn source(&self, dimension: Dimension) -> &Arc<AnvilChunkSource> {
         // Every constructor inserts all three dimensions.
         &self.sources[&dimension]
