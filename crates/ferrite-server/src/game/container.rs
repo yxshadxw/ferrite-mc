@@ -12,6 +12,7 @@ use ferrite_protocol::packets::play::{
 
 use super::anvil::AnvilChunkSource;
 use super::block_container::{self, Opened};
+use super::brewing;
 use super::furnace;
 use super::region::{Player, send};
 
@@ -41,6 +42,8 @@ pub enum OpenAt {
     Inventory(Opened),
     /// A furnace, blast furnace or smoker, whose items and timers live in its block entity.
     Furnace([i32; 3]),
+    /// A brewing stand, whose items and timers live in its block entity.
+    BrewingStand([i32; 3]),
     /// An anvil, which has no block entity.
     Anvil([i32; 3]),
     /// Any other station block: the position and the block name it must still be.
@@ -189,6 +192,10 @@ impl Player {
                 block_name(source, [*x, *y, *z])
                     .and_then(furnace::kind)
                     .is_some()
+                    && self.within_reach([*x, *y, *z])
+            }
+            Some(OpenAt::BrewingStand([x, y, z])) => {
+                block_name(source, [*x, *y, *z]) == Some("minecraft:brewing_stand")
                     && self.within_reach([*x, *y, *z])
             }
             Some(OpenAt::Anvil([x, y, z])) => {
@@ -366,6 +373,15 @@ impl Player {
             };
             furnace::store(source, pos, kind, &data);
         }
+        if let OpenAt::BrewingStand(pos) = at
+            && block_name(source, pos) == Some("minecraft:brewing_stand")
+        {
+            let data = brewing::BrewingData {
+                items: menu.container().to_vec(),
+                state: menu.brewing_state().cloned().unwrap_or_default(),
+            };
+            brewing::store(source, pos, &data);
+        }
     }
 
     /// Copies a shared container's current items into the open menu.
@@ -510,6 +526,21 @@ impl Player {
                 },
                 kind.title(),
                 Some(OpenAt::Furnace([pos.x, pos.y, pos.z])),
+            );
+            return true;
+        }
+        if block_name(&source, [pos.x, pos.y, pos.z]) == Some("minecraft:brewing_stand") {
+            let brewing::BrewingData { items, state } =
+                brewing::load(&source, [pos.x, pos.y, pos.z]);
+            self.open_menu(
+                |id| {
+                    let mut menu = Menu::brewing_stand(id);
+                    menu.container_mut().clone_from_slice(&items);
+                    menu.set_brewing_state(state);
+                    menu
+                },
+                "container.brewing",
+                Some(OpenAt::BrewingStand([pos.x, pos.y, pos.z])),
             );
             return true;
         }

@@ -760,6 +760,11 @@ impl Player {
                     self.menus.spilled.push((pos, stack));
                 }
             }
+            if name == Some("minecraft:brewing_stand") {
+                for stack in super::brewing::take_contents(source, pos) {
+                    self.menus.spilled.push((pos, stack));
+                }
+            }
         }
         true
     }
@@ -940,6 +945,13 @@ impl Player {
         drop(positions);
         if placed {
             self.changed_blocks.push([target.x, target.y, target.z]);
+            // A brewing stand keeps its state in a block entity from the moment it is placed.
+            if ferrite_data::blocks::state(state).map(|(name, _)| name)
+                == Some("minecraft:brewing_stand")
+                && let Some(source) = self.source.clone()
+            {
+                super::brewing::ensure(source.as_ref(), [target.x, target.y, target.z]);
+            }
         }
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
