@@ -66,6 +66,20 @@ pub enum Command {
         slot: u8,
         item: Option<ferrite_plugin::ItemSnapshot>,
     },
+    /// A plugin's `Player#setHealth`, applied on the owning region thread.
+    SetHealth {
+        health: f32,
+    },
+    /// A plugin's `Player#setFoodLevel`, applied on the owning region thread.
+    SetFood {
+        food: u8,
+    },
+    /// A plugin's experience setters, applied on the owning region thread.
+    SetExperience {
+        level: Option<i32>,
+        progress: Option<f32>,
+        total: Option<i32>,
+    },
     /// `/kill`: `damageSources().genericKill()` applied on the owning region thread.
     Kill,
     /// `/effect give`: apply a mob effect on the owning region thread.
@@ -1867,6 +1881,59 @@ impl Player {
                         &GameEvent {
                             event: 3,
                             value: mode as f32,
+                        },
+                    );
+                    continue;
+                }
+                Command::SetHealth { health } => {
+                    self.survival.health = health.clamp(0.0, self.survival.max_health);
+                    send(
+                        self,
+                        &SetHealth {
+                            health: self.survival.health,
+                            food: VarInt(self.survival.food.food),
+                            saturation: self.survival.food.saturation,
+                        },
+                    );
+                    continue;
+                }
+                Command::SetFood { food } => {
+                    self.survival.food.food = i32::from(food.min(20));
+                    self.survival.food.saturation = self
+                        .survival
+                        .food
+                        .saturation
+                        .min(self.survival.food.food as f32);
+                    send(
+                        self,
+                        &SetHealth {
+                            health: self.survival.health,
+                            food: VarInt(self.survival.food.food),
+                            saturation: self.survival.food.saturation,
+                        },
+                    );
+                    continue;
+                }
+                Command::SetExperience {
+                    level,
+                    progress,
+                    total,
+                } => {
+                    if let Some(level) = level {
+                        self.experience_level = level.max(0);
+                    }
+                    if let Some(progress) = progress {
+                        self.experience_progress = progress.clamp(0.0, 1.0);
+                    }
+                    if let Some(total) = total {
+                        self.experience_total = total.max(0);
+                    }
+                    send(
+                        self,
+                        &SetExperience {
+                            progress: self.experience_progress,
+                            level: VarInt(self.experience_level),
+                            total: VarInt(self.experience_total),
                         },
                     );
                     continue;

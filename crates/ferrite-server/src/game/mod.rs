@@ -931,6 +931,32 @@ fn route_plugin_command(
                 mailbox.lock().unwrap().push_back(Command::SetMode(mode));
             }
         }
+        PlayerCommand::SetHealth { player, health } => {
+            if let Some((_, mailbox, _)) = mailboxes.get(&player) {
+                mailbox.lock().unwrap().push_back(Command::SetHealth {
+                    health: health as f32,
+                });
+            }
+        }
+        PlayerCommand::SetFood { player, food } => {
+            if let Some((_, mailbox, _)) = mailboxes.get(&player) {
+                mailbox.lock().unwrap().push_back(Command::SetFood { food });
+            }
+        }
+        PlayerCommand::SetExperience {
+            player,
+            level,
+            progress,
+            total,
+        } => {
+            if let Some((_, mailbox, _)) = mailboxes.get(&player) {
+                mailbox.lock().unwrap().push_back(Command::SetExperience {
+                    level,
+                    progress,
+                    total,
+                });
+            }
+        }
         PlayerCommand::SetOperator { player, operator } => {
             permissions.insert(player, if operator { 4 } else { 0 });
         }
