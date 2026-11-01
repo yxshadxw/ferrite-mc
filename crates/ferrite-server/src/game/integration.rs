@@ -1502,6 +1502,8 @@ fn entities_follow_region_merges_splits_and_hand_offs() {
         rules: Default::default(),
         spawn: [0.0, 65.0, 0.0],
         command_entities: Default::default(),
+        state: Default::default(),
+        tree: None,
     };
     let scheduler = Scheduler::new(
         Regionizer::<super::Region>::default(),

@@ -28,6 +28,7 @@ pub mod beacon;
 mod block_container;
 mod chat;
 mod chunk;
+mod command_block;
 mod commands;
 mod commands_data;
 mod commands_exec;
@@ -440,6 +441,30 @@ async fn run(
         spawn[2] as f64 + 0.5,
     ];
     let command_entities: Arc<Mutex<entity_index::EntityIndex>> = Default::default();
+    // The command tree and state exist before the tick context: command blocks run through
+    // the same dispatcher as players and the world loop.
+    let mut tree = commands::dispatcher();
+    if let Some(plugins) = &settings.plugins {
+        match plugins.plugin_commands() {
+            Ok(commands) => commands::register_plugin_commands(&mut tree, &commands),
+            Err(error) => tracing::warn!(%error, "plugin commands unavailable"),
+        }
+    }
+    let command_tree = Arc::new(tree);
+    let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../vanilla/26.3/generated/reports");
+    let parser_registry = ferrite_command::ParserRegistry::load(&registry_dir).ok();
+    commands::load_lang(&registry_dir);
+    let world_path = source.as_ref().and_then(|source| source.path());
+    let entity_world = world_path.map(std::path::Path::to_path_buf);
+    let disabled_packs = world_path.map(functions::read_disabled).unwrap_or_default();
+    let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
+    initial_state.entities = command_entities.clone();
+    initial_state.functions = Arc::new(functions::FunctionStore::load_with_disabled(
+        world_path,
+        &disabled_packs,
+    ));
+    let command_state = Arc::new(Mutex::new(initial_state));
     let ctx = TickContext {
         signals: signal_tx.clone(),
         tracking: tracking.clone(),
@@ -449,6 +474,8 @@ async fn run(
         dimension: settings.dimension,
         raining: settings.raining,
         command_entities: command_entities.clone(),
+        state: command_state.clone(),
+        tree: Some(Arc::clone(&command_tree)),
     };
     let command_speed = Arc::clone(&random_tick_speed);
     let region_profiler = Arc::clone(&profiler);
@@ -496,14 +523,6 @@ async fn run(
     let mut permissions: HashMap<Uuid, u8> = HashMap::new();
     let mut names: HashMap<Uuid, String> = HashMap::new();
     let mut plugin_commands = settings.plugin_commands.take();
-    let mut tree = commands::dispatcher();
-    if let Some(plugins) = &settings.plugins {
-        match plugins.plugin_commands() {
-            Ok(commands) => commands::register_plugin_commands(&mut tree, &commands),
-            Err(error) => tracing::warn!(%error, "plugin commands unavailable"),
-        }
-    }
-    let command_tree = Arc::new(tree);
     let mut online: HashMap<Uuid, commands::OnlinePlayer> = HashMap::new();
     let mut admin = settings.admin.clone();
     let mut whitelist_enabled = settings.whitelist;
@@ -513,22 +532,8 @@ async fn run(
         std::time::Duration::from_secs(300),
     );
     autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let registry_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vanilla/26.3/generated/reports");
-    let parser_registry = ferrite_command::ParserRegistry::load(&registry_dir).ok();
     let mut holds: HashMap<ChunkPos, usize> = HashMap::new();
     let positions = Arc::new(Mutex::new(HashMap::new()));
-    commands::load_lang(&registry_dir);
-    let mut initial_state = commands::GameState::new(settings.gamemode, 0, settings.max_players);
-    initial_state.entities = command_entities;
-    let world_path = source.as_ref().and_then(|source| source.path());
-    let entity_world = world_path.map(std::path::Path::to_path_buf);
-    let disabled_packs = world_path.map(functions::read_disabled).unwrap_or_default();
-    initial_state.functions = Arc::new(functions::FunctionStore::load_with_disabled(
-        world_path,
-        &disabled_packs,
-    ));
-    let command_state = Arc::new(Mutex::new(initial_state));
     let mut clock = tokio::time::interval(std::time::Duration::from_millis(50));
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_ran = false;
@@ -591,7 +596,7 @@ async fn run(
            online.insert(uuid, commands::OnlinePlayer { name: name.clone(), entity, outbound: outbound.clone(), pos: start_pos, yaw: start_yaw, pitch: start_pitch });
            positions.lock().unwrap().insert(uuid, start_pos);
            tracking.lock().unwrap().insert(uuid, (HashSet::new(), outbound.clone()));
-           let mut player=Player{uuid,name:name.clone(),plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),ignited:Vec::new(),dimension:settings.dimension,sleeping:None,spawn:None,explosions:Vec::new(),button_press:Vec::new(),editing_sign:None,changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),playerdata:settings.playerdata.clone(),effects:Default::default(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false,attacks:Vec::new(),attack_ticks:0,blocking:false,shield_disabled:0,bow_charge:0,using_bow:false,bow_released:false};player.init_inventory_menu();player.refresh_chunks();
+           let mut player=Player{uuid,name:name.clone(),permission,plugins:settings.plugins.clone(),plugin_event_errors:settings.plugin_event_errors,session,entity,broken:Vec::new(),ignited:Vec::new(),dimension:settings.dimension,sleeping:None,spawn:None,explosions:Vec::new(),button_press:Vec::new(),editing_sign:None,changed_blocks:Vec::new(),primed_tnt:Vec::new(),tracking:tracking.clone(),positions:positions.clone(),source:source.clone(),playerdata:settings.playerdata.clone(),effects:Default::default(),pos:start_pos,yaw:start_yaw,pitch:start_pitch,ground:true,chunk:start_chunk,mailbox,outbound:outbound.clone(),signals:signal_tx.clone(),biome,gamemode:start_mode,experience_level:0,experience_progress:0.0,experience_total:0,inventory:start_inventory,menus:Default::default(),breaking:None,view:view_distance as i32,pending_teleport:Some(1),next_teleport:2,loaded:HashSet::new(),queue:VecDeque::new(),awaiting_batch:false,rate:4.0,survival:Default::default(),dimension_type,seed,flat,respawn_requested:false,attacks:Vec::new(),attack_ticks:0,blocking:false,shield_disabled:0,bow_charge:0,using_bow:false,bow_released:false};player.init_inventory_menu();player.refresh_chunks();
            scheduler.add_chunk(player.chunk);scheduler.schedule_at_chunk(player.chunk,move |r|{r.hold_chunk(player.chunk);r.players.insert(uuid,player);});
            names.insert(uuid, name.clone());
            if let Some(plugins) = &settings.plugins {
