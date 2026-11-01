@@ -723,7 +723,7 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
     fs::write(
         dir.path().join("ferrite.toml"),
         format!(
-            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\nmotd = \"Typical plugin\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
+            "bind-address = \"127.0.0.1:{port}\"\nonline-mode = false\nview-distance = 2\ngenerator = \"superflat\"\nmotd = \"Typical plugin\"\nplugins-dir = \"plugins\"\nplugin-bridge = \"{}\"\n",
             toml_path(&bridge_jar)
         ),
     )
@@ -780,6 +780,42 @@ fn typical_plugin_uses_config_commands_listener_and_repeating_task() {
         "the plugin.yml default permission was not granted: {joined}"
     );
     wait_for_line(&events, "tab [ping, where, info, give]", &stdout, &stderr);
+    // Server surface: the host's real bind address and settings, the vanilla recipe and tag
+    // tables loaded from the generated data pack, and the boss-bar registry.
+    bot.raw(7, "typical surface");
+    let dir_name = dir.path().file_name().unwrap().to_string_lossy();
+    wait_for_line(
+        &events,
+        &format!("ip 127.0.0.1 {port} 2 10 20"),
+        &stdout,
+        &stderr,
+    );
+    wait_for_line(
+        &events,
+        &format!("container {dir_name} update update"),
+        &stdout,
+        &stderr,
+    );
+    wait_for_line(&events, "recipes 1763 stick STICK 4 true", &stdout, &stderr);
+    wait_for_line(&events, "for-stick 2 true", &stdout, &stderr);
+    wait_for_line(
+        &events,
+        "tags coals true diamond false logs true",
+        &stdout,
+        &stderr,
+    );
+    wait_for_line(&events, "boss true 0.25 Boss true true", &stdout, &stderr);
+    // On-demand world reads: the superflat test world has grass at y=64 over dirt and air
+    // above it, full sky light in the open column, and the plains biome.
+    bot.raw(7, "typical world");
+    wait_for_line(&events, "block GRASS_BLOCK", &stdout, &stderr);
+    wait_for_line(&events, "air AIR sky 15 dark 0", &stdout, &stderr);
+    wait_for_line(
+        &events,
+        "highest 64 biome minecraft:plains",
+        &stdout,
+        &stderr,
+    );
     // Published before onEnable, so the fixture can target it with Paper's region scheduler.
     wait_for_line(&events, "region task false", &stdout, &stderr);
     // The Bukkit scheduler runs immediate, delayed and asynchronous tasks.

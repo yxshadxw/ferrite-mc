@@ -101,7 +101,36 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("give unavailable");
                 }
             }
-            default -> sender.sendMessage("usage: /typical <ping|where|info|give>");
+            case "world" -> {
+                var world = getServer().getWorlds().get(0);
+                var ground = world.getBlockAt(0, 64, 0);
+                var air = world.getBlockAt(0, 65, 0);
+                append("block " + ground.getType());
+                append("air " + air.getType() + " sky " + air.getLightFromSky() + " dark " + world.getBlockAt(0, 63, 0).getLightFromSky());
+                append("highest " + world.getHighestBlockYAt(0, 0) + " biome " + world.getBiome(0, 64, 0).getKey());
+            }
+            case "surface" -> {
+                var srv = getServer();
+                append("ip " + srv.getIp() + " " + srv.getPort() + " " + srv.getViewDistance() + " " + srv.getSimulationDistance() + " " + srv.getMaxPlayers());
+                append("container " + srv.getWorldContainer().getName() + " update " + srv.getUpdateFolder());
+                int recipes = 0;
+                for (var iterator = srv.recipeIterator(); iterator.hasNext(); ) { iterator.next(); recipes++; }
+                var stick = srv.getRecipe(org.bukkit.NamespacedKey.minecraft("stick"));
+                append("recipes " + recipes + " stick " + stick.getResult().getType() + " " + stick.getResult().getAmount() + " " + srv.hasRecipe(org.bukkit.NamespacedKey.minecraft("stick")));
+                var forStick = srv.getRecipesFor(new org.bukkit.inventory.ItemStack(org.bukkit.Material.STICK));
+                boolean stickKey = forStick.stream().anyMatch(recipe -> recipe instanceof org.bukkit.Keyed keyed && keyed.getKey().getKey().equals("stick"));
+                append("for-stick " + forStick.size() + " " + stickKey);
+                boolean coals = false, diamond = false;
+                for (var tag : srv.getTags(org.bukkit.Tag.REGISTRY_ITEMS, org.bukkit.Material.class)) if (tag.getKey().getKey().equals("coals")) { coals = tag.isTagged(org.bukkit.Material.COAL) && tag.isTagged(org.bukkit.Material.CHARCOAL); diamond = tag.isTagged(org.bukkit.Material.DIAMOND); }
+                boolean logs = false;
+                for (var tag : srv.getTags(org.bukkit.Tag.REGISTRY_BLOCKS, org.bukkit.Material.class)) if (tag.getKey().getKey().equals("logs")) logs = tag.isTagged(org.bukkit.Material.OAK_LOG);
+                append("tags coals " + coals + " diamond " + diamond + " logs " + logs);
+                var key = new org.bukkit.NamespacedKey("ferrite", "probe");
+                var bar = srv.createBossBar(key, "Boss", org.bukkit.boss.BarColor.RED, org.bukkit.boss.BarStyle.SOLID);
+                bar.setProgress(0.25);
+                append("boss " + (srv.getBossBar(key) == bar) + " " + bar.getProgress() + " " + bar.getTitle() + " " + srv.getBossBars().hasNext() + " " + srv.removeBossBar(key));
+            }
+            default -> sender.sendMessage("usage: /typical <ping|where|info|give|world|surface>");
         }
         return true;
     }
