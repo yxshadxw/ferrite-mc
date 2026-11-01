@@ -254,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_or_else(|| "playerdata".into(), |w| w.join("playerdata")),
         ),
         plugin_commands: Some(plugin_commands),
+        dimensions: None,
     };
     let terrain = match config.generator {
         WorldGenerator::Vanilla => Some(std::sync::Arc::new(

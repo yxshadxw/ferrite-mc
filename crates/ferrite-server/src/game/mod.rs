@@ -29,6 +29,8 @@ mod block_container;
 mod chat;
 mod chunk;
 mod commands;
+mod dimension;
+pub use dimension::{Dimension, DimensionRegistry};
 mod commands_data;
 mod commands_exec;
 mod commands_extras;
@@ -111,31 +113,6 @@ pub enum PluginEventPolicy {
     /// Treat the failure like a cancellation: undo the action and resend block/teleport state.
     Deny,
 }
-/// The dimensions the server can run (`DimensionType`): beds only work in the overworld, and
-/// each dimension has its own `infiniburn` tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Dimension {
-    #[default]
-    Overworld,
-    Nether,
-    End,
-}
-
-impl Dimension {
-    /// Vanilla `DimensionType.bedWorks`: beds explode in the nether and the end.
-    pub fn bed_works(self) -> bool {
-        matches!(self, Self::Overworld)
-    }
-
-    /// Vanilla `DimensionType.infiniburn`.
-    pub fn infiniburn_tag(self) -> &'static str {
-        match self {
-            Self::Overworld => "infiniburn_overworld",
-            Self::Nether => "infiniburn_nether",
-            Self::End => "infiniburn_end",
-        }
-    }
-}
 
 pub struct WorldSettings {
     pub gamemode: i32,
@@ -159,6 +136,9 @@ pub struct WorldSettings {
     pub playerdata: Option<std::path::PathBuf>,
     /// Player mutations plugins made through the Bukkit API, delivered to the owning region.
     pub plugin_commands: Option<mpsc::UnboundedReceiver<ferrite_plugin::PlayerCommand>>,
+    /// Per-dimension chunk sources. `None` opens the standard three dimensions from the
+    /// primary source's world directory (or in memory for a world without one).
+    pub dimensions: Option<Arc<DimensionRegistry>>,
 }
 impl WorldSettings {
     fn permission(&self, uuid: Uuid) -> u8 {
@@ -182,6 +162,7 @@ impl Default for WorldSettings {
             whitelist: false,
             playerdata: None,
             plugin_commands: None,
+            dimensions: None,
         }
     }
 }
@@ -195,6 +176,7 @@ pub struct World {
     profiler: Arc<profile::Profiler>,
     random_tick_speed: Arc<AtomicU32>,
     source: Arc<anvil::AnvilChunkSource>,
+    dimensions: Arc<DimensionRegistry>,
     stop: tokio::sync::watch::Receiver<bool>,
     game_rules: Arc<Mutex<ferrite_command::gamerule::GameRules>>,
 }
@@ -211,6 +193,10 @@ impl World {
     pub fn cache_stats(&self) -> anvil::CacheStats {
         self.source.cache_stats()
     }
+    /// The per-dimension chunk sources of this world.
+    pub fn dimensions(&self) -> &Arc<DimensionRegistry> {
+        &self.dimensions
+    }
     pub fn start_with(source: Option<Arc<anvil::AnvilChunkSource>>, spawn: [i32; 3]) -> Self {
         Self::start_configured(source, spawn, WorldSettings::default())
     }
@@ -221,6 +207,9 @@ impl World {
     ) -> Self {
         let flat = source.as_ref().is_none_or(|source| source.is_flat());
         let source = source.unwrap_or_else(anvil::AnvilChunkSource::new_memory);
+        let dimensions = settings.dimensions.clone().unwrap_or_else(|| {
+            DimensionRegistry::standard(source.path(), source.registry(), source.terrain(), spawn)
+        });
         let (sender, rx) = mpsc::unbounded_channel();
         let (signals, signal_rx) = mpsc::unbounded_channel();
         drops::preload();
@@ -261,6 +250,7 @@ impl World {
             profiler,
             random_tick_speed,
             source,
+            dimensions,
             stop,
             game_rules,
         }
