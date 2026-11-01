@@ -470,6 +470,37 @@ impl AnvilChunkSource {
         })
         .flatten()
     }
+    /// Every block entity in the loaded chunks, with its world position. Used by the beacon
+    /// scan, which has to find block entities no player has opened.
+    pub fn block_entities(&self) -> Vec<([i32; 3], ferrite_world::BlockEntity)> {
+        let cache = self.cache.lock().unwrap();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (&(cx, cz), dirty) in &cache.dirty {
+            seen.insert((cx, cz));
+            for (&(x, y, z), entity) in &dirty.chunk.block_entities {
+                out.push((
+                    [cx * 16 + i32::from(x), y, cz * 16 + i32::from(z)],
+                    entity.clone(),
+                ));
+            }
+        }
+        for (&(cx, cz, _), entry) in &cache.entries {
+            if !seen.insert((cx, cz)) {
+                continue;
+            }
+            if let Entry::Ready(Ok(column), _) = entry {
+                for (&(x, y, z), entity) in &column.chunk.block_entities {
+                    out.push((
+                        [cx * 16 + i32::from(x), y, cz * 16 + i32::from(z)],
+                        entity.clone(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Edits the block entity at a block (`None` when there is none) in a loaded chunk; the
     /// chunk is marked modified when `f` reports a change, so it is resent and saved.
     pub fn update_block_entity<R>(

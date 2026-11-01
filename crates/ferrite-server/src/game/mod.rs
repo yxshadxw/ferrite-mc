@@ -8,6 +8,7 @@ mod persistence_tests;
 mod terrain;
 pub use terrain::{Generated, StageTimings, TerrainKind, VanillaTerrain};
 pub mod playerdata;
+pub use brewing::BrewingData;
 pub fn new_anvil_source(
     path: std::path::PathBuf,
     registry: ferrite_world::RuntimeRegistry,
@@ -26,6 +27,7 @@ pub fn new_memory_source(terrain: Option<Arc<VanillaTerrain>>) -> Arc<AnvilChunk
 }
 pub mod beacon;
 mod block_container;
+mod brewing;
 mod chat;
 mod chunk;
 mod command_block;

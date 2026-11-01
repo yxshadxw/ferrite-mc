@@ -421,6 +421,8 @@ pub struct Region {
     /// Scope tree attached by the game loop; `None` until the first tick.
     pub timings: Option<Arc<Timings>>,
     rng: Rng,
+    /// Ticks this region has run, for the beacon's 80-tick effect refresh.
+    beacon_clock: u32,
     /// UUIDs this region last published into `TickContext::command_entities`.
     published_entities: HashSet<Uuid>,
 }
@@ -455,6 +457,7 @@ impl RegionData for Region {
         let mut result = Self {
             players: HashMap::new(),
             rng: Rng::default(),
+            beacon_clock: 0,
             entities: self
                 .entities
                 .split(|(x, z)| sections.contains(&SectionPos(x >> 4, z >> 4))),
@@ -913,6 +916,16 @@ impl Player {
                     self.menus.spilled.push((pos, stack));
                 }
             }
+            if name == Some("minecraft:brewing_stand") {
+                for stack in super::brewing::take_contents(source, pos) {
+                    self.menus.spilled.push((pos, stack));
+                }
+            }
+            if name == Some("minecraft:beacon") {
+                let _ = source.update_block_entity(pos[0], pos[1], pos[2], |entity| {
+                    (entity.take().is_some(), ())
+                });
+            }
         }
         true
     }
@@ -1103,6 +1116,21 @@ impl Player {
         drop(positions);
         if placed {
             self.changed_blocks.push([target.x, target.y, target.z]);
+            // Block entities are created with the block, so the menu, /data and the chunk save
+            // all find the state they expect.
+            match ferrite_data::blocks::state(state).map(|(name, _)| name) {
+                Some("minecraft:brewing_stand") => {
+                    if let Some(source) = self.source.clone() {
+                        super::brewing::ensure(source.as_ref(), [target.x, target.y, target.z]);
+                    }
+                }
+                Some("minecraft:beacon") => {
+                    if let Some(source) = self.source.clone() {
+                        super::beacon::ensure(source.as_ref(), [target.x, target.y, target.z]);
+                    }
+                }
+                _ => {}
+            }
         }
         // Survival uses the item up (vanilla `BlockItem.place`: `shrink(1)` unless the player
         // has infinite materials); the client gets the slot with the tick's `broadcastChanges`.
@@ -2244,6 +2272,7 @@ impl Player {
                 }
                 ServerboundPlay::ContainerClick(p) => self.handle_container_click(p),
                 ServerboundPlay::ContainerButtonClick(p) => self.handle_container_button(p),
+                ServerboundPlay::SetBeacon(p) => self.handle_set_beacon(p),
                 ServerboundPlay::RenameItem(p) => self.rename_item(p.name),
                 ServerboundPlay::ContainerClose(_) => self.close_container(),
                 ServerboundPlay::PlayerAction(p) => {
@@ -3741,6 +3770,7 @@ impl Region {
         self.pick_up_items(ctx);
         self.tick_falling(ctx);
         self.tick_tnt(ctx);
+        self.tick_beacons(ctx);
         for p in self.players.values_mut() {
             p.tick_containers();
         }
@@ -3754,6 +3784,65 @@ impl Region {
             });
         }
         self.publish_command_entities(&ctx.command_entities);
+    }
+
+    /// Vanilla `BeaconBlockEntity`'s 80-tick timer: recompute each beacon's pyramid, resend the
+    /// beam height and refresh the effects of the players inside the range.
+    fn tick_beacons(&mut self, ctx: &TickContext) {
+        self.beacon_clock = self.beacon_clock.wrapping_add(1);
+        if !self
+            .beacon_clock
+            .is_multiple_of(super::beacon::EFFECT_INTERVAL)
+        {
+            return;
+        }
+        let Some(source) = ctx.source.as_deref() else {
+            return;
+        };
+        let Some(block) = ferrite_data::registries::id("minecraft:block", "minecraft:beacon")
+        else {
+            return;
+        };
+        let beacons: Vec<[i32; 3]> = source
+            .block_entities()
+            .into_iter()
+            .filter(|(pos, entity)| {
+                self.held_chunks
+                    .contains_key(&ChunkPos(pos[0].div_euclid(16), pos[2].div_euclid(16)))
+                    && entity.data.get("id")
+                        == Some(&ferrite_nbt::Tag::String("minecraft:beacon".into()))
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+        for pos in beacons {
+            let mut data = super::beacon::load(source, pos);
+            let levels = super::beacon::scan_levels(source, pos);
+            if data.levels != levels {
+                data.levels = levels;
+                super::beacon::store(source, pos, &data);
+            }
+            if levels <= 0 {
+                continue;
+            }
+            // Vanilla `BeaconBlockEntity.triggerEvent`: event 1 sets the client's beam height.
+            let event = ferrite_protocol::packets::play::BlockEvent {
+                pos: ferrite_protocol::types::BlockPos::new(pos[0], pos[1], pos[2]),
+                block: VarInt(block),
+                param_a: 1,
+                param_b: u8::try_from(levels).unwrap_or(0),
+            };
+            for player in self.players.values() {
+                send(player, &event);
+            }
+            let effects = super::beacon::effects(&data);
+            for player in self.players.values_mut() {
+                if super::beacon::in_range(pos, levels, player.pos) {
+                    for effect in &effects {
+                        player.apply_effect(*effect);
+                    }
+                }
+            }
+        }
     }
 
     /// Publishes this region's entities for command selectors. Folia keeps the store region
