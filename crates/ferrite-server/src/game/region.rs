@@ -168,6 +168,92 @@ pub struct TickContext {
     pub spawn: [f64; 3],
     /// Command-visible entity snapshot this region publishes at the end of each tick.
     pub command_entities: Arc<Mutex<super::entity_index::EntityIndex>>,
+    /// Server command state, used by command blocks (storage, scores, `/function`).
+    pub state: Arc<Mutex<super::commands::GameState>>,
+    /// The server's command tree, for command blocks; `None` in tests that do not need it.
+    pub tree: Option<Arc<ferrite_command::CommandDispatcher<super::commands::Source>>>,
+}
+
+/// Runs a command block's command on the region thread. World edits and block-entity data are
+/// applied immediately (that is what command blocks exist for); actions that belong to the
+/// world loop (give, teleport, chat, ...) are dropped, so command block output never reaches
+/// players, as in vanilla.
+struct BlockCommands<'a> {
+    source: &'a Arc<super::anvil::AnvilChunkSource>,
+    tracking: &'a Tracking,
+    state: &'a Arc<Mutex<super::commands::GameState>>,
+    tree: &'a Arc<ferrite_command::CommandDispatcher<super::commands::Source>>,
+}
+
+impl super::command_block::Runner for BlockCommands<'_> {
+    fn run(&mut self, pos: [i32; 3], command: &str) -> Result<String, String> {
+        let origin = super::commands_world::Origin {
+            pos: [
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]) + 0.5,
+                f64::from(pos[2]) + 0.5,
+            ],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let (actions, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let source = super::commands::Source {
+            permission: 2,
+            origin: origin.pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            uuid: None,
+            name: None,
+            anchor: ferrite_command::EntityAnchor::Feet,
+            world: Some(Arc::clone(self.source)),
+            state: Arc::clone(self.state),
+            actions,
+            tree: Some(Arc::clone(self.tree)),
+            function_depth: 0,
+        };
+        self.tree
+            .execute(command.trim_start_matches('/'), source)
+            .map_err(|error| error.to_string())?;
+        let mut output = String::new();
+        let mut success = true;
+        while let Ok(action) = received.try_recv() {
+            match action {
+                super::commands::Action::World(command) => {
+                    match super::commands_world::apply_world_result(
+                        &command,
+                        &origin,
+                        &**self.source,
+                        self.tracking,
+                    ) {
+                        Ok(outcome) => output = outcome.message,
+                        Err(error) => {
+                            success = false;
+                            output = error;
+                        }
+                    }
+                }
+                super::commands::Action::Data(command) => {
+                    match super::commands_data::apply_block(Some(&**self.source), &command) {
+                        Ok(feedback) => output = feedback.text,
+                        Err(error) => {
+                            success = false;
+                            output = error;
+                        }
+                    }
+                }
+                super::commands::Action::Feedback(feedback)
+                | super::commands::Action::Broadcast(feedback) => output = feedback.text,
+                super::commands::Action::PlayerFeedback { feedback, .. } => {
+                    output = feedback.text;
+                }
+                // The world loop owns everything else (`/give`, `/tp`, `/say`, ...). The
+                // command itself parsed and ran, so it counts as a success like vanilla does
+                // when its target has no effect.
+                _ => {}
+            }
+        }
+        if success { Ok(output) } else { Err(output) }
+    }
 }
 /// Block access for entity physics, memoized for one tick (each lookup locks the chunk cache).
 pub(super) struct TickBlocks<'a> {
@@ -252,6 +338,8 @@ pub struct Player {
     /// The sign this player may edit.
     pub editing_sign: Option<([i32; 3], bool)>,
     pub name: String,
+    /// Permission level at join; command block editing needs 2 (gamemasters).
+    pub permission: u8,
     /// Plugin event hooks; `None` when the server runs without plugins.
     pub plugins: Option<Arc<dyn ferrite_plugin::ServerHooks>>,
     /// What a failed plugin event means for the action it guards.
@@ -324,6 +412,9 @@ pub struct Region {
     dispensers: super::dispenser::Dispensers,
     hoppers: super::hopper::Hoppers,
     redstone: super::redstone::Redstone,
+    command_blocks: super::command_block::CommandBlocks,
+    /// Monotonic per-region tick counter, the `LastExecution` clock command blocks use.
+    tick_clock: i64,
     held_chunks: HashMap<ChunkPos, usize>,
     /// Tick monitor slot, assigned by the game loop on this region's first tick.
     pub profile_slot: Option<u32>,
@@ -347,6 +438,8 @@ impl RegionData for Region {
         self.dispensers.merge(other.dispensers);
         self.hoppers.merge(other.hoppers);
         self.redstone.merge(other.redstone);
+        self.command_blocks.merge(other.command_blocks);
+        self.tick_clock = self.tick_clock.max(other.tick_clock);
         self.players.extend(other.players);
         self.entities.merge(other.entities);
         self.published_entities.extend(other.published_entities);
@@ -387,6 +480,10 @@ impl RegionData for Region {
             redstone: self.redstone.split(|x, z| {
                 sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
             }),
+            command_blocks: self.command_blocks.split(|x, z| {
+                sections.contains(&SectionPos(x.div_euclid(16) >> 4, z.div_euclid(16) >> 4))
+            }),
+            tick_clock: self.tick_clock,
             held_chunks: HashMap::new(),
             profile_slot: None,
             timings: self.timings.clone(),
@@ -721,6 +818,48 @@ impl Player {
             );
         }
     }
+    /// Sends one command block's NBT to every player that has its chunk loaded (vanilla
+    /// `ClientboundBlockEntityDataPacket` when a command block opens or is edited).
+    fn sync_block_entity(&self, pos: [i32; 3]) {
+        let Some(source) = &self.source else {
+            return;
+        };
+        let Some(entity) = source.block_entity(pos[0], pos[1], pos[2]) else {
+            return;
+        };
+        let chunk = (pos[0].div_euclid(16), pos[2].div_euclid(16));
+        let ferrite_world::BlockEntity { type_id, mut data } = entity;
+        data.shift_remove("x");
+        data.shift_remove("y");
+        data.shift_remove("z");
+        let update = packet(&BlockEntityData {
+            location: ferrite_protocol::types::BlockPos::new(pos[0], pos[1], pos[2]).pack(),
+            block_type: VarInt(i32::try_from(type_id).unwrap_or(0)),
+            nbt: data,
+        });
+        for (loaded, outbound) in self.tracking.lock().unwrap().values() {
+            if loaded.contains(&chunk) {
+                let _ = outbound.send(update.clone());
+            }
+        }
+    }
+
+    /// `ServerboundSetCommandBlockPacket`: an operator's editor writes the block entity
+    /// (vanilla `CommandBlockEntity` setters), including a mode change of the block itself.
+    fn edit_command_block(&mut self, packet: &SetCommandBlock) {
+        if self.permission < 2 || self.gamemode == 3 {
+            return;
+        }
+        let Some(source) = &self.source else {
+            return;
+        };
+        let pos = ferrite_protocol::types::BlockPos::unpack(packet.location);
+        let pos = [pos.x, pos.y, pos.z];
+        if super::command_block::edit(source, pos, packet) {
+            self.sync_block_entity(pos);
+        }
+    }
+
     /// Applies a block change and tells every player tracking the chunk. `expected` keeps the
     /// compare-and-set used by player interaction; commands pass `None`.
     pub(crate) fn change_block(&self, location: i64, expected: Option<u32>, state: u32) -> bool {
@@ -807,6 +946,16 @@ impl Player {
         if let Some(next) = super::redstone::use_block(clicked_state) {
             if self.change_block(p.location, Some(u32::from(clicked_state)), u32::from(next)) {
                 self.changed_blocks.push([clicked.x, clicked.y, clicked.z]);
+            }
+            return;
+        }
+        // Vanilla `CommandBlock.useWithoutItem`: an operator's right-click opens the editor,
+        // which needs the block entity on the client. Nobody may place against the block.
+        if ferrite_data::blocks::state(clicked_state)
+            .is_some_and(|(name, _)| super::command_block::Mode::of_block(name).is_some())
+        {
+            if self.permission >= 2 {
+                self.sync_block_entity([clicked.x, clicked.y, clicked.z]);
             }
             return;
         }
@@ -2267,6 +2416,7 @@ impl Player {
                     }
                 }
                 ServerboundPlay::SignUpdate(p) => super::blocks::edit_sign(self, &p),
+                ServerboundPlay::SetCommandBlock(p) => self.edit_command_block(&p),
                 ServerboundPlay::SetHeldItem(p) => {
                     // Vanilla `handleSetCarriedItem` ignores slots outside the hotbar.
                     if (0..=8).contains(&p.slot) {
@@ -2997,6 +3147,56 @@ impl Region {
         }
     }
 
+    /// Runs this region's command blocks after redstone settled for the tick (vanilla
+    /// `Level.tickBlockEntities` -> `CommandBlockEntity.tick`), then sends each changed block
+    /// entity to its viewers through `block_entity_data`.
+    fn tick_command_blocks(&mut self, ctx: &TickContext, changed: &[[i32; 3]]) {
+        let Some(source) = ctx.source.as_ref() else {
+            return;
+        };
+        let Some(tree) = ctx.tree.clone() else {
+            return;
+        };
+        let Self {
+            command_blocks,
+            redstone,
+            held_chunks,
+            tick_clock,
+            ..
+        } = self;
+        command_blocks.blocks_changed(source, changed);
+        let world = super::fluid::RegionFluidWorld::new(source, held_chunks, &ctx.tracking);
+        let power = |pos| redstone.power_at(&world, pos);
+        let mut runner = BlockCommands {
+            source,
+            tracking: &ctx.tracking,
+            state: &ctx.state,
+            tree: &tree,
+        };
+        let updated = command_blocks.tick(source, &power, &mut runner, *tick_clock);
+        if updated.is_empty() {
+            return;
+        }
+        let tracking = ctx.tracking.lock().unwrap();
+        for (pos, entity) in updated {
+            let chunk = (pos[0].div_euclid(16), pos[2].div_euclid(16));
+            let ferrite_world::BlockEntity { type_id, mut data } = entity;
+            data.shift_remove("x");
+            data.shift_remove("y");
+            data.shift_remove("z");
+            let update = packet(&BlockEntityData {
+                location: ferrite_protocol::types::BlockPos::new(pos[0], pos[1], pos[2]).pack(),
+                block_type: VarInt(i32::try_from(type_id).unwrap_or(0)),
+                nbt: data,
+            });
+            for (loaded, outbound) in tracking.values() {
+                if loaded.contains(&chunk) {
+                    let _ = outbound.send(update.clone());
+                }
+            }
+        }
+    }
+
     /// Ticks the region's redstone network after this tick's block changes, mirroring
     /// `Level.tickBlockEntities` + `Level.tickBlocks` + scheduled block ticks.
     fn tick_redstone(&mut self, ctx: &TickContext, changed: &[[i32; 3]]) {
@@ -3367,6 +3567,7 @@ impl Region {
     }
 
     pub fn tick(&mut self, ctx: &TickContext) {
+        self.tick_clock = self.tick_clock.wrapping_add(1);
         let timings = self.timings.clone();
         let _tick = timings.as_ref().map(|t| t.scope("region-tick"));
         let rules = SurvivalRules::from(&ctx.rules.lock().unwrap());
@@ -3520,6 +3721,7 @@ impl Region {
         self.tick_gravity(ctx);
         self.tick_redstone(ctx, &changed);
         self.tick_dispensers(ctx);
+        self.tick_command_blocks(ctx, &changed);
         let blocks = TickBlocks {
             source: ctx.source.as_deref(),
             seen: Default::default(),
@@ -3639,6 +3841,8 @@ mod tests {
             rules: Default::default(),
             spawn: [0.0, 65.0, 0.0],
             command_entities: Default::default(),
+            state: Default::default(),
+            tree: None,
         });
 
         let report = timings.report_all(50.0);
