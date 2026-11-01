@@ -230,6 +230,12 @@ pub enum PlayerCommand {
         player: uuid::Uuid,
         mode: GameMode,
     },
+    SetExperience {
+        player: uuid::Uuid,
+        level: Option<i32>,
+        progress: Option<f32>,
+        total: Option<i32>,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoundCategory {
@@ -1056,6 +1062,36 @@ extern "system" fn player_state(
                 _ => return,
             };
             PlayerCommand::SetGameMode { player, mode }
+        }
+        3 if value.is_finite()
+            && value >= 0.0
+            && value <= f64::from(i32::MAX)
+            && value.fract() == 0.0 =>
+        {
+            PlayerCommand::SetExperience {
+                player,
+                level: Some(value as i32),
+                progress: None,
+                total: None,
+            }
+        }
+        4 if value.is_finite() && (0.0..=1.0).contains(&value) => PlayerCommand::SetExperience {
+            player,
+            level: None,
+            progress: Some(value as f32),
+            total: None,
+        },
+        5 if value.is_finite()
+            && value >= 0.0
+            && value <= f64::from(i32::MAX)
+            && value.fract() == 0.0 =>
+        {
+            PlayerCommand::SetExperience {
+                player,
+                level: None,
+                progress: None,
+                total: Some(value as i32),
+            }
         }
         _ => return,
     };

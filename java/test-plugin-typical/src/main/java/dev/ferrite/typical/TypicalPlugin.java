@@ -49,6 +49,10 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
         getServer().getScheduler().runTaskLaterAsynchronously(this, () -> append("later async task"), 2);
         getServer().getScheduler().runTaskTimerAsynchronously(this, task -> { append("timer async task"); task.cancel(); }, 1, 1);
 
+        // Cancelling a repeating async task from the sync scheduler thread must stop it.
+        var asyncTimer = getServer().getScheduler().runTaskTimerAsynchronously(this, () -> append("async tick"), 1, 1);
+        getServer().getScheduler().runTaskLater(this, () -> { asyncTimer.cancel(); append("async cancelled"); }, 6);
+
         var command = getCommand("typical");
         command.setExecutor((sender, cmd, label, args) -> execute(sender, args));
         command.setTabCompleter((sender, cmd, alias, args) -> java.util.List.of("ping", "where", "info", "give"));
@@ -101,6 +105,21 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("give unavailable");
                 }
             }
+            case "state" -> {
+                if (!(sender instanceof org.bukkit.entity.Player player)) { sender.sendMessage("state: player only"); return true; }
+                player.setHealth(7.5);
+                player.setFoodLevel(11);
+                player.setLevel(12);
+                player.setExp(0.25f);
+                player.setTotalExperience(123);
+                append("state " + player.getHealth() + " " + player.getFoodLevel() + " " + player.getLevel() + " " + player.getExp() + " " + player.getTotalExperience());
+            }
+            case "tp" -> {
+                if (!(sender instanceof org.bukkit.entity.Player player)) { sender.sendMessage("tp: player only"); return true; }
+                boolean moved = player.teleport(new org.bukkit.Location(player.getWorld(), 2.5, 70.0, 2.5));
+                var location = player.getLocation();
+                append("tp " + moved + " " + location.getX() + " " + location.getY() + " " + location.getZ());
+            }
             case "world" -> {
                 var world = getServer().getWorlds().get(0);
                 var ground = world.getBlockAt(0, 64, 0);
@@ -130,7 +149,7 @@ public final class TypicalPlugin extends JavaPlugin implements Listener {
                 bar.setProgress(0.25);
                 append("boss " + (srv.getBossBar(key) == bar) + " " + bar.getProgress() + " " + bar.getTitle() + " " + srv.getBossBars().hasNext() + " " + srv.removeBossBar(key));
             }
-            default -> sender.sendMessage("usage: /typical <ping|where|info|give|world|surface>");
+            default -> sender.sendMessage("usage: /typical <ping|where|info|give|state|tp|world|surface>");
         }
         return true;
     }
